@@ -10,13 +10,10 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dashmap::DashMap;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,6 +28,7 @@ pub struct ProxyConfig {
     pub api_key: String,
     pub model_override: String,
     pub ui_index_path: PathBuf,
+    pub static_prefix_override: Option<String>,
 }
 
 struct RollingEntry {
@@ -56,6 +54,8 @@ struct PacerState {
     total_cached_tokens: u64,
     total_completion_tokens: u64,
     total_uncached_tokens: u64,
+    queue_ms_samples: Vec<f64>,
+    decode_tps_samples: Vec<f64>,
 }
 
 impl Default for PacerState {
@@ -78,6 +78,8 @@ impl Default for PacerState {
             total_cached_tokens: 0,
             total_completion_tokens: 0,
             total_uncached_tokens: 0,
+            queue_ms_samples: Vec::new(),
+            decode_tps_samples: Vec::new(),
         }
     }
 }
@@ -139,6 +141,11 @@ impl ProxyState {
 
     pub fn take_module_metrics(&self, module_id: &str) -> Option<LlmCallMetrics> {
         self.module_metrics.remove(module_id).map(|(_, v)| v)
+    }
+
+    pub fn timing_samples(&self) -> (Vec<f64>, Vec<f64>) {
+        let p = self.pacer.lock().unwrap();
+        (p.queue_ms_samples.clone(), p.decode_tps_samples.clone())
     }
 
     async fn wait_for_budget(&self, est_uncached: u64, est_total: u64) {
@@ -267,6 +274,12 @@ impl ProxyState {
             p.total_cached_tokens += m.cached_tokens;
             p.total_completion_tokens += m.completion_tokens;
             p.total_uncached_tokens += m.uncached_tokens;
+            if m.queue_ms > 0.0 {
+                p.queue_ms_samples.push(m.queue_ms);
+            }
+            if m.decode_tps > 0.0 {
+                p.decode_tps_samples.push(m.decode_tps);
+            }
             // Adjust most recent reservation delta
             let extra_unc = m.uncached_tokens.saturating_sub(est_uncached);
             let actual_tot = m.prompt_tokens + m.completion_tokens;
@@ -305,11 +318,11 @@ pub async fn start_proxy_server(
     telemetry: TelemetryHub,
 ) -> Result<(Arc<ProxyState>, tokio::task::JoinHandle<()>)> {
     let client = reqwest::Client::builder()
-        .http2_adaptive_window(true)
+        .user_agent("cerebras-cloud-sdk/1.91.0 (refit/0.3.0)")
         .pool_max_idle_per_host(32)
         .timeout(Duration::from_secs(180))
         .build()
-        .context("build reqwest HTTP/2 client")?;
+        .context("build reqwest HTTP client")?;
 
     let state = Arc::new(ProxyState {
         cfg: cfg.clone(),
@@ -410,11 +423,14 @@ async fn handle_chat_completions(
     headers: HeaderMap,
     Json(mut payload): Json<Value>,
 ) -> Response {
-    let module_id = headers
+    let mut module_id = headers
         .get("x-refit-module")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    if module_id.is_empty() {
+        module_id = infer_module_id_from_payload(&payload);
+    }
     let attempt: u32 = headers
         .get("x-refit-attempt")
         .and_then(|v| v.to_str().ok())
@@ -428,12 +444,26 @@ async fn handle_chat_completions(
         .unwrap_or(false);
 
     if let Some(obj) = payload.as_object_mut() {
-        if !state.cfg.model_override.is_empty() {
+        let effective_model = if !state.cfg.model_override.is_empty() {
             obj.insert("model".into(), Value::String(state.cfg.model_override.clone()));
+            state.cfg.model_override.clone()
+        } else {
+            obj.get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let is_qwen = effective_model.to_lowercase().contains("qwen");
+        if is_qwen {
+            obj.insert("disable_reasoning".into(), Value::Bool(true));
+            obj.remove("reasoning_effort");
+            obj.remove("reasoning_format");
+            obj.insert("temperature".into(), Value::from(if attempt > 1 { 0.35 } else { 0.2 }));
+        } else {
+            obj.insert("reasoning_effort".into(), Value::String("low".into()));
+            obj.insert("reasoning_format".into(), Value::String("parsed".into()));
+            obj.insert("temperature".into(), Value::from(1.0));
         }
-        obj.insert("reasoning_effort".into(), Value::String("low".into()));
-        obj.insert("reasoning_format".into(), Value::String("parsed".into()));
-        obj.insert("temperature".into(), Value::from(1.0));
         obj.remove("top_p");
         obj.remove("clear_thinking");
         if let Some(mt) = obj.remove("max_tokens") {
@@ -442,9 +472,24 @@ async fn handle_chat_completions(
         let max_comp = obj
             .get("max_completion_tokens")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1024)
-            .min(1536);
+            .unwrap_or(3200)
+            .clamp(256, 6144);
         obj.insert("max_completion_tokens".into(), Value::from(max_comp));
+        // Compact OpenClaw's ~21K-token default workspace/tool schema overhead on ASRF refit turns
+        // into the byte-identical static SKILL.md prefix so every worker stays inside the 50K uncached TPM cap.
+        if !module_id.is_empty() && module_id != "probe" {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+            if let Some(ref static_sys) = state.cfg.static_prefix_override {
+                if let Some(msgs) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                    if let Some(first) = msgs.first_mut() {
+                        if first.get("role").and_then(|r| r.as_str()) == Some("system") {
+                            first["content"] = Value::String(static_sys.clone());
+                        }
+                    }
+                }
+            }
+        }
         if is_stream {
             obj.insert(
                 "stream_options".into(),
@@ -472,26 +517,13 @@ async fn handle_chat_completions(
     );
     let started = Instant::now();
 
-    let mut req_builder = state
+    let req_builder = state
         .client
         .post(&url)
         .bearer_auth(&state.cfg.api_key)
-        .header("content-type", "application/json");
-
-    if body_bytes.len() > 2048 {
-        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
-        if enc.write_all(&body_bytes).is_ok() {
-            if let Ok(gz) = enc.finish() {
-                req_builder = req_builder.header("content-encoding", "gzip").body(gz);
-            } else {
-                req_builder = req_builder.body(body_bytes);
-            }
-        } else {
-            req_builder = req_builder.body(body_bytes);
-        }
-    } else {
-        req_builder = req_builder.body(body_bytes);
-    }
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(body_bytes);
 
     let upstream = match req_builder.send().await {
         Ok(r) => r,
@@ -715,6 +747,23 @@ fn extract_metrics_from_json(
         remaining_tpm_minute: None,
         limit_rpm_minute: None,
     }
+}
+
+fn infer_module_id_from_payload(payload: &Value) -> String {
+    let Some(msgs) = payload.get("messages").and_then(|m| m.as_array()) else {
+        return String::new();
+    };
+    for msg in msgs {
+        if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+            if let Some(pos) = text.find("Refactor unit `") {
+                let rest = &text[pos + "Refactor unit `".len()..];
+                if let Some(end) = rest.find('`') {
+                    return rest[..end].to_string();
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {

@@ -44,6 +44,24 @@
               "supportsReasoningEffort": true,
               "supportedReasoningEfforts": ["low", "high", "max"]
             }
+          },
+          {
+            "id": "qwen-3.8-27b",
+            "name": "Qwen 3.8 27B (Cerebras WSE-3T via refit proxy)",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "compat": {
+              "supportsTools": true,
+              "supportsStrictMode": false,
+              "supportsReasoningEffort": true,
+              "supportedReasoningEfforts": ["low", "high", "max"]
+            }
           }
         ]
       }

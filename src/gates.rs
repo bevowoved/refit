@@ -464,10 +464,14 @@ fn parse_ruff_json(stdout: &str) -> Vec<String> {
     };
     arr.into_iter()
         .map(|v| {
+            let fname = v["filename"]
+                .as_str()
+                .and_then(|s| s.replace('\\', "/").rsplit('/').next().map(|n| n.to_string()))
+                .unwrap_or_default();
             let code = v["code"].as_str().unwrap_or("RUFF");
             let msg = v["message"].as_str().unwrap_or("");
             let line = v["location"]["row"].as_u64().unwrap_or(0);
-            format!("ruff {code} L{line}: {msg}")
+            format!("ruff {fname} {code} L{line}: {msg}")
         })
         .collect()
 }

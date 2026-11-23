@@ -1,1 +1,1 @@
-refit: Cross-platform Rust + OpenClaw refactoring engine for Kimi K3.1 Pro built to survive the 50K uncached TPM limit and 32s queues (4 local gates + ACID WAL)
+refit: Cross-platform Rust + unpatched OpenClaw refactoring engine (62/62 units, 15->0 pytest fails, 909->0 ruff+ty warnings, 2,651 tok/s on Cerebras)

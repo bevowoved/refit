@@ -1,7 +1,7 @@
 ﻿Project Name: refit
 Team Members: @YOUR_X_HANDLE
 
-refit is a cross-platform Rust + OpenClaw refactoring engine built for Kimi K3.1 Pro on Cerebras under the 50K uncached TPM cap and 32s live queues. Using 90% AST micro-slicing, static prefix caching, Kahn parallel DAG waves, 4 local verification gates (AST/ABI, pytest, codehygiene v0.7.0, ruff + ty --error-on-warning), and zero-collision BLAKE3 CAS + ACID WAL crash-resume, it runs in 17.6 MB RSS across a 10,437-LOC 64-module codebase on standard unpatched OpenClaw 2026.11.6.
+refit is a cross-platform Rust + OpenClaw refactoring engine built for Cerebras WSE-3T under the 50K uncached TPM cap and live server queues. On a 64-file, 10,881-LOC modular Python codebase routed through standard unpatched OpenClaw 2026.11.6, refit committed all 62/62 DAG and Tarjan SCC units with 0 HTTP 429s at 2,651 tok/s median decode, driving pytest failures 15 -> 0 (128/128 passing, 0 tests edited), ruff+ty warnings 909 -> 0, codehygiene 0.75 -> 0.88, and 0.986x OS CPU runtime in 21.9 MB Rust RSS with zero-duplicate ACID WAL crash-resume.
 
 GitHub: https://github.com/patrickfield152-del/refit
 Live replay: https://patrickfield152-del.github.io/refit/?replay=run.jsonl

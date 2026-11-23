@@ -359,11 +359,14 @@ pub fn slice_ast_packet(
 
     if !diagnostics.is_empty() {
         out.push_str("Current Gate 1/2/3 diagnostics to fix completely:\n");
-        for d in diagnostics.iter().take(12) {
+        for d in diagnostics.iter().take(36) {
             out.push_str("- ");
             out.push_str(d.trim());
             out.push('\n');
         }
+    }
+    if unit.files.len() > 1 {
+        out.push_str("IMPORTANT: This cyclic SCC unit has multiple files. Emit <<<REFIT_PATCH>>> blocks to fix ALL defects in EVERY file below (including every B006 mutable default, every Optional/+ None type error, every semicolon E702, every >88-col E501 line, and every deep nesting/if-elif chain).\n");
     }
 
     // Include compact test expectations when tests are failing so Gate 1 passes in 1 shot

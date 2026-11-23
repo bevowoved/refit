@@ -62,6 +62,8 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
     let wall_start = Instant::now();
     let run_id = format!("refit-{}", now_ms() % 10_000_000);
 
+    let static_system_prompt = load_static_system_prompt(&opts.skill_path);
+
     let telemetry = TelemetryHub::new(opts.telemetry_path.clone())?;
     let proxy_cfg = ProxyConfig {
         listen_addr: opts.proxy_addr.clone(),
@@ -69,6 +71,7 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
         api_key: opts.api_key.clone(),
         model_override: opts.model.clone(),
         ui_index_path: opts.ui_index_path.clone(),
+        static_prefix_override: Some(static_system_prompt.clone()),
     };
     let (proxy_state, proxy_handle) = start_proxy_server(proxy_cfg, telemetry.clone()).await?;
 
@@ -96,8 +99,6 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
     let plan = build_dag_plan(&opts.repo_root, None, &hygiene)?;
     let all_rel_files: Vec<String> = plan.units.iter().flat_map(|u| u.files.clone()).collect();
     let baseline_audit = run_full_repo_audit(&gate_cfg, &all_rel_files, &hygiene)?;
-
-    let static_system_prompt = load_static_system_prompt(&opts.skill_path);
 
     // Decide chat endpoint (prefer OpenClaw Gateway if reachable, else local :18790 proxy)
     let client = reqwest::Client::builder()
@@ -335,6 +336,13 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
     };
 
     let p_snap = proxy_state.snapshot();
+    let (proxy_q, proxy_tps) = proxy_state.timing_samples();
+    if all_queue_ms.is_empty() {
+        all_queue_ms = proxy_q;
+    }
+    if all_decode_tps.is_empty() {
+        all_decode_tps = proxy_tps;
+    }
     let self_m = self_metrics();
     let total_wall_s = wall_start.elapsed().as_secs_f64();
     let avg_queue_s = if all_queue_ms.is_empty() {
@@ -478,7 +486,8 @@ async fn process_single_unit(
         unit.base_blake3 = expected_hashes.clone();
 
         let learn_suffix = learn.prompt_suffix(&dir_prefix);
-        let user_prompt = match slice_ast_packet(&repo_root, &unit, &cur_diags, &learn_suffix, 6_500) {
+        let slice_budget = if unit.files.len() > 1 { 24_000 } else { 10_000 };
+        let user_prompt = match slice_ast_packet(&repo_root, &unit, &cur_diags, &learn_suffix, slice_budget) {
             Ok(p) => p,
             Err(_) => break,
         };
@@ -494,19 +503,24 @@ async fn process_single_unit(
         );
 
         let mut messages = vec![json!({ "role": "system", "content": static_sys.as_str() })];
-        if let (Some(prev_u), Some((prev_r, prev_c))) = (&prev_user_msg, &prev_assistant) {
-            messages.push(json!({ "role": "user", "content": prev_u }));
-            let mut asst = json!({ "role": "assistant", "content": prev_c });
-            if !prev_r.is_empty() {
-                asst["reasoning"] = json!(prev_r);
+        if attempt == 2 {
+            if let (Some(prev_u), Some((prev_r, prev_c))) = (&prev_user_msg, &prev_assistant) {
+                messages.push(json!({ "role": "user", "content": prev_u }));
+                let mut asst = json!({ "role": "assistant", "content": prev_c });
+                if !prev_r.is_empty() {
+                    asst["reasoning"] = json!(prev_r);
+                }
+                messages.push(asst);
+                let retry_feedback = format!(
+                    "Your previous patch failed verification and was ROLLED BACK (the file on disk is UNCHANGED). Every <<<SEARCH>>> block MUST match the ORIGINAL file shown in the first user message verbatim. Fix EVERY diagnostic below and emit ONLY complete <<<REFIT_PATCH>>> blocks:\n- {}\n{}",
+                    cur_diags.join("\n- "),
+                    learn_suffix
+                );
+                messages.push(json!({ "role": "user", "content": retry_feedback }));
+            } else {
+                messages.push(json!({ "role": "user", "content": user_prompt }));
+                prev_user_msg = Some(user_prompt);
             }
-            messages.push(asst);
-            let retry_feedback = format!(
-                "Your previous patch failed verification. Fix EVERY diagnostic below and emit ONLY corrected <<<REFIT_PATCH>>> blocks:\n- {}\n{}",
-                cur_diags.join("\n- "),
-                learn_suffix
-            );
-            messages.push(json!({ "role": "user", "content": retry_feedback }));
         } else {
             messages.push(json!({ "role": "user", "content": user_prompt }));
             prev_user_msg = Some(user_prompt);
@@ -516,7 +530,7 @@ async fn process_single_unit(
             "model": chat_model,
             "messages": messages,
             "stream": true,
-            "max_completion_tokens": 1200,
+            "max_completion_tokens": if unit.files.len() > 1 { 5500 } else { 3200 },
             "temperature": 1.0,
             "reasoning_effort": "low",
             "reasoning_format": "parsed"

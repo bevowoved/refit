@@ -217,6 +217,7 @@ async fn main() -> Result<()> {
                     api_key,
                     model_override: model.clone(),
                     ui_index_path: PathBuf::from("ui/index.html"),
+                    static_prefix_override: None,
                 },
                 tel,
             )
@@ -383,6 +384,7 @@ async fn main() -> Result<()> {
                     api_key,
                     model_override: model,
                     ui_index_path: ui_index,
+                    static_prefix_override: None,
                 },
                 tel,
             )
