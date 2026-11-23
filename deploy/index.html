@@ -1515,6 +1515,260 @@
   #error-toast.visible {
     display: flex;
   }
+
+  /* ================= UNSLOP CEREBRAS LIGHT PAPER & HALFTONE EDITORIAL THEME ================= */
+  :root {
+    --ground: #F8F7F2;
+    --card: #FFFFFF;
+    --card-well: #F3F1EC;
+    --border: rgba(28, 28, 27, 0.13);
+    --border-hi: rgba(28, 28, 27, 0.22);
+    --ink: #1C1C1B;
+    --muted: #575753;
+    --dim: #747470;
+    --orange: #D94826;
+    --cyan: #1D4ED8;
+    --purple: #6D28D9;
+    --emerald: #146C43;
+    --rose: #B42318;
+    --amber: #B45309;
+    --blue: #1D4ED8;
+    --sky: #1D4ED8;
+  }
+
+  #viewport {
+    background: #EFECE6;
+  }
+
+  #hud-stage {
+    background-color: #F8F7F2;
+    background-image:
+      radial-gradient(ellipse 680px 380px at 100% 0%, rgba(251, 238, 232, 0.9), transparent 72%),
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='9' height='9'><rect x='3' y='3' width='3' height='3' fill='%23f1957b' fill-opacity='0.34'/></svg>");
+    background-size: 100% 100%, 9px 9px;
+  }
+
+  .topbar,
+  .panel,
+  .score-card,
+  .timeline-bar {
+    background: #FFFFFF;
+    border-color: rgba(28, 28, 27, 0.13);
+    box-shadow: 0 10px 26px rgba(28, 28, 27, 0.05), 0 1px 3px rgba(28, 28, 27, 0.04);
+  }
+
+  .brand-badge {
+    background: #FBEAE0;
+    border-color: rgba(217, 72, 38, 0.35);
+  }
+
+  .mode-chip {
+    background: #EAF6F0;
+    color: #146C43;
+    border-color: rgba(20, 108, 67, 0.35);
+  }
+
+  .mode-chip.replay {
+    background: #EEF4FD;
+    color: #1D4ED8;
+    border-color: rgba(29, 78, 216, 0.35);
+  }
+
+  .mode-chip.demo {
+    background: #F3EEFE;
+    color: #6D28D9;
+    border-color: rgba(109, 40, 217, 0.35);
+  }
+
+  .pill,
+  .metric-well,
+  .tpm-stat-box,
+  .log-strip,
+  .wall-box,
+  .replay-bar {
+    background: #F3F1EC !important;
+    border-color: rgba(28, 28, 27, 0.12) !important;
+    color: #1C1C1B !important;
+  }
+
+  .rp-btn {
+    background: #FFFFFF !important;
+    color: #1C1C1B !important;
+    border-color: rgba(28, 28, 27, 0.16) !important;
+  }
+
+  .rp-btn.active {
+    background: #D94826 !important;
+    color: #FFFFFF !important;
+    border-color: #D94826 !important;
+  }
+
+  .rp-scrub,
+  .mini-track,
+  .tpm-track,
+  .tl-bar {
+    background: #E5E2DA !important;
+    border-color: rgba(28, 28, 27, 0.14) !important;
+  }
+
+  .panel-hdr {
+    background: #F8F7F2 !important;
+    border-bottom-color: rgba(28, 28, 27, 0.1) !important;
+  }
+
+  .layer-row {
+    background: #FAF9F5 !important;
+    border-color: rgba(28, 28, 27, 0.08) !important;
+  }
+
+  .tile {
+    background: #F1EFE9 !important;
+    border-color: rgba(28, 28, 27, 0.12) !important;
+    color: #1C1C1B !important;
+  }
+
+  .tile .tile-id {
+    color: #1C1C1B !important;
+  }
+
+  .tile .tile-meta {
+    color: #575753 !important;
+  }
+
+  .tile.st-queued .tile-bar { background: #C8C4BA !important; }
+  .tile.st-queued .tile-name { color: #575753 !important; }
+  .tile.st-queued .tile-score { color: #4A4A47 !important; }
+  .tile.st-in_queue { background: #FEF6E7 !important; border-color: rgba(180, 83, 9, 0.35) !important; }
+  .tile.st-in_queue .tile-bar { background: #D97706 !important; }
+  .tile.st-in_queue .tile-name { color: #92400E !important; }
+  .tile.st-in_queue .tile-score { color: #B45309 !important; }
+  .tile.st-streaming { background: #EEF4FD !important; border-color: rgba(29, 78, 216, 0.35) !important; }
+  .tile.st-streaming .tile-bar { background: #2563EB !important; }
+  .tile.st-streaming .tile-name { color: #1E40AF !important; }
+  .tile.st-streaming .tile-score { color: #1D4ED8 !important; }
+  .tile.st-gating { background: #F3F0FA !important; border-color: rgba(109, 40, 217, 0.35) !important; }
+  .tile.st-gating .tile-bar { background: #6D28D9 !important; }
+  .tile.st-gating .tile-name { color: #5B21B6 !important; }
+  .tile.st-gating .tile-score { color: #6D28D9 !important; }
+  .tile.st-retry { background: #FDF0EE !important; border-color: rgba(217, 72, 38, 0.45) !important; }
+  .tile.st-retry .tile-bar { background: #D94826 !important; }
+  .tile.st-retry .tile-name { color: #9A2B14 !important; }
+  .tile.st-retry .tile-score { color: #C83E1D !important; }
+  .tile.st-committed { background: #EAF6F0 !important; border-color: rgba(20, 108, 67, 0.38) !important; }
+  .tile.st-committed .tile-bar { background: #15803D !important; }
+  .tile.st-committed .tile-name { color: #166534 !important; }
+  .tile.st-committed .tile-score { color: #14532D !important; }
+  .tile.st-committed .tile-st { color: #15803D !important; }
+  .tile.st-skipped_resumed { background: #EEF4FD !important; border-color: rgba(29, 78, 216, 0.38) !important; }
+  .tile.st-skipped_resumed .tile-bar { background: #1D4ED8 !important; }
+  .tile.st-skipped_resumed .tile-name { color: #1E40AF !important; }
+  .tile.st-skipped_resumed .tile-score { color: #1D4ED8 !important; }
+  .billing-note { color: #575753 !important; background: #F3F1EC !important; border-color: rgba(28, 28, 27, 0.12) !important; }
+  .billing-note b { color: #1C1C1B !important; }
+
+  .status-pill {
+    background: #F3F1EC !important;
+    border-color: rgba(28, 28, 27, 0.14) !important;
+    color: #4A4A47 !important;
+  }
+
+  .status-pill.pass,
+  .delta-tag {
+    background: #EAF6F0 !important;
+    border-color: rgba(20, 108, 67, 0.35) !important;
+    color: #146C43 !important;
+  }
+
+  .status-pill.warn {
+    background: #FEF6E7 !important;
+    border-color: rgba(180, 83, 9, 0.35) !important;
+    color: #B45309 !important;
+  }
+
+  .status-pill.fail {
+    background: #FDF0EE !important;
+    border-color: rgba(180, 35, 24, 0.35) !important;
+    color: #B42318 !important;
+  }
+
+  .status-pill.purple {
+    background: #F3EEFE !important;
+    border-color: rgba(109, 40, 217, 0.35) !important;
+    color: #6D28D9 !important;
+  }
+
+  .sc-num {
+    background: #FBEAE0 !important;
+    border-color: rgba(217, 72, 38, 0.35) !important;
+    color: #C83E1D !important;
+  }
+
+  .p10-line,
+  .event-row {
+    border-color: rgba(28, 28, 27, 0.1) !important;
+  }
+
+  .tl-seg {
+    color: #FFFFFF !important;
+    border-right-color: rgba(255, 255, 255, 0.5) !important;
+  }
+
+  #tile-tooltip {
+    background: #FFFFFF !important;
+    border-color: rgba(28, 28, 27, 0.18) !important;
+    box-shadow: 0 14px 36px rgba(28, 28, 27, 0.14) !important;
+    color: #1C1C1B !important;
+  }
+
+  .hero-badge,
+  .hero-badge.aimd,
+  .hero-badge.decode,
+  .hero-badge.tps {
+    background: #F3F1EC !important;
+    border: 1px solid rgba(28, 28, 27, 0.14) !important;
+    color: #1C1C1B !important;
+  }
+
+  .hero-badge.aimd {
+    background: #FBEAE0 !important;
+    border-color: rgba(217, 72, 38, 0.3) !important;
+  }
+
+  .hero-badge.decode,
+  .hero-badge.tps {
+    background: #EEF4FD !important;
+    border-color: rgba(29, 78, 216, 0.28) !important;
+  }
+
+  .hero-badge .hb-label,
+  .hero-badge .hb-unit {
+    color: #575753 !important;
+  }
+
+  .pacer-track {
+    background: #E7E4DC !important;
+    border: 1px solid rgba(28, 28, 27, 0.14) !important;
+  }
+
+  .pacer-fill {
+    background: linear-gradient(90deg, #15803D 0%, #2563EB 58%, #D97706 84%, #E24F2A 100%) !important;
+  }
+
+  .ceiling-flag {
+    background: #FDF0EE !important;
+    border: 1px solid rgba(217, 72, 38, 0.4) !important;
+    color: #C83E1D !important;
+  }
+
+  .wal-pill {
+    max-width: 340px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .circuit-tag {
+    color: #146C43 !important;
+  }
 </style>
 </head>
 <body>
@@ -1608,13 +1862,13 @@
               <span class="mono" style="color:var(--ink);font-weight:700" id="dag-meta">64 modules · 4 layers · 0 committed</span>
             </div>
             <div class="legend-row">
-              <span class="leg"><span class="leg-sw" style="background:#131B2A;border-color:#334155"></span>queued <b id="cnt-queued">64</b></span>
-              <span class="leg"><span class="leg-sw" style="background:rgba(245,158,11,0.35);border-color:#F59E0B"></span>in_queue <b id="cnt-in_queue">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:rgba(34,211,238,0.35);border-color:#22D3EE"></span>streaming <b id="cnt-streaming">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:rgba(168,85,247,0.35);border-color:#A855F7"></span>gating <b id="cnt-gating">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:rgba(244,63,94,0.35);border-color:#F43F5E"></span>retry <b id="cnt-retry">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:rgba(16,185,129,0.35);border-color:#10B981"></span>committed <b id="cnt-committed">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:rgba(56,189,248,0.3);border-color:#38BDF8;border-style:dashed"></span>resumed <b id="cnt-skipped_resumed">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#F1EFE9;border-color:#B5B1A7"></span>queued <b id="cnt-queued">64</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#FEF6E7;border-color:#D97706"></span>in_queue <b id="cnt-in_queue">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#EEF4FD;border-color:#2563EB"></span>streaming <b id="cnt-streaming">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#F3F0FA;border-color:#6D28D9"></span>gating <b id="cnt-gating">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#FDF0EE;border-color:#D94826"></span>retry <b id="cnt-retry">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#EAF6F0;border-color:#15803D"></span>committed <b id="cnt-committed">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#EEF4FD;border-color:#1D4ED8;border-style:dashed"></span>resumed <b id="cnt-skipped_resumed">0</b></span>
             </div>
           </div>
 
@@ -2343,8 +2597,14 @@
       st.decodeTpsCurrent = m.decode_tps;
       st.decodeSamples.push(m.decode_tps);
     }
-    if (typeof m.prompt_tokens === 'number' && m.prompt_tokens > 0 && st.totalPromptTokens < m.prompt_tokens) {
-      // Only add if proxy snapshot isn't already driving cumulative counters
+    if (typeof m.prompt_tokens === 'number' && m.prompt_tokens > 0) {
+      st.totalPromptTokens += m.prompt_tokens;
+    }
+    if (typeof m.cached_tokens === 'number' && m.cached_tokens > 0) {
+      st.totalCachedTokens += m.cached_tokens;
+    }
+    if (typeof m.uncached_tokens === 'number' && m.uncached_tokens > 0) {
+      st.totalUncachedTokens += m.uncached_tokens;
     }
     if (m.prefix_drift === true) st.prefixDriftEvents += 1;
     if (typeof m.limit_tpm_minute === 'number' && m.limit_tpm_minute > 0) st.uncachedTpmCap = m.limit_tpm_minute;
@@ -2416,8 +2676,34 @@
     else if (Array.isArray(d.units)) applyDagPlan(st, d);
 
     if (typeof d.host_os === 'string' && d.host_os) st.hostOs = d.host_os;
-    if (typeof d.model === 'string' && d.model) st.model = d.model;
+    if (typeof d.model === 'string' && d.model) {
+      st.model = d.model.indexOf('kimi-k3.1') >= 0 ? 'Kimi K3.1 Pro' : d.model;
+    }
     if (typeof d.provider_label === 'string' && d.provider_label) st.providerLabel = d.provider_label;
+    if (typeof d.uncached_tpm_cap === 'number' && d.uncached_tpm_cap > 0) st.uncachedTpmCap = d.uncached_tpm_cap;
+    if (d.baseline && typeof d.baseline === 'object') {
+      const b = d.baseline;
+      if (typeof b.ruff_errors === 'number') {
+        st.gate3BeforeRuff = b.ruff_errors;
+        if (!st.gate3Tracked) st.gate3AfterRuff = b.ruff_errors;
+      }
+      if (typeof b.ty_errors === 'number') {
+        st.gate3BeforeTy = b.ty_errors;
+        if (!st.gate3Tracked) st.gate3AfterTy = b.ty_errors;
+      }
+      if (typeof b.tests_total === 'number' && b.tests_total > 0) {
+        st.testsTotal = b.tests_total;
+        if (typeof b.tests_failed === 'number') {
+          st.testsBeforeFail = b.tests_failed;
+          if (st.testsPassedLive === 0) {
+            st.testsAfterFail = b.tests_failed;
+            st.testsPassedLive = Math.max(0, b.tests_total - b.tests_failed);
+          }
+        }
+      }
+      if (typeof b.hygiene_median === 'number' && b.hygiene_median > 0) st.hygieneBeforeMedianOverride = b.hygiene_median;
+      if (typeof b.hygiene_p10 === 'number' && b.hygiene_p10 > 0) st.hygieneBeforeP10Override = b.hygiene_p10;
+    }
     if (typeof d.head_rev === 'number') st.walRev = Math.max(st.walRev, d.head_rev);
     if (typeof d.wal_rev === 'number') st.walRev = Math.max(st.walRev, d.wal_rev);
     if (typeof d.torn === 'number') st.walTorn = d.torn;
@@ -2528,6 +2814,7 @@
 
       case 'module_in_queue':
       case 'module_start':
+      case 'wave_dispatch':
       case 'llm_queued':
       case 'llm_request':
       case 'in_queue': {
@@ -2598,6 +2885,7 @@
       }
 
       case 'module_committed':
+      case 'mvcc_commit':
       case 'wal_commit':
       case 'committed':
       case 'commit': {
@@ -2628,14 +2916,15 @@
           st.gate3AfterTy = Math.max(0, st.gate3AfterTy - d.ty_delta);
           st.gate3Tracked = true;
         }
+        const fmtH = (v) => (v <= 1.5 ? v.toFixed(2) : v.toFixed(1));
         const g3Clean = (Number(d.gate3_ruff_errors) || 0) === 0 && (Number(d.gate3_ty_errors) || 0) === 0;
-        const deltaStr = (afterHyg - beforeHyg >= 0 ? '+' : '') + (afterHyg - beforeHyg).toFixed(1);
+        const deltaStr = (afterHyg - beforeHyg >= 0 ? '+' : '') + (Math.abs(afterHyg) <= 1.5 ? (afterHyg - beforeHyg).toFixed(2) : (afterHyg - beforeHyg).toFixed(1));
         pushFeed(
           st,
           g3Clean && d.highlight_g3 ? 'g3' : 'commit',
           g3Clean && d.highlight_g3 ? 'G3 0-WARN' : 'COMMIT',
           ev.module_id,
-          'hyg ' + beforeHyg.toFixed(1) + ' → ' + afterHyg.toFixed(1) + ' (' + deltaStr + ')' + (g3Clean ? ' · G3 0 err/0 warn' : ''),
+          'hyg ' + fmtH(beforeHyg) + ' → ' + fmtH(afterHyg) + ' (' + deltaStr + ')' + (g3Clean ? ' · G3 0 err/0 warn' : ''),
           'WAL rev ' + st.walRev,
           ev.ts_ms
         );
@@ -2643,6 +2932,7 @@
       }
 
       case 'module_retry':
+      case 'mvcc_rollback':
       case 'retry':
       case 'rollback':
       case 'wal_rollback': {
@@ -3121,7 +3411,7 @@
           dom.lastState = u.state;
         }
         const scoreVal = u.current_hygiene > 0 ? u.current_hygiene : u.baseline_hygiene;
-        const scoreTxt = scoreVal > 0 ? String(Math.round(scoreVal)) : '--';
+        const scoreTxt = scoreVal > 0 ? (scoreVal <= 1.5 ? scoreVal.toFixed(2) : String(Math.round(scoreVal))) : '--';
         if (dom.lastScoreTxt !== scoreTxt) {
           dom.score.textContent = scoreTxt;
           dom.lastScoreTxt = scoreTxt;
@@ -3130,7 +3420,7 @@
     }
 
     const doneCount = st.committedUnitsOverride != null
-      ? st.committedUnitsOverride + st.skippedResumedUnits
+      ? Math.min(st.totalUnits, st.committedUnitsOverride)
       : (counts.committed + counts.skipped_resumed);
     els.dagMeta.textContent =
       st.totalUnits + ' modules · ' +
@@ -3149,8 +3439,10 @@
       els.layerRows[l].done.textContent = String(layerDone[l]);
       els.layerRows[l].tot.textContent = String(layerTot[l]);
       if (layerBeforeHyg[l].length) {
-        const bMed = percentile(layerBeforeHyg[l], 0.5).toFixed(0);
-        const cMed = percentile(layerCurHyg[l], 0.5).toFixed(0);
+        const bRaw = percentile(layerBeforeHyg[l], 0.5);
+        const cRaw = percentile(layerCurHyg[l], 0.5);
+        const bMed = bRaw <= 1.5 ? bRaw.toFixed(2) : bRaw.toFixed(0);
+        const cMed = cRaw <= 1.5 ? cRaw.toFixed(2) : cRaw.toFixed(0);
         els.layerRows[l].hyg.textContent = 'hyg ' + bMed + ' → ' + cMed;
       } else {
         els.layerRows[l].hyg.textContent = 'hyg -- → --';
@@ -3215,11 +3507,12 @@
     const aP10 = st.hygieneAfterP10Override != null ? st.hygieneAfterP10Override : percentile(allCurHyg, 0.1);
     const hDelta = aMed - bMed;
 
-    els.hygMedBefore.textContent = bMed.toFixed(1);
-    els.hygMedAfter.textContent = aMed.toFixed(1);
-    els.hygDelta.textContent = (hDelta >= 0 ? '+' : '') + hDelta.toFixed(1);
-    els.hygP10Before.textContent = bP10.toFixed(1);
-    els.hygP10After.textContent = aP10.toFixed(1);
+    const fmtHyg = (v) => (v <= 1.5 ? v.toFixed(2) : v.toFixed(1));
+    els.hygMedBefore.textContent = fmtHyg(bMed);
+    els.hygMedAfter.textContent = fmtHyg(aMed);
+    els.hygDelta.textContent = (hDelta >= 0 ? '+' : '') + (Math.abs(aMed) <= 1.5 ? hDelta.toFixed(2) : hDelta.toFixed(1));
+    els.hygP10Before.textContent = fmtHyg(bP10);
+    els.hygP10After.textContent = fmtHyg(aP10);
 
     const rBef = st.gate3BeforeRuff;
     const rAft = st.gate3AfterRuff;
@@ -4182,4 +4475,3 @@
 </script>
 </body>
 </html>
-=== END FILE ===

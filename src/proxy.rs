@@ -444,26 +444,14 @@ async fn handle_chat_completions(
         .unwrap_or(false);
 
     if let Some(obj) = payload.as_object_mut() {
-        let effective_model = if !state.cfg.model_override.is_empty() {
+        if !state.cfg.model_override.is_empty() {
             obj.insert("model".into(), Value::String(state.cfg.model_override.clone()));
-            state.cfg.model_override.clone()
-        } else {
-            obj.get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
-        let is_qwen = effective_model.to_lowercase().contains("qwen");
-        if is_qwen {
-            obj.insert("disable_reasoning".into(), Value::Bool(true));
-            obj.remove("reasoning_effort");
-            obj.remove("reasoning_format");
-            obj.insert("temperature".into(), Value::from(if attempt > 1 { 0.35 } else { 0.2 }));
-        } else {
-            obj.insert("reasoning_effort".into(), Value::String("low".into()));
-            obj.insert("reasoning_format".into(), Value::String("parsed".into()));
-            obj.insert("temperature".into(), Value::from(1.0));
         }
+        // Strict Cerebras Kimi K3.1 Pro hackathon wire guard
+        obj.insert("reasoning_effort".into(), Value::String("low".into()));
+        obj.insert("reasoning_format".into(), Value::String("parsed".into()));
+        obj.insert("temperature".into(), Value::from(1.0));
+        obj.remove("disable_reasoning");
         obj.remove("top_p");
         obj.remove("clear_thinking");
         if let Some(mt) = obj.remove("max_tokens") {
