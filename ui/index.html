@@ -1515,6 +1515,241 @@
   #error-toast.visible {
     display: flex;
   }
+
+  /* ================= UNSLOP CEREBRAS LIGHT PAPER & HALFTONE EDITORIAL THEME ================= */
+  :root {
+    --ground: #F8F7F2;
+    --card: #FFFFFF;
+    --card-well: #F3F1EC;
+    --border: rgba(28, 28, 27, 0.13);
+    --border-hi: rgba(28, 28, 27, 0.22);
+    --ink: #1C1C1B;
+    --muted: #575753;
+    --dim: #747470;
+    --orange: #D94826;
+    --cyan: #1D4ED8;
+    --purple: #6D28D9;
+    --emerald: #146C43;
+    --rose: #B42318;
+    --amber: #B45309;
+    --blue: #1D4ED8;
+    --sky: #1D4ED8;
+  }
+
+  #viewport {
+    background: #EFECE6;
+  }
+
+  #hud-stage {
+    background-color: #F8F7F2;
+    background-image:
+      radial-gradient(ellipse 680px 380px at 100% 0%, rgba(251, 238, 232, 0.9), transparent 72%),
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='9' height='9'><rect x='3' y='3' width='3' height='3' fill='%23f1957b' fill-opacity='0.34'/></svg>");
+    background-size: 100% 100%, 9px 9px;
+  }
+
+  .topbar,
+  .panel,
+  .score-card,
+  .timeline-bar {
+    background: #FFFFFF;
+    border-color: rgba(28, 28, 27, 0.13);
+    box-shadow: 0 10px 26px rgba(28, 28, 27, 0.05), 0 1px 3px rgba(28, 28, 27, 0.04);
+  }
+
+  .brand-badge {
+    background: #FBEAE0;
+    border-color: rgba(217, 72, 38, 0.35);
+  }
+
+  .mode-chip {
+    background: #EAF6F0;
+    color: #146C43;
+    border-color: rgba(20, 108, 67, 0.35);
+  }
+
+  .mode-chip.replay {
+    background: #EEF4FD;
+    color: #1D4ED8;
+    border-color: rgba(29, 78, 216, 0.35);
+  }
+
+  .mode-chip.demo {
+    background: #F3EEFE;
+    color: #6D28D9;
+    border-color: rgba(109, 40, 217, 0.35);
+  }
+
+  .pill,
+  .metric-well,
+  .tpm-stat-box,
+  .log-strip,
+  .wall-box,
+  .replay-bar {
+    background: #F3F1EC !important;
+    border-color: rgba(28, 28, 27, 0.12) !important;
+    color: #1C1C1B !important;
+  }
+
+  .rp-btn {
+    background: #FFFFFF !important;
+    color: #1C1C1B !important;
+    border-color: rgba(28, 28, 27, 0.16) !important;
+  }
+
+  .rp-btn.active {
+    background: #D94826 !important;
+    color: #FFFFFF !important;
+    border-color: #D94826 !important;
+  }
+
+  .rp-scrub,
+  .mini-track,
+  .tpm-track,
+  .tl-bar {
+    background: #E5E2DA !important;
+    border-color: rgba(28, 28, 27, 0.14) !important;
+  }
+
+  .panel-hdr {
+    background: #F8F7F2 !important;
+    border-bottom-color: rgba(28, 28, 27, 0.1) !important;
+  }
+
+  .layer-row {
+    background: #FAF9F5 !important;
+    border-color: rgba(28, 28, 27, 0.08) !important;
+  }
+
+  .tile {
+    background: #F1EFE9 !important;
+    border-color: rgba(28, 28, 27, 0.12) !important;
+    color: #1C1C1B !important;
+  }
+
+  .tile .tile-id {
+    color: #1C1C1B !important;
+  }
+
+  .tile .tile-meta {
+    color: #575753 !important;
+  }
+
+  .tile.st-queued .tile-bar { background: #C8C4BA !important; }
+  .tile.st-in_queue { background: #FEF6E7 !important; border-color: rgba(180, 83, 9, 0.35) !important; }
+  .tile.st-in_queue .tile-bar { background: #D97706 !important; }
+  .tile.st-streaming { background: #EEF4FD !important; border-color: rgba(29, 78, 216, 0.35) !important; }
+  .tile.st-streaming .tile-bar { background: #2563EB !important; }
+  .tile.st-gating { background: #F3F0FA !important; border-color: rgba(109, 40, 217, 0.35) !important; }
+  .tile.st-gating .tile-bar { background: #6D28D9 !important; }
+  .tile.st-retry { background: #FDF0EE !important; border-color: rgba(217, 72, 38, 0.45) !important; }
+  .tile.st-retry .tile-bar { background: #D94826 !important; }
+  .tile.st-committed { background: #EAF6F0 !important; border-color: rgba(20, 108, 67, 0.38) !important; }
+  .tile.st-committed .tile-bar { background: #15803D !important; }
+  .tile.st-skipped_resumed { background: #EEF4FD !important; border-color: rgba(29, 78, 216, 0.38) !important; }
+  .tile.st-skipped_resumed .tile-bar { background: #1D4ED8 !important; }
+
+  .status-pill {
+    background: #F3F1EC !important;
+    border-color: rgba(28, 28, 27, 0.14) !important;
+    color: #4A4A47 !important;
+  }
+
+  .status-pill.pass,
+  .delta-tag {
+    background: #EAF6F0 !important;
+    border-color: rgba(20, 108, 67, 0.35) !important;
+    color: #146C43 !important;
+  }
+
+  .status-pill.warn {
+    background: #FEF6E7 !important;
+    border-color: rgba(180, 83, 9, 0.35) !important;
+    color: #B45309 !important;
+  }
+
+  .status-pill.fail {
+    background: #FDF0EE !important;
+    border-color: rgba(180, 35, 24, 0.35) !important;
+    color: #B42318 !important;
+  }
+
+  .status-pill.purple {
+    background: #F3EEFE !important;
+    border-color: rgba(109, 40, 217, 0.35) !important;
+    color: #6D28D9 !important;
+  }
+
+  .sc-num {
+    background: #FBEAE0 !important;
+    border-color: rgba(217, 72, 38, 0.35) !important;
+    color: #C83E1D !important;
+  }
+
+  .p10-line,
+  .event-row {
+    border-color: rgba(28, 28, 27, 0.1) !important;
+  }
+
+  .tl-seg {
+    color: #FFFFFF !important;
+    border-right-color: rgba(255, 255, 255, 0.5) !important;
+  }
+
+  #tile-tooltip {
+    background: #FFFFFF !important;
+    border-color: rgba(28, 28, 27, 0.18) !important;
+    box-shadow: 0 14px 36px rgba(28, 28, 27, 0.14) !important;
+    color: #1C1C1B !important;
+  }
+
+  .hero-badge,
+  .hero-badge.aimd,
+  .hero-badge.tps {
+    background: #F3F1EC !important;
+    border: 1px solid rgba(28, 28, 27, 0.14) !important;
+    color: #1C1C1B !important;
+  }
+
+  .hero-badge.aimd {
+    background: #FBEAE0 !important;
+    border-color: rgba(217, 72, 38, 0.3) !important;
+  }
+
+  .hero-badge.tps {
+    background: #EEF4FD !important;
+    border-color: rgba(29, 78, 216, 0.28) !important;
+  }
+
+  .hero-badge .hb-label,
+  .hero-badge .hb-unit {
+    color: #575753 !important;
+  }
+
+  .pacer-track {
+    background: #E7E4DC !important;
+    border: 1px solid rgba(28, 28, 27, 0.14) !important;
+  }
+
+  .pacer-fill {
+    background: linear-gradient(90deg, #15803D 0%, #2563EB 58%, #D97706 84%, #E24F2A 100%) !important;
+  }
+
+  .ceiling-flag {
+    background: #FDF0EE !important;
+    border: 1px solid rgba(217, 72, 38, 0.4) !important;
+    color: #C83E1D !important;
+  }
+
+  .wal-pill {
+    max-width: 245px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .circuit-tag {
+    color: #146C43 !important;
+  }
 </style>
 </head>
 <body>
@@ -2528,6 +2763,7 @@
 
       case 'module_in_queue':
       case 'module_start':
+      case 'wave_dispatch':
       case 'llm_queued':
       case 'llm_request':
       case 'in_queue': {
@@ -2598,6 +2834,7 @@
       }
 
       case 'module_committed':
+      case 'mvcc_commit':
       case 'wal_commit':
       case 'committed':
       case 'commit': {
@@ -2643,6 +2880,7 @@
       }
 
       case 'module_retry':
+      case 'mvcc_rollback':
       case 'retry':
       case 'rollback':
       case 'wal_rollback': {
@@ -3215,11 +3453,12 @@
     const aP10 = st.hygieneAfterP10Override != null ? st.hygieneAfterP10Override : percentile(allCurHyg, 0.1);
     const hDelta = aMed - bMed;
 
-    els.hygMedBefore.textContent = bMed.toFixed(1);
-    els.hygMedAfter.textContent = aMed.toFixed(1);
-    els.hygDelta.textContent = (hDelta >= 0 ? '+' : '') + hDelta.toFixed(1);
-    els.hygP10Before.textContent = bP10.toFixed(1);
-    els.hygP10After.textContent = aP10.toFixed(1);
+    const fmtHyg = (v) => (v <= 1.5 ? v.toFixed(2) : v.toFixed(1));
+    els.hygMedBefore.textContent = fmtHyg(bMed);
+    els.hygMedAfter.textContent = fmtHyg(aMed);
+    els.hygDelta.textContent = (hDelta >= 0 ? '+' : '') + (Math.abs(aMed) <= 1.5 ? hDelta.toFixed(2) : hDelta.toFixed(1));
+    els.hygP10Before.textContent = fmtHyg(bP10);
+    els.hygP10After.textContent = fmtHyg(aP10);
 
     const rBef = st.gate3BeforeRuff;
     const rAft = st.gate3AfterRuff;
@@ -4182,4 +4421,3 @@
 </script>
 </body>
 </html>
-=== END FILE ===
