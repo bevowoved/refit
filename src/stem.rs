@@ -1,7 +1,9 @@
-use crate::platform::{create_private_dir, run_sandboxed_cmd};
-use rusqlite::{Connection, OpenFlags};
+use crate::platform::create_private_dir;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Instant;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -9,6 +11,7 @@ pub struct StemDiscovery {
     pub used_stem: bool,
     pub index_ms: u64,
     pub edges: Vec<(String, String)>,
+    #[allow(dead_code)]
     pub symbol_counts: HashMap<String, usize>,
 }
 
@@ -46,9 +49,9 @@ fn stem_exe_name() -> &'static str {
     if cfg!(windows) { "stem.exe" } else { "stem" }
 }
 
-/// Runs proxysoul/stem v0.4.0 inside an airtight 0700 isolated HOME with env_clear()
-/// (zero access to host ~/.stem/.env, OAuth tokens, or CEREBRAS_API_KEY), reads
-/// facts.db in strict SQLITE_OPEN_READ_ONLY mode, and merges deterministic Python import edges.
+/// Runs proxysoul/stem v0.4.0 `stem mcp` inside an airtight 0700 isolated HOME with env_clear()
+/// (zero access to host ~/.stem/.env, OAuth tokens, or CEREBRAS_API_KEY), queries Stem's
+/// deterministic SQL fact store via read-only `sql` tool, and merges Python import edges.
 pub fn discover_repo(repo_root: &Path, stem_bin_hint: Option<&Path>) -> StemDiscovery {
     let mut used_stem = false;
     let mut index_ms = 0u64;
@@ -58,34 +61,64 @@ pub fn discover_repo(repo_root: &Path, stem_bin_hint: Option<&Path>) -> StemDisc
     if let Some(stem_bin) = resolve_stem_bin(stem_bin_hint) {
         let stem_home = repo_root.join(".refit/stem-home");
         if create_private_dir(&stem_home).is_ok() {
-            let mut env_allow = vec![
-                ("HOME".to_string(), stem_home.display().to_string()),
-                ("USERPROFILE".to_string(), stem_home.display().to_string()),
-                (
-                    "STEM_MCP_TOOLS".to_string(),
-                    "defs,refs,callers,impls,symbols,sql,brief".to_string(),
-                ),
-            ];
+            let started = Instant::now();
+            let mut cmd = Command::new(&stem_bin);
+            cmd.arg("mcp")
+                .current_dir(repo_root)
+                .env_clear()
+                .env("HOME", &stem_home)
+                .env("USERPROFILE", &stem_home)
+                .env("STEM_MCP_TOOLS", "defs,refs,callers,impls,symbols,sql,brief")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+
             for k in ["PATH", "SYSTEMROOT", "TEMP", "TMP"] {
                 if let Ok(v) = std::env::var(k) {
-                    env_allow.push((k.to_string(), v));
+                    cmd.env(k, v);
                 }
             }
 
-            let args = vec!["index".to_string(), repo_root.display().to_string()];
-            if let Ok(res) = run_sandboxed_cmd(
-                &stem_bin.display().to_string(),
-                &args,
-                repo_root,
-                &env_allow,
-                true, // strict env_clear()!
-                20_000,
-            ) {
-                index_ms = res.wall_ms;
-                if res.exit_code == 0 {
-                    used_stem = true;
-                    if let Some(db_path) = find_facts_db(&stem_home) {
-                        read_facts_db(&db_path, &mut edge_set, &mut symbol_counts);
+            if let Ok(mut child) = cmd.spawn() {
+                let reqs = concat!(
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"refit\",\"version\":\"0.3.0\"}}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"sql\",\"arguments\":{\"query\":\"SELECT DISTINCT r.file AS src, s.file AS dst FROM refs r JOIN symbols s ON r.name = s.name WHERE r.file != s.file LIMIT 2000\"}}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"sql\",\"arguments\":{\"query\":\"SELECT file, COUNT(*) AS cnt FROM symbols GROUP BY file\"}}}\n"
+                );
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(reqs.as_bytes());
+                    let _ = stdin.flush();
+                }
+                if let Ok(output) = child.wait_with_output() {
+                    index_ms = started.elapsed().as_millis() as u64;
+                    if output.status.success() {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        for line in text.lines() {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                                let id = v["id"].as_u64().unwrap_or(0);
+                                if id == 1 && v.get("result").is_some() {
+                                    used_stem = true;
+                                }
+                                if id == 2 {
+                                    if let Some(rows) = v["result"]["structuredContent"]["rows"].as_array() {
+                                        for row in rows {
+                                            if let (Some(src), Some(dst)) = (row["src"].as_str(), row["dst"].as_str()) {
+                                                edge_set.insert((src.replace('\\', "/"), dst.replace('\\', "/")));
+                                            }
+                                        }
+                                    }
+                                }
+                                if id == 3 {
+                                    if let Some(rows) = v["result"]["structuredContent"]["rows"].as_array() {
+                                        for row in rows {
+                                            if let (Some(f), Some(c)) = (row["file"].as_str(), row["cnt"].as_u64()) {
+                                                symbol_counts.insert(f.replace('\\', "/"), c as usize);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -103,64 +136,6 @@ pub fn discover_repo(repo_root: &Path, stem_bin_hint: Option<&Path>) -> StemDisc
         index_ms,
         edges,
         symbol_counts,
-    }
-}
-
-fn find_facts_db(stem_home: &Path) -> Option<PathBuf> {
-    for entry in WalkDir::new(stem_home).into_iter().flatten() {
-        if entry.file_type().is_file() && entry.file_name() == "facts.db" {
-            return Some(entry.path().to_path_buf());
-        }
-    }
-    None
-}
-
-fn read_facts_db(
-    db_path: &Path,
-    edges: &mut HashSet<(String, String)>,
-    symbol_counts: &mut HashMap<String, usize>,
-) {
-    let Ok(conn) = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
-        return;
-    };
-    let _ = conn.execute_batch("PRAGMA query_only = ON;");
-
-    let mut tables = HashSet::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT name FROM sqlite_master WHERE type='table'") {
-        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-            for t in rows.flatten() {
-                tables.insert(t);
-            }
-        }
-    }
-
-    if tables.contains("files") && tables.contains("symbols") {
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT f.path, COUNT(s.id) FROM files f LEFT JOIN symbols s ON s.file_id = f.id GROUP BY f.path",
-        ) {
-            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
-                for (path, cnt) in rows.flatten() {
-                    let norm = path.replace('\\', "/");
-                    symbol_counts.insert(norm, cnt.max(0) as usize);
-                }
-            }
-        }
-    }
-
-    if tables.contains("files") && tables.contains("symbols") && tables.contains("refs") {
-        let q = "SELECT DISTINCT f_src.path, f_dst.path \
-                 FROM refs r \
-                 JOIN files f_src ON r.file_id = f_src.id \
-                 JOIN symbols s ON r.symbol_id = s.id \
-                 JOIN files f_dst ON s.file_id = f_dst.id \
-                 WHERE f_src.path != f_dst.path";
-        if let Ok(mut stmt) = conn.prepare(q) {
-            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
-                for (src, dst) in rows.flatten() {
-                    edges.insert((src.replace('\\', "/"), dst.replace('\\', "/")));
-                }
-            }
-        }
     }
 }
 
@@ -217,7 +192,6 @@ fn extract_python_import_edges(
                 if let Some(mod_part) = rest.split_whitespace().next() {
                     if let Some(target) = module_to_rel.get(mod_part) {
                         if target != rel {
-                            // rel depends on target
                             edges.insert((rel.clone(), target.clone()));
                         }
                     }
