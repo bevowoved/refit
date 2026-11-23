@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import importlib
 import json
 import sys
 import time
+import tracemalloc
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +67,10 @@ def run_benchmark(
     grand_total = 0.0
     status_ok = True
 
+    tracemalloc.start()
+    gc.collect()
+    idle_before_kb = round(tracemalloc.get_traced_memory()[0] / 1024.0, 2)
+
     t0 = time.perf_counter()
     for it in range(iterations):
         entries = _build_iteration_entries(it, BATCH_SIZE)
@@ -90,6 +96,10 @@ def run_benchmark(
         hasher.update(digest_line.encode("ascii"))
 
     wall_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    _, peak_traced_bytes = tracemalloc.get_traced_memory()
+    gc.collect()
+    idle_after_kb = round(tracemalloc.get_traced_memory()[0] / 1024.0, 2)
+    tracemalloc.stop()
     checksum = hasher.hexdigest()[:16]
 
     probe = _build_iteration_entries(0, 64)
@@ -114,6 +124,9 @@ def run_benchmark(
         "checksum": checksum,
         "wall_ms": wall_ms,
         "rows": total_rows,
+        "idle_before_kb": idle_before_kb,
+        "idle_after_kb": idle_after_kb,
+        "peak_py_kb": round(peak_traced_bytes / 1024.0, 2),
     }
 
 

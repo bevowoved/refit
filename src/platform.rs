@@ -1,15 +1,20 @@
 use crate::types::{SandboxResult, SelfMetrics};
 use anyhow::{Context, Result};
+use ignore::WalkBuilder;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CLOCK_ANCHOR: OnceLock<(u64, Instant)> = OnceLock::new();
 
-pub fn host_os_tag() -> String {
+pub fn os_tag() -> String {
     let os = match std::env::consts::OS {
         "macos" => "macos",
         other => other,
@@ -22,14 +27,471 @@ pub fn host_os_tag() -> String {
     format!("{os}-{arch}")
 }
 
+#[inline]
 pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    let (epoch_ms, started) = CLOCK_ANCHOR.get_or_init(|| {
+        let base = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        (base, Instant::now())
+    });
+    epoch_ms.saturating_add(started.elapsed().as_millis() as u64)
 }
 
-pub fn create_private_dir(path: &Path) -> Result<()> {
+#[inline]
+pub fn skip_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".refit"
+            | ".venv"
+            | "venv"
+            | ".git"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".ruff_cache"
+            | ".mypy_cache"
+            | ".tox"
+            | "target"
+            | "node_modules"
+            | ".tools"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".nuxt"
+            | ".terraform"
+            | "vendor"
+            | "coverage"
+            | "out"
+            | "tmp"
+            | ".cache"
+    )
+}
+
+/// Check that `rel` stays inside the repository and never targets `.git` or `.refit`.
+pub fn check_rel(rel: &str) -> bool {
+    if rel.is_empty() || rel.contains('\0') {
+        return false;
+    }
+    let norm = rel.replace('\\', "/");
+    let p = Path::new(&norm);
+    if p.is_absolute() {
+        return false;
+    }
+    let mut has_normal = false;
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return false,
+            std::path::Component::Normal(seg) => {
+                let s = seg.to_string_lossy();
+                if s == ".git" || s == ".refit" {
+                    return false;
+                }
+                has_normal = true;
+            }
+            std::path::Component::CurDir => {}
+        }
+    }
+    has_normal
+}
+
+pub fn walk_files(repo_root: &Path, max_depth: Option<usize>) -> Vec<PathBuf> {
+    walk_tree(repo_root, max_depth, false)
+}
+
+pub fn walk_tree(
+    repo_root: &Path,
+    max_depth: Option<usize>,
+    include_hidden_configs: bool,
+) -> Vec<PathBuf> {
+    let mut wb = WalkBuilder::new(repo_root);
+    wb.hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(false)
+        .require_git(false)
+        .add_custom_ignore_filename(".refitignore")
+        .filter_entry(move |e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if !is_dir {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            if skip_dir(&name) {
+                return false;
+            }
+            if name.starts_with('.') {
+                return include_hidden_configs && name == ".github";
+            }
+            true
+        });
+    if let Some(d) = max_depth {
+        wb.max_depth(Some(d));
+    }
+    let mut out: Vec<PathBuf> = wb
+        .build()
+        .flatten()
+        .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .map(|e| e.into_path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Build a minimal environment allowlist for sandboxed commands (`clear_env = true`).
+pub fn sandbox_env(extra: &[(String, String)]) -> Vec<(String, String)> {
+    const ALLOWED_VARS: &[&str] = &[
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "LANG",
+        "LC_ALL",
+        "RUSTUP_HOME",
+        "CARGO_HOME",
+        "GOPATH",
+        "GOROOT",
+        "GOCACHE",
+        "VIRTUAL_ENV",
+        "NODE_PATH",
+    ];
+    let mut env: Vec<(String, String)> = Vec::with_capacity(ALLOWED_VARS.len() + extra.len());
+    for &k in ALLOWED_VARS {
+        if let Ok(v) = std::env::var(k) {
+            env.push((k.to_string(), v));
+        }
+    }
+    for (k, v) in extra {
+        if let Some(existing) = env.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(k)) {
+            existing.1 = v.clone();
+        } else {
+            env.push((k.clone(), v.clone()));
+        }
+    }
+    env
+}
+
+/// Detect hardcoded secret tokens, PEM keys, or credentialed DB URIs in a line.
+pub fn find_secret(line: &str) -> Option<&'static str> {
+    if line.contains("-----BEGIN ") && line.contains("PRIVATE KEY-----") {
+        return Some("pem_private_key");
+    }
+    const PREFIX_RULES: &[(&str, usize, &str)] = &[
+        ("csk-", 12, "cerebras_api_key"),
+        ("keen_", 12, "keenable_api_key"),
+        ("sk-ant-", 16, "anthropic_api_key"),
+        ("sk-proj-", 16, "openai_api_key"),
+        ("sk_live_", 16, "stripe_live_key"),
+        ("rk_live_", 16, "stripe_restricted_key"),
+        ("ghp_", 20, "github_pat"),
+        ("gho_", 20, "github_oauth"),
+        ("github_pat_", 20, "github_fine_grained_pat"),
+        ("xoxb-", 16, "slack_bot_token"),
+        ("xoxp-", 16, "slack_user_token"),
+        ("xoxa-", 16, "slack_app_token"),
+        ("AKIA", 16, "aws_access_key_id"),
+        ("ASIA", 16, "aws_sts_key_id"),
+        ("sk-", 24, "generic_sk_secret"),
+    ];
+    for &(prefix, min_tail, kind) in PREFIX_RULES {
+        let mut rest = line;
+        while let Some(pos) = rest.find(prefix) {
+            let valid_boundary = pos == 0
+                || !rest[..pos]
+                    .chars()
+                    .next_back()
+                    .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                    .unwrap_or(false);
+            let tail = &rest[pos + prefix.len()..];
+            if valid_boundary {
+                let token_len = if prefix == "AKIA" || prefix == "ASIA" {
+                    tail.chars()
+                        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                        .count()
+                } else {
+                    tail.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                        .count()
+                };
+                if token_len >= min_tail {
+                    return Some(kind);
+                }
+            }
+            rest = tail;
+        }
+    }
+    for scheme in [
+        "postgres://",
+        "postgresql://",
+        "mysql://",
+        "mongodb://",
+        "mongodb+srv://",
+        "redis://",
+    ] {
+        let mut rest = line;
+        while let Some(pos) = rest.find(scheme) {
+            let after = &rest[pos + scheme.len()..];
+            let authority = after
+                .split(['/', ' ', '"', '\'', ')', ']'])
+                .next()
+                .unwrap_or("");
+            if let Some((creds, host)) = authority.split_once('@') {
+                if !host.is_empty()
+                    && creds.contains(':')
+                    && !creds.ends_with(':')
+                    && !creds.contains("${")
+                    && !creds.contains("REDACTED")
+                {
+                    return Some("database_credential_url");
+                }
+            }
+            rest = after;
+        }
+    }
+    None
+}
+
+pub fn redact_secrets(mut s: String) -> String {
+    const REDACT_PREFIXES: &[(&str, &str, usize)] = &[
+        ("csk-", "REDACTED_CSK_", 8),
+        ("keen_", "REDACTED_KEEN_", 8),
+        ("sk-ant-", "REDACTED_ANTHROPIC_", 12),
+        ("sk-proj-", "REDACTED_OPENAI_", 12),
+        ("sk_live_", "REDACTED_STRIPE_", 12),
+        ("rk_live_", "REDACTED_STRIPE_", 12),
+        ("ghp_", "REDACTED_GITHUB_", 16),
+        ("gho_", "REDACTED_GITHUB_", 16),
+        ("github_pat_", "REDACTED_GITHUB_", 16),
+        ("xoxb-", "REDACTED_SLACK_", 12),
+        ("xoxp-", "REDACTED_SLACK_", 12),
+        ("xoxa-", "REDACTED_SLACK_", 12),
+        ("AKIA", "REDACTED_AWS_", 16),
+        ("ASIA", "REDACTED_AWS_", 16),
+        ("sk-", "REDACTED_SK_", 24),
+    ];
+    for &(prefix, replacement, min_tail) in REDACT_PREFIXES {
+        if s.contains(prefix) {
+            s = redact_prefix(&s, prefix, replacement, min_tail);
+        }
+    }
+    for scheme in [
+        "postgres://",
+        "postgresql://",
+        "mysql://",
+        "mongodb://",
+        "mongodb+srv://",
+        "redis://",
+    ] {
+        if s.contains(scheme) {
+            s = redact_uris(&s, scheme);
+        }
+    }
+    if s.contains("PRIVATE KEY-----") {
+        s = redact_pem(&s);
+    }
+    s
+}
+
+fn redact_pem(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(begin) = rest.find("-----BEGIN ") {
+        let after_begin = &rest[begin..];
+        let Some(hdr_end_rel) = after_begin.find("PRIVATE KEY-----") else {
+            out.push_str(&rest[..begin + 11]);
+            rest = &rest[begin + 11..];
+            continue;
+        };
+        out.push_str(&rest[..begin]);
+        out.push_str("[REDACTED_PEM_PRIVATE_KEY]");
+        let body_start = begin + hdr_end_rel + "PRIVATE KEY-----".len();
+        let tail = &rest[body_start..];
+        if let Some(end_rel) = tail.find("-----END ") {
+            let after_end = &tail[end_rel..];
+            if let Some(close_rel) = after_end.find("PRIVATE KEY-----") {
+                rest = &tail[end_rel + close_rel + "PRIVATE KEY-----".len()..];
+                continue;
+            }
+        }
+        rest = "";
+        break;
+    }
+    out.push_str(rest);
+    out.replace("PRIVATE KEY-----", "REDACTED_PRIVATE_KEY-----")
+}
+
+fn redact_prefix(input: &str, prefix: &str, replacement: &str, min_tail: usize) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find(prefix) {
+        let valid_boundary = pos == 0
+            || !rest[..pos]
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                .unwrap_or(false);
+        let after = &rest[pos + prefix.len()..];
+        let skip = after
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+            .count();
+        if valid_boundary && skip >= min_tail {
+            out.push_str(&rest[..pos]);
+            out.push_str(replacement);
+            rest = &after[skip..];
+        } else {
+            out.push_str(&rest[..pos + prefix.len()]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_uris(input: &str, scheme: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find(scheme) {
+        out.push_str(&rest[..pos + scheme.len()]);
+        let after = &rest[pos + scheme.len()..];
+        let end = after
+            .find(['/', ' ', '"', '\'', ')', ']', '\n', '\r'])
+            .unwrap_or(after.len());
+        let auth = &after[..end];
+        if let Some((creds, host)) = auth.split_once('@') {
+            if creds.contains(':') && !host.is_empty() {
+                out.push_str("REDACTED:REDACTED@");
+                out.push_str(host);
+                rest = &after[end..];
+                continue;
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+pub fn char_prefix(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+pub fn new_http(user_agent: &str, timeout_secs: u64, pool_max: usize) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(user_agent)
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .connect_timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(pool_max)
+        .pool_idle_timeout(Some(Duration::from_secs(600)))
+        .http2_keep_alive_interval(Some(Duration::from_secs(15)))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        .http2_adaptive_window(true)
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .context("build HTTP/2 keep-alive client")
+}
+
+pub fn stream_http(
+    user_agent: &str,
+    connect_timeout_secs: u64,
+    pool_idle_secs: u64,
+    pool_max: usize,
+) -> Result<reqwest::Client> {
+    // No global total-request timeout: long-lived SSE streams are guarded by per-chunk stall watchdogs.
+    reqwest::Client::builder()
+        .user_agent(user_agent)
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .connect_timeout(Duration::from_secs(connect_timeout_secs))
+        .pool_max_idle_per_host(pool_max)
+        .pool_idle_timeout(Some(Duration::from_secs(pool_idle_secs)))
+        .http2_keep_alive_interval(Some(Duration::from_secs(15)))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        .http2_adaptive_window(true)
+        .build()
+        .context("build HTTP/2 streaming keep-alive client")
+}
+
+#[inline]
+pub fn is_retryable(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+pub fn retry_ms(header_val: &str, max_cap_ms: u64) -> Option<u64> {
+    let trimmed = header_val.trim();
+    if let Ok(secs) = trimmed.parse::<f64>() {
+        if secs.is_finite() && secs >= 0.0 {
+            let ms = (secs * 1000.0).round() as u64;
+            return Some(ms.min(max_cap_ms));
+        }
+    }
+    if let Ok(target) = httpdate::parse_http_date(trimmed) {
+        let wait_ms = target
+            .duration_since(SystemTime::now())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        return Some(wait_ms.min(max_cap_ms));
+    }
+    None
+}
+
+pub fn backoff_ms(
+    attempt: u32,
+    base_ms: u64,
+    cap_ms: u64,
+    retry_after_ms: Option<u64>,
+    jitter_seed: u64,
+) -> u64 {
+    if let Some(ra) = retry_after_ms {
+        return ra.min(cap_ms);
+    }
+    let exp = base_ms
+        .saturating_mul(1u64.checked_shl(attempt.min(10)).unwrap_or(1024))
+        .min(cap_ms);
+    let half = exp / 2;
+    let span = (exp - half).max(1);
+    let mix = jitter_seed
+        .wrapping_mul(0x9e3779b97f4a7c15)
+        .wrapping_add(attempt as u64);
+    half + (mix % span)
+}
+
+pub fn write_zstd<T: Serialize>(path: &Path, val: &T) -> Result<()> {
+    let raw = serde_json::to_vec(val)?;
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3)?;
+    write_atomic(path, &compressed)
+}
+
+pub fn read_zstd<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let raw = fs::read(path).ok()?;
+    let decoded = zstd::stream::decode_all(raw.as_slice()).ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+pub fn mkdir_private(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .with_context(|| format!("create private directory {}", path.display()))?;
     #[cfg(unix)]
@@ -42,7 +504,7 @@ pub fn create_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn atomic_replace_file(target: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
     let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -116,6 +578,10 @@ pub fn atomic_replace_file(target: &Path, bytes: &[u8]) -> Result<()> {
             let _ = fs::remove_file(&tmp_path);
             format!("atomic rename {} -> {}", tmp_path.display(), target.display())
         })?;
+        // Sync parent dir on Unix so rename directory entry survives sudden power loss.
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 }
@@ -188,7 +654,7 @@ pub fn self_metrics() -> SelfMetrics {
         .unwrap_or_default()
 }
 
-pub fn run_sandboxed_cmd(
+pub fn run_cmd(
     program: &str,
     args: &[String],
     cwd: &Path,
@@ -224,13 +690,16 @@ pub fn run_sandboxed_cmd(
         }
     }
 
+    #[cfg(unix)]
+    let (unix_cpu_before, _) = unix_rusage();
+
     let started = Instant::now();
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn sandboxed command `{program}` in {}", cwd.display()))?;
 
     #[cfg(windows)]
-    let job_handle = attach_windows_job(&child);
+    let job_handle = attach_job(&child);
 
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
@@ -250,16 +719,12 @@ pub fn run_sandboxed_cmd(
         String::from_utf8_lossy(&buf).into_owned()
     });
 
+    // Event-driven wait_timeout (WaitForSingleObject on Windows / SIGCHLD on Unix): zero 10ms polling waste.
     let deadline = Duration::from_millis(timeout_ms.max(100));
     let mut timed_out = false;
-    let exit_code;
-
-    loop {
-        if let Some(status) = child.try_wait()? {
-            exit_code = status.code().unwrap_or(-1);
-            break;
-        }
-        if started.elapsed() >= deadline {
+    let exit_code = match wait_timeout::ChildExt::wait_timeout(&mut child, deadline)? {
+        Some(status) => status.code().unwrap_or(-1),
+        None => {
             timed_out = true;
             #[cfg(windows)]
             {
@@ -274,26 +739,30 @@ pub fn run_sandboxed_cmd(
             {
                 let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
                 let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
-                std::thread::sleep(Duration::from_millis(100));
-                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-                let _ = child.kill();
+                if wait_timeout::ChildExt::wait_timeout(&mut child, Duration::from_millis(100))
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+                    let _ = child.kill();
+                }
             }
             let _ = child.wait();
-            exit_code = -1;
-            break;
+            -1
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    };
 
     let wall_ms = started.elapsed().as_millis() as u64;
     let (cpu_ms, peak_rss_bytes) = {
         #[cfg(windows)]
         {
-            query_and_close_windows_job(job_handle)
+            close_job(job_handle)
         }
         #[cfg(unix)]
         {
-            query_unix_children_rusage()
+            let (after_cpu, rss) = unix_rusage();
+            (after_cpu.saturating_sub(unix_cpu_before), rss)
         }
     };
 
@@ -312,7 +781,7 @@ pub fn run_sandboxed_cmd(
 }
 
 #[cfg(windows)]
-fn attach_windows_job(child: &std::process::Child) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+fn attach_job(child: &std::process::Child) -> Option<windows_sys::Win32::Foundation::HANDLE> {
     use std::mem::{size_of, zeroed};
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -349,7 +818,7 @@ fn attach_windows_job(child: &std::process::Child) -> Option<windows_sys::Win32:
 }
 
 #[cfg(windows)]
-fn query_and_close_windows_job(
+fn close_job(
     job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
 ) -> (u64, u64) {
     use std::mem::{size_of, zeroed};
@@ -399,7 +868,7 @@ fn query_and_close_windows_job(
 }
 
 #[cfg(unix)]
-fn query_unix_children_rusage() -> (u64, u64) {
+fn unix_rusage() -> (u64, u64) {
     nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_CHILDREN)
         .map(|u| {
             let ut = u.user_time();
@@ -415,4 +884,194 @@ fn query_unix_children_rusage() -> (u64, u64) {
             (cpu_ms, rss_bytes)
         })
         .unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_08_http_client_h2() {
+        let client = new_http("refit-probe/0.4.0", 30, 16);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn probe_09_retry_status() {
+        for ok_code in [200, 201, 204, 400, 401, 403, 404, 422] {
+            assert!(!is_retryable(ok_code), "must not retry {ok_code}");
+        }
+        for retry_code in [408, 429, 500, 502, 503, 504, 529] {
+            assert!(is_retryable(retry_code), "must retry {retry_code}");
+        }
+    }
+
+    #[test]
+    fn probe_10_retry_after_cap() {
+        assert_eq!(retry_ms("3", 30_000), Some(3_000));
+        assert_eq!(retry_ms("1.5", 30_000), Some(1_500));
+        assert_eq!(retry_ms("9999", 30_000), Some(30_000));
+        assert_eq!(retry_ms("-5", 30_000), None);
+        assert_eq!(retry_ms("invalid", 30_000), None);
+    }
+
+    #[test]
+    fn probe_11_retry_backoff() {
+        let d0 = backoff_ms(0, 200, 10_000, None, 1);
+        let d2 = backoff_ms(2, 200, 10_000, None, 1);
+        let d9 = backoff_ms(9, 200, 10_000, None, 1);
+        let ra = backoff_ms(0, 200, 10_000, Some(4_500), 1);
+        assert!((100..=200).contains(&d0));
+        assert!((400..=800).contains(&d2));
+        assert!((5_000..=10_000).contains(&d9));
+        assert_eq!(ra, 4_500);
+        let s1 = backoff_ms(2, 200, 10_000, None, 11);
+        let s2 = backoff_ms(2, 200, 10_000, None, 97);
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn probe_40_write_atomic() {
+        let dir = std::env::temp_dir().join(format!("refit_atomic_{}_{}", std::process::id(), now_ms()));
+        let target = dir.join("state.json");
+        for i in 0..25 {
+            let payload = format!("{{\"rev\":{i}}}");
+            write_atomic(&target, payload.as_bytes()).unwrap();
+            assert_eq!(fs::read_to_string(&target).unwrap(), payload);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_47_walk_prune() {
+        let dir = std::env::temp_dir().join(format!("refit_walk_{}_{}", std::process::id(), now_ms()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(dir.join("target/debug")).unwrap();
+        fs::create_dir_all(dir.join(".refit/cas")).unwrap();
+        fs::write(dir.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(dir.join("node_modules/pkg/index.js"), "module.exports = 1;\n").unwrap();
+        fs::write(dir.join("target/debug/bin.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.join(".refit/cas/blob"), "x").unwrap();
+
+        let files = walk_files(&dir, None);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("a.rs"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_48_monotonic_ms() {
+        let mut prev = now_ms();
+        for _ in 0..10_000 {
+            let cur = now_ms();
+            assert!(cur >= prev);
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn probe_50_cmd_timeout() {
+        let cwd = std::env::temp_dir();
+        #[cfg(windows)]
+        let (prog, ok_args, slow_args) = (
+            "cmd",
+            vec!["/C".into(), "echo ok".into()],
+            vec!["/C".into(), "ping -n 5 127.0.0.1 >nul".into()],
+        );
+        #[cfg(unix)]
+        let (prog, ok_args, slow_args) = (
+            "sh",
+            vec!["-c".into(), "echo ok".into()],
+            vec!["-c".into(), "sleep 3".into()],
+        );
+
+        let r_ok = run_cmd(prog, &ok_args, &cwd, &[], false, 5_000).unwrap();
+        assert_eq!(r_ok.exit_code, 0);
+        assert!(!r_ok.timed_out);
+        assert!(r_ok.stdout.to_lowercase().contains("ok"));
+
+        let r_to = run_cmd(prog, &slow_args, &cwd, &[], false, 150).unwrap();
+        assert!(r_to.timed_out);
+        assert_eq!(r_to.exit_code, -1);
+    }
+
+    #[test]
+    fn probe_64_retry_http_date() {
+        let future = SystemTime::now() + Duration::from_secs(5);
+        let http_date = httpdate::fmt_http_date(future);
+        let parsed = retry_ms(&http_date, 30_000).unwrap();
+        assert!((2_000..=6_500).contains(&parsed), "expected ~5s, got {parsed}ms");
+
+        let far = SystemTime::now() + Duration::from_secs(3600);
+        assert_eq!(retry_ms(&httpdate::fmt_http_date(far), 15_000), Some(15_000));
+        assert!(stream_http("refit-stream/0.4.0", 15, 600, 16).is_ok());
+    }
+
+    #[test]
+    fn probe_76_walk_ignore() {
+        let dir = std::env::temp_dir().join(format!("refit_gi76_{}_{}", std::process::id(), now_ms()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("ignored_gen")).unwrap();
+        fs::create_dir_all(dir.join("custom_skip")).unwrap();
+        fs::write(dir.join(".gitignore"), "ignored_gen/\n*.generated.py\n").unwrap();
+        fs::write(dir.join(".refitignore"), "custom_skip/\n").unwrap();
+        fs::write(dir.join("src/keep.rs"), "pub fn keep() {}\n").unwrap();
+        fs::write(dir.join("ignored_gen/junk.py"), "x = 1\n").unwrap();
+        fs::write(dir.join("src/auto.generated.py"), "x = 2\n").unwrap();
+        fs::write(dir.join("custom_skip/skip.ts"), "export const x = 1;\n").unwrap();
+
+        let files = walk_files(&dir, None);
+        let rels: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.strip_prefix(&dir).ok())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(rels.contains(&"src/keep.rs".to_string()), "rels={rels:?}");
+        assert!(!rels.iter().any(|r| r.contains("ignored_gen")), "rels={rels:?}");
+        assert!(!rels.iter().any(|r| r.contains("generated.py")), "rels={rels:?}");
+        assert!(!rels.iter().any(|r| r.contains("custom_skip")), "rels={rels:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_77_secret_families() {
+        let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+        let gh = ["ghp_", "1234567890abcdefghij123456"].concat();
+        let db = ["postgres://", "admin:sup3rs3cr3t@db.internal:5432/prod"].concat();
+        let pem = ["-----BEGIN RSA ", "PRIVATE KEY-----"].concat();
+        assert_eq!(find_secret(&format!("key = \"{aws}\"")), Some("aws_access_key_id"));
+        assert_eq!(find_secret(&format!("tok = '{gh}'")), Some("github_pat"));
+        assert_eq!(find_secret(&db), Some("database_credential_url"));
+        assert_eq!(find_secret(&pem), Some("pem_private_key"));
+        assert_eq!(find_secret("let normal = \"hello_world\";"), None);
+
+        let redacted = redact_secrets(format!("a={aws} b={gh} c={db}"));
+        assert!(!redacted.contains(&aws));
+        assert!(!redacted.contains(&gh));
+        assert!(!redacted.contains("sup3rs3cr3t"));
+        assert!(redacted.contains("REDACTED_AWS_"));
+        assert!(redacted.contains("REDACTED_GITHUB_"));
+    }
+
+    #[test]
+    fn probe_99_pem_and_uri() {
+        let slack_app = ["xoxa-", "1234567890abcdef1234"].concat();
+        let pem_full = [
+            "-----BEGIN RSA ",
+            "PRIVATE KEY-----\nMIIEpAIBAAKCAQEASuperSecretBodyPayload==\n-----END RSA ",
+            "PRIVATE KEY-----",
+        ]
+        .concat();
+        let red = redact_secrets(format!("t={slack_app} pem={pem_full}"));
+        assert!(!red.contains("SuperSecretBodyPayload"), "PEM body leaked: {red}");
+        assert!(!red.contains(&slack_app), "xoxa- token leaked: {red}");
+        assert!(red.contains("REDACTED_SLACK_"));
+
+        // Non-credentialed URI earlier on same line must NOT hide a credentialed URI later on the line.
+        let line = "docs = 'postgres://localhost/db' prod = 'postgres://admin:p4ssw0rd@db.prod:5432/app'";
+        assert_eq!(find_secret(line), Some("database_credential_url"));
+    }
 }

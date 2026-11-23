@@ -1769,6 +1769,103 @@
   .circuit-tag {
     color: #146C43 !important;
   }
+
+  /* ================= TIME-TRAVEL MVCC DIFF DRAWER ================= */
+  .mvcc-diff-btn {
+    height: 30px;
+    padding: 0 11px;
+    border-radius: 999px;
+    border: 1px solid #1C1C1B;
+    background: #FFFFFF;
+    color: #1C1C1B;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+  }
+  .mvcc-diff-btn:hover, .mvcc-diff-btn.active {
+    background: #1C1C1B;
+    color: #F8F7F2;
+  }
+  #mvcc-drawer {
+    position: absolute;
+    top: 66px;
+    right: 22px;
+    bottom: 22px;
+    width: 560px;
+    background: #F8F7F2;
+    border: 2px solid #1C1C1B;
+    border-radius: 10px;
+    box-shadow: 0 18px 48px rgba(28, 28, 27, 0.22);
+    z-index: 60;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    color: #1C1C1B;
+  }
+  #mvcc-drawer.open { display: flex; }
+  .mvcc-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: #FFFFFF;
+    border-bottom: 1.5px solid #1C1C1B;
+  }
+  .mvcc-title {
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  .mvcc-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: #F3F1EC;
+    border-bottom: 1px solid rgba(28, 28, 27, 0.16);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+  }
+  .mvcc-controls input[type="range"] { flex: 1; accent-color: #1D4ED8; }
+  .mvcc-nav-btn {
+    padding: 3px 9px;
+    border: 1px solid #1C1C1B;
+    border-radius: 5px;
+    background: #FFFFFF;
+    color: #1C1C1B;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .mvcc-meta {
+    padding: 10px 16px;
+    background: #FFFFFF;
+    border-bottom: 1px solid rgba(28, 28, 27, 0.14);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+  }
+  .mvcc-badge-ok { color: #146C43; font-weight: 800; }
+  .mvcc-badge-rb { color: #D94826; font-weight: 800; }
+  .mvcc-body {
+    flex: 1;
+    overflow: auto;
+    padding: 12px 16px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    line-height: 1.48;
+  }
+  .mvcc-diff-line { white-space: pre-wrap; word-break: break-all; padding: 1px 6px; border-radius: 3px; }
+  .mvcc-diff-add { background: rgba(20, 108, 67, 0.13); color: #0B4A2D; }
+  .mvcc-diff-del { background: rgba(217, 72, 38, 0.13); color: #9A2B12; }
+  .mvcc-diff-hdr { color: #1D4ED8; font-weight: 700; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -1813,6 +1910,8 @@
           <span class="pill-sep">|</span>
           <span>Circuit: <span class="circuit-tag" id="circuit-state">CLOSED</span></span>
         </div>
+
+        <button class="mvcc-diff-btn" id="btn-mvcc-diff" type="button" title="Toggle MVCC Time-Travel Diff &amp; Causality Drawer">MVCC Diff</button>
       </div>
 
       <!-- Replay / Demo Controls (Auto-shown when ?replay= or ?demo=1) -->
@@ -2919,6 +3018,15 @@
         const fmtH = (v) => (v <= 1.5 ? v.toFixed(2) : v.toFixed(1));
         const g3Clean = (Number(d.gate3_ruff_errors) || 0) === 0 && (Number(d.gate3_ty_errors) || 0) === 0;
         const deltaStr = (afterHyg - beforeHyg >= 0 ? '+' : '') + (Math.abs(afterHyg) <= 1.5 ? (afterHyg - beforeHyg).toFixed(2) : (afterHyg - beforeHyg).toFixed(1));
+        if (!st.causalTimeline) st.causalTimeline = [];
+        st.causalTimeline.push({
+          rev: st.walRev,
+          tx_id: d.tx_id || ('rev-' + st.walRev),
+          module_id: ev.module_id || 'unit',
+          state: 'COMMITTED',
+          reason: 'hyg ' + fmtH(beforeHyg) + ' -> ' + fmtH(afterHyg) + ' (' + deltaStr + ') | ruff ' + (Number(d.gate3_ruff_errors) || 0) + ' | ty ' + (Number(d.gate3_ty_errors) || 0),
+          ts_ms: ev.ts_ms || 0
+        });
         pushFeed(
           st,
           g3Clean && d.highlight_g3 ? 'g3' : 'commit',
@@ -2945,6 +3053,15 @@
         incrementGateRollback(st, gName);
         st.retriesTotal += 1;
         if (d.verdict) applyGateVerdict(st, unit, d.verdict);
+        if (!st.causalTimeline) st.causalTimeline = [];
+        st.causalTimeline.push({
+          rev: st.walRev,
+          tx_id: d.tx_id || ('rb-' + st.causalTimeline.length),
+          module_id: ev.module_id || 'unit',
+          state: 'ROLLED_BACK',
+          reason: '[' + String(gName).toUpperCase() + '] ' + (d.reason || (Array.isArray(d.diagnostics) ? d.diagnostics[0] : 'retrying in clean sandbox')),
+          ts_ms: ev.ts_ms || 0
+        });
         pushFeed(
           st,
           'rollback',
@@ -3704,12 +3821,17 @@
     el.textContent = pct >= 7.5 ? label : '';
   }
 
+  let lastClockSec = -1;
   function rafLoop(now) {
     if (now - lastRenderMs >= 33.33) {
       if (replayController.active) {
         replayController.step(now);
       } else if (state.mode === 'live' && state.runStatus === 'running') {
-        dirty = true; // keep wall clock ticking smoothly at 30 Hz
+        const curSec = Math.floor(now / 1000);
+        if (curSec !== lastClockSec) {
+          lastClockSec = curSec;
+          dirty = true; // event-driven: only tick wall clock once/sec when idle, zero wasted DOM repaints
+        }
       }
       if (dirty) {
         renderFrame();
@@ -4468,6 +4590,160 @@
   } else {
     startLiveSse();
   }
+
+  /* ================= TIME-TRAVEL MVCC DIFF DRAWER ================= */
+  (function initMvccTimeTravel() {
+    const stageEl = document.getElementById('hud-stage');
+    const toggleBtn = document.getElementById('btn-mvcc-diff');
+    if (!stageEl || !toggleBtn) return;
+
+    const drawer = document.createElement('aside');
+    drawer.id = 'mvcc-drawer';
+    drawer.innerHTML =
+      '<div class="mvcc-head">' +
+        '<span class="mvcc-title">Time-Travel MVCC Diff &amp; Causality</span>' +
+        '<button class="mvcc-nav-btn" id="mvcc-close" type="button">Close</button>' +
+      '</div>' +
+      '<div class="mvcc-controls">' +
+        '<button class="mvcc-nav-btn" id="mvcc-prev" type="button">Prev</button>' +
+        '<input id="mvcc-slider" type="range" min="0" max="0" value="0" />' +
+        '<button class="mvcc-nav-btn" id="mvcc-next" type="button">Next</button>' +
+        '<span id="mvcc-idx">0/0</span>' +
+      '</div>' +
+      '<div class="mvcc-meta" id="mvcc-meta">No WAL revisions recorded yet.</div>' +
+      '<div class="mvcc-body" id="mvcc-body"></div>';
+    stageEl.appendChild(drawer);
+
+    const slider = drawer.querySelector('#mvcc-slider');
+    const idxEl = drawer.querySelector('#mvcc-idx');
+    const metaEl = drawer.querySelector('#mvcc-meta');
+    const bodyEl = drawer.querySelector('#mvcc-body');
+    let liveEntries = null;
+    let curIdx = 0;
+
+    function getEntries() {
+      if (Array.isArray(liveEntries) && liveEntries.length) return liveEntries;
+      return Array.isArray(state.causalTimeline) ? state.causalTimeline : [];
+    }
+
+    function renderDiffText(text) {
+      bodyEl.innerHTML = '';
+      String(text || '').split('\n').forEach(function (line) {
+        const div = document.createElement('div');
+        div.className = 'mvcc-diff-line';
+        if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) {
+          div.className += ' mvcc-diff-hdr';
+        } else if (line.startsWith('+')) {
+          div.className += ' mvcc-diff-add';
+        } else if (line.startsWith('-')) {
+          div.className += ' mvcc-diff-del';
+        }
+        div.textContent = line;
+        bodyEl.appendChild(div);
+      });
+    }
+
+    function renderSelected() {
+      const list = getEntries();
+      slider.max = String(Math.max(0, list.length - 1));
+      if (!list.length) {
+        idxEl.textContent = '0/0';
+        metaEl.textContent = 'Waiting for MVCC commit or rollback events...';
+        bodyEl.textContent = '';
+        return;
+      }
+      curIdx = Math.max(0, Math.min(curIdx, list.length - 1));
+      slider.value = String(curIdx);
+      idxEl.textContent = (curIdx + 1) + '/' + list.length;
+      const item = list[curIdx];
+      const cls = item.state === 'COMMITTED' ? 'mvcc-badge-ok' : 'mvcc-badge-rb';
+      metaEl.innerHTML =
+        '<span class="' + cls + '">' + item.state + '</span>' +
+        '<span>rev <b>' + (item.rev || 0) + '</b></span>' +
+        '<span>unit <b>' + (item.module_id || 'unit') + '</b></span>' +
+        '<span>tx <b>' + (item.tx_id || '-') + '</b></span>' +
+        (typeof item.loc_delta === 'number' ? '<span>LOC <b>' + (item.loc_delta >= 0 ? '+' : '') + item.loc_delta + '</b></span>' : '');
+
+      if (liveEntries && item.state === 'COMMITTED' && item.tx_id) {
+        bodyEl.textContent = 'Loading BLAKE3 CAS unified diff...';
+        fetch('/api/diff/' + encodeURIComponent(item.tx_id))
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (rep) {
+            if (!rep || !Array.isArray(rep.files) || !rep.files.length) {
+              renderDiffText(item.reason || 'Committed revision verified across Gates 0 to 3.5.');
+              return;
+            }
+            const joined = rep.files.map(function (f) { return f.unified_diff || ''; }).join('\n');
+            renderDiffText(joined);
+          })
+          .catch(function () {
+            renderDiffText(item.reason || 'Diff unavailable in static replay mode.');
+          });
+      } else {
+        const lines = [
+          '--- a/' + (item.module_id || 'unit'),
+          '+++ b/' + (item.module_id || 'unit'),
+          '@@ MVCC Causality Snapshot @@',
+          (item.state === 'COMMITTED' ? '+ ' : '- ') + (item.reason || 'Verified transaction event')
+        ];
+        renderDiffText(lines.join('\n'));
+      }
+    }
+
+    function refreshTimeline() {
+      const isStatic = Boolean(replayUrl) || demoFlag === '1' || demoFlag === 'true';
+      if (isStatic) {
+        liveEntries = null;
+        curIdx = Math.max(0, getEntries().length - 1);
+        renderSelected();
+        return;
+      }
+      fetch('/api/timeline')
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (data) {
+          if (data && Array.isArray(data.entries) && data.entries.length) {
+            liveEntries = data.entries;
+          }
+          curIdx = Math.max(0, getEntries().length - 1);
+          renderSelected();
+        })
+        .catch(function () {
+          curIdx = Math.max(0, getEntries().length - 1);
+          renderSelected();
+        });
+    }
+
+    toggleBtn.addEventListener('click', function () {
+      const open = drawer.classList.toggle('open');
+      toggleBtn.classList.toggle('active', open);
+      if (open) refreshTimeline();
+    });
+    drawer.querySelector('#mvcc-close').addEventListener('click', function () {
+      drawer.classList.remove('open');
+      toggleBtn.classList.remove('active');
+    });
+    drawer.querySelector('#mvcc-prev').addEventListener('click', function () {
+      curIdx = Math.max(0, curIdx - 1);
+      renderSelected();
+    });
+    drawer.querySelector('#mvcc-next').addEventListener('click', function () {
+      curIdx = Math.min(Math.max(0, getEntries().length - 1), curIdx + 1);
+      renderSelected();
+    });
+    slider.addEventListener('input', function () {
+      curIdx = Number(slider.value) || 0;
+      renderSelected();
+    });
+    if (els.feedList) {
+      els.feedList.addEventListener('click', function () {
+        if (!drawer.classList.contains('open')) {
+          drawer.classList.add('open');
+          toggleBtn.classList.add('active');
+        }
+        refreshTimeline();
+      });
+    }
+  })();
 
   renderFrame();
   requestAnimationFrame(rafLoop);

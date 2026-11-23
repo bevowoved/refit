@@ -1,1 +1,1 @@
-refit: Cross-platform Rust + unpatched OpenClaw refactoring engine for Kimi K3.1 Pro on Cerebras (938 tok/s, 50K TPM pacer, 4 local gates, ACID WAL)
+[Post-deadline share + Kimi K3.1 Pro feedback] refit v0.4: Pure-Rust polyglot refactoring engine for Cerebras Kimi K3.1 Pro + unpatched OpenClaw (938 tok/s, 10.98 MB mimalloc RSS, 0-copy staging, git worktree, 10 req/s KeenAble ROI)

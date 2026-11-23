@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Cross-platform OS-measured execution result for a sandboxed child process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxResult {
     pub exit_code: i32,
@@ -13,14 +12,12 @@ pub struct SandboxResult {
     pub peak_rss_bytes: u64,
 }
 
-/// Self-process OS resource sample.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SelfMetrics {
     pub rss_bytes: u64,
     pub cpu_ms: u64,
 }
 
-/// Single geometric squiggle returned by codehygiene v0.7.0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Squiggle {
     pub line: usize,
@@ -30,7 +27,6 @@ pub struct Squiggle {
     pub message: String,
 }
 
-/// Maintainability score returned by Gate 2 (brianbell-x/codehygiene v0.7.0).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HygieneResult {
     pub score: f64,
@@ -42,7 +38,6 @@ pub struct HygieneResult {
     pub latency_us: u64,
 }
 
-/// Atomic refactoring unit (single file or Tarjan SCC multi-file cycle).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleUnit {
     pub id: String,
@@ -59,7 +54,6 @@ pub struct ModuleUnit {
     pub allow_abi_change: bool,
 }
 
-/// Full repository dependency graph plan built from stem + AST analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DagPlan {
     pub repo_root: String,
@@ -73,15 +67,27 @@ pub struct DagPlan {
     pub units: Vec<ModuleUnit>,
 }
 
-/// Parsed raw unescaped ASRF patch hunk from assistant.message.content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchOp {
+    #[default]
+    Edit,
+    Create,
+    Delete,
+    Rename,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsrfHunk {
     pub path: String,
+    #[serde(default)]
+    pub op: PatchOp,
+    #[serde(default)]
+    pub new_path: Option<String>,
     pub search: String,
     pub replace: String,
 }
 
-/// Verdict for all 4 local verification stages (Gates 0, 1, 2, 3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateVerdict {
     pub passed: bool,
@@ -100,21 +106,28 @@ pub struct GateVerdict {
     pub gate3_ruff_errors: usize,
     pub gate3_ty_errors: usize,
     pub gate3_ms: u64,
+    #[serde(default)]
+    pub formatted_files: usize,
+    #[serde(default)]
+    pub gate1_skipped_reason: Option<String>,
     pub diagnostics: Vec<String>,
-    /// Final file bytes (may reflect ruff --fix formatting applied before commit).
     #[serde(skip)]
     pub final_contents: BTreeMap<String, Vec<u8>>,
+    #[serde(skip)]
+    pub deleted_files: Vec<String>,
 }
 
-/// File entry recorded inside an ACID WAL transaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalFileEntry {
     pub path: String,
     pub old_blake3: String,
     pub new_blake3: String,
+    #[serde(default)]
+    pub created: bool,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
-/// Append-only ACID WAL record in .refit/wal.jsonl.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WalRecord {
@@ -134,6 +147,8 @@ pub enum WalRecord {
         module_id: String,
         head_rev: u64,
         ts_ms: u64,
+        #[serde(default)]
+        loc_delta: Option<i64>,
         files: Vec<WalFileEntry>,
     },
     Rollback {
@@ -145,7 +160,6 @@ pub enum WalRecord {
     },
 }
 
-/// Learned operational rule stored in .refit/learn.jsonl (injected only in dynamic suffix).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnRule {
     pub key: String,
@@ -156,7 +170,6 @@ pub struct LearnRule {
     pub helpful: u32,
 }
 
-/// Live Cerebras / provider response timing and rate-limit snapshot tapped by :18790 proxy.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmCallMetrics {
     pub module_id: String,
@@ -178,7 +191,6 @@ pub struct LlmCallMetrics {
     pub limit_rpm_minute: Option<u64>,
 }
 
-/// Live proxy pacer and circuit-breaker telemetry snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProxySnapshot {
     pub circuit_state: String,
@@ -198,20 +210,22 @@ pub struct ProxySnapshot {
     pub total_uncached_tokens: u64,
 }
 
-/// 5-run alternating OS CPU/RSS benchmark summary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BenchComparison {
+pub struct BenchReport {
     pub pairs: usize,
     pub before_cpu_ms_median: f64,
     pub after_cpu_ms_median: f64,
     pub cpu_ratio: f64,
+    #[serde(default)]
+    pub before_wall_ms_median: f64,
+    #[serde(default)]
+    pub after_wall_ms_median: f64,
     pub before_rss_mb_median: f64,
     pub after_rss_mb_median: f64,
     pub rss_ratio: f64,
     pub passed_anti_regression: bool,
 }
 
-/// Final Phase 0 vs Phase 2 run summary embedded in run_end and UI scorecard.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunSummary {
     pub run_id: String,
@@ -251,10 +265,116 @@ pub struct RunSummary {
     pub total_uncached_tokens: u64,
     pub total_cached_tokens: u64,
     pub engine_rss_mb: f64,
-    pub bench: Option<BenchComparison>,
+    pub bench: Option<BenchReport>,
+    #[serde(default)]
+    pub loc_before: usize,
+    #[serde(default)]
+    pub loc_after: usize,
+    #[serde(default)]
+    pub telemetry_raw_bytes: u64,
+    #[serde(default)]
+    pub telemetry_zstd_bytes: u64,
+    #[serde(default)]
+    pub stage_hardlinked_files: u64,
+    #[serde(default)]
+    pub research_queries: u64,
+    #[serde(default)]
+    pub research_cache_hits: u64,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub ready_for_manual_merge: bool,
+    #[serde(default)]
+    pub detected_languages: Vec<String>,
+    #[serde(default)]
+    pub blocked_units: usize,
+    #[serde(default)]
+    pub formatted_files_total: u64,
 }
 
-/// Unified lossless JSONL & 30 Hz SSE telemetry event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloneCluster {
+    pub fingerprint: String,
+    pub line_count: usize,
+    pub sample_line: String,
+    pub occurrences: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadSymbol {
+    pub file: String,
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GodFileScore {
+    pub file: String,
+    pub loc: usize,
+    pub hygiene_score: f64,
+    pub fan_in: usize,
+    pub fan_out: usize,
+    pub risk_score: f64,
+    pub recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnusedDep {
+    pub manifest: String,
+    pub ecosystem: String,
+    pub package: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraFinding {
+    pub file: String,
+    pub line: usize,
+    pub severity: String,
+    pub rule_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleCluster {
+    pub capability: String,
+    pub files: Vec<String>,
+    pub recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriageEntry {
+    pub file: String,
+    pub action: String,
+    pub reason: String,
+    pub priority: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditReport {
+    pub repo_root: String,
+    pub total_source_files: usize,
+    pub total_infra_files: usize,
+    pub hygiene_median: f64,
+    pub hygiene_p10: f64,
+    pub scc_count: usize,
+    pub dead_symbols: Vec<DeadSymbol>,
+    pub orphan_files: Vec<String>,
+    pub clone_clusters: Vec<CloneCluster>,
+    pub god_files: Vec<GodFileScore>,
+    pub capability_clusters: Vec<RoleCluster>,
+    pub unused_deps: Vec<UnusedDep>,
+    pub infra_findings: Vec<InfraFinding>,
+    pub triage_plan: Vec<TriageEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SustainFiles {
+    pub files_written: Vec<String>,
+    pub invariant_rules_count: usize,
+    pub layers_detected: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryEvent {
     pub seq: u64,

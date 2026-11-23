@@ -1,57 +1,131 @@
-# `refit`
+# refit v0.5.0
 
-Cross-platform Rust and OpenClaw refactoring engine built for **Kimi K3.1 Pro on Cerebras** (`moonshotai-kimi-k3.1-pro-trial`).
+`refit` is a pure-Rust polyglot refactoring and untangling engine. It runs with **Cerebras Kimi K3.1 Pro**, **unpatched OpenClaw `2026.11.6`**, and **KeenAble** web search.
 
-Built to survive the live **50K uncached TPM / 500K total TPM** hackathon rate limit and **32.4s live server queues** without stalling, corrupting files, or duplicating LLM calls.
+- **Interactive Replay:** [patrickfield152-del.github.io/refit/?replay=run.jsonl](https://patrickfield152-del.github.io/refit/?replay=run.jsonl)
+- **Single Stripped Binary (`9.02 MB`, Windows `x86_64`):** Builds on Linux, macOS, and Windows. Embeds `codehygiene v0.7.0` weights (`weights.npz`) with zero Node or Bun runtime.
 
-## Measured Kimi K3.1 Pro and local engine benchmarks
+## Execution Sequence
 
-| Component | Measured evidence | Details |
-| :--- | :--- | :--- |
-| Live Cerebras Kimi K3.1 Pro probes (`moonshotai-kimi-k3.1-pro-trial`) | **`891` to `938 tok/s`** wafer decode (`18.8x` vs ~50 tok/s GPU) | Probe 1 (`23:22 CET`): `HTTP 200`, `50,000` uncached TPM, `1,000` RPM, `32.44 s` queue, `41 ms` prefill, `27 ms` decode (`891 tok/s`). Probe 2 (`01:58 CET`): `HTTP 200`, `6.8 ms` queue, `11.6 ms` prefill, `17.1 ms` decode (`938 tok/s`). |
-| Standard unpatched OpenClaw harness | **OpenClaw `2026.11.6`** (`openclaw config validate` passed) | Routes `cerebras/moonshotai-kimi-k3.1-pro-trial` (`thinkingDefault: "low"`) through `:18790` HTTP/2 proxy. |
-| Zero-key `proxysoul/stem v0.4.0` discovery | **`stem_used: true`** in **`245 ms`** | Runs `stem mcp` SQL inside `env_clear()` + isolated `0700` `.refit/stem-home/` (`0` host API keys exposed). |
-| Modular Python target codebase | **`64` files, `10,437` LOC, `62` units (`2` Tarjan SCC cycles)** | `4` dependency layers, `128` unit tests (`15` seeded failures), `589` `ruff` + `320` `ty` baseline diagnostics. |
-| Local verification gates (Gates 0 to 3) | **Gate 0 `< 1 ms`, Gate 1 `pytest`, Gate 2 `codehygiene`, Gate 3 `ruff` + `ty`** | Isolated per-transaction staging verifies syntax/ABI pin, unit tests, warm `codehygiene v0.7.0` (`8,400 B` weights), and `ruff` + `ty --error-on-warning`. |
-| MVCC CAS + ACID WAL crash recovery | **`0` torn files, `0` duplicate LLM calls** | Verified by `cargo test` (`mvcc_cas_and_crash_recovery_roundtrip`) and BLAKE3 disk hash validation on `refit resume`. |
-| 5-run alternating OS CPU / RSS bench | **`0.986x` CPU (`282 ms -> 278 ms`), `1.002x` RSS** | `61,440` ledger rows per run, exact deterministic SHA-256 checksum `3db944c2245e37fa`, `<= 1.05x` anti-regression guard. |
-| Cross-platform Rust binary footprint | **`7.56 MB` scan / `21.85 MB` run RSS** | Verified with `cargo build --release`, `cargo test`, and WSL2 `Ubuntu-24.04` Linux `cargo check` (`0` errors). |
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as Developer / CLI
+    participant WT as Git Worktree
+    participant DAG as Symbol Graph + DAG
+    participant BUS as RunState
+    participant WEB as KeenAble Cache
+    participant PRX as Proxy :18790
+    participant OC as OpenClaw 2026.11.6
+    participant WSE as Cerebras Kimi K3.1 Pro
+    participant STG as Stage (.refit-stages)
+    participant WAL as MVCC CAS + WAL
+    participant HUD as Telemetry + HUD
 
-Note on interactive `?replay=` data (per `HACKATHON.md`): `telemetry/kimi-probes.json` stores the live measured `moonshotai-kimi-k3.1-pro-trial` probes (`50,000` uncached TPM, `1,000` RPM, `891` to `938 tok/s`). Because `moonshotai-kimi-k3.1-pro-trial` returned `HTTP 404 model_not_found` on this preview key after `02:00 CET`, the 64-module wave timeline in `telemetry/run.jsonl` and the demo video uses probe-calibrated mock wave data and states so explicitly in its footnote. Re-running `refit run` with any active Kimi K3.1 Pro key replaces `telemetry/run.jsonl` with a live multi-wave trace in one command.
+    rect rgb(248, 247, 242)
+        Note over Dev,BUS: Phase 0: Isolation and Audit
+        Dev->>WT: refit run repo --worktree
+        WT-->>Dev: Create branch refit/run_id (main stays unchanged)
+        WT->>DAG: Walk files (.gitignore), index symbols, build DAG
+        DAG->>DAG: Collapse Tarjan SCCs, order Kahn waves, pin ABI
+        DAG->>BUS: Initialize RunState and baseline audit
+        DAG->>HUD: Emit run_start and dag_ready
+    end
 
-## Architecture
+    rect rgb(239, 246, 255)
+        Note over BUS,WEB: Optional Dependency Audit and Error Lookup
+        BUS->>WEB: audit_deps / search_web
+        alt Cache Hit
+            WEB-->>BUS: Return cached snippets in 0 ms
+        else Cache Miss
+            WEB->>WEB: Acquire GCRA permit (10 req/s) and coalesce callers
+            WEB-->>BUS: Return sanitized web snippets
+        end
+    end
 
-1. **Single cross-platform Rust binary (`7.6 MB` to `21.9 MB` RSS):** OS-native process sandboxing (Windows Job Objects, Linux `setpgid`/`killpg` and `/proc/self/statm`, macOS `rusage`) and atomic file replacement (`MoveFileExW` / `rename`).
-2. **Airtight `proxysoul/stem v0.4.0` discovery:** Runs `stem mcp` SQL inside `env_clear()` and isolated `0700` `.refit/stem-home/` feeding `petgraph 0.8.3` Tarjan SCC cycle condensation and Kahn disjoint wave scheduling.
-3. **Zero-collision MVCC CAS + ACID WAL:** Every edit stages in an isolated copy, verifies BLAKE3 expected hashes before commit, writes `PREPARED` -> atomic rename -> `COMMITTED` in `.refit/wal.jsonl`, and deterministically recovers incomplete transactions on `refit resume`.
-4. **Four local verification gates (Gates 0 to 3):**
-   - **Gate 0 (`< 1 ms`):** Python AST syntax check and canonical exported `abi_hash` pin.
-   - **Gate 1:** Sandboxed impact-cone `pytest` unit tests.
-   - **Gate 2 (`< 5 ms` warm):** Embedded `brianbell-x/codehygiene v0.7.0` geometric layout scorer (`weights.npz`, 8,400 B) over a persistent warm worker with `DashMap` BLAKE3 memoization.
-   - **Gate 3:** `ruff check --fix` + `ruff check` (`0` diagnostics) + Astral `ty check --error-on-warning` (`0` errors, `0` warnings).
-5. **50K uncached TPM Kimi K3.1 Pro HTTP/2 proxy (`127.0.0.1:18790`):** Enforces exact Kimi K3.1 Pro wire parameters (`model: "moonshotai-kimi-k3.1-pro-trial"`, `reasoning_effort: "low"`, `reasoning_format: "parsed"`, `temperature: 1.0`), compacts OpenClaw's 21K-token default workspace boilerplate into the byte-identical static `SKILL.md` prefix (`0` prefix drift), paces under `44,000 / 50,000` uncached TPM with an automatic 5-minute Outage Circuit Breaker, uses raw unescaped `<<<REFIT_PATCH>>>` blocks, and serves the light-editorial 30 Hz SSE HUD + static `?replay=`.
+    rect rgb(254, 243, 199)
+        Note over BUS,WSE: Phase 1: Parallel Kahn Wave Dispatch
+        loop For each ready disjoint unit
+            alt Clean unchanged unit (0 diags and hygiene >= 0.85)
+                BUS-->>WAL: Skip unit (0 LLM tokens, 0 stage I/O)
+            else Dirty unit
+                BUS->>OC: Send anchored micro-slice + learned rules
+                OC->>PRX: POST /v1/chat/completions
+                PRX->>PRX: Apply wire guard, preserve tools, pace 44K TPM
+                PRX->>WSE: Stream HTTP/2 request
+                WSE-->>PRX: Return SSE deltas (891 to 938 tok/s) + usage
+                PRX-->>OC: Tap raw SSE bytes and reconcile rolling TPM
+                PRX->>HUD: Emit redacted llm_done event
+                OC-->>BUS: Return raw REFIT_PATCH hunks
+            end
+        end
+    end
 
-## Quick start
+    rect rgb(236, 253, 245)
+        Note over BUS,WAL: Phase 2: Stage Formatters, Gates 0 to 3.5, and Commit
+        BUS->>STG: Hardlink unchanged files and write fresh candidate inodes
+        STG->>STG: Run formatters, Gate 0 (syntax + ABI), Gate 3.5 (secrets + rules)
+        STG->>STG: Run Gate 1 (sandboxed tests), Gate 3 (linters), Gate 2 (codehygiene v0.7.0)
+        alt All Gates Pass
+            STG-->>WAL: Return verified bytes and drop stage
+            WAL->>WAL: Check BLAKE3 CAS, lock WAL, atomic replace, log COMMITTED
+            WAL->>BUS: Record commit metrics
+            WAL->>HUD: Emit mvcc_commit
+        else Any Gate or CAS Fails
+            STG-->>WAL: Log rollback (disk stays unchanged)
+            WAL->>BUS: Store canonical rule in learn.jsonl and retry
+            WAL->>HUD: Emit mvcc_rollback
+        end
+    end
 
-```bash
-# Build cross-platform Rust binary
-cargo build --release
-
-# Generate 10,437-LOC, 64-module benchmark repo
-python fixture/generate_fixture.py fixture/target_repo
-
-# Scan DAG + Gates 1-3 baseline
-./target/release/refit scan fixture/target_repo
-
-# Run live on Kimi K3.1 Pro through standard unpatched OpenClaw 2026.11.6
-export CEREBRAS_API_KEY="your-key"
-OPENCLAW_CONFIG_PATH=./openclaw/openclaw.refit.json openclaw gateway run --port 18789 --bind loopback --auth token --token refit-local-gw --raw-stream
-./target/release/refit run fixture/target_repo --model moonshotai-kimi-k3.1-pro-trial --openclaw-url http://127.0.0.1:18789/v1 --openclaw-token refit-local-gw
+    rect rgb(243, 240, 230)
+        Note over WT,Dev: Phase 3 and 4: Final Audit, Archive, and Sustain
+        BUS->>HUD: Run final audit and write compact .jsonl.zst archive
+        WT-->>Dev: Print RunSummary JSON and git diff --stat
+    end
 ```
 
-## Attribution and honest disclosure
+## Core Capabilities
 
-- Code graph discovery integrates [`proxysoul/stem` `v0.4.0`](https://github.com/proxysoul/stem) inside an isolated zero-key sandbox.
-- Gate 2 geometric layout scoring uses [`brianbell-x/codehygiene` `v0.7.0`](https://github.com/brianbell-x/codehygiene) (`engine.js` + 8,400 B `weights.npz`); functional and type correctness are verified separately by Gate 1 (`pytest`) and Gate 3 (`ruff` + `ty`).
-- Cerebras prompt caching (`cached_tokens`) excludes cached prefix tokens from the 50K uncached TPM cap and speeds up prefill, while AST micro-slicing and BLAKE3 skip reduce billable input tokens.
-- All public X and `r/cerebras` demos are built for standard unpatched OpenClaw `2026.11.6` (no speed patch used).
+1. **Phase 0 Audit (`refit audit`, `refit_audit`):** Detect cross-file clones, dead exported symbols, orphan files, large high-risk files, duplicate domain modules, unused dependencies (`package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`), and infra issues (Terraform, Dockerfiles, GitHub Actions, SQL).
+2. **Exact Pure-Rust Hygiene (`src/hygiene.rs`):** Run the embedded `codehygiene v0.7.0` ternary neural model (`weights.npz`) in Rust. Achieves **`0.0000` max parity error** against `worker.mjs` with zero JS sidecar.
+3. **Polyglot Symbol Graph and DAG (`src/stem.rs`, `src/graph.rs`):** Index Python, Rust, TypeScript/TSX, JavaScript, and Go with `.gitignore` filtering and test-code stripping. Collapse cyclic SCCs and dispatch disjoint Kahn waves.
+4. **Structural Multi-File Patches (`src/graph.rs`, `src/mvcc.rs`, `src/mcp.rs`):** Support `edit`, `create`, `delete`, and `rename` patches inside atomic MVCC WAL transactions with OS file locks and crash recovery.
+5. **Deterministic Formatters and Sandboxed Gates (`src/gates.rs`):** Run `ruff format`, `rustfmt`, `gofmt`, and `biome format` before Gates 0 to 3.5. Execute all subprocesses with `clear_env = true` and a minimal env allowlist.
+6. **Hardened Proxy and Concurrent MCP (`src/proxy.rs`, `src/mcp.rs`):** Pace rolling uncached TPM with exact refunds, preserve deterministic tool schemas, enforce loopback CORS, and handle MCP tools concurrently (`refit_scan`, `refit_symbols`, `refit_audit`, `refit_sustain`, `refit_read`, `refit_apply`, `refit_verify`, `refit_resume`, `refit_search`, `refit_tx_*`).
+7. **Phase 4 Sustain (`refit sustain`, `refit_sustain`):** Generate `AGENTS.md`, `.refit/invariants.yml`, `docs/ADR-001-untangle.md`, and `.github/workflows/refit-guard.yml`.
+
+## Measured Results
+
+| Check | Measured Evidence |
+| :--- | :--- |
+| Live Kimi K3.1 Pro probes (`moonshotai-kimi-k3.1-pro-trial`) | Probe 1 (`22:22 UTC`, Nov 22): `HTTP 200`, `50,000` uncached TPM, `1,000` RPM, `32.44 s` queue, `41 ms` prefill, **`891 tok/s`** decode. Probe 2 (`00:58 UTC`, Nov 23): `6.8 ms` queue, `11.6 ms` prefill, **`938 tok/s`** decode. Saved in [telemetry/kimi-probes.json](telemetry/kimi-probes.json). |
+| Pure-Rust `codehygiene v0.7.0` parity | **`0.000000` max absolute delta** across all 10 benchmark files (`src/*.rs`, `engine.js`, `mod_*.py`, 2-space nested TS) vs `worker.mjs`. |
+| Repo scan latency and RSS (`mimalloc`) | `refit scan . --fast`: **`345 ms` cold `--no-cache`** (`117.96 MB` peak RSS, `0` false Rust SCCs) and **`7 ms` warm (`11.21 MB` RSS)**. `fixture/target_repo --fast`: **`194 ms` cold (`16.79 MB` RSS)**, **`9 ms` warm (`11.45 MB` RSS)**, `62` units, `2` SCCs, `4` waves. |
+| Concurrent MCP and Audit CLI | 5 concurrent MCP calls (`initialize`, `refit_scan`, `ping`, `refit_symbols`, `refit_audit`) finish in **`86.8 ms`**. `refit audit . --markdown` finishes in **`93.3 ms`**. |
+| Unit and adversarial probes (`-D warnings`) | **`100 / 100` passed** with **`0` compiler warnings** in `3.27 s`. |
+| Alternating OS CPU and RSS bench (`refit bench`) | Supports Python `--script` and generic polyglot `--cmd` templates with separate `cpu_ms` and `wall_ms` checks (`<= 1.05x`). |
+
+## Quick Start
+
+```bash
+# Build and test with warnings denied
+RUSTFLAGS="-D warnings" cargo test
+RUSTFLAGS="-D warnings" cargo build --release
+
+# Scan or audit a polyglot repository
+./target/release/refit scan ./fixture/target_repo --fast
+./target/release/refit audit ./your_repo --markdown
+./target/release/refit sustain ./your_repo --dry-run
+
+# Run parallel refactoring in an isolated git worktree
+export CEREBRAS_API_KEY="csk-..."
+export KEENABLE_API_KEY="keen_..."
+./target/release/refit run ./your_repo --worktree --openclaw-url http://127.0.0.1:18789/v1
+```
+
+## Disclosures and Credits
+
+- All local Rust metrics (`9.02 MB` binary, `0.000000` hygiene parity delta, `345 ms` cold / `7 ms` warm repo scan, `86.8 ms` concurrent MCP, `100/100` probes) and live Kimi K3.1 Pro probes (`891`–`938 tok/s`) were measured directly. The 64-module wave replay uses Kimi K3.1 Pro probe-calibrated mock wave data because `moonshotai-kimi-k3.1-pro-trial` returned `HTTP 404 model_not_found` after `01:02 UTC` (Nov 23).
+- Public demos use standard unpatched **OpenClaw `2026.11.6`**.
+- Credits: [`proxysoul/stem v0.4.0`](https://github.com/proxysoul/stem) and [`brianbell-x/codehygiene v0.7.0`](https://github.com/brianbell-x/codehygiene).
