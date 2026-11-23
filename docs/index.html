@@ -1,0 +1,4185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>refit — Cerebras Kimi K3.1 Pro Live Refactoring HUD</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230A0D14'/%3E%3Ccircle cx='10' cy='10' r='3' fill='%23FF5A1F'/%3E%3Ccircle cx='22' cy='10' r='2.2' fill='%23FF5A1F' opacity='.7'/%3E%3Ccircle cx='10' cy='22' r='2.2' fill='%2322D3EE' opacity='.85'/%3E%3Ccircle cx='22' cy='22' r='3' fill='%2310B981'/%3E%3C/svg%3E" />
+<style>
+  :root {
+    --ground: #0A0D14;
+    --card: #111827;
+    --card-well: #0C121E;
+    --border: #1E293B;
+    --border-hi: #334155;
+    --ink: #F8FAFC;
+    --muted: #94A3B8;
+    --dim: #64748B;
+    --orange: #FF5A1F;
+    --cyan: #22D3EE;
+    --purple: #A855F7;
+    --emerald: #10B981;
+    --rose: #F43F5E;
+    --amber: #F59E0B;
+    --blue: #3B82F6;
+    --sky: #38BDF8;
+    --font-sans: "Inter", "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-variant-numeric: tabular-nums;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+
+  #viewport {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #06080D;
+    overflow: hidden;
+  }
+
+  /* Native 16:9 1920x1080 Broadcast Stage with Cerebras Halftone Texture */
+  #hud-stage {
+    position: relative;
+    width: 1920px;
+    height: 1080px;
+    flex-shrink: 0;
+    padding: 14px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    background-color: var(--ground);
+    background-image:
+      radial-gradient(ellipse 760px 360px at 6% 0%, rgba(255, 90, 31, 0.13), transparent 70%),
+      radial-gradient(ellipse 680px 340px at 94% 100%, rgba(34, 211, 238, 0.08), transparent 70%),
+      radial-gradient(rgba(148, 163, 184, 0.13) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 16px 16px;
+    transform-origin: center center;
+    overflow: hidden;
+  }
+
+  .mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ================= TOP STATUS BAR ================= */
+  .topbar {
+    height: 62px;
+    flex-shrink: 0;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  }
+
+  .top-left {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+  }
+
+  .brand-badge {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 6px 12px 6px 9px;
+    background: linear-gradient(135deg, rgba(255, 90, 31, 0.2), rgba(255, 90, 31, 0.05));
+    border: 1px solid rgba(255, 90, 31, 0.55);
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+
+  .brand-wordmark {
+    font-family: var(--font-mono);
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    color: var(--ink);
+  }
+
+  .mode-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: rgba(16, 185, 129, 0.16);
+    color: var(--emerald);
+    border: 1px solid rgba(16, 185, 129, 0.4);
+  }
+
+  .mode-chip.replay {
+    background: rgba(34, 211, 238, 0.15);
+    color: var(--cyan);
+    border-color: rgba(34, 211, 238, 0.45);
+  }
+
+  .mode-chip.demo {
+    background: rgba(168, 85, 247, 0.18);
+    color: #D8B4FE;
+    border-color: rgba(168, 85, 247, 0.5);
+  }
+
+  .mode-chip.warn {
+    background: rgba(245, 158, 11, 0.18);
+    color: var(--amber);
+    border-color: rgba(245, 158, 11, 0.5);
+  }
+
+  .pulse-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 8px currentColor;
+    animation: pulse 1.6s infinite ease-in-out;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.8); }
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 36px;
+    padding: 0 11px;
+    border-radius: 7px;
+    background: var(--card-well);
+    border: 1px solid var(--border);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+
+  .pill-sep {
+    color: var(--dim);
+    font-weight: 400;
+  }
+
+  .pill-label {
+    color: var(--muted);
+    font-weight: 500;
+  }
+
+  .pill-accent-orange {
+    color: var(--orange);
+    font-weight: 700;
+  }
+
+  .pill-accent-cyan {
+    color: var(--cyan);
+    font-weight: 700;
+  }
+
+  .pill-accent-emerald {
+    color: var(--emerald);
+    font-weight: 700;
+  }
+
+  .wal-pill {
+    transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  }
+
+  .wal-pill .circuit-tag {
+    color: var(--emerald);
+    font-weight: 700;
+  }
+
+  .wal-pill.circuit-open {
+    background: rgba(245, 158, 11, 0.18);
+    border-color: var(--amber);
+    box-shadow: 0 0 18px rgba(245, 158, 11, 0.3);
+    animation: amberAlert 1.1s infinite ease-in-out;
+  }
+
+  .wal-pill.circuit-open .circuit-tag {
+    color: #FDE68A;
+    background: rgba(245, 158, 11, 0.3);
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .wal-pill.circuit-half {
+    background: rgba(245, 158, 11, 0.11);
+    border-color: rgba(245, 158, 11, 0.6);
+  }
+
+  .wal-pill.circuit-half .circuit-tag {
+    color: var(--amber);
+  }
+
+  @keyframes amberAlert {
+    0%, 100% { box-shadow: 0 0 14px rgba(245, 158, 11, 0.25); }
+    50% { box-shadow: 0 0 24px rgba(245, 158, 11, 0.55); }
+  }
+
+  /* Replay Controls Bar */
+  .replay-bar {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    height: 38px;
+    padding: 0 11px;
+    background: rgba(15, 23, 42, 0.95);
+    border: 1px solid rgba(34, 211, 238, 0.4);
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+
+  .replay-bar.visible {
+    display: inline-flex;
+  }
+
+  .rp-btn {
+    height: 26px;
+    min-width: 28px;
+    padding: 0 8px;
+    border-radius: 5px;
+    border: 1px solid var(--border-hi);
+    background: var(--card);
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.12s ease;
+  }
+
+  .rp-btn:hover {
+    border-color: var(--cyan);
+    color: var(--cyan);
+  }
+
+  .rp-btn.active {
+    background: var(--orange);
+    border-color: var(--orange);
+    color: #0A0D14;
+  }
+
+  .rp-speeds {
+    display: inline-flex;
+    gap: 3px;
+  }
+
+  .rp-scrub {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 140px;
+    height: 6px;
+    border-radius: 999px;
+    background: #1E293B;
+    outline: none;
+    cursor: pointer;
+  }
+
+  .rp-scrub::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--orange);
+    border: 2px solid var(--ink);
+    box-shadow: 0 0 8px rgba(255, 90, 31, 0.6);
+    cursor: pointer;
+  }
+
+  .rp-scrub::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--orange);
+    border: 2px solid var(--ink);
+    cursor: pointer;
+  }
+
+  .rp-pos {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    min-width: 44px;
+    text-align: right;
+  }
+
+  /* Wall Clock Cluster */
+  .clock-cluster {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+
+  .phase-breakdown {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    border-radius: 7px;
+    background: var(--card-well);
+    border: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .phase-item b {
+    color: var(--ink);
+    font-weight: 700;
+  }
+
+  .phase-item.q b { color: var(--amber); }
+  .phase-item.d b { color: var(--cyan); }
+  .phase-item.g b { color: var(--emerald); }
+
+  .wall-box {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.14), rgba(15, 23, 42, 0.9));
+    border: 1px solid rgba(16, 185, 129, 0.45);
+  }
+
+  .wall-box.warn {
+    background: linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(15, 23, 42, 0.9));
+    border-color: var(--amber);
+  }
+
+  .wall-box.over {
+    background: linear-gradient(135deg, rgba(244, 63, 94, 0.2), rgba(15, 23, 42, 0.9));
+    border-color: var(--rose);
+  }
+
+  .wall-time {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    font-weight: 800;
+    line-height: 1;
+    color: var(--ink);
+    letter-spacing: -0.02em;
+  }
+
+  .wall-cap {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  /* ================= MAIN BODY GRID ================= */
+  .main-grid {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 1052px 1fr;
+    gap: 14px;
+  }
+
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
+  }
+
+  .panel-hdr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(10, 13, 20, 0.45);
+    flex-shrink: 0;
+  }
+
+  .panel-title {
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .panel-title .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    background: var(--orange);
+  }
+
+  /* ================= LEFT PANE ================= */
+  .left-pane {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 0;
+  }
+
+  /* 64-Module Topological Wave Grid */
+  .wave-card {
+    height: 504px;
+    flex-shrink: 0;
+  }
+
+  .legend-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: nowrap;
+  }
+
+  .leg {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  .leg-sw {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    border: 1px solid transparent;
+  }
+
+  .leg b {
+    color: var(--ink);
+  }
+
+  .wave-body {
+    flex: 1;
+    padding: 10px 14px 12px 14px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 0;
+  }
+
+  .layer-row {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    gap: 10px;
+    align-items: stretch;
+    min-height: 0;
+  }
+
+  .layer-meta {
+    background: var(--card-well);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .layer-tag {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+
+  .layer-id {
+    font-family: var(--font-mono);
+    font-size: 16px;
+    font-weight: 800;
+    color: var(--orange);
+  }
+
+  .layer-name {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--ink);
+    text-transform: lowercase;
+  }
+
+  .layer-prog {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--muted);
+  }
+
+  .layer-prog b {
+    color: var(--emerald);
+  }
+
+  .layer-hyg {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--dim);
+  }
+
+  .tile-row {
+    display: grid;
+    grid-template-columns: repeat(16, minmax(0, 1fr));
+    gap: 5px;
+    min-height: 0;
+  }
+
+  .tile {
+    position: relative;
+    border-radius: 6px;
+    border: 1px solid #243044;
+    background: #131B2A;
+    padding: 5px 4px 4px 4px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: center;
+    cursor: default;
+    overflow: hidden;
+    transition: background-color 0.16s ease, border-color 0.16s ease, transform 0.12s ease, box-shadow 0.16s ease;
+  }
+
+  .tile:hover {
+    transform: translateY(-1px);
+    z-index: 4;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.55);
+  }
+
+  .tile-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: #334155;
+  }
+
+  .tile-name {
+    margin-top: 2px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 700;
+    color: var(--muted);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    letter-spacing: -0.02em;
+  }
+
+  .tile-score {
+    font-family: var(--font-mono);
+    font-size: 16px;
+    font-weight: 800;
+    line-height: 1;
+    color: #CBD5E1;
+  }
+
+  .tile-foot {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    color: var(--dim);
+    padding: 0 1px;
+  }
+
+  /* 7 Exact Tile States */
+  .tile.st-queued {
+    background: #131B2A;
+    border-color: #243044;
+  }
+  .tile.st-queued .tile-bar { background: #334155; }
+  .tile.st-queued .tile-score { color: #64748B; }
+  .tile.st-queued .tile-st { color: #64748B; }
+
+  .tile.st-in_queue {
+    background: rgba(245, 158, 11, 0.14);
+    border-color: var(--amber);
+    box-shadow: inset 0 0 10px rgba(245, 158, 11, 0.14);
+  }
+  .tile.st-in_queue .tile-bar { background: var(--amber); }
+  .tile.st-in_queue .tile-name { color: #FDE68A; }
+  .tile.st-in_queue .tile-score { color: #FCD34D; }
+  .tile.st-in_queue .tile-st { color: var(--amber); }
+
+  .tile.st-streaming {
+    background: rgba(34, 211, 238, 0.16);
+    border-color: var(--cyan);
+    box-shadow: 0 0 12px rgba(34, 211, 238, 0.28), inset 0 0 12px rgba(34, 211, 238, 0.18);
+  }
+  .tile.st-streaming .tile-bar { background: var(--cyan); }
+  .tile.st-streaming .tile-name { color: #CFFAFE; }
+  .tile.st-streaming .tile-score { color: #67E8F9; }
+  .tile.st-streaming .tile-st { color: var(--cyan); }
+
+  .tile.st-gating {
+    background: rgba(168, 85, 247, 0.18);
+    border-color: var(--purple);
+    box-shadow: 0 0 10px rgba(168, 85, 247, 0.25);
+  }
+  .tile.st-gating .tile-bar { background: var(--purple); }
+  .tile.st-gating .tile-name { color: #F3E8FF; }
+  .tile.st-gating .tile-score { color: #D8B4FE; }
+  .tile.st-gating .tile-st { color: #C084FC; }
+
+  .tile.st-retry {
+    background: rgba(244, 63, 94, 0.19);
+    border-color: var(--rose);
+    box-shadow: 0 0 10px rgba(244, 63, 94, 0.3);
+  }
+  .tile.st-retry .tile-bar { background: var(--rose); }
+  .tile.st-retry .tile-name { color: #FFE4E6; }
+  .tile.st-retry .tile-score { color: #FDA4AF; }
+  .tile.st-retry .tile-st { color: var(--rose); }
+
+  .tile.st-committed {
+    background: rgba(16, 185, 129, 0.15);
+    border-color: rgba(16, 185, 129, 0.72);
+  }
+  .tile.st-committed .tile-bar { background: var(--emerald); }
+  .tile.st-committed .tile-name { color: #D1FAE5; }
+  .tile.st-committed .tile-score { color: #34D399; }
+  .tile.st-committed .tile-st { color: var(--emerald); }
+
+  .tile.st-skipped_resumed {
+    background: repeating-linear-gradient(
+      -45deg,
+      rgba(56, 189, 248, 0.12),
+      rgba(56, 189, 248, 0.12) 6px,
+      rgba(15, 23, 42, 0.85) 6px,
+      rgba(15, 23, 42, 0.85) 12px
+    );
+    border-color: var(--sky);
+    border-style: dashed;
+  }
+  .tile.st-skipped_resumed .tile-bar { background: var(--sky); }
+  .tile.st-skipped_resumed .tile-name { color: #E0F2FE; }
+  .tile.st-skipped_resumed .tile-score { color: #7DD3FC; }
+  .tile.st-skipped_resumed .tile-st { color: var(--sky); }
+
+  /* 50K Uncached TPM Pacer Bar + AIMD K + Wafer Decode */
+  .pacer-card {
+    height: 152px;
+    flex-shrink: 0;
+  }
+
+  .pacer-body {
+    flex: 1;
+    padding: 10px 14px 10px 14px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .pacer-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .tpm-headline {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+
+  .tpm-val {
+    font-family: var(--font-mono);
+    font-size: 32px;
+    font-weight: 800;
+    line-height: 1;
+    color: var(--ink);
+  }
+
+  .tpm-val.amber { color: var(--amber); }
+  .tpm-val.rose { color: var(--rose); }
+
+  .tpm-sub {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .tpm-sub b {
+    color: var(--ink);
+  }
+
+  .pacer-badges {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .hero-badge {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 14px;
+    border-radius: 8px;
+    background: var(--card-well);
+    border: 1px solid var(--border-hi);
+  }
+
+  .hero-badge.aimd {
+    border-color: rgba(255, 90, 31, 0.55);
+    background: linear-gradient(135deg, rgba(255, 90, 31, 0.14), rgba(12, 18, 30, 0.95));
+  }
+
+  .hero-badge.decode {
+    border-color: rgba(34, 211, 238, 0.55);
+    background: linear-gradient(135deg, rgba(34, 211, 238, 0.14), rgba(12, 18, 30, 0.95));
+  }
+
+  .hb-label {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    line-height: 1.2;
+  }
+
+  .hb-val {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    font-weight: 800;
+    line-height: 1;
+  }
+
+  .hero-badge.aimd .hb-val { color: var(--orange); }
+  .hero-badge.decode .hb-val { color: var(--cyan); }
+
+  .hb-unit {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--muted);
+  }
+
+  .pacer-meter-wrap {
+    position: relative;
+    padding-top: 16px;
+  }
+
+  .ceiling-flag {
+    position: absolute;
+    top: 0;
+    left: 88%;
+    transform: translateX(-50%);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 800;
+    color: #FDA4AF;
+    background: rgba(244, 63, 94, 0.22);
+    border: 1px solid var(--rose);
+    padding: 0 5px;
+    border-radius: 3px;
+    white-space: nowrap;
+    line-height: 14px;
+  }
+
+  .pacer-track {
+    position: relative;
+    height: 22px;
+    border-radius: 6px;
+    background: #0B1120;
+    border: 1px solid var(--border-hi);
+    overflow: hidden;
+  }
+
+  .pacer-fill {
+    height: 100%;
+    width: 0%;
+    border-radius: 5px;
+    background: linear-gradient(90deg, var(--emerald) 0%, var(--cyan) 55%, var(--amber) 82%, var(--orange) 100%);
+    transition: width 0.15s linear;
+  }
+
+  .pacer-fill.hot {
+    background: linear-gradient(90deg, var(--amber) 0%, var(--orange) 65%, var(--rose) 100%);
+  }
+
+  .ceiling-line {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 88%;
+    width: 2px;
+    background: var(--rose);
+    box-shadow: 0 0 8px var(--rose);
+    z-index: 3;
+  }
+
+  .pacer-ticks {
+    margin-top: 4px;
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--dim);
+  }
+
+  .pacer-ticks .t-red {
+    color: var(--rose);
+    font-weight: 700;
+  }
+
+  /* Compact 5-Row Live Event Feed */
+  .feed-card {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .feed-list {
+    flex: 1;
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 4px;
+    min-height: 0;
+  }
+
+  .feed-row {
+    height: 28px;
+    display: grid;
+    grid-template-columns: 62px 84px 168px 1fr 122px;
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px;
+    border-radius: 5px;
+    background: var(--card-well);
+    border: 1px solid rgba(30, 41, 59, 0.7);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  .feed-row.empty {
+    opacity: 0.35;
+  }
+
+  .feed-row.latest {
+    border-color: rgba(255, 90, 31, 0.45);
+    background: rgba(255, 90, 31, 0.06);
+  }
+
+  .ev-ts {
+    color: var(--dim);
+    font-size: 11px;
+  }
+
+  .ev-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 19px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .ev-badge.commit { background: rgba(16, 185, 129, 0.18); color: var(--emerald); border: 1px solid rgba(16, 185, 129, 0.45); }
+  .ev-badge.g3 { background: rgba(168, 85, 247, 0.2); color: #D8B4FE; border: 1px solid rgba(168, 85, 247, 0.5); }
+  .ev-badge.rollback { background: rgba(244, 63, 94, 0.2); color: #FDA4AF; border: 1px solid rgba(244, 63, 94, 0.5); }
+  .ev-badge.learn { background: rgba(34, 211, 238, 0.18); color: var(--cyan); border: 1px solid rgba(34, 211, 238, 0.45); }
+  .ev-badge.circuit { background: rgba(245, 158, 11, 0.22); color: #FDE68A; border: 1px solid var(--amber); }
+  .ev-badge.resume { background: rgba(56, 189, 248, 0.18); color: #7DD3FC; border: 1px solid rgba(56, 189, 248, 0.45); }
+
+  .ev-mod {
+    color: var(--ink);
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ev-msg {
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ev-right {
+    text-align: right;
+    color: var(--ink);
+    font-weight: 700;
+    font-size: 11.5px;
+  }
+
+  /* ================= RIGHT PANE (4-CARD SCORECARD) ================= */
+  .right-pane {
+    display: grid;
+    grid-template-rows: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    min-height: 0;
+  }
+
+  .score-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
+    overflow: hidden;
+  }
+
+  .sc-hdr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .sc-title {
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .sc-num {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 800;
+    color: var(--orange);
+    background: rgba(255, 90, 31, 0.14);
+    border: 1px solid rgba(255, 90, 31, 0.4);
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
+
+  .status-pill {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 800;
+    padding: 3px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--border-hi);
+    background: var(--card-well);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .status-pill.pass {
+    background: rgba(16, 185, 129, 0.16);
+    border-color: rgba(16, 185, 129, 0.55);
+    color: #34D399;
+  }
+
+  .status-pill.warn {
+    background: rgba(245, 158, 11, 0.16);
+    border-color: rgba(245, 158, 11, 0.55);
+    color: #FCD34D;
+  }
+
+  .status-pill.fail {
+    background: rgba(244, 63, 94, 0.18);
+    border-color: rgba(244, 63, 94, 0.6);
+    color: #FDA4AF;
+  }
+
+  .status-pill.purple {
+    background: rgba(168, 85, 247, 0.16);
+    border-color: rgba(168, 85, 247, 0.55);
+    color: #D8B4FE;
+  }
+
+  /* Card 1 Layout */
+  .c1-grid {
+    display: grid;
+    grid-template-columns: 1.08fr 1fr;
+    gap: 14px;
+    align-items: stretch;
+    margin-top: 6px;
+    flex: 1;
+  }
+
+  .metric-well {
+    background: var(--card-well);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 13px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .mw-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .big-transition {
+    display: flex;
+    align-items: baseline;
+    gap: 9px;
+    margin: 2px 0;
+  }
+
+  .bt-before {
+    font-family: var(--font-mono);
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--muted);
+  }
+
+  .bt-arrow {
+    font-family: var(--font-mono);
+    font-size: 20px;
+    font-weight: 800;
+    color: var(--orange);
+  }
+
+  .bt-after {
+    font-family: var(--font-mono);
+    font-size: 40px;
+    font-weight: 800;
+    line-height: 1;
+    color: var(--emerald);
+  }
+
+  .delta-tag {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 800;
+    color: #34D399;
+    background: rgba(16, 185, 129, 0.16);
+    padding: 2px 7px;
+    border-radius: 5px;
+  }
+
+  .p10-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    color: var(--muted);
+    padding-top: 5px;
+    border-top: 1px solid rgba(30, 41, 59, 0.8);
+  }
+
+  .p10-line b {
+    color: var(--ink);
+    font-size: 15px;
+  }
+
+  .burndown-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 4px;
+  }
+
+  .bd-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .bd-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    font-family: var(--font-mono);
+  }
+
+  .bd-name {
+    font-size: 13px;
+    font-weight: 800;
+    color: var(--ink);
+  }
+
+  .bd-nums {
+    font-size: 14px;
+    color: var(--muted);
+  }
+
+  .bd-nums b {
+    font-size: 22px;
+    font-weight: 800;
+    color: var(--emerald);
+  }
+
+  .bd-nums b.nonzero {
+    color: var(--amber);
+  }
+
+  .mini-track {
+    height: 8px;
+    border-radius: 999px;
+    background: #1E293B;
+    overflow: hidden;
+  }
+
+  .mini-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: var(--purple);
+    transition: width 0.2s ease, background-color 0.2s ease;
+  }
+
+  .mini-fill.zero {
+    background: var(--emerald);
+  }
+
+  /* Card 2 Layout */
+  .c2-top {
+    display: grid;
+    grid-template-columns: 1.35fr 0.82fr 0.82fr;
+    gap: 10px;
+    margin-top: 6px;
+  }
+
+  .kpi-box {
+    background: var(--card-well);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .kpi-val {
+    font-family: var(--font-mono);
+    font-size: 32px;
+    font-weight: 800;
+    line-height: 1.05;
+    color: var(--ink);
+    margin-top: 2px;
+  }
+
+  .kpi-val.emerald { color: var(--emerald); }
+  .kpi-val.cyan { color: var(--cyan); }
+  .kpi-val.orange { color: var(--orange); }
+  .kpi-val.sky { color: var(--sky); }
+  .kpi-val.amber { color: var(--amber); }
+  .kpi-val.rose { color: var(--rose); }
+
+  .kpi-sub {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  .c2-bottom {
+    display: grid;
+    grid-template-columns: 1.08fr 1fr;
+    gap: 10px;
+    margin-top: 8px;
+  }
+
+  .gate-strip {
+    background: var(--card-well);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 6px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+  }
+
+  .gs-label {
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+  }
+
+  .gs-pills {
+    display: flex;
+    gap: 5px;
+  }
+
+  .rb-pill {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 800;
+    padding: 2px 7px;
+    border-radius: 4px;
+    background: #161F30;
+    border: 1px solid var(--border);
+    color: var(--dim);
+  }
+
+  .rb-pill.hit {
+    background: rgba(244, 63, 94, 0.16);
+    border-color: rgba(244, 63, 94, 0.5);
+    color: #FDA4AF;
+  }
+
+  .learn-strip {
+    background: var(--card-well);
+    border: 1px solid rgba(34, 211, 238, 0.3);
+    border-radius: 7px;
+    padding: 6px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .learn-stat {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 800;
+    color: var(--cyan);
+    white-space: nowrap;
+  }
+
+  .learn-rule-preview {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Card 3 Layout */
+  .c3-kpis {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin-top: 6px;
+  }
+
+  .billing-note {
+    margin-top: 8px;
+    padding: 6px 11px;
+    border-radius: 7px;
+    background: rgba(255, 90, 31, 0.08);
+    border: 1px solid rgba(255, 90, 31, 0.28);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: #CBD5E1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  .billing-note b {
+    color: var(--ink);
+  }
+
+  /* Card 4 Layout */
+  .c4-grid {
+    display: grid;
+    grid-template-columns: 0.9fr 1.05fr 1.05fr;
+    gap: 10px;
+    margin-top: 6px;
+    flex: 1;
+  }
+
+  .bench-box {
+    background: var(--card-well);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 12px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .bench-ratio {
+    font-family: var(--font-mono);
+    font-size: 30px;
+    font-weight: 800;
+    line-height: 1.05;
+    color: var(--emerald);
+  }
+
+  .bench-ratio.warn { color: var(--amber); }
+  .bench-ratio.fail { color: var(--rose); }
+
+  .bench-delta {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+
+  .bench-delta b {
+    color: var(--ink);
+  }
+
+  /* ================= BOTTOM 5-SEGMENT TIMELINE ================= */
+  .timeline-card {
+    height: 82px;
+    flex-shrink: 0;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.3);
+  }
+
+  .tl-hdr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .tl-legend {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+  }
+
+  .tl-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+
+  .tl-item b {
+    color: var(--ink);
+    font-weight: 800;
+  }
+
+  .tl-dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 3px;
+  }
+
+  .tl-bar {
+    height: 28px;
+    width: 100%;
+    border-radius: 6px;
+    background: #0B1120;
+    border: 1px solid var(--border-hi);
+    display: flex;
+    overflow: hidden;
+  }
+
+  .tl-seg {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 800;
+    color: #090D14;
+    white-space: nowrap;
+    overflow: hidden;
+    transition: width 0.2s linear;
+    border-right: 1px solid rgba(10, 13, 20, 0.45);
+  }
+
+  .tl-seg:last-child { border-right: none; }
+  .seg-queue { background: var(--amber); }
+  .seg-decode { background: var(--cyan); }
+  .seg-g1 { background: var(--blue); color: #F8FAFC; }
+  .seg-g2 { background: var(--emerald); }
+  .seg-g3 { background: var(--purple); color: #F8FAFC; }
+
+  /* Floating Module Tooltip */
+  #tile-tooltip {
+    position: absolute;
+    pointer-events: none;
+    z-index: 50;
+    display: none;
+    min-width: 240px;
+    max-width: 340px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(10, 13, 20, 0.96);
+    border: 1px solid var(--border-hi);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.65);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink);
+    line-height: 1.45;
+  }
+
+  #tile-tooltip .tt-title {
+    font-size: 12.5px;
+    font-weight: 800;
+    color: var(--orange);
+    margin-bottom: 4px;
+    word-break: break-all;
+  }
+
+  #tile-tooltip .tt-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 14px;
+    color: var(--muted);
+  }
+
+  #tile-tooltip .tt-row b {
+    color: var(--ink);
+  }
+
+  /* Non-intrusive Replay Error Banner */
+  #error-toast {
+    position: absolute;
+    bottom: 98px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+    display: none;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-radius: 8px;
+    background: rgba(30, 14, 22, 0.96);
+    border: 1px solid var(--rose);
+    color: #FFE4E6;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  }
+
+  #error-toast.visible {
+    display: flex;
+  }
+</style>
+</head>
+<body>
+<div id="viewport">
+  <div id="hud-stage">
+
+    <!-- ================= TOP STATUS BAR ================= -->
+    <header class="topbar">
+      <div class="top-left">
+        <div class="brand-badge">
+          <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="1" y="1" width="22" height="22" rx="5" fill="#0A0D14" stroke="#FF5A1F" stroke-width="1.4"/>
+            <circle cx="7" cy="7" r="2.2" fill="#FF5A1F"/>
+            <circle cx="12" cy="7" r="1.6" fill="#FF5A1F" opacity="0.75"/>
+            <circle cx="17" cy="7" r="1.2" fill="#FF5A1F" opacity="0.45"/>
+            <circle cx="7" cy="12" r="1.6" fill="#FF5A1F" opacity="0.75"/>
+            <circle cx="12" cy="12" r="2.2" fill="#22D3EE"/>
+            <circle cx="17" cy="12" r="1.6" fill="#22D3EE" opacity="0.7"/>
+            <circle cx="7" cy="17" r="1.2" fill="#22D3EE" opacity="0.5"/>
+            <circle cx="12" cy="17" r="1.6" fill="#10B981" opacity="0.8"/>
+            <circle cx="17" cy="17" r="2.2" fill="#10B981"/>
+          </svg>
+          <span class="brand-wordmark">refit</span>
+          <span id="mode-chip" class="mode-chip"><span class="pulse-dot"></span><span id="mode-label">LIVE</span></span>
+        </div>
+
+        <div class="pill mono" id="os-pill">
+          <span class="pill-label">OS</span>
+          <span id="host-os">windows-x64</span>
+        </div>
+
+        <div class="pill" id="model-pill">
+          <span class="pill-accent-orange" id="model-name">Kimi K3.1 Pro on Cerebras</span>
+          <span class="pill-sep">|</span>
+          <span class="mono" id="tpm-cap-label">50K Uncached TPM</span>
+        </div>
+
+        <div class="pill mono wal-pill" id="wal-pill">
+          <span>WAL rev <b id="wal-rev">0</b></span>
+          <span class="pill-sep">|</span>
+          <span><b id="wal-torn">0</b> torn</span>
+          <span class="pill-sep">|</span>
+          <span>Circuit: <span class="circuit-tag" id="circuit-state">CLOSED</span></span>
+        </div>
+      </div>
+
+      <!-- Replay / Demo Controls (Auto-shown when ?replay= or ?demo=1) -->
+      <div class="replay-bar" id="replay-bar">
+        <button class="rp-btn" id="btn-play" title="Play / Pause (Space)">⏸</button>
+        <button class="rp-btn" id="btn-restart" title="Restart (R)">↺</button>
+        <div class="rp-speeds" id="speed-group">
+          <button class="rp-btn" data-speed="1">1x</button>
+          <button class="rp-btn active" data-speed="2">2x</button>
+          <button class="rp-btn" data-speed="4">4x</button>
+          <button class="rp-btn" data-speed="8">8x</button>
+        </div>
+        <input type="range" class="rp-scrub" id="rp-scrub" min="0" max="1000" value="0" />
+        <span class="rp-pos" id="rp-pos">0%</span>
+      </div>
+
+      <!-- Wall Clock vs 5:00 Cap -->
+      <div class="clock-cluster">
+        <div class="phase-breakdown">
+          <span class="phase-item">Wall <b id="pb-wall">0.0s</b></span>
+          <span class="pill-sep">|</span>
+          <span class="phase-item q">Queue <b id="pb-queue">0.0s</b></span>
+          <span class="pill-sep">|</span>
+          <span class="phase-item d">Decode <b id="pb-decode">0.0s</b></span>
+          <span class="pill-sep">|</span>
+          <span class="phase-item g">4-Gate <b id="pb-gates">0.0s</b></span>
+        </div>
+        <div class="wall-box" id="wall-box">
+          <span class="wall-time" id="wall-clock">00:00</span>
+          <span class="wall-cap">/ 5:00</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- ================= MAIN TWO-COLUMN BODY ================= -->
+    <main class="main-grid">
+
+      <!-- LEFT PANE -->
+      <section class="left-pane">
+
+        <!-- 64-Module Topological Wave Grid -->
+        <div class="panel wave-card">
+          <div class="panel-hdr">
+            <div class="panel-title">
+              <span class="dot"></span>
+              <span>TOPOLOGICAL WAVEFRONT</span>
+              <span class="mono" style="color:var(--ink);font-weight:700" id="dag-meta">64 modules · 4 layers · 0 committed</span>
+            </div>
+            <div class="legend-row">
+              <span class="leg"><span class="leg-sw" style="background:#131B2A;border-color:#334155"></span>queued <b id="cnt-queued">64</b></span>
+              <span class="leg"><span class="leg-sw" style="background:rgba(245,158,11,0.35);border-color:#F59E0B"></span>in_queue <b id="cnt-in_queue">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:rgba(34,211,238,0.35);border-color:#22D3EE"></span>streaming <b id="cnt-streaming">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:rgba(168,85,247,0.35);border-color:#A855F7"></span>gating <b id="cnt-gating">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:rgba(244,63,94,0.35);border-color:#F43F5E"></span>retry <b id="cnt-retry">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:rgba(16,185,129,0.35);border-color:#10B981"></span>committed <b id="cnt-committed">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:rgba(56,189,248,0.3);border-color:#38BDF8;border-style:dashed"></span>resumed <b id="cnt-skipped_resumed">0</b></span>
+            </div>
+          </div>
+
+          <div class="wave-body" id="wave-body">
+            <!-- 4 Layer Rows: L0 core, L1 engine, L2 services, L3 api -->
+            <div class="layer-row" data-layer="0">
+              <div class="layer-meta">
+                <div class="layer-tag"><span class="layer-id">L0</span><span class="layer-name">core</span></div>
+                <div class="layer-prog"><b id="l0-done">0</b>/<span id="l0-tot">16</span> done</div>
+                <div class="layer-hyg" id="l0-hyg">hyg -- → --</div>
+              </div>
+              <div class="tile-row" id="tiles-l0"></div>
+            </div>
+            <div class="layer-row" data-layer="1">
+              <div class="layer-meta">
+                <div class="layer-tag"><span class="layer-id">L1</span><span class="layer-name">engine</span></div>
+                <div class="layer-prog"><b id="l1-done">0</b>/<span id="l1-tot">16</span> done</div>
+                <div class="layer-hyg" id="l1-hyg">hyg -- → --</div>
+              </div>
+              <div class="tile-row" id="tiles-l1"></div>
+            </div>
+            <div class="layer-row" data-layer="2">
+              <div class="layer-meta">
+                <div class="layer-tag"><span class="layer-id">L2</span><span class="layer-name">services</span></div>
+                <div class="layer-prog"><b id="l2-done">0</b>/<span id="l2-tot">16</span> done</div>
+                <div class="layer-hyg" id="l2-hyg">hyg -- → --</div>
+              </div>
+              <div class="tile-row" id="tiles-l2"></div>
+            </div>
+            <div class="layer-row" data-layer="3">
+              <div class="layer-meta">
+                <div class="layer-tag"><span class="layer-id">L3</span><span class="layer-name">api</span></div>
+                <div class="layer-prog"><b id="l3-done">0</b>/<span id="l3-tot">16</span> done</div>
+                <div class="layer-hyg" id="l3-hyg">hyg -- → --</div>
+              </div>
+              <div class="tile-row" id="tiles-l3"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Live 50K Uncached TPM Pacer Bar + AIMD K + Wafer Decode tok/s -->
+        <div class="panel pacer-card">
+          <div class="panel-hdr">
+            <div class="panel-title">
+              <span class="dot" style="background:var(--cyan)"></span>
+              <span>50K UNCACHED TPM PACER &amp; WAFER TELEMETRY</span>
+            </div>
+            <div class="mono" style="font-size:11.5px;color:var(--muted)" id="proxy-meta">
+              RPM <b style="color:var(--ink)" id="rpm-val">0/60</b> · 429s <b style="color:var(--ink)" id="http429-val">0</b> · Total TPM <b style="color:var(--cyan)" id="total-tpm-val">0</b>
+            </div>
+          </div>
+
+          <div class="pacer-body">
+            <div class="pacer-top">
+              <div class="tpm-headline">
+                <span class="tpm-val" id="pacer-tpm">0</span>
+                <span class="tpm-sub">/ <b id="pacer-cap">50,000</b> uncached TPM · peak <b id="pacer-peak">0</b></span>
+              </div>
+              <div class="pacer-badges">
+                <div class="hero-badge aimd">
+                  <div>
+                    <div class="hb-label">AIMD Concurrency</div>
+                    <div class="hb-unit" id="aimd-trend">STEADY</div>
+                  </div>
+                  <div class="hb-val" id="aimd-k">K=4</div>
+                </div>
+                <div class="hero-badge decode">
+                  <div>
+                    <div class="hb-label">Wafer Decode</div>
+                    <div class="hb-unit" id="decode-sub">median --</div>
+                  </div>
+                  <div class="hb-val" id="decode-tps">0</div>
+                  <div class="hb-unit">tok/s</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="pacer-meter-wrap">
+              <div class="ceiling-flag" id="ceiling-flag">44K PACER CEILING</div>
+              <div class="pacer-track">
+                <div class="pacer-fill" id="pacer-fill"></div>
+                <div class="ceiling-line" id="ceiling-line"></div>
+              </div>
+              <div class="pacer-ticks">
+                <span>0</span>
+                <span>10,000</span>
+                <span>20,000</span>
+                <span>30,000</span>
+                <span>40,000</span>
+                <span class="t-red">44K CEILING</span>
+                <span>50,000 CAP</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Compact 5-Row Live Event Feed -->
+        <div class="panel feed-card">
+          <div class="panel-hdr">
+            <div class="panel-title">
+              <span class="dot" style="background:var(--emerald)"></span>
+              <span>LIVE EVENT FEED</span>
+              <span class="mono" style="font-size:11px;color:var(--dim)">commits · Gate 3 zero-warn · rollbacks · learn hits</span>
+            </div>
+            <span class="mono" style="font-size:11px;color:var(--muted)" id="feed-seq">seq #0</span>
+          </div>
+          <div class="feed-list" id="feed-list">
+            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge commit">READY</span><span class="ev-mod">awaiting stream</span><span class="ev-msg">Connecting to refit telemetry...</span><span class="ev-right">--</span></div>
+            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge g3">G3</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>
+            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge learn">LEARN</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>
+            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge rollback">GATE</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>
+            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge resume">WAL</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- RIGHT PANE: 4-CARD SCORECARD -->
+      <section class="right-pane">
+
+        <!-- CARD 1: Maintainability + Gate 3 Zero-Warning Burndown -->
+        <article class="score-card">
+          <div class="sc-hdr">
+            <div class="sc-title"><span class="sc-num">01</span>MAINTAINABILITY + GATE 3 ZERO-WARNING BURNDOWN</div>
+            <span class="status-pill purple" id="g3-zero-pill">BURNDOWN ACTIVE</span>
+          </div>
+          <div class="c1-grid">
+            <div class="metric-well">
+              <div class="mw-label">
+                <span>codehygiene v0.7.0 · median</span>
+                <span class="delta-tag" id="hyg-delta">+0.0</span>
+              </div>
+              <div class="big-transition">
+                <span class="bt-before" id="hyg-med-before">0.0</span>
+                <span class="bt-arrow">→</span>
+                <span class="bt-after" id="hyg-med-after">0.0</span>
+              </div>
+              <div class="p10-line">
+                <span>p10 tail floor</span>
+                <span><span id="hyg-p10-before">0.0</span> → <b id="hyg-p10-after">0.0</b></span>
+              </div>
+            </div>
+
+            <div class="metric-well">
+              <div class="mw-label">
+                <span>Gate 3 Lint &amp; Types</span>
+                <span class="mono" style="color:var(--purple)">ruff + ty</span>
+              </div>
+              <div class="burndown-rows">
+                <div class="bd-item">
+                  <div class="bd-head">
+                    <span class="bd-name">ruff <span style="color:var(--dim);font-weight:600">err/warn</span></span>
+                    <span class="bd-nums"><span id="ruff-before">0</span> → <b id="ruff-after">0</b></span>
+                  </div>
+                  <div class="mini-track"><div class="mini-fill" id="ruff-bar" style="width:100%"></div></div>
+                </div>
+                <div class="bd-item">
+                  <div class="bd-head">
+                    <span class="bd-name">ty <span style="color:var(--dim);font-weight:600">type err</span></span>
+                    <span class="bd-nums"><span id="ty-before">0</span> → <b id="ty-after">0</b></span>
+                  </div>
+                  <div class="mini-track"><div class="mini-fill" id="ty-bar" style="width:100%"></div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <!-- CARD 2: Correctness + MVCC + Learn -->
+        <article class="score-card">
+          <div class="sc-hdr">
+            <div class="sc-title"><span class="sc-num">02</span>CORRECTNESS + MVCC + LEARN</div>
+            <span class="status-pill pass" id="pytest-pill">PYTEST READY</span>
+          </div>
+          <div class="c2-top">
+            <div class="kpi-box">
+              <div class="mw-label"><span>pytest passed / total</span><span id="pytest-pct" style="color:var(--emerald)">100%</span></div>
+              <div class="kpi-val emerald" id="pytest-ratio">0 / 0</div>
+              <div class="kpi-sub" id="pytest-sub">before 0 fail · after 0 fail</div>
+            </div>
+            <div class="kpi-box">
+              <div class="mw-label"><span>cas_conflicts</span></div>
+              <div class="kpi-val" id="cas-conflicts">0</div>
+              <div class="kpi-sub">MVCC retries <b id="retries-total" style="color:var(--ink)">0</b></div>
+            </div>
+            <div class="kpi-box">
+              <div class="mw-label"><span>resumed_skipped</span></div>
+              <div class="kpi-val sky" id="resumed-skipped">0</div>
+              <div class="kpi-sub">ACID WAL fast-skip</div>
+            </div>
+          </div>
+          <div class="c2-bottom">
+            <div class="gate-strip">
+              <span class="gs-label">Rollbacks</span>
+              <div class="gs-pills">
+                <span class="rb-pill" id="rb-g0">G0: 0</span>
+                <span class="rb-pill" id="rb-g1">G1: 0</span>
+                <span class="rb-pill" id="rb-g2">G2: 0</span>
+                <span class="rb-pill" id="rb-g3">G3: 0</span>
+              </div>
+            </div>
+            <div class="learn-strip">
+              <span class="learn-stat" id="learn-stat">learn: 0 rules · 0 hits</span>
+              <span class="learn-rule-preview" id="learn-latest">suffix-only injection</span>
+            </div>
+          </div>
+        </article>
+
+        <!-- CARD 3: 50K TPM Survival & Prefix Cache -->
+        <article class="score-card">
+          <div class="sc-hdr">
+            <div class="sc-title"><span class="sc-num">03</span>50K TPM SURVIVAL &amp; PREFIX CACHE</div>
+            <span class="status-pill pass" id="drift-pill">prefix_drift == 0</span>
+          </div>
+          <div class="c3-kpis">
+            <div class="kpi-box">
+              <div class="mw-label"><span>AST Strip %</span></div>
+              <div class="kpi-val orange" id="ast-strip">0.0%</div>
+              <div class="kpi-sub">context pruned</div>
+            </div>
+            <div class="kpi-box">
+              <div class="mw-label"><span>Prefix Cache</span></div>
+              <div class="kpi-val cyan" id="cache-hit">0.0%</div>
+              <div class="kpi-sub">static 2K prefix</div>
+            </div>
+            <div class="kpi-box">
+              <div class="mw-label"><span>Uncached TPM</span></div>
+              <div class="kpi-val" id="card-tpm">0.0K</div>
+              <div class="kpi-sub">vs <b id="card-tpm-cap" style="color:var(--ink)">50K</b> limit</div>
+            </div>
+            <div class="kpi-box">
+              <div class="mw-label"><span>Prefix Drift</span></div>
+              <div class="kpi-val emerald" id="prefix-drift">0</div>
+              <div class="kpi-sub" id="drift-sub">byte-identical</div>
+            </div>
+          </div>
+          <div class="billing-note" id="billing-note">
+            <span>Cached prefix tokens (<b id="cached-tok-sum">0</b>) bypass 50K uncached TPM &amp; bill at 0.25x input</span>
+            <span>uncached <b id="uncached-tok-sum">0</b> · pauses <b id="circuit-pauses">0</b></span>
+          </div>
+        </article>
+
+        <!-- CARD 4: OS-Measured Compute Cost -->
+        <article class="score-card">
+          <div class="sc-hdr">
+            <div class="sc-title"><span class="sc-num">04</span>OS-MEASURED COMPUTE COST</div>
+            <span class="status-pill" id="bench-pill">&lt;= 1.05x PENDING</span>
+          </div>
+          <div class="c4-grid">
+            <div class="bench-box">
+              <div class="mw-label"><span>refit Rust RSS</span></div>
+              <div class="kpi-val orange" id="engine-rss">0.0 MB</div>
+              <div class="bench-delta">native binary · <b id="stem-stat">stem 0ms</b></div>
+            </div>
+            <div class="bench-box">
+              <div class="mw-label"><span>Target CPU ms</span><span class="mono" id="bench-pairs-cpu" style="color:var(--dim)">5x A/B</span></div>
+              <div class="bench-ratio" id="cpu-ratio">--</div>
+              <div class="bench-delta"><span id="cpu-before">--</span> → <b id="cpu-after">--</b> ms</div>
+            </div>
+            <div class="bench-box">
+              <div class="mw-label"><span>Target Peak RSS</span><span class="mono" id="bench-pairs-rss" style="color:var(--dim)">5x A/B</span></div>
+              <div class="bench-ratio" id="rss-ratio">--</div>
+              <div class="bench-delta"><span id="rss-before">--</span> → <b id="rss-after">--</b> MB</div>
+            </div>
+          </div>
+        </article>
+
+      </section>
+    </main>
+
+    <!-- ================= BOTTOM 5-SEGMENT HORIZONTAL TIMELINE ================= -->
+    <footer class="timeline-card">
+      <div class="tl-hdr">
+        <div class="panel-title">
+          <span class="dot" style="background:var(--orange)"></span>
+          <span>5-SEGMENT LATENCY TIMELINE</span>
+          <span class="mono" style="color:var(--dim)" id="tl-speedup">parallelism 1.0x</span>
+        </div>
+        <div class="tl-legend">
+          <span class="tl-item"><span class="tl-dot seg-queue"></span>Queue <b id="tl-q-txt">0.0s (0%)</b></span>
+          <span class="tl-item"><span class="tl-dot seg-decode"></span>Decode <b id="tl-d-txt">0.0s (0%)</b></span>
+          <span class="tl-item"><span class="tl-dot seg-g1"></span>Gate 1 Tests <b id="tl-g1-txt">0.0s (0%)</b></span>
+          <span class="tl-item"><span class="tl-dot seg-g2"></span>Gate 2 Hygiene <b id="tl-g2-txt">0.0s (0%)</b></span>
+          <span class="tl-item"><span class="tl-dot seg-g3"></span>Gate 3 Lint/Types <b id="tl-g3-txt">0.0s (0%)</b></span>
+        </div>
+      </div>
+      <div class="tl-bar" id="tl-bar">
+        <div class="tl-seg seg-queue" id="seg-queue" style="width:20%"></div>
+        <div class="tl-seg seg-decode" id="seg-decode" style="width:20%"></div>
+        <div class="tl-seg seg-g1" id="seg-g1" style="width:20%"></div>
+        <div class="tl-seg seg-g2" id="seg-g2" style="width:20%"></div>
+        <div class="tl-seg seg-g3" id="seg-g3" style="width:20%"></div>
+      </div>
+    </footer>
+
+    <div id="tile-tooltip"></div>
+    <div id="error-toast">
+      <span id="error-msg"></span>
+      <button class="rp-btn active" id="btn-fallback-demo">Open ?demo=1</button>
+    </div>
+
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ================= 16:9 STAGE FITTER ================= */
+  const stageEl = document.getElementById('hud-stage');
+  let stageScale = 1;
+  function fitStage() {
+    const sx = window.innerWidth / 1920;
+    const sy = window.innerHeight / 1080;
+    stageScale = Math.min(sx, sy);
+    stageEl.style.transform = 'scale(' + stageScale.toFixed(5) + ')';
+  }
+  window.addEventListener('resize', fitStage);
+  fitStage();
+
+  /* ================= HELPERS ================= */
+  const LAYER_NAMES = ['core', 'engine', 'services', 'api'];
+  const STATE_SHORT = {
+    queued: 'QUE',
+    in_queue: 'INQ',
+    streaming: 'STR',
+    gating: 'GAT',
+    retry: 'RTY',
+    committed: 'OK',
+    skipped_resumed: 'RES'
+  };
+
+  function escHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function fmtInt(n) {
+    return Math.round(Number(n) || 0).toLocaleString('en-US');
+  }
+
+  function fmtK(n) {
+    const v = Number(n) || 0;
+    if (v >= 1000000) return (v / 1000000).toFixed(2) + 'M';
+    if (v >= 1000) return (v / 1000).toFixed(1) + 'K';
+    return String(Math.round(v));
+  }
+
+  function fmtClock(sec) {
+    const s = Math.max(0, Math.floor(Number(sec) || 0));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+  }
+
+  function fmtSec(sec) {
+    const v = Math.max(0, Number(sec) || 0);
+    return v >= 100 ? v.toFixed(0) + 's' : v.toFixed(1) + 's';
+  }
+
+  function percentile(arr, p) {
+    if (!arr.length) return 0;
+    const sorted = arr.slice().sort(function (a, b) { return a - b; });
+    const idx = (sorted.length - 1) * p;
+    const lo = Math.floor(idx);
+    const hi = Math.ceil(idx);
+    if (lo === hi) return sorted[lo];
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+  }
+
+  function shortModName(id) {
+    if (!id) return 'mod';
+    let s = String(id).replace(/\\/g, '/');
+    s = s.split('/').pop();
+    s = s.replace(/\.py$/i, '');
+    s = s.replace(/^[a-z]\d+_/i, '');
+    if (s.length > 7) return s.slice(0, 7);
+    return s;
+  }
+
+  function normalizeCircuit(raw) {
+    const u = String(raw || 'CLOSED').toUpperCase();
+    if (u.indexOf('HALF') >= 0) return 'HALF_OPEN';
+    if (u.indexOf('OPEN') >= 0) return 'CIRCUIT_OPEN';
+    return 'CLOSED';
+  }
+
+  function normalizeState(raw) {
+    const s = String(raw || '').toLowerCase();
+    if (s === 'queued' || s === 'pending') return 'queued';
+    if (s === 'in_queue' || s === 'waiting' || s === 'llm_queued') return 'in_queue';
+    if (s === 'streaming' || s === 'decoding' || s === 'llm_streaming') return 'streaming';
+    if (s === 'gating' || s === 'verifying' || s === 'testing') return 'gating';
+    if (s === 'retry' || s === 'retrying' || s === 'rollback' || s === 'failed') return 'retry';
+    if (s === 'committed' || s === 'done' || s === 'passed' || s === 'ok') return 'committed';
+    if (s === 'skipped_resumed' || s === 'resumed' || s === 'skipped') return 'skipped_resumed';
+    return null;
+  }
+
+  /* ================= STATE MODEL ================= */
+  function createPlaceholderUnits() {
+    const units = [];
+    for (let layer = 0; layer < 4; layer++) {
+      for (let i = 0; i < 16; i++) {
+        const id = LAYER_NAMES[layer] + '/mod_' + String(i + 1).padStart(2, '0') + '.py';
+        units.push({
+          id: id,
+          files: [id],
+          layer: layer,
+          wave: layer * 2 + (i >= 8 ? 1 : 0),
+          loc: 0,
+          deps: [],
+          dependents: [],
+          baseline_hygiene: 0,
+          current_hygiene: 0,
+          state: 'queued',
+          retries: 0,
+          ruff_before: 0,
+          ruff_after: 0,
+          ty_before: 0,
+          ty_after: 0,
+          placeholder: true
+        });
+      }
+    }
+    return units;
+  }
+
+  function createInitialState() {
+    const units = createPlaceholderUnits();
+    const byId = Object.create(null);
+    for (let i = 0; i < units.length; i++) byId[units[i].id] = units[i];
+    return {
+      mode: 'live', // 'live' | 'replay' | 'demo'
+      connectionStatus: 'connecting', // 'live' | 'connecting' | 'reconnecting' | 'replay' | 'demo'
+      runStatus: 'idle', // 'idle' | 'running' | 'done'
+      runId: '',
+      hostOs: 'windows-x64',
+      model: 'Kimi K3.1 Pro',
+      providerLabel: 'Cerebras',
+      stemUsed: true,
+      stemIndexMs: 0,
+      totalFiles: 64,
+      totalLoc: 0,
+      totalUnits: 64,
+      waveCount: 8,
+
+      firstTsMs: null,
+      lastTsMs: null,
+      liveAnchorLocalMs: null,
+      finalWallS: null,
+      lastSeq: 0,
+
+      // WAL & Circuit
+      walRev: 0,
+      walTorn: 0,
+      circuitState: 'CLOSED',
+
+      // Units
+      units: units,
+      unitById: byId,
+      planLoaded: false,
+
+      // Pacer & ProxySnapshot
+      uncachedTpmRolling: 0,
+      uncachedTpmPeak: 0,
+      uncachedTpmCap: 50000,
+      totalTpmRolling: 0,
+      totalTpmCap: 250000,
+      rpmRolling: 0,
+      rpmCap: 60,
+      http429Count: 0,
+      http5xxCount: 0,
+      circuitPauses: 0,
+      prefixDriftEvents: 0,
+      totalPromptTokens: 0,
+      totalCachedTokens: 0,
+      totalCompletionTokens: 0,
+      totalUncachedTokens: 0,
+      astStripPct: 0,
+      prefixCacheHitPctOverride: null,
+
+      // AIMD & Decode
+      aimdK: 4,
+      aimdTrend: 'STEADY',
+      decodeTpsCurrent: 0,
+      decodeSamples: [],
+      medianDecodeTpsOverride: null,
+
+      // Maintainability + Gate 3
+      hygieneBeforeMedianOverride: null,
+      hygieneBeforeP10Override: null,
+      hygieneAfterMedianOverride: null,
+      hygieneAfterP10Override: null,
+      gate3BeforeRuff: 0,
+      gate3BeforeTy: 0,
+      gate3AfterRuff: 0,
+      gate3AfterTy: 0,
+      gate3Tracked: false,
+
+      // Correctness + MVCC + Learn
+      testsTotal: 0,
+      testsBeforeFail: 0,
+      testsAfterFail: 0,
+      testsPassedLive: 0,
+      casConflicts: 0,
+      rollbacksG0: 0,
+      rollbacksG1: 0,
+      rollbacksG2: 0,
+      rollbacksG3: 0,
+      retriesTotal: 0,
+      skippedResumedUnits: 0,
+      committedUnitsOverride: null,
+      learnRules: Object.create(null),
+      learnRulesCountOverride: null,
+      learnHitsTotal: 0,
+      learnHelpfulTotal: 0,
+      latestLearnAdvice: 'suffix-only injection',
+
+      // Compute Cost & Bench
+      engineRssMb: 0,
+      bench: null,
+      liveGate1CpuSamples: [],
+      liveGate1RssSamples: [],
+
+      // 5-Segment Timeline cumulative ms
+      tlQueueMs: 0,
+      tlDecodeMs: 0,
+      tlGate1Ms: 0,
+      tlGate2Ms: 0,
+      tlGate3Ms: 0,
+      tlGate0Ms: 0,
+
+      // 5-row live event feed
+      feed: []
+    };
+  }
+
+  let state = createInitialState();
+  let dirty = true;
+  let gridNeedsRebuild = true;
+
+  /* ================= EVENT REDUCER (EXACT types.rs MATCH) ================= */
+  function pushFeed(st, badgeClass, badgeText, moduleId, msg, rightText, tsMs) {
+    const relSec = st.firstTsMs != null && tsMs != null ? Math.max(0, (tsMs - st.firstTsMs) / 1000) : 0;
+    st.feed.unshift({
+      ts: fmtClock(relSec),
+      badgeClass: badgeClass,
+      badgeText: badgeText,
+      mod: moduleId || 'system',
+      msg: msg,
+      right: rightText || ''
+    });
+    if (st.feed.length > 5) st.feed.length = 5;
+  }
+
+  function ensureUnit(st, moduleId, layer, wave) {
+    if (!moduleId) return null;
+    if (st.unitById[moduleId]) return st.unitById[moduleId];
+    const lyr = typeof layer === 'number' && layer >= 0 && layer <= 3 ? layer : 0;
+    // Try replacing first placeholder in same layer
+    for (let i = 0; i < st.units.length; i++) {
+      if (st.units[i].placeholder && st.units[i].layer === lyr) {
+        const u = st.units[i];
+        delete st.unitById[u.id];
+        u.id = moduleId;
+        u.files = [moduleId];
+        u.wave = typeof wave === 'number' ? wave : lyr * 2;
+        u.placeholder = false;
+        st.unitById[moduleId] = u;
+        gridNeedsRebuild = true;
+        return u;
+      }
+    }
+    const created = {
+      id: moduleId,
+      files: [moduleId],
+      layer: lyr,
+      wave: typeof wave === 'number' ? wave : lyr * 2,
+      loc: 0,
+      deps: [],
+      dependents: [],
+      baseline_hygiene: 0,
+      current_hygiene: 0,
+      state: 'queued',
+      retries: 0,
+      ruff_before: 0,
+      ruff_after: 0,
+      ty_before: 0,
+      ty_after: 0,
+      placeholder: false
+    };
+    st.units.push(created);
+    st.unitById[moduleId] = created;
+    gridNeedsRebuild = true;
+    return created;
+  }
+
+  function applyDagPlan(st, plan) {
+    if (!plan || !Array.isArray(plan.units) || !plan.units.length) return;
+    if (plan.host_os) st.hostOs = plan.host_os;
+    if (typeof plan.stem_used === 'boolean') st.stemUsed = plan.stem_used;
+    if (typeof plan.stem_index_ms === 'number') st.stemIndexMs = plan.stem_index_ms;
+    if (typeof plan.total_files === 'number') st.totalFiles = plan.total_files;
+    if (typeof plan.total_loc === 'number') st.totalLoc = plan.total_loc;
+    if (typeof plan.wave_count === 'number') st.waveCount = plan.wave_count;
+
+    const newUnits = [];
+    const newById = Object.create(null);
+    for (let i = 0; i < plan.units.length; i++) {
+      const m = plan.units[i];
+      const existing = st.unitById[m.id];
+      const layer = Math.max(0, Math.min(3, Number(m.layer) || 0));
+      const baseHyg = Number(m.baseline_hygiene) || 0;
+      const u = {
+        id: m.id,
+        files: Array.isArray(m.files) ? m.files : [m.id],
+        layer: layer,
+        wave: Number(m.wave) || 0,
+        loc: Number(m.loc) || 0,
+        deps: Array.isArray(m.deps) ? m.deps : [],
+        dependents: Array.isArray(m.dependents) ? m.dependents : [],
+        baseline_hygiene: baseHyg,
+        current_hygiene: existing && existing.current_hygiene > 0 ? existing.current_hygiene : baseHyg,
+        state: existing ? existing.state : 'queued',
+        retries: existing ? existing.retries : 0,
+        ruff_before: Number(m.ruff_before) || 0,
+        ruff_after: Number(m.ruff_before) || 0,
+        ty_before: Number(m.ty_before) || 0,
+        ty_after: Number(m.ty_before) || 0,
+        placeholder: false
+      };
+      newUnits.push(u);
+      newById[u.id] = u;
+    }
+    st.units = newUnits;
+    st.unitById = newById;
+    st.totalUnits = newUnits.length;
+    st.planLoaded = true;
+    gridNeedsRebuild = true;
+  }
+
+  function applyProxySnapshot(st, p) {
+    if (!p || typeof p !== 'object') return;
+    if (p.circuit_state != null) st.circuitState = normalizeCircuit(p.circuit_state);
+    if (typeof p.uncached_tpm_rolling === 'number') {
+      st.uncachedTpmRolling = p.uncached_tpm_rolling;
+      if (p.uncached_tpm_rolling > st.uncachedTpmPeak) st.uncachedTpmPeak = p.uncached_tpm_rolling;
+    }
+    if (typeof p.uncached_tpm_cap === 'number' && p.uncached_tpm_cap > 0) st.uncachedTpmCap = p.uncached_tpm_cap;
+    if (typeof p.total_tpm_rolling === 'number') st.totalTpmRolling = p.total_tpm_rolling;
+    if (typeof p.total_tpm_cap === 'number' && p.total_tpm_cap > 0) st.totalTpmCap = p.total_tpm_cap;
+    if (typeof p.rpm_rolling === 'number') st.rpmRolling = p.rpm_rolling;
+    if (typeof p.rpm_cap === 'number' && p.rpm_cap > 0) st.rpmCap = p.rpm_cap;
+    if (typeof p.http_429_count === 'number') st.http429Count = p.http_429_count;
+    if (typeof p.http_5xx_count === 'number') st.http5xxCount = p.http_5xx_count;
+    if (typeof p.circuit_pauses === 'number') st.circuitPauses = p.circuit_pauses;
+    if (typeof p.prefix_drift_events === 'number') st.prefixDriftEvents = p.prefix_drift_events;
+    if (typeof p.total_prompt_tokens === 'number') st.totalPromptTokens = p.total_prompt_tokens;
+    if (typeof p.total_cached_tokens === 'number') st.totalCachedTokens = p.total_cached_tokens;
+    if (typeof p.total_completion_tokens === 'number') st.totalCompletionTokens = p.total_completion_tokens;
+    if (typeof p.total_uncached_tokens === 'number') st.totalUncachedTokens = p.total_uncached_tokens;
+  }
+
+  function applyRunSummary(st, s) {
+    if (!s || typeof s !== 'object') return;
+    if (s.run_id) st.runId = s.run_id;
+    if (s.host_os) st.hostOs = s.host_os;
+    if (s.model) st.model = s.model;
+    if (s.provider_label) st.providerLabel = s.provider_label;
+    if (typeof s.total_files === 'number' && s.total_files > 0) st.totalFiles = s.total_files;
+    if (typeof s.total_loc === 'number' && s.total_loc > 0) st.totalLoc = s.total_loc;
+    if (typeof s.total_units === 'number' && s.total_units > 0) st.totalUnits = s.total_units;
+    if (typeof s.committed_units === 'number') st.committedUnitsOverride = s.committed_units;
+    if (typeof s.skipped_resumed_units === 'number') st.skippedResumedUnits = s.skipped_resumed_units;
+    if (typeof s.total_wall_s === 'number' && s.total_wall_s > 0) st.finalWallS = s.total_wall_s;
+    if (typeof s.median_decode_tps === 'number' && s.median_decode_tps > 0) {
+      st.medianDecodeTpsOverride = s.median_decode_tps;
+      if (st.decodeTpsCurrent === 0) st.decodeTpsCurrent = s.median_decode_tps;
+    }
+    if (typeof s.hygiene_before_median === 'number' && s.hygiene_before_median > 0) st.hygieneBeforeMedianOverride = s.hygiene_before_median;
+    if (typeof s.hygiene_before_p10 === 'number' && s.hygiene_before_p10 > 0) st.hygieneBeforeP10Override = s.hygiene_before_p10;
+    if (typeof s.hygiene_after_median === 'number' && s.hygiene_after_median > 0) st.hygieneAfterMedianOverride = s.hygiene_after_median;
+    if (typeof s.hygiene_after_p10 === 'number' && s.hygiene_after_p10 > 0) st.hygieneAfterP10Override = s.hygiene_after_p10;
+    if (typeof s.tests_total === 'number' && s.tests_total > 0) st.testsTotal = s.tests_total;
+    if (typeof s.tests_before_fail === 'number') st.testsBeforeFail = s.tests_before_fail;
+    if (typeof s.tests_after_fail === 'number') {
+      st.testsAfterFail = s.tests_after_fail;
+      if (st.testsTotal > 0) st.testsPassedLive = Math.max(0, st.testsTotal - s.tests_after_fail);
+    }
+    if (typeof s.gate3_before_ruff === 'number') st.gate3BeforeRuff = s.gate3_before_ruff;
+    if (typeof s.gate3_before_ty === 'number') st.gate3BeforeTy = s.gate3_before_ty;
+    if (typeof s.gate3_after_ruff === 'number') {
+      st.gate3AfterRuff = s.gate3_after_ruff;
+      st.gate3Tracked = true;
+    }
+    if (typeof s.gate3_after_ty === 'number') {
+      st.gate3AfterTy = s.gate3_after_ty;
+      st.gate3Tracked = true;
+    }
+    if (typeof s.cas_conflicts === 'number') st.casConflicts = s.cas_conflicts;
+    if (typeof s.rollbacks_g0 === 'number') st.rollbacksG0 = s.rollbacks_g0;
+    if (typeof s.rollbacks_g1 === 'number') st.rollbacksG1 = s.rollbacks_g1;
+    if (typeof s.rollbacks_g2 === 'number') st.rollbacksG2 = s.rollbacks_g2;
+    if (typeof s.rollbacks_g3 === 'number') st.rollbacksG3 = s.rollbacks_g3;
+    if (typeof s.retries_total === 'number') st.retriesTotal = s.retries_total;
+    if (typeof s.http_429_count === 'number') st.http429Count = s.http_429_count;
+    if (typeof s.circuit_pauses === 'number') st.circuitPauses = s.circuit_pauses;
+    if (typeof s.prefix_drift_events === 'number') st.prefixDriftEvents = s.prefix_drift_events;
+    if (typeof s.prefix_cache_hit_pct === 'number' && s.prefix_cache_hit_pct > 0) st.prefixCacheHitPctOverride = s.prefix_cache_hit_pct;
+    if (typeof s.uncached_tpm_cap === 'number' && s.uncached_tpm_cap > 0) st.uncachedTpmCap = s.uncached_tpm_cap;
+    if (typeof s.total_uncached_tokens === 'number') st.totalUncachedTokens = s.total_uncached_tokens;
+    if (typeof s.total_cached_tokens === 'number') st.totalCachedTokens = s.total_cached_tokens;
+    if (typeof s.engine_rss_mb === 'number' && s.engine_rss_mb > 0) st.engineRssMb = s.engine_rss_mb;
+    if (s.bench && typeof s.bench === 'object') st.bench = s.bench;
+  }
+
+  function applyLlmMetrics(st, m) {
+    if (!m || typeof m !== 'object') return;
+    if (typeof m.queue_ms === 'number' && m.queue_ms >= 0) st.tlQueueMs += m.queue_ms;
+    const dec = (Number(m.prompt_ms) || 0) + (Number(m.completion_ms) || 0);
+    if (dec > 0) st.tlDecodeMs += dec;
+    if (typeof m.decode_tps === 'number' && m.decode_tps > 0) {
+      st.decodeTpsCurrent = m.decode_tps;
+      st.decodeSamples.push(m.decode_tps);
+    }
+    if (typeof m.prompt_tokens === 'number' && m.prompt_tokens > 0 && st.totalPromptTokens < m.prompt_tokens) {
+      // Only add if proxy snapshot isn't already driving cumulative counters
+    }
+    if (m.prefix_drift === true) st.prefixDriftEvents += 1;
+    if (typeof m.limit_tpm_minute === 'number' && m.limit_tpm_minute > 0) st.uncachedTpmCap = m.limit_tpm_minute;
+    if (typeof m.limit_rpm_minute === 'number' && m.limit_rpm_minute > 0) st.rpmCap = m.limit_rpm_minute;
+  }
+
+  function applyGateVerdict(st, unit, v) {
+    if (!v || typeof v !== 'object') return;
+    if (typeof v.gate0_ms === 'number') st.tlGate0Ms += v.gate0_ms;
+    if (typeof v.gate1_ms === 'number') st.tlGate1Ms += v.gate1_ms;
+    if (typeof v.gate2_ms === 'number') st.tlGate2Ms += v.gate2_ms;
+    if (typeof v.gate3_ms === 'number') st.tlGate3Ms += v.gate3_ms;
+    if (typeof v.gate1_cpu_ms === 'number' && v.gate1_cpu_ms > 0) st.liveGate1CpuSamples.push(v.gate1_cpu_ms);
+    if (typeof v.gate1_peak_rss_bytes === 'number' && v.gate1_peak_rss_bytes > 0) {
+      st.liveGate1RssSamples.push(v.gate1_peak_rss_bytes / (1024 * 1024));
+    }
+    if (typeof v.gate1_tests_passed === 'number' && typeof v.gate1_tests_failed === 'number') {
+      const tot = v.gate1_tests_passed + v.gate1_tests_failed;
+      if (tot >= st.testsTotal) {
+        st.testsTotal = tot;
+        st.testsPassedLive = v.gate1_tests_passed;
+        st.testsAfterFail = v.gate1_tests_failed;
+      }
+    }
+    if (unit) {
+      if (typeof v.gate2_score_before === 'number' && v.gate2_score_before > 0 && unit.baseline_hygiene === 0) {
+        unit.baseline_hygiene = v.gate2_score_before;
+      }
+      if (v.passed && typeof v.gate2_score_after === 'number' && v.gate2_score_after > 0) {
+        unit.current_hygiene = v.gate2_score_after;
+      }
+      if (typeof v.gate3_ruff_errors === 'number') unit.ruff_after = v.gate3_ruff_errors;
+      if (typeof v.gate3_ty_errors === 'number') unit.ty_after = v.gate3_ty_errors;
+    }
+  }
+
+  function applyEvent(st, ev) {
+    if (!ev || typeof ev !== 'object') return;
+
+    if (typeof ev.seq === 'number' && ev.seq > st.lastSeq) st.lastSeq = ev.seq;
+    if (typeof ev.ts_ms === 'number' && ev.ts_ms > 0) {
+      if (st.firstTsMs == null) {
+        st.firstTsMs = ev.ts_ms;
+        st.liveAnchorLocalMs = performance.now();
+      }
+      if (st.lastTsMs == null || ev.ts_ms >= st.lastTsMs) {
+        st.lastTsMs = ev.ts_ms;
+      }
+    }
+
+    if (typeof ev.uncached_tpm === 'number') {
+      st.uncachedTpmRolling = ev.uncached_tpm;
+      if (ev.uncached_tpm > st.uncachedTpmPeak) st.uncachedTpmPeak = ev.uncached_tpm;
+    }
+
+    const kind = String(ev.type || ev.kind || '').toLowerCase();
+    const d = (ev.data && typeof ev.data === 'object') ? ev.data : {};
+
+    // Merge embedded RunSummary if present
+    if (ev.summary) applyRunSummary(st, ev.summary);
+
+    // Generic embedded snapshots / common optional fields on `data`
+    if (d.proxy && typeof d.proxy === 'object') applyProxySnapshot(st, d.proxy);
+    if (d.uncached_tpm_rolling != null || d.circuit_state != null || d.total_cached_tokens != null) {
+      applyProxySnapshot(st, d);
+    }
+    if (d.plan && Array.isArray(d.plan.units)) applyDagPlan(st, d.plan);
+    else if (d.dag && Array.isArray(d.dag.units)) applyDagPlan(st, d.dag);
+    else if (Array.isArray(d.units)) applyDagPlan(st, d);
+
+    if (typeof d.host_os === 'string' && d.host_os) st.hostOs = d.host_os;
+    if (typeof d.model === 'string' && d.model) st.model = d.model;
+    if (typeof d.provider_label === 'string' && d.provider_label) st.providerLabel = d.provider_label;
+    if (typeof d.head_rev === 'number') st.walRev = Math.max(st.walRev, d.head_rev);
+    if (typeof d.wal_rev === 'number') st.walRev = Math.max(st.walRev, d.wal_rev);
+    if (typeof d.torn === 'number') st.walTorn = d.torn;
+    if (typeof d.torn_writes === 'number') st.walTorn = d.torn_writes;
+    if (typeof d.ast_strip_pct === 'number') st.astStripPct = d.ast_strip_pct;
+    if (typeof d.engine_rss_mb === 'number' && d.engine_rss_mb > 0) st.engineRssMb = d.engine_rss_mb;
+    if (typeof d.rss_bytes === 'number' && d.rss_bytes > 0) st.engineRssMb = d.rss_bytes / (1024 * 1024);
+
+    // AIMD K
+    const nextK = typeof d.aimd_k === 'number' ? d.aimd_k
+      : (typeof d.concurrency_k === 'number' ? d.concurrency_k
+      : (typeof d.k === 'number' ? d.k : null));
+    if (nextK != null && nextK > 0) {
+      if (nextK > st.aimdK) st.aimdTrend = 'AIMD ▲ +1';
+      else if (nextK < st.aimdK) st.aimdTrend = 'BACKOFF ▼ /2';
+      else st.aimdTrend = 'STEADY';
+      st.aimdK = nextK;
+    }
+
+    if (typeof d.decode_tps === 'number' && d.decode_tps > 0) {
+      st.decodeTpsCurrent = d.decode_tps;
+      st.decodeSamples.push(d.decode_tps);
+    }
+
+    if (typeof d.gate3_before_ruff === 'number') {
+      st.gate3BeforeRuff = d.gate3_before_ruff;
+      if (!st.gate3Tracked) st.gate3AfterRuff = d.gate3_before_ruff;
+    }
+    if (typeof d.gate3_before_ty === 'number') {
+      st.gate3BeforeTy = d.gate3_before_ty;
+      if (!st.gate3Tracked) st.gate3AfterTy = d.gate3_before_ty;
+    }
+    if (typeof d.ruff_remaining === 'number') {
+      st.gate3AfterRuff = d.ruff_remaining;
+      st.gate3Tracked = true;
+    }
+    if (typeof d.ty_remaining === 'number') {
+      st.gate3AfterTy = d.ty_remaining;
+      st.gate3Tracked = true;
+    }
+    if (typeof d.tests_total === 'number' && d.tests_total > 0) {
+      st.testsTotal = d.tests_total;
+      if (st.testsPassedLive === 0 && typeof d.tests_before_fail === 'number') {
+        st.testsBeforeFail = d.tests_before_fail;
+        st.testsAfterFail = d.tests_before_fail;
+        st.testsPassedLive = Math.max(0, d.tests_total - d.tests_before_fail);
+      }
+    }
+
+    const unit = ev.module_id ? ensureUnit(st, ev.module_id, ev.layer, ev.wave) : null;
+
+    // Event-type specific handling
+    switch (kind) {
+      case 'run_start':
+      case 'dag_ready':
+      case 'plan_ready':
+      case 'phase0_complete':
+      case 'baseline': {
+        st.runStatus = 'running';
+        if (d.run_id) st.runId = d.run_id;
+        if (typeof d.hygiene_before_median === 'number') st.hygieneBeforeMedianOverride = d.hygiene_before_median;
+        if (typeof d.hygiene_before_p10 === 'number') st.hygieneBeforeP10Override = d.hygiene_before_p10;
+        if (kind === 'run_start') {
+          pushFeed(
+            st,
+            'resume',
+            'START',
+            'dag_plan',
+            st.totalUnits + ' modules · ' + fmtInt(st.totalLoc) + ' LOC · stem ' + st.stemIndexMs + 'ms',
+            'WAL rev ' + st.walRev,
+            ev.ts_ms
+          );
+        }
+        break;
+      }
+
+      case 'module_resumed':
+      case 'module_skipped':
+      case 'skipped_resumed':
+      case 'resume_skip': {
+        st.runStatus = 'running';
+        if (unit) {
+          unit.state = 'skipped_resumed';
+          if (typeof d.hygiene_after === 'number') unit.current_hygiene = d.hygiene_after;
+          else if (typeof d.score === 'number') unit.current_hygiene = d.score;
+          unit.ruff_after = 0;
+          unit.ty_after = 0;
+        }
+        st.skippedResumedUnits = countUnitsByState(st, 'skipped_resumed');
+        pushFeed(
+          st,
+          'resume',
+          'RESUMED',
+          ev.module_id,
+          'ACID WAL match — skipped already committed module',
+          'WAL rev ' + st.walRev,
+          ev.ts_ms
+        );
+        break;
+      }
+
+      case 'module_queued':
+      case 'unit_queued': {
+        st.runStatus = 'running';
+        if (unit && unit.state !== 'committed' && unit.state !== 'skipped_resumed') unit.state = 'queued';
+        break;
+      }
+
+      case 'module_in_queue':
+      case 'module_start':
+      case 'llm_queued':
+      case 'llm_request':
+      case 'in_queue': {
+        st.runStatus = 'running';
+        if (unit) unit.state = 'in_queue';
+        break;
+      }
+
+      case 'module_streaming':
+      case 'llm_streaming':
+      case 'llm_stream':
+      case 'streaming':
+      case 'decode_start': {
+        st.runStatus = 'running';
+        if (unit) unit.state = 'streaming';
+        break;
+      }
+
+      case 'llm_complete':
+      case 'llm_done':
+      case 'llm_metrics': {
+        st.runStatus = 'running';
+        applyLlmMetrics(st, d.llm || d);
+        if (unit && (unit.state === 'streaming' || unit.state === 'in_queue')) unit.state = 'gating';
+        break;
+      }
+
+      case 'module_gating':
+      case 'gate_start':
+      case 'gating': {
+        st.runStatus = 'running';
+        if (unit) unit.state = 'gating';
+        if (d.llm) applyLlmMetrics(st, d.llm);
+        break;
+      }
+
+      case 'gate_result':
+      case 'gate_verdict':
+      case 'gate_pass':
+      case 'gate_fail': {
+        st.runStatus = 'running';
+        const verdict = d.verdict || d;
+        applyGateVerdict(st, unit, verdict);
+        if (verdict.passed === false) {
+          if (unit) {
+            unit.state = 'retry';
+            unit.retries += 1;
+          }
+          incrementGateRollback(st, verdict.failed_gate || d.gate);
+          st.retriesTotal += 1;
+          const gateName = String(verdict.failed_gate || d.gate || 'gate').toUpperCase();
+          const diag = Array.isArray(verdict.diagnostics) && verdict.diagnostics.length
+            ? verdict.diagnostics[0]
+            : (d.reason || 'verification rollback — retrying');
+          pushFeed(st, 'rollback', 'ROLLBACK', ev.module_id, '[' + gateName + '] ' + diag, 'retry #' + (unit ? unit.retries : 1), ev.ts_ms);
+        } else if (verdict.passed === true && verdict.gate3_ruff_errors === 0 && verdict.gate3_ty_errors === 0) {
+          pushFeed(
+            st,
+            'g3',
+            'G3 0-WARN',
+            ev.module_id,
+            'Gate 3 ruff 0 err / ty 0 err · hygiene ' + (verdict.gate2_score_before || 0).toFixed(1) + ' → ' + (verdict.gate2_score_after || 0).toFixed(1),
+            Math.round((verdict.gate1_ms || 0) + (verdict.gate2_ms || 0) + (verdict.gate3_ms || 0)) + 'ms',
+            ev.ts_ms
+          );
+        }
+        break;
+      }
+
+      case 'module_committed':
+      case 'wal_commit':
+      case 'committed':
+      case 'commit': {
+        st.runStatus = 'running';
+        if (d.llm) applyLlmMetrics(st, d.llm);
+        if (d.verdict) applyGateVerdict(st, unit, d.verdict);
+        else if (d.gate1_ms != null || d.gate2_score_after != null) applyGateVerdict(st, unit, d);
+
+        const beforeHyg = unit ? unit.baseline_hygiene : (Number(d.gate2_score_before) || 0);
+        const afterHyg = Number(d.gate2_score_after != null ? d.gate2_score_after
+          : (d.hygiene_after != null ? d.hygiene_after
+          : (d.verdict && d.verdict.gate2_score_after != null ? d.verdict.gate2_score_after : beforeHyg)));
+
+        if (unit) {
+          unit.state = 'committed';
+          if (afterHyg > 0) unit.current_hygiene = afterHyg;
+          unit.ruff_after = Number(d.gate3_ruff_errors != null ? d.gate3_ruff_errors : 0);
+          unit.ty_after = Number(d.gate3_ty_errors != null ? d.gate3_ty_errors : 0);
+        }
+        if (typeof d.head_rev !== 'number' && typeof d.wal_rev !== 'number') {
+          st.walRev += 1;
+        }
+        if (typeof d.ruff_delta === 'number') {
+          st.gate3AfterRuff = Math.max(0, st.gate3AfterRuff - d.ruff_delta);
+          st.gate3Tracked = true;
+        }
+        if (typeof d.ty_delta === 'number') {
+          st.gate3AfterTy = Math.max(0, st.gate3AfterTy - d.ty_delta);
+          st.gate3Tracked = true;
+        }
+        const g3Clean = (Number(d.gate3_ruff_errors) || 0) === 0 && (Number(d.gate3_ty_errors) || 0) === 0;
+        const deltaStr = (afterHyg - beforeHyg >= 0 ? '+' : '') + (afterHyg - beforeHyg).toFixed(1);
+        pushFeed(
+          st,
+          g3Clean && d.highlight_g3 ? 'g3' : 'commit',
+          g3Clean && d.highlight_g3 ? 'G3 0-WARN' : 'COMMIT',
+          ev.module_id,
+          'hyg ' + beforeHyg.toFixed(1) + ' → ' + afterHyg.toFixed(1) + ' (' + deltaStr + ')' + (g3Clean ? ' · G3 0 err/0 warn' : ''),
+          'WAL rev ' + st.walRev,
+          ev.ts_ms
+        );
+        break;
+      }
+
+      case 'module_retry':
+      case 'retry':
+      case 'rollback':
+      case 'wal_rollback': {
+        st.runStatus = 'running';
+        if (unit) {
+          unit.state = 'retry';
+          unit.retries += 1;
+        }
+        const gName = d.gate || d.failed_gate || 'gate1';
+        incrementGateRollback(st, gName);
+        st.retriesTotal += 1;
+        if (d.verdict) applyGateVerdict(st, unit, d.verdict);
+        pushFeed(
+          st,
+          'rollback',
+          'ROLLBACK',
+          ev.module_id,
+          '[' + String(gName).toUpperCase() + '] ' + (d.reason || 'retrying in clean sandbox'),
+          'attempt #' + ((unit ? unit.retries : 1) + 1),
+          ev.ts_ms
+        );
+        break;
+      }
+
+      case 'cas_conflict': {
+        st.runStatus = 'running';
+        st.casConflicts += 1;
+        st.retriesTotal += 1;
+        if (unit) {
+          unit.state = 'retry';
+          unit.retries += 1;
+        }
+        pushFeed(
+          st,
+          'rollback',
+          'CAS RETRY',
+          ev.module_id,
+          d.reason || 'BLAKE3 base mismatch — rebasing patch on latest WAL head',
+          'CAS #' + st.casConflicts,
+          ev.ts_ms
+        );
+        break;
+      }
+
+      case 'learn_hit':
+      case 'learn_rule':
+      case 'learn_record':
+      case 'learn_update': {
+        const key = d.key || d.rule_key || ('rule_' + (Object.keys(st.learnRules).length + 1));
+        const existing = st.learnRules[key];
+        const ruleObj = {
+          key: key,
+          gate: d.gate || (existing ? existing.gate : 'gate3'),
+          dir_prefix: d.dir_prefix || (existing ? existing.dir_prefix : '*'),
+          advice: d.advice || (existing ? existing.advice : 'apply learned pattern'),
+          hits: typeof d.hits === 'number' ? d.hits : ((existing ? existing.hits : 0) + 1),
+          helpful: typeof d.helpful === 'number' ? d.helpful : (existing ? existing.helpful : 0)
+        };
+        st.learnRules[key] = ruleObj;
+        st.latestLearnAdvice = '[' + ruleObj.key + '] ' + ruleObj.advice;
+        if (typeof d.total_rules === 'number') st.learnRulesCountOverride = d.total_rules;
+        if (typeof d.total_hits === 'number') st.learnHitsTotal = d.total_hits;
+        else st.learnHitsTotal += 1;
+        if (typeof d.total_helpful === 'number') st.learnHelpfulTotal = d.total_helpful;
+        pushFeed(
+          st,
+          'learn',
+          'LEARN HIT',
+          ev.module_id || ruleObj.dir_prefix,
+          ruleObj.key + ': ' + ruleObj.advice,
+          Object.keys(st.learnRules).length + ' rules',
+          ev.ts_ms
+        );
+        break;
+      }
+
+      case 'circuit_open': {
+        st.circuitState = 'CIRCUIT_OPEN';
+        if (typeof d.circuit_pauses !== 'number') st.circuitPauses += 1;
+        pushFeed(
+          st,
+          'circuit',
+          'CIRCUIT',
+          'proxy:18790',
+          d.reason || '44K uncached TPM pacer ceiling hit — backing off AIMD K',
+          'K=' + st.aimdK,
+          ev.ts_ms
+        );
+        break;
+      }
+
+      case 'circuit_closed':
+      case 'circuit_recover': {
+        st.circuitState = 'CLOSED';
+        pushFeed(
+          st,
+          'commit',
+          'CIRCUIT OK',
+          'proxy:18790',
+          'Uncached TPM cooled below ceiling — resuming AIMD ramp',
+          'K=' + st.aimdK,
+          ev.ts_ms
+        );
+        break;
+      }
+
+      case 'module_state':
+      case 'unit_state': {
+        st.runStatus = 'running';
+        const ns = normalizeState(d.state || d.status);
+        if (unit && ns) unit.state = ns;
+        break;
+      }
+
+      case 'bench_result':
+      case 'bench_complete':
+      case 'benchmark': {
+        const b = d.bench || d;
+        if (b && typeof b.cpu_ratio === 'number') st.bench = b;
+        pushFeed(
+          st,
+          'commit',
+          '5x BENCH',
+          'os_meter',
+          'CPU ' + (b.cpu_ratio || 1).toFixed(2) + 'x · Peak RSS ' + (b.rss_ratio || 1).toFixed(2) + 'x (' + (b.pairs || 5) + '-run A/B)',
+          b.passed_anti_regression ? '<= 1.05x PASS' : 'CHECK',
+          ev.ts_ms
+        );
+        break;
+      }
+
+      case 'run_end':
+      case 'run_complete':
+      case 'done': {
+        st.runStatus = 'done';
+        if (d.summary) applyRunSummary(st, d.summary);
+        if (d.bench) st.bench = d.bench;
+        pushFeed(
+          st,
+          'g3',
+          'COMPLETE',
+          'refit',
+          'All waves committed · G3 ' + st.gate3AfterRuff + ' ruff / ' + st.gate3AfterTy + ' ty · 0 torn',
+          fmtClock(getWallSeconds(st)),
+          ev.ts_ms
+        );
+        break;
+      }
+
+      default: {
+        // Proxy tick / heartbeat / generic event
+        if (unit && (d.state || d.status)) {
+          const ns = normalizeState(d.state || d.status);
+          if (ns) unit.state = ns;
+        }
+        break;
+      }
+    }
+
+    dirty = true;
+  }
+
+  function incrementGateRollback(st, gate) {
+    const g = String(gate || '').toLowerCase();
+    if (g.indexOf('0') >= 0 || g.indexOf('syntax') >= 0 || g.indexOf('abi') >= 0) st.rollbacksG0 += 1;
+    else if (g.indexOf('1') >= 0 || g.indexOf('test') >= 0 || g.indexOf('pytest') >= 0) st.rollbacksG1 += 1;
+    else if (g.indexOf('2') >= 0 || g.indexOf('hyg') >= 0) st.rollbacksG2 += 1;
+    else st.rollbacksG3 += 1;
+  }
+
+  function countUnitsByState(st, target) {
+    let n = 0;
+    for (let i = 0; i < st.units.length; i++) if (st.units[i].state === target) n++;
+    return n;
+  }
+
+  function getWallSeconds(st) {
+    if (st.finalWallS != null && st.runStatus === 'done') return st.finalWallS;
+    if (st.mode === 'live' && st.runStatus === 'running' && st.firstTsMs != null && st.liveAnchorLocalMs != null) {
+      const elapsedLive = (performance.now() - st.liveAnchorLocalMs) / 1000;
+      const eventSpan = st.lastTsMs != null ? (st.lastTsMs - st.firstTsMs) / 1000 : 0;
+      return Math.max(eventSpan, elapsedLive);
+    }
+    if (st.firstTsMs != null && st.lastTsMs != null) {
+      return Math.max(0, (st.lastTsMs - st.firstTsMs) / 1000);
+    }
+    return 0;
+  }
+
+  /* ================= DOM CACHE & GRID BUILDER ================= */
+  const els = {
+    modeChip: document.getElementById('mode-chip'),
+    modeLabel: document.getElementById('mode-label'),
+    hostOs: document.getElementById('host-os'),
+    modelName: document.getElementById('model-name'),
+    tpmCapLabel: document.getElementById('tpm-cap-label'),
+    walPill: document.getElementById('wal-pill'),
+    walRev: document.getElementById('wal-rev'),
+    walTorn: document.getElementById('wal-torn'),
+    circuitState: document.getElementById('circuit-state'),
+    replayBar: document.getElementById('replay-bar'),
+    btnPlay: document.getElementById('btn-play'),
+    btnRestart: document.getElementById('btn-restart'),
+    rpScrub: document.getElementById('rp-scrub'),
+    rpPos: document.getElementById('rp-pos'),
+    pbWall: document.getElementById('pb-wall'),
+    pbQueue: document.getElementById('pb-queue'),
+    pbDecode: document.getElementById('pb-decode'),
+    pbGates: document.getElementById('pb-gates'),
+    wallBox: document.getElementById('wall-box'),
+    wallClock: document.getElementById('wall-clock'),
+
+    dagMeta: document.getElementById('dag-meta'),
+    cntQueued: document.getElementById('cnt-queued'),
+    cntInQueue: document.getElementById('cnt-in_queue'),
+    cntStreaming: document.getElementById('cnt-streaming'),
+    cntGating: document.getElementById('cnt-gating'),
+    cntRetry: document.getElementById('cnt-retry'),
+    cntCommitted: document.getElementById('cnt-committed'),
+    cntResumed: document.getElementById('cnt-skipped_resumed'),
+    layerRows: [
+      { grid: document.getElementById('tiles-l0'), done: document.getElementById('l0-done'), tot: document.getElementById('l0-tot'), hyg: document.getElementById('l0-hyg') },
+      { grid: document.getElementById('tiles-l1'), done: document.getElementById('l1-done'), tot: document.getElementById('l1-tot'), hyg: document.getElementById('l1-hyg') },
+      { grid: document.getElementById('tiles-l2'), done: document.getElementById('l2-done'), tot: document.getElementById('l2-tot'), hyg: document.getElementById('l2-hyg') },
+      { grid: document.getElementById('tiles-l3'), done: document.getElementById('l3-done'), tot: document.getElementById('l3-tot'), hyg: document.getElementById('l3-hyg') }
+    ],
+
+    rpmVal: document.getElementById('rpm-val'),
+    http429Val: document.getElementById('http429-val'),
+    totalTpmVal: document.getElementById('total-tpm-val'),
+    pacerTpm: document.getElementById('pacer-tpm'),
+    pacerCap: document.getElementById('pacer-cap'),
+    pacerPeak: document.getElementById('pacer-peak'),
+    aimdK: document.getElementById('aimd-k'),
+    aimdTrend: document.getElementById('aimd-trend'),
+    decodeTps: document.getElementById('decode-tps'),
+    decodeSub: document.getElementById('decode-sub'),
+    pacerFill: document.getElementById('pacer-fill'),
+    ceilingLine: document.getElementById('ceiling-line'),
+    ceilingFlag: document.getElementById('ceiling-flag'),
+
+    feedSeq: document.getElementById('feed-seq'),
+    feedList: document.getElementById('feed-list'),
+
+    g3ZeroPill: document.getElementById('g3-zero-pill'),
+    hygDelta: document.getElementById('hyg-delta'),
+    hygMedBefore: document.getElementById('hyg-med-before'),
+    hygMedAfter: document.getElementById('hyg-med-after'),
+    hygP10Before: document.getElementById('hyg-p10-before'),
+    hygP10After: document.getElementById('hyg-p10-after'),
+    ruffBefore: document.getElementById('ruff-before'),
+    ruffAfter: document.getElementById('ruff-after'),
+    ruffBar: document.getElementById('ruff-bar'),
+    tyBefore: document.getElementById('ty-before'),
+    tyAfter: document.getElementById('ty-after'),
+    tyBar: document.getElementById('ty-bar'),
+
+    pytestPill: document.getElementById('pytest-pill'),
+    pytestPct: document.getElementById('pytest-pct'),
+    pytestRatio: document.getElementById('pytest-ratio'),
+    pytestSub: document.getElementById('pytest-sub'),
+    casConflicts: document.getElementById('cas-conflicts'),
+    retriesTotal: document.getElementById('retries-total'),
+    resumedSkipped: document.getElementById('resumed-skipped'),
+    rbG0: document.getElementById('rb-g0'),
+    rbG1: document.getElementById('rb-g1'),
+    rbG2: document.getElementById('rb-g2'),
+    rbG3: document.getElementById('rb-g3'),
+    learnStat: document.getElementById('learn-stat'),
+    learnLatest: document.getElementById('learn-latest'),
+
+    driftPill: document.getElementById('drift-pill'),
+    astStrip: document.getElementById('ast-strip'),
+    cacheHit: document.getElementById('cache-hit'),
+    cardTpm: document.getElementById('card-tpm'),
+    cardTpmCap: document.getElementById('card-tpm-cap'),
+    prefixDrift: document.getElementById('prefix-drift'),
+    driftSub: document.getElementById('drift-sub'),
+    cachedTokSum: document.getElementById('cached-tok-sum'),
+    uncachedTokSum: document.getElementById('uncached-tok-sum'),
+    circuitPauses: document.getElementById('circuit-pauses'),
+
+    benchPill: document.getElementById('bench-pill'),
+    engineRss: document.getElementById('engine-rss'),
+    stemStat: document.getElementById('stem-stat'),
+    benchPairsCpu: document.getElementById('bench-pairs-cpu'),
+    benchPairsRss: document.getElementById('bench-pairs-rss'),
+    cpuRatio: document.getElementById('cpu-ratio'),
+    cpuBefore: document.getElementById('cpu-before'),
+    cpuAfter: document.getElementById('cpu-after'),
+    rssRatio: document.getElementById('rss-ratio'),
+    rssBefore: document.getElementById('rss-before'),
+    rssAfter: document.getElementById('rss-after'),
+
+    tlSpeedup: document.getElementById('tl-speedup'),
+    tlQTxt: document.getElementById('tl-q-txt'),
+    tlDTxt: document.getElementById('tl-d-txt'),
+    tlG1Txt: document.getElementById('tl-g1-txt'),
+    tlG2Txt: document.getElementById('tl-g2-txt'),
+    tlG3Txt: document.getElementById('tl-g3-txt'),
+    segQueue: document.getElementById('seg-queue'),
+    segDecode: document.getElementById('seg-decode'),
+    segG1: document.getElementById('seg-g1'),
+    segG2: document.getElementById('seg-g2'),
+    segG3: document.getElementById('seg-g3'),
+
+    tooltip: document.getElementById('tile-tooltip'),
+    errorToast: document.getElementById('error-toast'),
+    errorMsg: document.getElementById('error-msg'),
+    btnFallbackDemo: document.getElementById('btn-fallback-demo')
+  };
+
+  let tileDomMap = Object.create(null);
+
+  function rebuildTileGrid() {
+    tileDomMap = Object.create(null);
+    const buckets = [[], [], [], []];
+    for (let i = 0; i < state.units.length; i++) {
+      const u = state.units[i];
+      const l = Math.max(0, Math.min(3, u.layer));
+      buckets[l].push(u);
+    }
+
+    for (let l = 0; l < 4; l++) {
+      const row = els.layerRows[l];
+      const list = buckets[l];
+      const cols = Math.max(16, list.length);
+      row.grid.style.gridTemplateColumns = 'repeat(' + cols + ', minmax(0, 1fr))';
+      const frag = document.createDocumentFragment();
+      for (let i = 0; i < list.length; i++) {
+        const u = list[i];
+        const div = document.createElement('div');
+        div.className = 'tile st-' + u.state;
+        div.dataset.uid = u.id;
+        div.innerHTML =
+          '<div class="tile-bar"></div>' +
+          '<div class="tile-name">' + escHtml(shortModName(u.id)) + '</div>' +
+          '<div class="tile-score">--</div>' +
+          '<div class="tile-foot"><span>W' + u.wave + '</span><span class="tile-st">' + (STATE_SHORT[u.state] || 'QUE') + '</span></div>';
+        frag.appendChild(div);
+        tileDomMap[u.id] = {
+          root: div,
+          score: div.children[2],
+          st: div.children[3].children[1],
+          lastState: u.state,
+          lastScoreTxt: '--'
+        };
+      }
+      row.grid.innerHTML = '';
+      row.grid.appendChild(frag);
+      row.tot.textContent = String(list.length);
+    }
+    gridNeedsRebuild = false;
+  }
+
+  /* Tile Hover Tooltip */
+  document.getElementById('wave-body').addEventListener('mousemove', function (e) {
+    const tile = e.target.closest('.tile');
+    if (!tile || !tile.dataset.uid) {
+      els.tooltip.style.display = 'none';
+      return;
+    }
+    const u = state.unitById[tile.dataset.uid];
+    if (!u) {
+      els.tooltip.style.display = 'none';
+      return;
+    }
+    const baseH = u.baseline_hygiene ? u.baseline_hygiene.toFixed(1) : '--';
+    const curH = u.current_hygiene ? u.current_hygiene.toFixed(1) : '--';
+    els.tooltip.innerHTML =
+      '<div class="tt-title">' + escHtml(u.id) + '</div>' +
+      '<div class="tt-row"><span>State</span><b>' + escHtml(u.state) + '</b></div>' +
+      '<div class="tt-row"><span>Layer / Wave</span><b>L' + u.layer + ' ' + LAYER_NAMES[u.layer] + ' · W' + u.wave + '</b></div>' +
+      '<div class="tt-row"><span>LOC / Deps</span><b>' + fmtInt(u.loc) + ' LOC · ' + u.deps.length + ' deps</b></div>' +
+      '<div class="tt-row"><span>codehygiene</span><b>' + baseH + ' → ' + curH + '</b></div>' +
+      '<div class="tt-row"><span>Gate 3 (ruff/ty)</span><b>' + u.ruff_after + ' / ' + u.ty_after + '</b></div>' +
+      '<div class="tt-row"><span>Retries</span><b>' + u.retries + '</b></div>';
+
+    const rect = stageEl.getBoundingClientRect();
+    let x = (e.clientX - rect.left) / stageScale + 14;
+    let y = (e.clientY - rect.top) / stageScale + 14;
+    if (x > 1540) x -= 280;
+    if (y > 880) y -= 170;
+    els.tooltip.style.left = x + 'px';
+    els.tooltip.style.top = y + 'px';
+    els.tooltip.style.display = 'block';
+  });
+
+  document.getElementById('wave-body').addEventListener('mouseleave', function () {
+    els.tooltip.style.display = 'none';
+  });
+
+  /* ================= 30 HZ RENDERER ================= */
+  let lastRenderMs = 0;
+
+  function renderFrame() {
+    if (gridNeedsRebuild) rebuildTileGrid();
+
+    const st = state;
+
+    // Top bar: OS, Model, WAL, Circuit
+    els.hostOs.textContent = st.hostOs;
+    els.modelName.textContent = st.model + ' on ' + st.providerLabel;
+    const capK = Math.round(st.uncachedTpmCap / 1000) + 'K';
+    els.tpmCapLabel.textContent = capK + ' Uncached TPM';
+    els.walRev.textContent = String(st.walRev);
+    els.walTorn.textContent = String(st.walTorn);
+    els.circuitState.textContent = st.circuitState;
+
+    els.walPill.classList.toggle('circuit-open', st.circuitState === 'CIRCUIT_OPEN');
+    els.walPill.classList.toggle('circuit-half', st.circuitState === 'HALF_OPEN');
+
+    // Mode pill
+    if (st.mode === 'demo') {
+      els.modeChip.className = 'mode-chip demo';
+      els.modeLabel.textContent = 'DEMO';
+    } else if (st.mode === 'replay') {
+      els.modeChip.className = 'mode-chip replay';
+      els.modeLabel.textContent = 'REPLAY';
+    } else if (st.connectionStatus === 'live') {
+      els.modeChip.className = 'mode-chip';
+      els.modeLabel.textContent = 'LIVE SSE';
+    } else {
+      els.modeChip.className = 'mode-chip warn';
+      els.modeLabel.textContent = st.connectionStatus === 'reconnecting' ? 'RECONNECT' : 'CONNECTING';
+    }
+
+    // Wall clock & phase breakdown
+    const wallS = getWallSeconds(st);
+    els.wallClock.textContent = fmtClock(wallS);
+    els.wallBox.classList.toggle('warn', wallS >= 240 && wallS < 300);
+    els.wallBox.classList.toggle('over', wallS >= 300);
+
+    const sumStageMs = st.tlQueueMs + st.tlDecodeMs + st.tlGate0Ms + st.tlGate1Ms + st.tlGate2Ms + st.tlGate3Ms;
+    const gatesMs = st.tlGate0Ms + st.tlGate1Ms + st.tlGate2Ms + st.tlGate3Ms;
+    const wallQ = sumStageMs > 0 ? wallS * (st.tlQueueMs / sumStageMs) : 0;
+    const wallD = sumStageMs > 0 ? wallS * (st.tlDecodeMs / sumStageMs) : 0;
+    const wallG = sumStageMs > 0 ? wallS * (gatesMs / sumStageMs) : 0;
+    els.pbWall.textContent = fmtSec(wallS);
+    els.pbQueue.textContent = fmtSec(wallQ);
+    els.pbDecode.textContent = fmtSec(wallD);
+    els.pbGates.textContent = fmtSec(wallG);
+
+    // 64-module grid counts, layer metrics, and hygiene aggregates
+    const counts = {
+      queued: 0, in_queue: 0, streaming: 0, gating: 0, retry: 0, committed: 0, skipped_resumed: 0
+    };
+    const layerDone = [0, 0, 0, 0];
+    const layerTot = [0, 0, 0, 0];
+    const layerBeforeHyg = [[], [], [], []];
+    const layerCurHyg = [[], [], [], []];
+    const allBeforeHyg = [];
+    const allCurHyg = [];
+
+    for (let i = 0; i < st.units.length; i++) {
+      const u = st.units[i];
+      const sKey = counts[u.state] != null ? u.state : 'queued';
+      counts[sKey]++;
+      const l = Math.max(0, Math.min(3, u.layer));
+      layerTot[l]++;
+      if (u.state === 'committed' || u.state === 'skipped_resumed') layerDone[l]++;
+
+      if (u.baseline_hygiene > 0) {
+        layerBeforeHyg[l].push(u.baseline_hygiene);
+        allBeforeHyg.push(u.baseline_hygiene);
+        const curH = u.current_hygiene > 0 ? u.current_hygiene : u.baseline_hygiene;
+        layerCurHyg[l].push(curH);
+        allCurHyg.push(curH);
+      }
+
+      const dom = tileDomMap[u.id];
+      if (dom) {
+        if (dom.lastState !== u.state) {
+          dom.root.className = 'tile st-' + u.state;
+          dom.st.textContent = STATE_SHORT[u.state] || 'QUE';
+          dom.lastState = u.state;
+        }
+        const scoreVal = u.current_hygiene > 0 ? u.current_hygiene : u.baseline_hygiene;
+        const scoreTxt = scoreVal > 0 ? String(Math.round(scoreVal)) : '--';
+        if (dom.lastScoreTxt !== scoreTxt) {
+          dom.score.textContent = scoreTxt;
+          dom.lastScoreTxt = scoreTxt;
+        }
+      }
+    }
+
+    const doneCount = st.committedUnitsOverride != null
+      ? st.committedUnitsOverride + st.skippedResumedUnits
+      : (counts.committed + counts.skipped_resumed);
+    els.dagMeta.textContent =
+      st.totalUnits + ' modules · ' +
+      (st.totalLoc > 0 ? fmtInt(st.totalLoc) + ' LOC · ' : '4 layers · ') +
+      doneCount + '/' + st.totalUnits + ' done';
+
+    els.cntQueued.textContent = String(counts.queued);
+    els.cntInQueue.textContent = String(counts.in_queue);
+    els.cntStreaming.textContent = String(counts.streaming);
+    els.cntGating.textContent = String(counts.gating);
+    els.cntRetry.textContent = String(counts.retry);
+    els.cntCommitted.textContent = String(counts.committed);
+    els.cntResumed.textContent = String(counts.skipped_resumed);
+
+    for (let l = 0; l < 4; l++) {
+      els.layerRows[l].done.textContent = String(layerDone[l]);
+      els.layerRows[l].tot.textContent = String(layerTot[l]);
+      if (layerBeforeHyg[l].length) {
+        const bMed = percentile(layerBeforeHyg[l], 0.5).toFixed(0);
+        const cMed = percentile(layerCurHyg[l], 0.5).toFixed(0);
+        els.layerRows[l].hyg.textContent = 'hyg ' + bMed + ' → ' + cMed;
+      } else {
+        els.layerRows[l].hyg.textContent = 'hyg -- → --';
+      }
+    }
+
+    // 50K Uncached TPM Pacer Bar + AIMD K + Wafer Decode tok/s
+    const cap = st.uncachedTpmCap || 50000;
+    const tpm = st.uncachedTpmRolling || 0;
+    const pct = Math.min(100, (tpm / cap) * 100);
+    const ceilPct = Math.min(96, (44000 / cap) * 100);
+
+    els.pacerTpm.textContent = fmtInt(tpm);
+    els.pacerTpm.classList.toggle('amber', tpm >= cap * 0.78 && tpm < 44000);
+    els.pacerTpm.classList.toggle('rose', tpm >= 44000);
+    els.pacerCap.textContent = fmtInt(cap);
+    els.pacerPeak.textContent = fmtInt(st.uncachedTpmPeak);
+    els.pacerFill.style.width = pct.toFixed(1) + '%';
+    els.pacerFill.classList.toggle('hot', tpm >= 42000);
+    els.ceilingLine.style.left = ceilPct.toFixed(1) + '%';
+    els.ceilingFlag.style.left = ceilPct.toFixed(1) + '%';
+
+    els.rpmVal.textContent = st.rpmRolling + '/' + st.rpmCap;
+    els.http429Val.textContent = String(st.http429Count);
+    els.totalTpmVal.textContent = fmtInt(st.totalTpmRolling);
+
+    els.aimdK.textContent = 'K=' + st.aimdK;
+    els.aimdTrend.textContent = st.aimdTrend;
+
+    const medDecode = st.medianDecodeTpsOverride != null
+      ? st.medianDecodeTpsOverride
+      : (st.decodeSamples.length ? percentile(st.decodeSamples, 0.5) : 0);
+    els.decodeTps.textContent = fmtInt(st.decodeTpsCurrent || medDecode);
+    els.decodeSub.textContent = 'median ' + (medDecode > 0 ? fmtInt(medDecode) : '--');
+
+    // 5-row Live Event Feed
+    els.feedSeq.textContent = 'seq #' + st.lastSeq;
+    if (st.feed.length > 0) {
+      let feedHtml = '';
+      for (let i = 0; i < 5; i++) {
+        const item = st.feed[i];
+        if (item) {
+          feedHtml +=
+            '<div class="feed-row' + (i === 0 ? ' latest' : '') + '">' +
+            '<span class="ev-ts">' + escHtml(item.ts) + '</span>' +
+            '<span class="ev-badge ' + escHtml(item.badgeClass) + '">' + escHtml(item.badgeText) + '</span>' +
+            '<span class="ev-mod">' + escHtml(item.mod) + '</span>' +
+            '<span class="ev-msg">' + escHtml(item.msg) + '</span>' +
+            '<span class="ev-right">' + escHtml(item.right) + '</span>' +
+            '</div>';
+        } else {
+          feedHtml += '<div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge commit">—</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>';
+        }
+      }
+      els.feedList.innerHTML = feedHtml;
+    }
+
+    // CARD 1: Maintainability + Gate 3 Zero-Warning Burndown
+    const bMed = st.hygieneBeforeMedianOverride != null ? st.hygieneBeforeMedianOverride : percentile(allBeforeHyg, 0.5);
+    const aMed = st.hygieneAfterMedianOverride != null ? st.hygieneAfterMedianOverride : percentile(allCurHyg, 0.5);
+    const bP10 = st.hygieneBeforeP10Override != null ? st.hygieneBeforeP10Override : percentile(allBeforeHyg, 0.1);
+    const aP10 = st.hygieneAfterP10Override != null ? st.hygieneAfterP10Override : percentile(allCurHyg, 0.1);
+    const hDelta = aMed - bMed;
+
+    els.hygMedBefore.textContent = bMed.toFixed(1);
+    els.hygMedAfter.textContent = aMed.toFixed(1);
+    els.hygDelta.textContent = (hDelta >= 0 ? '+' : '') + hDelta.toFixed(1);
+    els.hygP10Before.textContent = bP10.toFixed(1);
+    els.hygP10After.textContent = aP10.toFixed(1);
+
+    const rBef = st.gate3BeforeRuff;
+    const rAft = st.gate3AfterRuff;
+    const tBef = st.gate3BeforeTy;
+    const tAft = st.gate3AfterTy;
+
+    els.ruffBefore.textContent = String(rBef);
+    els.ruffAfter.textContent = String(rAft);
+    els.ruffAfter.classList.toggle('nonzero', rAft > 0);
+    const rPct = rBef > 0 ? Math.min(100, (rAft / rBef) * 100) : 0;
+    els.ruffBar.style.width = (rAft === 0 ? 100 : Math.max(4, rPct)).toFixed(1) + '%';
+    els.ruffBar.classList.toggle('zero', rAft === 0 && (st.gate3Tracked || st.runStatus === 'done'));
+
+    els.tyBefore.textContent = String(tBef);
+    els.tyAfter.textContent = String(tAft);
+    els.tyAfter.classList.toggle('nonzero', tAft > 0);
+    const tPct = tBef > 0 ? Math.min(100, (tAft / tBef) * 100) : 0;
+    els.tyBar.style.width = (tAft === 0 ? 100 : Math.max(4, tPct)).toFixed(1) + '%';
+    els.tyBar.classList.toggle('zero', tAft === 0 && (st.gate3Tracked || st.runStatus === 'done'));
+
+    if (st.gate3Tracked && rAft === 0 && tAft === 0) {
+      els.g3ZeroPill.className = 'status-pill pass';
+      els.g3ZeroPill.textContent = '0 err / 0 warn ✓';
+    } else {
+      els.g3ZeroPill.className = 'status-pill purple';
+      els.g3ZeroPill.textContent = rAft + ' ruff · ' + tAft + ' ty left';
+    }
+
+    // CARD 2: Correctness + MVCC + Learn
+    const tTot = st.testsTotal;
+    const tPass = tTot > 0 ? Math.max(0, tTot - st.testsAfterFail) : st.testsPassedLive;
+    const tRate = tTot > 0 ? ((tPass / tTot) * 100).toFixed(1) + '%' : '--';
+    els.pytestRatio.textContent = tPass + ' / ' + tTot;
+    els.pytestPct.textContent = tRate;
+    els.pytestSub.textContent = 'before ' + st.testsBeforeFail + ' fail · after ' + st.testsAfterFail + ' fail';
+    if (tTot > 0 && st.testsAfterFail === 0) {
+      els.pytestPill.className = 'status-pill pass';
+      els.pytestPill.textContent = 'ALL TESTS GREEN';
+      els.pytestRatio.className = 'kpi-val emerald';
+    } else if (st.testsAfterFail > 0) {
+      els.pytestPill.className = 'status-pill fail';
+      els.pytestPill.textContent = st.testsAfterFail + ' FAILING';
+      els.pytestRatio.className = 'kpi-val rose';
+    } else {
+      els.pytestPill.className = 'status-pill';
+      els.pytestPill.textContent = 'PYTEST READY';
+    }
+
+    els.casConflicts.textContent = String(st.casConflicts);
+    els.casConflicts.className = 'kpi-val' + (st.casConflicts > 0 ? ' amber' : ' emerald');
+    els.retriesTotal.textContent = String(st.retriesTotal);
+    const resSkipped = Math.max(st.skippedResumedUnits, counts.skipped_resumed);
+    els.resumedSkipped.textContent = String(resSkipped);
+
+    setRbPill(els.rbG0, 'G0', st.rollbacksG0);
+    setRbPill(els.rbG1, 'G1', st.rollbacksG1);
+    setRbPill(els.rbG2, 'G2', st.rollbacksG2);
+    setRbPill(els.rbG3, 'G3', st.rollbacksG3);
+
+    const ruleCount = st.learnRulesCountOverride != null ? st.learnRulesCountOverride : Object.keys(st.learnRules).length;
+    els.learnStat.textContent = 'learn: ' + ruleCount + ' rules · ' + st.learnHitsTotal + ' hits';
+    els.learnLatest.textContent = st.latestLearnAdvice;
+
+    // CARD 3: 50K TPM Survival & Prefix Cache
+    els.astStrip.textContent = st.astStripPct.toFixed(1) + '%';
+    const cachePct = st.prefixCacheHitPctOverride != null
+      ? st.prefixCacheHitPctOverride
+      : (st.totalPromptTokens > 0 ? (st.totalCachedTokens / st.totalPromptTokens) * 100 : 0);
+    els.cacheHit.textContent = cachePct.toFixed(1) + '%';
+    els.cardTpm.textContent = (tpm / 1000).toFixed(1) + 'K';
+    els.cardTpm.className = 'kpi-val' + (tpm >= 44000 ? ' rose' : (tpm >= 39000 ? ' amber' : ''));
+    els.cardTpmCap.textContent = capK;
+    els.prefixDrift.textContent = String(st.prefixDriftEvents);
+
+    if (st.prefixDriftEvents === 0) {
+      els.driftPill.className = 'status-pill pass';
+      els.driftPill.textContent = 'prefix_drift == 0 ✓';
+      els.prefixDrift.className = 'kpi-val emerald';
+      els.driftSub.textContent = 'byte-identical';
+    } else {
+      els.driftPill.className = 'status-pill fail';
+      els.driftPill.textContent = 'DRIFT DETECTED (' + st.prefixDriftEvents + ')';
+      els.prefixDrift.className = 'kpi-val rose';
+      els.driftSub.textContent = 'cache invalidated';
+    }
+    els.cachedTokSum.textContent = fmtK(st.totalCachedTokens);
+    els.uncachedTokSum.textContent = fmtK(st.totalUncachedTokens);
+    els.circuitPauses.textContent = String(st.circuitPauses);
+
+    // CARD 4: OS-Measured Compute Cost
+    els.engineRss.textContent = st.engineRssMb > 0 ? st.engineRssMb.toFixed(1) + ' MB' : '-- MB';
+    els.stemStat.textContent = st.stemUsed ? ('stem ' + st.stemIndexMs + 'ms') : 'AST fallback';
+
+    if (st.bench) {
+      const b = st.bench;
+      const ok = b.passed_anti_regression !== false && b.cpu_ratio <= 1.05 && b.rss_ratio <= 1.05;
+      els.benchPill.className = ok ? 'status-pill pass' : 'status-pill fail';
+      els.benchPill.textContent = ok ? '<= 1.05x PASS (' + (b.pairs || 5) + 'x A/B)' : '> 1.05x REGRESSION';
+      els.benchPairsCpu.textContent = (b.pairs || 5) + 'x A/B';
+      els.benchPairsRss.textContent = (b.pairs || 5) + 'x A/B';
+      els.cpuRatio.textContent = b.cpu_ratio.toFixed(2) + 'x';
+      els.cpuRatio.className = 'bench-ratio' + (b.cpu_ratio > 1.05 ? ' fail' : '');
+      els.cpuBefore.textContent = b.before_cpu_ms_median.toFixed(1);
+      els.cpuAfter.textContent = b.after_cpu_ms_median.toFixed(1);
+
+      els.rssRatio.textContent = b.rss_ratio.toFixed(2) + 'x';
+      els.rssRatio.className = 'bench-ratio' + (b.rss_ratio > 1.05 ? ' fail' : '');
+      els.rssBefore.textContent = b.before_rss_mb_median.toFixed(1);
+      els.rssAfter.textContent = b.after_rss_mb_median.toFixed(1);
+    } else if (st.liveGate1CpuSamples.length > 0) {
+      const curCpu = percentile(st.liveGate1CpuSamples, 0.5);
+      const curRss = st.liveGate1RssSamples.length ? percentile(st.liveGate1RssSamples, 0.5) : 0;
+      els.benchPill.className = 'status-pill warn';
+      els.benchPill.textContent = '<= 1.05x LIVE GATE 1';
+      els.benchPairsCpu.textContent = 'live med';
+      els.benchPairsRss.textContent = 'live med';
+      els.cpuRatio.textContent = curCpu.toFixed(0) + ' ms';
+      els.cpuRatio.className = 'bench-ratio warn';
+      els.cpuBefore.textContent = 'Phase 2';
+      els.cpuAfter.textContent = 'pending';
+      els.rssRatio.textContent = curRss > 0 ? curRss.toFixed(1) + ' MB' : '--';
+      els.rssRatio.className = 'bench-ratio warn';
+      els.rssBefore.textContent = 'Phase 2';
+      els.rssAfter.textContent = 'pending';
+    } else {
+      els.benchPill.className = 'status-pill';
+      els.benchPill.textContent = '<= 1.05x PENDING';
+      els.cpuRatio.textContent = '--';
+      els.rssRatio.textContent = '--';
+      els.cpuBefore.textContent = '--';
+      els.cpuAfter.textContent = '--';
+      els.rssBefore.textContent = '--';
+      els.rssAfter.textContent = '--';
+    }
+
+    // BOTTOM 5-SEGMENT TIMELINE
+    const qMs = st.tlQueueMs;
+    const dMs = st.tlDecodeMs;
+    const g1Ms = st.tlGate1Ms;
+    const g2Ms = st.tlGate2Ms;
+    const g3Ms = st.tlGate3Ms + st.tlGate0Ms;
+    const totMs = qMs + dMs + g1Ms + g2Ms + g3Ms;
+
+    if (totMs > 0) {
+      const pq = (qMs / totMs) * 100;
+      const pd = (dMs / totMs) * 100;
+      const p1 = (g1Ms / totMs) * 100;
+      const p2 = (g2Ms / totMs) * 100;
+      const p3 = Math.max(0, 100 - pq - pd - p1 - p2);
+
+      setSeg(els.segQueue, pq, 'Queue ' + pq.toFixed(0) + '%');
+      setSeg(els.segDecode, pd, 'Decode ' + pd.toFixed(0) + '%');
+      setSeg(els.segG1, p1, 'Gate 1 ' + p1.toFixed(0) + '%');
+      setSeg(els.segG2, p2, 'Gate 2 ' + p2.toFixed(0) + '%');
+      setSeg(els.segG3, p3, 'Gate 3 ' + p3.toFixed(0) + '%');
+
+      els.tlQTxt.textContent = fmtSec(qMs / 1000) + ' (' + pq.toFixed(0) + '%)';
+      els.tlDTxt.textContent = fmtSec(dMs / 1000) + ' (' + pd.toFixed(0) + '%)';
+      els.tlG1Txt.textContent = fmtSec(g1Ms / 1000) + ' (' + p1.toFixed(0) + '%)';
+      els.tlG2Txt.textContent = fmtSec(g2Ms / 1000) + ' (' + p2.toFixed(0) + '%)';
+      els.tlG3Txt.textContent = fmtSec(g3Ms / 1000) + ' (' + p3.toFixed(0) + '%)';
+
+      const par = wallS > 0.5 ? (totMs / 1000) / wallS : 1.0;
+      els.tlSpeedup.textContent = 'cumulative ' + fmtSec(totMs / 1000) + ' · effective parallelism ' + Math.max(1, par).toFixed(1) + 'x';
+    } else {
+      setSeg(els.segQueue, 20, '');
+      setSeg(els.segDecode, 20, '');
+      setSeg(els.segG1, 20, '');
+      setSeg(els.segG2, 20, '');
+      setSeg(els.segG3, 20, '');
+      els.tlQTxt.textContent = '0.0s (0%)';
+      els.tlDTxt.textContent = '0.0s (0%)';
+      els.tlG1Txt.textContent = '0.0s (0%)';
+      els.tlG2Txt.textContent = '0.0s (0%)';
+      els.tlG3Txt.textContent = '0.0s (0%)';
+      els.tlSpeedup.textContent = 'awaiting telemetry';
+    }
+
+    dirty = false;
+  }
+
+  function setRbPill(el, name, count) {
+    el.textContent = name + ': ' + count;
+    el.classList.toggle('hit', count > 0);
+  }
+
+  function setSeg(el, pct, label) {
+    el.style.width = pct.toFixed(2) + '%';
+    el.textContent = pct >= 7.5 ? label : '';
+  }
+
+  function rafLoop(now) {
+    if (now - lastRenderMs >= 33.33) {
+      if (replayController.active) {
+        replayController.step(now);
+      } else if (state.mode === 'live' && state.runStatus === 'running') {
+        dirty = true; // keep wall clock ticking smoothly at 30 Hz
+      }
+      if (dirty) {
+        renderFrame();
+      }
+      lastRenderMs = now;
+    }
+    requestAnimationFrame(rafLoop);
+  }
+
+  /* ================= REPLAY ENGINE (?replay= & ?demo=1) ================= */
+  const replayController = {
+    active: false,
+    events: [],
+    startTs: 0,
+    endTs: 0,
+    durationMs: 1,
+    playheadMs: 0,
+    cursor: 0,
+    playing: true,
+    speed: 2,
+    lastTickNow: 0,
+    modeTag: 'replay',
+
+    load: function (events, modeTag, initialFraction) {
+      this.modeTag = modeTag;
+      this.events = events.slice().sort(function (a, b) {
+        return (a.ts_ms - b.ts_ms) || ((a.seq || 0) - (b.seq || 0));
+      });
+      if (!this.events.length) return;
+      this.startTs = this.events[0].ts_ms || 0;
+      this.endTs = this.events[this.events.length - 1].ts_ms || (this.startTs + 1000);
+      this.durationMs = Math.max(1000, this.endTs - this.startTs);
+      this.active = true;
+      this.playing = true;
+      this.lastTickNow = performance.now();
+
+      els.replayBar.classList.add('visible');
+      this.seekFraction(typeof initialFraction === 'number' ? initialFraction : 0);
+      this.syncControls();
+    },
+
+    seekFraction: function (frac) {
+      const f = Math.max(0, Math.min(1, Number(frac) || 0));
+      const targetTs = this.startTs + this.durationMs * f;
+      this.playheadMs = targetTs - this.startTs;
+
+      state = createInitialState();
+      state.mode = this.modeTag;
+      state.connectionStatus = this.modeTag;
+      gridNeedsRebuild = true;
+
+      let idx = 0;
+      while (idx < this.events.length && (this.events[idx].ts_ms || 0) <= targetTs) {
+        applyEvent(state, this.events[idx]);
+        idx++;
+      }
+      this.cursor = idx;
+      this.lastTickNow = performance.now();
+      dirty = true;
+      this.syncControls();
+      renderFrame();
+    },
+
+    step: function (now) {
+      if (!this.playing) {
+        this.lastTickNow = now;
+        return;
+      }
+      const dt = Math.min(200, Math.max(0, now - this.lastTickNow));
+      this.lastTickNow = now;
+      if (this.cursor >= this.events.length) {
+        this.playing = false;
+        this.syncControls();
+        return;
+      }
+      this.playheadMs = Math.min(this.durationMs, this.playheadMs + dt * this.speed);
+      const targetTs = this.startTs + this.playheadMs;
+      while (this.cursor < this.events.length && (this.events[this.cursor].ts_ms || 0) <= targetTs) {
+        applyEvent(state, this.events[this.cursor]);
+        this.cursor++;
+      }
+      if (this.cursor >= this.events.length) {
+        this.playing = false;
+      }
+      this.syncControls();
+    },
+
+    togglePlay: function () {
+      if (this.cursor >= this.events.length) {
+        this.seekFraction(0);
+        this.playing = true;
+      } else {
+        this.playing = !this.playing;
+      }
+      this.lastTickNow = performance.now();
+      this.syncControls();
+    },
+
+    setSpeed: function (spd) {
+      this.speed = spd;
+      this.syncControls();
+    },
+
+    syncControls: function () {
+      els.btnPlay.textContent = this.playing ? '⏸' : '▶';
+      const frac = this.durationMs > 0 ? (this.playheadMs / this.durationMs) : 0;
+      els.rpScrub.value = String(Math.round(frac * 1000));
+      els.rpPos.textContent = Math.round(frac * 100) + '%';
+      const btns = document.querySelectorAll('#speed-group .rp-btn');
+      for (let i = 0; i < btns.length; i++) {
+        btns[i].classList.toggle('active', Number(btns[i].dataset.speed) === this.speed);
+      }
+    }
+  };
+
+  els.btnPlay.addEventListener('click', function () { replayController.togglePlay(); });
+  els.btnRestart.addEventListener('click', function () {
+    replayController.seekFraction(0);
+    replayController.playing = true;
+    replayController.syncControls();
+  });
+  els.rpScrub.addEventListener('input', function () {
+    replayController.seekFraction(Number(this.value) / 1000);
+  });
+  document.getElementById('speed-group').addEventListener('click', function (e) {
+    const btn = e.target.closest('.rp-btn');
+    if (btn && btn.dataset.speed) replayController.setSpeed(Number(btn.dataset.speed));
+  });
+  els.btnFallbackDemo.addEventListener('click', function () {
+    window.location.search = '?demo=1';
+  });
+
+  window.addEventListener('keydown', function (e) {
+    if (!replayController.active) return;
+    if (e.code === 'Space') { e.preventDefault(); replayController.togglePlay(); }
+    else if (e.key === '1') replayController.setSpeed(1);
+    else if (e.key === '2') replayController.setSpeed(2);
+    else if (e.key === '4') replayController.setSpeed(4);
+    else if (e.key === '8') replayController.setSpeed(8);
+    else if (e.key === 'r' || e.key === 'R') { replayController.seekFraction(0); replayController.playing = true; replayController.syncControls(); }
+    else if (e.key === 'ArrowRight') replayController.seekFraction(Math.min(1, (replayController.playheadMs / replayController.durationMs) + 0.05));
+    else if (e.key === 'ArrowLeft') replayController.seekFraction(Math.max(0, (replayController.playheadMs / replayController.durationMs) - 0.05));
+  });
+
+  /* ================= DETERMINISTIC ?demo=1 GENERATOR ================= */
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a |= 0;
+      a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function buildDemoEvents() {
+    const rand = mulberry32(20260319);
+    const modNames = [
+      // L0 core (16)
+      ['types', 'errors', 'consts', 'clock', 'config', 'hashing', 'paths', 'tokens', 'schema', 'codec', 'semver', 'logging', 'metrics', 'retry', 'locks', 'env'],
+      // L1 engine (16)
+      ['parser', 'ast_map', 'graph', 'tarjan', 'planner', 'cache', 'index', 'sandbox', 'runner', 'diffing', 'patcher', 'abi_pin', 'pacer', 'circuit', 'wal_log', 'mvcc'],
+      // L2 services (16)
+      ['auth', 'session', 'billing', 'ledger', 'quota', 'pricing', 'invoice', 'payout', 'webhook', 'mailer', 'audit', 'reconc', 'search', 'indexer', 'export', 'notify'],
+      // L3 api (16)
+      ['router', 'middle', 'health', 'users', 'orgs', 'keys', 'orders', 'refunds', 'plans', 'usage', 'events', 'streams', 'admin', 'reports', 'openapi', 'server']
+    ];
+
+    const units = [];
+    let totalLoc = 0;
+    let totalRuffBefore = 0;
+    let totalTyBefore = 0;
+
+    for (let l = 0; l < 4; l++) {
+      for (let i = 0; i < 16; i++) {
+        const id = LAYER_NAMES[l] + '/' + modNames[l][i] + '.py';
+        const loc = Math.round(145 + rand() * 140);
+        const baseHyg = Number((43 + rand() * 24).toFixed(1));
+        const ruffB = Math.floor(1 + rand() * 4);
+        const tyB = Math.floor(rand() * 3);
+        totalLoc += loc;
+        totalRuffBefore += ruffB;
+        totalTyBefore += tyB;
+        const deps = l === 0 ? [] : [LAYER_NAMES[l - 1] + '/' + modNames[l - 1][i] + '.py'];
+        units.push({
+          id: id,
+          files: [id],
+          layer: l,
+          wave: l * 2 + (i >= 8 ? 1 : 0),
+          deps: deps,
+          dependents: [],
+          test_files: ['tests/test_' + modNames[l][i] + '.py'],
+          loc: loc,
+          base_blake3: {},
+          abi_hash: {},
+          baseline_hygiene: baseHyg,
+          allow_abi_change: false,
+          ruff_before: ruffB,
+          ty_before: tyB
+        });
+      }
+    }
+
+    const baseTs = 1764000000000;
+    const events = [];
+    let seq = 1;
+    function emit(tsOffsetMs, type, fields) {
+      const ev = Object.assign({
+        seq: seq++,
+        ts_ms: baseTs + Math.round(tsOffsetMs),
+        type: type
+      }, fields || {});
+      events.push(ev);
+    }
+
+    const baselineHygs = units.map(function (u) { return u.baseline_hygiene; });
+    const hygBeforeMed = Number(percentile(baselineHygs, 0.5).toFixed(1));
+    const hygBeforeP10 = Number(percentile(baselineHygs, 0.1).toFixed(1));
+
+    // Event 1: run_start with full DagPlan
+    emit(0, 'run_start', {
+      uncached_tpm: 0,
+      data: {
+        run_id: 'demo-cerebras-kimi-k31',
+        host_os: 'windows-x64',
+        model: 'Kimi K3.1 Pro',
+        provider_label: 'Cerebras',
+        stem_used: true,
+        stem_index_ms: 38,
+        total_files: 64,
+        total_loc: totalLoc,
+        scc_count: 2,
+        wave_count: 8,
+        units: units,
+        wal_rev: 4,
+        torn: 0,
+        aimd_k: 4,
+        ast_strip_pct: 47.6,
+        engine_rss_mb: 26.8,
+        tests_total: 256,
+        tests_before_fail: 0,
+        gate3_before_ruff: totalRuffBefore,
+        gate3_before_ty: totalTyBefore,
+        hygiene_before_median: hygBeforeMed,
+        hygiene_before_p10: hygBeforeP10
+      }
+    });
+
+    // 4 WAL-resumed skipped units in L0 core
+    let ruffRem = totalRuffBefore;
+    let tyRem = totalTyBefore;
+    const afterHygs = baselineHygs.slice();
+
+    for (let i = 0; i < 4; i++) {
+      const u = units[i];
+      const improved = Number(Math.min(94.8, u.baseline_hygiene + 26 + rand() * 8).toFixed(1));
+      afterHygs[i] = improved;
+      ruffRem = Math.max(0, ruffRem - u.ruff_before);
+      tyRem = Math.max(0, tyRem - u.ty_before);
+      emit(250 + i * 180, 'skipped_resumed', {
+        module_id: u.id,
+        layer: u.layer,
+        wave: u.wave,
+        data: {
+          hygiene_after: improved,
+          wal_rev: 4,
+          ruff_remaining: ruffRem,
+          ty_remaining: tyRem
+        }
+      });
+    }
+
+    // Special deterministic fault & learn scenarios keyed by unit index
+    const faultMap = {
+      19: { gate: 'gate0_abi', key: 'abi_pin', advice: 'Preserve exact public def/class signatures and argument names.' },
+      21: { gate: 'gate3_ruff', key: 'ruff_b006', advice: 'Replace mutable default args ([]/{}) with None and initialize inside body.' },
+      35: { gate: 'gate1_pytest', key: 'pytest_edge', advice: 'Preserve decimal rounding mode on zero-balance ledger entries.' },
+      43: { gate: 'gate2_hygiene', key: 'deep_nesting', advice: 'Flatten nested if/for blocks to <= 2 levels using early-return guard clauses.' },
+      45: { cas: true },
+      54: { gate: 'gate3_ty', key: 'ty_types', advice: 'Add explicit PEP 484 parameter and return types; narrow Optional before indexing.' }
+    };
+
+    // Schedule remaining 60 modules cleanly across 168 seconds
+    let walRev = 4;
+    let totPrompt = 0;
+    let totCached = 0;
+    let totComp = 0;
+    let totUncached = 0;
+    let http429 = 0;
+    let circuitPauses = 0;
+    let aimdK = 4;
+    let learnHits = 0;
+    const decodeSamples = [];
+    const queueSamples = [];
+
+    // 44K ceiling spike & circuit open window around 92s - 98s (54% of timeline)
+    const circuitStartMs = 92000;
+    const circuitEndMs = 98500;
+
+    for (let idx = 4; idx < 64; idx++) {
+      const u = units[idx];
+      const pos = idx - 4; // 0..59
+      // Spread nicely across 165s with 6-way wave overlap
+      let tStart = 1400 + pos * 2650;
+      if (tStart > circuitStartMs - 1500) tStart += 4500;
+
+      const qMs = Math.round(520 + rand() * 680);
+      const pMs = Math.round(140 + rand() * 110);
+      const decodeTps = Number((2280 + rand() * 540).toFixed(0));
+      const compTok = Math.round(780 + rand() * 520);
+      const cMs = Math.round((compTok / decodeTps) * 1000);
+      const promptTok = Math.round(3250 + rand() * 650);
+      const cachedTok = Math.round(promptTok * (0.83 + rand() * 0.05));
+      const uncachedTok = (promptTok - cachedTok) + compTok;
+
+      // Rolling uncached TPM shape: healthy 31K-41K, spikes to 44,320 at circuitStartMs
+      let rollingTpm = Math.round(31500 + Math.sin(pos * 0.45) * 6200 + rand() * 2800);
+      if (pos >= 31 && pos <= 33) rollingTpm = 44320;
+      if (pos === 34) rollingTpm = 24800;
+      if (pos >= 56) rollingTpm = Math.round(18000 + (60 - pos) * 3200);
+
+      if (pos === 6) aimdK = 6;
+      if (pos === 18) aimdK = 8;
+      if (pos === 33) aimdK = 4;
+      if (pos === 41) aimdK = 6;
+
+      totPrompt += promptTok;
+      totCached += cachedTok;
+      totComp += compTok;
+      totUncached += uncachedTok;
+      decodeSamples.push(decodeTps);
+      queueSamples.push(qMs);
+
+      const g0Ms = Math.round(28 + rand() * 22);
+      const g1Ms = Math.round(780 + rand() * 440);
+      const g2Ms = Math.round(160 + rand() * 120);
+      const g3Ms = Math.round(290 + rand() * 170);
+
+      // in_queue
+      emit(tStart, 'module_in_queue', {
+        module_id: u.id,
+        layer: u.layer,
+        wave: u.wave,
+        uncached_tpm: rollingTpm,
+        data: { aimd_k: aimdK, rpm_rolling: Math.min(54, 18 + aimdK * 4), rpm_cap: 60 }
+      });
+
+      // streaming
+      emit(tStart + qMs, 'module_streaming', {
+        module_id: u.id,
+        layer: u.layer,
+        wave: u.wave,
+        uncached_tpm: rollingTpm,
+        data: {
+          decode_tps: decodeTps,
+          aimd_k: aimdK,
+          ast_strip_pct: Number((46.8 + (pos / 60) * 1.9).toFixed(1)),
+          engine_rss_mb: Number((26.8 + (pos / 60) * 1.6).toFixed(1)),
+          proxy: {
+            circuit_state: (tStart >= circuitStartMs && tStart <= circuitEndMs) ? 'CIRCUIT_OPEN' : 'CLOSED',
+            uncached_tpm_rolling: rollingTpm,
+            uncached_tpm_cap: 50000,
+            total_tpm_rolling: Math.round(rollingTpm * 3.1),
+            total_tpm_cap: 250000,
+            rpm_rolling: Math.min(54, 20 + aimdK * 4),
+            rpm_cap: 60,
+            http_429_count: http429,
+            http_5xx_count: 0,
+            circuit_pauses: circuitPauses,
+            prefix_drift_events: 0,
+            total_prompt_tokens: totPrompt,
+            total_cached_tokens: totCached,
+            total_completion_tokens: totComp,
+            total_uncached_tokens: totUncached
+          }
+        }
+      });
+
+      // Trigger CIRCUIT_OPEN mid-run once cleanly
+      if (pos === 32) {
+        http429 = 1;
+        circuitPauses = 1;
+        aimdK = 4;
+        emit(circuitStartMs, 'circuit_open', {
+          uncached_tpm: 44320,
+          data: {
+            aimd_k: 4,
+            reason: 'Uncached TPM 44,320 crossed 44K ceiling — pausing dispatch 6.5s & halving K (8 -> 4)',
+            proxy: {
+              circuit_state: 'CIRCUIT_OPEN',
+              uncached_tpm_rolling: 44320,
+              uncached_tpm_cap: 50000,
+              total_tpm_rolling: 141800,
+              total_tpm_cap: 250000,
+              rpm_rolling: 46,
+              rpm_cap: 60,
+              http_429_count: 1,
+              http_5xx_count: 0,
+              circuit_pauses: 1,
+              prefix_drift_events: 0,
+              total_prompt_tokens: totPrompt,
+              total_cached_tokens: totCached,
+              total_completion_tokens: totComp,
+              total_uncached_tokens: totUncached
+            }
+          }
+        });
+        emit(circuitEndMs, 'circuit_closed', {
+          uncached_tpm: 26400,
+          data: {
+            aimd_k: 4,
+            proxy: {
+              circuit_state: 'CLOSED',
+              uncached_tpm_rolling: 26400,
+              uncached_tpm_cap: 50000,
+              total_tpm_rolling: 84200,
+              total_tpm_cap: 250000,
+              rpm_rolling: 24,
+              rpm_cap: 60,
+              http_429_count: 1,
+              http_5xx_count: 0,
+              circuit_pauses: 1,
+              prefix_drift_events: 0,
+              total_prompt_tokens: totPrompt,
+              total_cached_tokens: totCached,
+              total_completion_tokens: totComp,
+              total_uncached_tokens: totUncached
+            }
+          }
+        });
+      }
+
+      const tGateStart = tStart + qMs + pMs + cMs;
+
+      // gating
+      emit(tGateStart, 'module_gating', {
+        module_id: u.id,
+        layer: u.layer,
+        wave: u.wave,
+        data: {
+          llm: {
+            module_id: u.id,
+            attempt: 1,
+            http_status: 200,
+            wall_ms: qMs + pMs + cMs,
+            queue_ms: qMs,
+            prompt_ms: pMs,
+            completion_ms: cMs,
+            decode_tps: decodeTps,
+            prompt_tokens: promptTok,
+            cached_tokens: cachedTok,
+            completion_tokens: compTok,
+            reasoning_tokens: Math.round(compTok * 0.25),
+            uncached_tokens: uncachedTok,
+            prefix_drift: false,
+            limit_tpm_minute: 50000,
+            remaining_tpm_minute: Math.max(4000, 50000 - rollingTpm),
+            limit_rpm_minute: 60
+          }
+        }
+      });
+
+      // Handle deterministic faults / CAS retry + learn rule hits
+      let extraDelay = 0;
+      const fault = faultMap[idx];
+      if (fault) {
+        if (fault.cas) {
+          emit(tGateStart + g0Ms + g1Ms, 'cas_conflict', {
+            module_id: u.id,
+            layer: u.layer,
+            wave: u.wave,
+            data: { reason: 'BLAKE3 base diverged on concurrent wave write — clean MVCC rebase' }
+          });
+          extraDelay = 2400;
+        } else {
+          emit(tGateStart + g0Ms + 420, 'module_retry', {
+            module_id: u.id,
+            layer: u.layer,
+            wave: u.wave,
+            data: {
+              gate: fault.gate,
+              reason: fault.advice
+            }
+          });
+          learnHits += 1;
+          emit(tGateStart + g0Ms + 560, 'learn_hit', {
+            module_id: u.id,
+            layer: u.layer,
+            wave: u.wave,
+            data: {
+              key: fault.key,
+              gate: fault.gate,
+              dir_prefix: LAYER_NAMES[u.layer],
+              advice: fault.advice,
+              hits: 1,
+              helpful: 0,
+              total_hits: learnHits
+            }
+          });
+          extraDelay = 3100;
+        }
+      } else if (pos > 16 && pos % 5 === 0) {
+        // Periodic helpful learn hit in later waves
+        const ruleChoices = [
+          { key: 'ruff_b006', gate: 'gate3_ruff', advice: 'Replace mutable default args ([]/{}) with None and initialize inside body.' },
+          { key: 'deep_nesting', gate: 'gate2_hygiene', advice: 'Flatten nested if/for blocks to <= 2 levels using early-return guard clauses.' },
+          { key: 'abi_pin', gate: 'gate0_abi', advice: 'Preserve exact public def/class signatures and argument names.' },
+          { key: 'ty_types', gate: 'gate3_ty', advice: 'Add explicit PEP 484 parameter and return types; narrow Optional before indexing.' }
+        ];
+        const rc = ruleChoices[pos % ruleChoices.length];
+        learnHits += 1;
+        emit(tGateStart + 300, 'learn_hit', {
+          module_id: u.id,
+          layer: u.layer,
+          wave: u.wave,
+          data: {
+            key: rc.key,
+            gate: rc.gate,
+            dir_prefix: LAYER_NAMES[u.layer],
+            advice: rc.advice,
+            total_hits: learnHits
+          }
+        });
+      }
+
+      // Commit with GateVerdict
+      const improved = Number(Math.min(96.4, Math.max(76.0, u.baseline_hygiene + 25 + rand() * 11)).toFixed(1));
+      afterHygs[idx] = improved;
+      ruffRem = Math.max(0, ruffRem - u.ruff_before);
+      tyRem = Math.max(0, tyRem - u.ty_before);
+      walRev += 1;
+
+      const tCommit = tGateStart + g0Ms + g1Ms + g2Ms + g3Ms + extraDelay;
+      emit(tCommit, 'module_committed', {
+        module_id: u.id,
+        layer: u.layer,
+        wave: u.wave,
+        uncached_tpm: rollingTpm,
+        data: {
+          head_rev: walRev,
+          ruff_remaining: ruffRem,
+          ty_remaining: tyRem,
+          highlight_g3: (pos % 3 === 0),
+          verdict: {
+            passed: true,
+            failed_gate: null,
+            gate0_syntax_ok: true,
+            gate0_abi_ok: true,
+            gate0_ms: g0Ms,
+            gate1_tests_passed: 256,
+            gate1_tests_failed: 0,
+            gate1_ms: g1Ms,
+            gate1_cpu_ms: Math.round(398 + rand() * 18),
+            gate1_peak_rss_bytes: Math.round((67.2 + rand() * 1.4) * 1024 * 1024),
+            gate2_score_before: u.baseline_hygiene,
+            gate2_score_after: improved,
+            gate2_ms: g2Ms,
+            gate3_ruff_errors: 0,
+            gate3_ty_errors: 0,
+            gate3_ms: g3Ms,
+            diagnostics: []
+          }
+        }
+      });
+
+      // Emit a realistic rolling benchmark preview near 70% so mid-run screenshots also display OS-measured cost delta
+      if (pos === 38) {
+        emit(tCommit + 120, 'bench_result', {
+          data: {
+            bench: {
+              pairs: 5,
+              before_cpu_ms_median: 418.4,
+              after_cpu_ms_median: 407.6,
+              cpu_ratio: 0.974,
+              before_rss_mb_median: 68.4,
+              after_rss_mb_median: 67.9,
+              rss_ratio: 0.993,
+              passed_anti_regression: true
+            }
+          }
+        });
+      }
+    }
+
+    // Final 5-run alternating OS benchmark & RunSummary
+    const endOffset = 171200;
+    const finalBench = {
+      pairs: 5,
+      before_cpu_ms_median: 418.4,
+      after_cpu_ms_median: 405.8,
+      cpu_ratio: 0.970,
+      before_rss_mb_median: 68.4,
+      after_rss_mb_median: 67.8,
+      rss_ratio: 0.991,
+      passed_anti_regression: true
+    };
+
+    emit(endOffset - 900, 'bench_result', { data: { bench: finalBench } });
+
+    emit(endOffset, 'run_end', {
+      uncached_tpm: 0,
+      summary: {
+        run_id: 'demo-cerebras-kimi-k31',
+        host_os: 'windows-x64',
+        model: 'Kimi K3.1 Pro',
+        provider_label: 'Cerebras',
+        total_files: 64,
+        total_loc: totalLoc,
+        total_units: 64,
+        committed_units: 60,
+        skipped_resumed_units: 4,
+        total_wall_s: Number((endOffset / 1000).toFixed(1)),
+        avg_queue_s: Number((percentile(queueSamples, 0.5) / 1000).toFixed(2)),
+        median_decode_tps: Number(percentile(decodeSamples, 0.5).toFixed(0)),
+        hygiene_before_median: hygBeforeMed,
+        hygiene_before_p10: hygBeforeP10,
+        hygiene_after_median: Number(percentile(afterHygs, 0.5).toFixed(1)),
+        hygiene_after_p10: Number(percentile(afterHygs, 0.1).toFixed(1)),
+        tests_total: 256,
+        tests_before_fail: 0,
+        tests_after_fail: 0,
+        gate3_before_ruff: totalRuffBefore,
+        gate3_before_ty: totalTyBefore,
+        gate3_after_ruff: 0,
+        gate3_after_ty: 0,
+        cas_conflicts: 1,
+        rollbacks_g0: 1,
+        rollbacks_g1: 1,
+        rollbacks_g2: 1,
+        rollbacks_g3: 2,
+        retries_total: 6,
+        http_429_count: 1,
+        circuit_pauses: 1,
+        prefix_drift_events: 0,
+        prefix_cache_hit_pct: Number(((totCached / Math.max(1, totPrompt)) * 100).toFixed(1)),
+        uncached_tpm_cap: 50000,
+        total_uncached_tokens: totUncached,
+        total_cached_tokens: totCached,
+        engine_rss_mb: 28.4,
+        bench: finalBench
+      }
+    });
+
+    return events;
+  }
+
+  /* ================= MODE 1: LIVE SSE (/events) ================= */
+  function startLiveSse() {
+    state = createInitialState();
+    state.mode = 'live';
+    state.connectionStatus = 'connecting';
+    dirty = true;
+    gridNeedsRebuild = true;
+
+    function handlePayload(raw) {
+      if (!raw) return;
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          for (let i = 0; i < parsed.length; i++) applyEvent(state, parsed[i]);
+        } else {
+          applyEvent(state, parsed);
+        }
+      } catch (_err) {
+        // Ignore keepalive comments / malformed frames
+      }
+    }
+
+    const es = new EventSource('/events');
+    es.onopen = function () {
+      state.connectionStatus = 'live';
+      dirty = true;
+    };
+    es.onmessage = function (evt) {
+      state.connectionStatus = 'live';
+      handlePayload(evt.data);
+    };
+    // Support named SSE events if the Rust server tags `.event(...)`
+    const namedEvents = [
+      'telemetry', 'event', 'snapshot', 'run_start', 'run_end', 'dag_ready',
+      'proxy_tick', 'proxy_snapshot', 'module_state', 'module_committed',
+      'module_in_queue', 'module_streaming', 'module_gating', 'module_retry',
+      'skipped_resumed', 'gate_result', 'llm_complete', 'learn_hit',
+      'circuit_open', 'circuit_closed', 'cas_conflict', 'bench_result'
+    ];
+    for (let i = 0; i < namedEvents.length; i++) {
+      es.addEventListener(namedEvents[i], function (evt) {
+        state.connectionStatus = 'live';
+        handlePayload(evt.data);
+      });
+    }
+    es.onerror = function () {
+      state.connectionStatus = 'reconnecting';
+      dirty = true;
+    };
+  }
+
+  /* ================= MODE 2: STATIC JSONL REPLAY (?replay=) ================= */
+  function startStaticReplay(url, atParam) {
+    state = createInitialState();
+    state.mode = 'replay';
+    state.connectionStatus = 'replay';
+    els.replayBar.classList.add('visible');
+    dirty = true;
+    gridNeedsRebuild = true;
+
+    fetch(url)
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status + ' loading ' + url);
+        return res.text();
+      })
+      .then(function (text) {
+        const lines = text.split(/\r?\n/);
+        const parsed = [];
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (typeof obj.ts_ms !== 'number') obj.ts_ms = parsed.length * 150;
+            parsed.push(obj);
+          } catch (_e) {
+            // Skip malformed trailing line
+          }
+        }
+        if (!parsed.length) throw new Error('No valid JSONL TelemetryEvent records found in ' + url);
+        const initFrac = atParam != null ? Math.max(0, Math.min(1, Number(atParam) / 100)) : 0;
+        replayController.load(parsed, 'replay', initFrac);
+      })
+      .catch(function (err) {
+        els.errorMsg.textContent = 'Replay load failed: ' + (err && err.message ? err.message : String(err));
+        els.errorToast.classList.add('visible');
+      });
+  }
+
+  /* ================= BOOTSTRAP ================= */
+  const params = new URLSearchParams(window.location.search);
+  const replayUrl = params.get('replay');
+  const demoFlag = params.get('demo');
+  const atParam = params.get('at');
+  const speedParam = params.get('speed');
+
+  if (speedParam && [1, 2, 4, 8].indexOf(Number(speedParam)) >= 0) {
+    replayController.speed = Number(speedParam);
+  }
+
+  if (demoFlag === '1' || demoFlag === 'true') {
+    const demoEvents = buildDemoEvents();
+    // Default to 74% active frame so headless screenshots inspect all 7 tile states & 100% of cards immediately,
+    // while continuing smooth playback through completion (pass ?demo=1&at=0 to start at 0%, or ?demo=1&at=100 for final).
+    const initFrac = atParam != null ? Math.max(0, Math.min(1, Number(atParam) / 100)) : 0.74;
+    replayController.load(demoEvents, 'demo', initFrac);
+  } else if (replayUrl) {
+    startStaticReplay(replayUrl, atParam);
+  } else {
+    startLiveSse();
+  }
+
+  renderFrame();
+  requestAnimationFrame(rafLoop);
+})();
+</script>
+</body>
+</html>
+=== END FILE ===

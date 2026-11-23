@@ -1,0 +1,43 @@
+[package]
+name = "refit"
+version = "0.3.0"
+edition = "2024"
+description = "Cross-platform Rust + OpenClaw refactoring engine for Kimi K3.1 Pro on Cerebras"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8.9"
+blake3 = { version = "1.8.7", features = ["rayon"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+dashmap = "6.2.1"
+flate2 = "1"
+futures-util = "0.3"
+petgraph = "0.8.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls", "stream", "gzip", "json"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", features = ["process", "signal", "resource"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Win32_Storage_FileSystem",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
