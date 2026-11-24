@@ -306,6 +306,8 @@ pub struct CloneCluster {
 pub struct DeadSymbol {
     pub file: String,
     pub symbol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +368,10 @@ pub struct AuditReport {
     pub unused_deps: Vec<UnusedDep>,
     pub infra_findings: Vec<InfraFinding>,
     pub triage_plan: Vec<TriageEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub genome_twins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deep_module_findings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

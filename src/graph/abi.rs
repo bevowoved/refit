@@ -145,17 +145,39 @@ fn def_colon(sig: &str) -> Option<usize> {
 }
 
 fn norm_sig(sig: &str) -> String {
-    let mut s = sig.split_whitespace().collect::<Vec<_>>().join(" ");
-    const PAIRS: &[(&str, &str)] = &[
-        ("( ", "("), (" )", ")"), ("< ", "<"), (" >", ">"),
-        ("[ ", "["), (" ]", "]"), (" ,", ","), (",)", ")"), (",>", ">"),
-    ];
-    for &(from, to) in PAIRS {
-        while s.contains(from) {
-            s = s.replace(from, to);
+    let mut collapsed = String::with_capacity(sig.len());
+    for (idx, word) in sig.split_whitespace().enumerate() {
+        if idx > 0 {
+            collapsed.push(' ');
         }
+        collapsed.push_str(word);
     }
-    s.trim().to_string()
+    let bytes = collapsed.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b' ' {
+            let prev = out.last().copied();
+            let next = bytes.get(i + 1).copied();
+            if matches!(prev, Some(b'(' | b'<' | b'['))
+                || matches!(next, Some(b')' | b'>' | b']' | b','))
+            {
+                i += 1;
+                continue;
+            }
+        }
+        if b == b',' && matches!(bytes.get(i + 1), Some(b')' | b'>')) {
+            i += 1;
+            continue;
+        }
+        if matches!(b, b')' | b'>') && out.last() == Some(&b',') {
+            out.pop();
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or(collapsed)
 }
 
 fn sig_end(sig: &str, allow_semi: bool, stop_arrow: bool) -> Option<usize> {

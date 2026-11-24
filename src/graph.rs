@@ -14,12 +14,12 @@ use crate::hygiene::HygieneScorer;
 use crate::mvcc::MvccStore;
 use crate::platform::os_tag;
 use crate::source::{count_lines, ext_str, read_text, scan_files, stem_of};
+use crate::stem::csr::{CsrGraph, match_tests_inverted};
 use crate::stem::{EdgeScan, scan_edges};
 use crate::types::{DagPlan, ModuleUnit};
 use anyhow::{Context, Result};
-use petgraph::algo::tarjan_scc;
-use petgraph::graph::{DiGraph, NodeIndex};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
@@ -54,9 +54,14 @@ pub fn dag_from(
     let source_files: Vec<String> = scan.sources.into_iter().map(|(r, _, _)| r).collect();
     let test_files: Vec<String> = scan.tests.into_iter().map(|(r, _, _)| r).collect();
 
-    let mod_tests = match_tests(repo_root, &source_files, &test_files, preloaded);
+    let mod_tests = match_tests_inverted(repo_root, &source_files, &test_files, preloaded);
+    let active_edges = if !discovery.runtime_edges.is_empty() || discovery.edges.is_empty() {
+        &discovery.runtime_edges
+    } else {
+        &discovery.edges
+    };
     let (scc_files, scc_deps, scc_dependents, wave_of) =
-        compute_waves(&source_files, &discovery.edges);
+        compute_waves(&source_files, active_edges);
     let scc_ids = assign_ids(&scc_files);
     let bctx = BuildCtx { repo_root, preloaded, hygiene, scc_ids: &scc_ids, mod_tests: &mod_tests };
 
@@ -89,98 +94,33 @@ pub fn dag_from(
     })
 }
 
-fn match_tests(
-    repo_root: &Path,
-    source_files: &[String],
-    test_files: &[String],
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
-) -> HashMap<String, Vec<String>> {
-    let contents: Vec<(&str, String)> = if crate::platform::budget().is_constrained() {
-        test_files
-            .iter()
-            .map(|tf| {
-                let txt = read_text(repo_root, tf, preloaded)
-                    .map(|c| c.into_owned())
-                    .unwrap_or_default();
-                (tf.as_str(), txt)
-            })
-            .collect()
-    } else {
-        test_files
-            .par_iter()
-            .map(|tf| {
-                let txt = read_text(repo_root, tf, preloaded)
-                    .map(|c| c.into_owned())
-                    .unwrap_or_default();
-                (tf.as_str(), txt)
-            })
-            .collect()
-    };
-
-    let mut map = HashMap::with_capacity(source_files.len());
-    for src in source_files {
-        let stem = stem_of(Path::new(src));
-        let mut matched: BTreeSet<String> = test_files
-            .iter()
-            .filter(|t| stem_matches(stem_of(Path::new(t)), stem))
-            .cloned()
-            .collect();
-
-        if matched.is_empty() && stem.len() >= 3 {
-            let py_mod = src.trim_end_matches(".py").replace('/', ".");
-            let imp_n = format!("import {stem}");
-            let from_n = format!("from {stem}");
-            let slash_n = format!("/{stem}");
-            for (tf, body) in &contents {
-                let hit = body.contains(&py_mod)
-                    || body.contains(&imp_n)
-                    || body.contains(&from_n)
-                    || body.contains(&slash_n);
-                if hit {
-                    matched.insert((*tf).to_string());
-                }
-            }
-        }
-        map.insert(src.clone(), matched.into_iter().collect());
-    }
-    map
-}
-
-fn stem_matches(ts: &str, stem: &str) -> bool {
-    if ts.strip_prefix("test_") == Some(stem) {
-        return true;
-    }
-    if ts.strip_suffix(stem).is_some_and(|p| p.ends_with('_')) {
-        return true;
-    }
-    ts.strip_prefix(stem)
-        .is_some_and(|s| matches!(s, "_test" | ".test" | ".spec"))
-}
-
 fn compute_waves(source_files: &[String], edges: &[(String, String)]) -> SccWaves {
-    let mut g: DiGraph<&str, ()> = DiGraph::new();
-    let mut idx_map: HashMap<&str, NodeIndex> = HashMap::with_capacity(source_files.len());
-    for f in source_files {
-        idx_map.insert(f.as_str(), g.add_node(f.as_str()));
+    let mut idx_map: FxHashMap<&str, u32> =
+        FxHashMap::with_capacity_and_hasher(source_files.len(), Default::default());
+    for (i, f) in source_files.iter().enumerate() {
+        idx_map.insert(f.as_str(), i as u32);
     }
 
+    let mut csr_edges: Vec<(u32, u32)> = Vec::with_capacity(edges.len());
     for (src, dst) in edges {
         if let (Some(&u), Some(&v)) = (idx_map.get(src.as_str()), idx_map.get(dst.as_str()))
             && u != v
-            && !g.contains_edge(u, v)
         {
-            g.add_edge(u, v, ());
+            csr_edges.push((u, v));
         }
     }
 
-    let sccs = tarjan_scc(&g);
-    let mut file_scc: HashMap<&str, usize> = HashMap::with_capacity(source_files.len());
+    let csr = CsrGraph::from_edges(source_files.len(), &csr_edges);
+    let sccs = csr.pearce_scc();
+
+    let mut file_scc = vec![0usize; source_files.len()];
     let mut scc_files = Vec::with_capacity(sccs.len());
-    for (idx, comp) in sccs.iter().enumerate() {
+    for (idx, comp) in sccs.into_iter().enumerate() {
         let mut files = Vec::with_capacity(comp.len());
-        for &ni in comp {
-            files.push(g[ni].to_string());
-            file_scc.insert(g[ni], idx);
+        for node in comp {
+            let nu = node as usize;
+            file_scc[nu] = idx;
+            files.push(source_files[nu].clone());
         }
         files.sort();
         scc_files.push(files);
@@ -189,10 +129,10 @@ fn compute_waves(source_files: &[String], edges: &[(String, String)]) -> SccWave
     let n = scc_files.len();
     let mut deps = vec![BTreeSet::new(); n];
     let mut dependents = vec![BTreeSet::new(); n];
-    for (src, dst) in edges {
-        if let (Some(&su), Some(&sv)) = (file_scc.get(src.as_str()), file_scc.get(dst.as_str()))
-            && su != sv
-        {
+    for &(u, v) in &csr_edges {
+        let su = file_scc[u as usize];
+        let sv = file_scc[v as usize];
+        if su != sv {
             deps[su].insert(sv);
             dependents[sv].insert(su);
         }
@@ -382,42 +322,63 @@ pub fn impacted_tests(plan: &DagPlan, changed_files: &[String]) -> Vec<String> {
     tests.into_iter().collect()
 }
 
+/// Iterative longest-path critical depth over the unit dependent graph (zero recursion).
 pub fn critical_depths(units: &[ModuleUnit]) -> HashMap<String, usize> {
-    let by_id: HashMap<&str, &ModuleUnit> = units.iter().map(|u| (u.id.as_str(), u)).collect();
-    let mut memo = HashMap::with_capacity(units.len());
-    let mut visiting = HashSet::new();
+    let n = units.len();
+    let mut idx_of: FxHashMap<&str, usize> =
+        FxHashMap::with_capacity_and_hasher(n, Default::default());
+    for (i, u) in units.iter().enumerate() {
+        idx_of.insert(u.id.as_str(), i);
+    }
 
-    for u in units {
-        depth_dfs(&u.id, &by_id, &mut memo, &mut visiting);
+    let mut state = vec![0u8; n]; // 0 = unvisited, 1 = on_stack, 2 = done
+    let mut depth = vec![0usize; n];
+    let mut stack: Vec<(usize, usize)> = Vec::with_capacity(n.min(256));
+
+    for start in 0..n {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        stack.push((start, 0));
+
+        while let Some((u, mut ei)) = stack.pop() {
+            let deps = &units[u].dependents;
+            let mut pushed = false;
+            while ei < deps.len() {
+                let dep_name = deps[ei].as_str();
+                ei += 1;
+                if let Some(&v) = idx_of.get(dep_name) {
+                    if state[v] == 0 {
+                        stack.push((u, ei));
+                        state[v] = 1;
+                        stack.push((v, 0));
+                        pushed = true;
+                        break;
+                    } else if state[v] == 2 {
+                        depth[u] = depth[u].max(1 + depth[v]);
+                    } else {
+                        // Back-edge guard (matches recursive visiting -> 0).
+                        depth[u] = depth[u].max(1);
+                    }
+                } else {
+                    depth[u] = depth[u].max(1);
+                }
+            }
+            if !pushed {
+                state[u] = 2;
+                if let Some(&(parent, _)) = stack.last() {
+                    depth[parent] = depth[parent].max(1 + depth[u]);
+                }
+            }
+        }
+    }
+
+    let mut memo = HashMap::with_capacity(n);
+    for (i, u) in units.iter().enumerate() {
+        memo.insert(u.id.clone(), depth[i]);
     }
     memo
-}
-
-fn depth_dfs<'a>(
-    id: &'a str,
-    by_id: &HashMap<&'a str, &'a ModuleUnit>,
-    memo: &mut HashMap<String, usize>,
-    visiting: &mut HashSet<&'a str>,
-) -> usize {
-    if let Some(&d) = memo.get(id) {
-        return d;
-    }
-    if !visiting.insert(id) {
-        return 0;
-    }
-
-    let best = by_id
-        .get(id)
-        .and_then(|u| {
-            u.dependents
-                .iter()
-                .map(|dep| 1 + depth_dfs(dep.as_str(), by_id, memo, visiting))
-                .max()
-        })
-        .unwrap_or(0);
-    visiting.remove(id);
-    memo.insert(id.to_string(), best);
-    best
 }
 
 pub fn units_interfere(a: &ModuleUnit, b: &ModuleUnit) -> bool {
@@ -468,9 +429,10 @@ mod tests {
         for i in 0..25 {
             src.push_str(&format!("def clean_{i}(x: int) -> int:\n    return x + {i}\n\n"));
         }
-        src.push_str("def hot_target(items=[]):\n    if items:\n        if len(items) > 1:\n            return items[0]\n    return None\n");
+        src.push_str("@app.get('/hot')\ndef hot_target(items=[]):\n    if items:\n        if len(items) > 1:\n            return items[0]\n    return None\n");
         let sliced = packet::slice_anchored(&src, 400, &HashSet::new());
         assert!(sliced.len() < src.len() && sliced.contains("def hot_target(items=[]):"));
+        assert!(sliced.contains("@app.get('/hot')"), "decorator detached from hot_target: {sliced}");
         assert!(sliced.contains("// stub: def clean_"));
 
         let mut utf = String::from("# こんにちは世界 🚀 café résumé\n");
