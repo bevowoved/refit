@@ -1,13 +1,18 @@
 pub mod budget;
 pub mod memgate;
+pub mod paths;
 mod proc;
 mod redact;
 
 pub use crate::net::backoff_ms;
 #[cfg(test)]
-use crate::net::{is_retryable, retry_ms};
+use crate::net::{is_quota_exhausted, is_retryable, retry_ms};
 pub use budget::{allocator_name, budget, collect_os_memory, init_allocator, under_memory_pressure};
 pub use memgate::{MemGate, TangoCreditRing};
+pub use paths::{
+    check_rel, check_target_in_repo, normalize_rel, pwsh_utf8_preamble, rel_to_root,
+    strip_utf8_bom, trim_crlf,
+};
 pub use proc::{run_cmd, self_metrics};
 pub use redact::{find_secret, redact_secrets};
 
@@ -16,7 +21,6 @@ use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -66,37 +70,6 @@ pub fn now_ms() -> u64 {
 #[inline]
 pub fn skip_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name)
-}
-
-pub fn check_rel(rel: &str) -> bool {
-    if rel.is_empty() || rel.contains('\0') {
-        return false;
-    }
-
-    let norm: Cow<'_, str> = if rel.contains('\\') {
-        Cow::Owned(rel.replace('\\', "/"))
-    } else {
-        Cow::Borrowed(rel)
-    };
-    let p = Path::new(norm.as_ref());
-    if p.is_absolute() {
-        return false;
-    }
-
-    let mut has_normal = false;
-    for comp in p.components() {
-        match comp {
-            std::path::Component::Normal(seg) => {
-                if seg == ".git" || seg == ".refit" {
-                    return false;
-                }
-                has_normal = true;
-            }
-            std::path::Component::CurDir => {}
-            _ => return false,
-        }
-    }
-    has_normal
 }
 
 pub fn walk_files(repo_root: &Path, max_depth: Option<usize>) -> Vec<PathBuf> {
@@ -149,11 +122,14 @@ fn keep_entry(e: &ignore::DirEntry, include_hidden: bool) -> bool {
 }
 
 pub fn sandbox_env(extra: &[(String, String)]) -> Vec<(String, String)> {
-    let mut env = Vec::with_capacity(SANDBOX_VARS.len() + extra.len());
+    let mut env = Vec::with_capacity(SANDBOX_VARS.len() + extra.len() + 1);
     for &k in SANDBOX_VARS {
         if let Ok(v) = std::env::var(k) {
             env.push((k.to_string(), v));
         }
+    }
+    if std::env::var_os("MSYSTEM").is_some() {
+        env.push(("MSYS_NO_PATHCONV".to_string(), "1".to_string()));
     }
 
     for (k, v) in extra {
@@ -286,9 +262,10 @@ mod tests {
         assert!(new_http(concat!("refit-probe/", env!("CARGO_PKG_VERSION")), 30, 16).is_ok());
         assert!(stream_http(concat!("refit-stream/", env!("CARGO_PKG_VERSION")), 15, 600, 16).is_ok());
 
-        for code in [200, 201, 204, 400, 401, 403, 404, 422] {
+        for code in [200, 201, 204, 400, 401, 403, 404, 422, 432] {
             assert!(!is_retryable(code), "code={code}");
         }
+        assert!(is_quota_exhausted(432) && !is_quota_exhausted(429));
         for code in [408, 429, 500, 502, 503, 504, 529] {
             assert!(is_retryable(code), "code={code}");
         }

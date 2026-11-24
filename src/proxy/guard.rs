@@ -259,27 +259,31 @@ pub(super) fn find_module(payload: &Value) -> String {
 
 pub(super) fn localip(origin: &HeaderValue) -> bool {
     let Ok(s) = origin.to_str() else { return false };
-    let lower = s.to_ascii_lowercase();
-    let Some(rest) = lower
-        .strip_prefix("http://")
-        .or_else(|| lower.strip_prefix("https://"))
-    else {
-        return false;
-    };
-    if rest.bytes().any(|b| matches!(b, b'/' | b'@' | b'?' | b'#')) {
+    if s.is_empty() || s.ends_with(':') {
         return false;
     }
-
-    for host in ["127.0.0.1", "localhost", "[::1]"] {
-        let Some(after) = rest.strip_prefix(host) else { continue };
-        if after.is_empty() {
-            return true;
-        }
-        if let Some(port) = after.strip_prefix(':') {
-            return !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
-        }
+    let Ok(parsed) = url::Url::parse(s) else { return false };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
     }
-    false
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.port() == Some(0)
+    {
+        return false;
+    }
+    let after_scheme = s.split_once("://").map_or("", |(_, rest)| rest);
+    if after_scheme.contains('/') || after_scheme.contains('@') {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => std::net::IpAddr::V4(ip).is_loopback(),
+        Some(url::Host::Ipv6(ip)) => std::net::IpAddr::V6(ip).is_loopback(),
+        None => false,
+    }
 }
 
 pub(super) fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
@@ -329,5 +333,34 @@ pub(super) fn parse_metrics(
         uncached_tokens,
         prefix_drift,
         ..LlmCallMetrics::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localip_url_parser_rejects_bad_ports_and_spoofing() {
+        for (orig, want) in [
+            ("http://127.0.0.1:18790", true),
+            ("http://127.0.0.2:65535", true),
+            ("http://localhost", true),
+            ("https://[::1]:8443", true),
+            ("http://127.0.0.1:65536", false),
+            ("http://127.0.0.1:999999", false),
+            ("http://127.0.0.1:0", false),
+            ("http://127.0.0.1:", false),
+            ("http://user@127.0.0.1:3000", false),
+            ("http://127.0.0.1:3000/api", false),
+            ("http://127.0.0.1:3000?x=1", false),
+            ("http://127.0.0.1:3000#h", false),
+            ("ftp://127.0.0.1:21", false),
+            ("http://0.0.0.0:3000", false),
+            ("http://192.168.1.1:3000", false),
+            ("http://localhost.evil.com", false),
+        ] {
+            assert_eq!(localip(&HeaderValue::from_static(orig)), want, "origin={orig}");
+        }
     }
 }

@@ -176,13 +176,12 @@ pub(super) fn ruff_map(stdout: &str, repo_root: &Path) -> Vec<(String, String)> 
     let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) else {
         return Vec::new();
     };
-    let root_prefix = format!("{}/", repo_root.display().to_string().replace('\\', "/"));
 
     arr.into_iter()
         .map(|v| {
             let raw = v["filename"].as_str().unwrap_or("");
-            let fname = raw.replace('\\', "/");
-            let rel = fname.strip_prefix(&root_prefix).unwrap_or(&fname).to_string();
+            let rel = crate::platform::rel_to_root(repo_root, Path::new(raw))
+                .unwrap_or_else(|| raw.replace('\\', "/"));
             let code = v["code"].as_str().unwrap_or("RUFF");
             let msg = v["message"].as_str().unwrap_or("");
             let line = v["location"]["row"].as_u64().unwrap_or(0);
@@ -223,4 +222,35 @@ pub(super) fn first_pair(a: &str, b: &str, max: usize) -> String {
         .take(max)
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ruff_map_normalizes_verbatim_and_drive_case() {
+        let json_out = serde_json::json!([
+            {
+                "filename": r"\\?\d:\cerebras\refit\src\mod_a.py",
+                "code": "F401",
+                "message": "unused import",
+                "location": { "row": 3 }
+            },
+            {
+                "filename": r"D:\cerebras\refit\pkg\sub\b.py",
+                "code": "E501",
+                "message": "line too long",
+                "location": { "row": 12 }
+            }
+        ])
+        .to_string();
+
+        let mapped = ruff_map(&json_out, Path::new(r"D:\cerebras\refit"));
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].0, "src/mod_a.py");
+        assert_eq!(mapped[0].1, "ruff F401 L3: unused import");
+        assert_eq!(mapped[1].0, "pkg/sub/b.py");
+        assert_eq!(mapped[1].1, "ruff E501 L12: line too long");
+    }
 }

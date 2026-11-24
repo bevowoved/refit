@@ -63,71 +63,104 @@ impl CsrGraph {
     /// Reuses a single `rindex: Vec<u32>` for both discovery index and final component ID
     /// with an explicit heap stack (immune to recursion stack overflow).
     pub fn pearce_scc(&self) -> Vec<Vec<u32>> {
-        let n = self.n;
-        let mut rindex = vec![0u32; n];
-        let mut stack: Vec<u32> = Vec::with_capacity(n.min(1024));
-        let mut call_stack: Vec<(u32, u32, bool)> = Vec::with_capacity(n.min(256));
-        let mut idx = 1u32;
-        let mut c_id = (n as u32).saturating_add(1);
-        let mut comps: Vec<Vec<u32>> = Vec::new();
-
-        for start in 0..n {
-            if rindex[start] != 0 {
-                continue;
-            }
-            rindex[start] = idx;
-            idx += 1;
-            call_stack.push((start as u32, self.offsets[start], true));
-
-            while let Some((v, mut ei, mut is_root)) = call_stack.pop() {
-                let vu = v as usize;
-                let end = self.offsets[vu + 1];
-                let mut descended = false;
-                while ei < end {
-                    let w = self.targets[ei as usize] as usize;
-                    ei += 1;
-                    if rindex[w] == 0 {
-                        call_stack.push((v, ei, is_root));
-                        rindex[w] = idx;
-                        idx += 1;
-                        call_stack.push((w as u32, self.offsets[w], true));
-                        descended = true;
-                        break;
-                    } else if rindex[w] < rindex[vu] {
-                        rindex[vu] = rindex[w];
-                        is_root = false;
-                    }
-                }
-                if !descended {
-                    if is_root {
-                        let mut comp = vec![v];
-                        let vr = rindex[vu];
-                        while let Some(&top) = stack.last() {
-                            if rindex[top as usize] >= vr {
-                                stack.pop();
-                                rindex[top as usize] = c_id;
-                                comp.push(top);
-                            } else {
-                                break;
-                            }
-                        }
-                        rindex[vu] = c_id;
-                        c_id += 1;
-                        comps.push(comp);
-                    } else {
-                        stack.push(v);
-                    }
-                    if let Some(parent) = call_stack.last_mut() {
-                        let pu = parent.0 as usize;
-                        if rindex[vu] < rindex[pu] {
-                            rindex[pu] = rindex[vu];
-                            parent.2 = false;
-                        }
-                    }
-                }
+        let mut state = PearceState::new(self);
+        for start in 0..self.n {
+            if state.rindex[start] == 0 {
+                state.visit_from(start);
             }
         }
-        comps
+        state.comps
+    }
+}
+
+struct PearceState<'a> {
+    graph: &'a CsrGraph,
+    rindex: Vec<u32>,
+    stack: Vec<u32>,
+    call_stack: Vec<(u32, u32, bool)>,
+    next_idx: u32,
+    comp_id: u32,
+    comps: Vec<Vec<u32>>,
+}
+
+impl<'a> PearceState<'a> {
+    fn new(graph: &'a CsrGraph) -> Self {
+        let n = graph.n;
+        Self {
+            graph,
+            rindex: vec![0u32; n],
+            stack: Vec::with_capacity(n.min(1024)),
+            call_stack: Vec::with_capacity(n.min(256)),
+            next_idx: 1,
+            comp_id: (n as u32).saturating_add(1),
+            comps: Vec::new(),
+        }
+    }
+
+    fn visit_from(&mut self, start: usize) {
+        self.rindex[start] = self.next_idx;
+        self.next_idx += 1;
+        self.call_stack.push((start as u32, self.graph.offsets[start], true));
+
+        while let Some((node, edge_idx, is_root)) = self.call_stack.pop() {
+            if let Some(finished_root) = self.advance_node(node, edge_idx, is_root) {
+                self.finish_node(node, finished_root);
+            }
+        }
+    }
+
+    fn advance_node(&mut self, node: u32, mut edge_idx: u32, mut is_root: bool) -> Option<bool> {
+        let node_u = node as usize;
+        let end = self.graph.offsets[node_u + 1];
+        while edge_idx < end {
+            let neighbor = self.graph.targets[edge_idx as usize] as usize;
+            edge_idx += 1;
+            if self.rindex[neighbor] == 0 {
+                self.call_stack.push((node, edge_idx, is_root));
+                self.rindex[neighbor] = self.next_idx;
+                self.next_idx += 1;
+                self.call_stack.push((neighbor as u32, self.graph.offsets[neighbor], true));
+                return None;
+            }
+            if self.rindex[neighbor] < self.rindex[node_u] {
+                self.rindex[node_u] = self.rindex[neighbor];
+                is_root = false;
+            }
+        }
+        Some(is_root)
+    }
+
+    fn finish_node(&mut self, node: u32, is_root: bool) {
+        let node_u = node as usize;
+        if is_root {
+            self.emit_component(node);
+        } else {
+            self.stack.push(node);
+        }
+        if let Some(parent) = self.call_stack.last_mut() {
+            let parent_u = parent.0 as usize;
+            if self.rindex[node_u] < self.rindex[parent_u] {
+                self.rindex[parent_u] = self.rindex[node_u];
+                parent.2 = false;
+            }
+        }
+    }
+
+    fn emit_component(&mut self, root: u32) {
+        let root_u = root as usize;
+        let mut comp = vec![root];
+        let root_rindex = self.rindex[root_u];
+        while let Some(&top) = self.stack.last() {
+            if self.rindex[top as usize] < root_rindex {
+                break;
+            }
+            self.stack.pop();
+            self.rindex[top as usize] = self.comp_id;
+            comp.push(top);
+        }
+        self.rindex[root_u] = self.comp_id;
+        self.comp_id += 1;
+        self.comps.push(comp);
     }
 }
 
@@ -140,6 +173,123 @@ pub struct ModuleMetrics {
     pub passthrough_fns: usize,
     pub pub_fields: Vec<String>,
     pub field_reads: Vec<String>,
+}
+
+fn append_cycle_findings(
+    source_rels: &[String],
+    csr_edges: &[(u32, u32)],
+    findings: &mut Vec<String>,
+) {
+    let csr = CsrGraph::from_edges(source_rels.len(), csr_edges);
+    let mut cycles: Vec<Vec<&str>> = csr
+        .pearce_scc()
+        .into_iter()
+        .filter(|comp| comp.len() >= 2)
+        .map(|comp| {
+            let mut files: Vec<&str> =
+                comp.into_iter().map(|id| source_rels[id as usize].as_str()).collect();
+            files.sort_unstable();
+            files
+        })
+        .collect();
+    cycles.sort();
+    for cyc in cycles.into_iter().take(12) {
+        let preview = cyc.iter().take(4).copied().collect::<Vec<_>>().join(" <-> ");
+        findings.push(format!("[module-cycle] {preview} ({} files)", cyc.len()));
+    }
+}
+
+fn append_tangle_findings(
+    source_rels: &[String],
+    fan_in: &[usize],
+    fan_out: &[usize],
+    neighbor_dirs: &[FxHashSet<String>],
+    findings: &mut Vec<String>,
+) {
+    for (idx, rel) in source_rels.iter().enumerate() {
+        let fi = fan_in[idx];
+        let fo = fan_out[idx];
+        if fi < 6 || fo < 6 || neighbor_dirs[idx].len() < 2 {
+            continue;
+        }
+        let instability = (fo as f64) / ((fi + fo) as f64);
+        if (0.35..=0.65).contains(&instability) {
+            findings.push(format!(
+                "[tangle] {rel}: fan_in={fi}, fan_out={fo}, instability={instability:.2} across {} dirs",
+                neighbor_dirs[idx].len()
+            ));
+        }
+    }
+}
+
+fn build_field_readers<'a>(
+    source_rels: &[String],
+    metrics: &'a BTreeMap<String, ModuleMetrics>,
+) -> FxHashMap<&'a str, FxHashSet<usize>> {
+    let mut field_readers: FxHashMap<&'a str, FxHashSet<usize>> = FxHashMap::default();
+    for (idx, rel) in source_rels.iter().enumerate() {
+        let Some(metric) = metrics.get(rel) else { continue };
+        for field in &metric.field_reads {
+            field_readers.entry(field.as_str()).or_default().insert(idx);
+        }
+    }
+    field_readers
+}
+
+fn append_field_leak_findings(
+    source_rels: &[String],
+    metrics: &BTreeMap<String, ModuleMetrics>,
+    findings: &mut Vec<String>,
+) {
+    let field_readers = build_field_readers(source_rels, metrics);
+    let mut leak_count = 0usize;
+    for (idx, rel) in source_rels.iter().enumerate() {
+        if leak_count >= 12 {
+            break;
+        }
+        let Some(metric) = metrics.get(rel) else { continue };
+        for pub_field in &metric.pub_fields {
+            let ext_readers = field_readers
+                .get(pub_field.as_str())
+                .map(|set| set.iter().filter(|&&reader| reader != idx).count())
+                .unwrap_or(0);
+            if ext_readers >= 2 {
+                findings.push(format!(
+                    "[field-leak] {rel}: public field `.{pub_field}` accessed directly by {ext_readers} external modules"
+                ));
+                leak_count += 1;
+                break;
+            }
+        }
+    }
+}
+
+fn append_shallow_module_findings(
+    source_rels: &[String],
+    metrics: &BTreeMap<String, ModuleMetrics>,
+    findings: &mut Vec<String>,
+) {
+    let mut shallow_count = 0usize;
+    for rel in source_rels {
+        if shallow_count >= 12 {
+            break;
+        }
+        let Some(metric) = metrics.get(rel) else { continue };
+        if metric.exported_symbols < 4 || metric.total_fns < 3 || metric.loc == 0 {
+            continue;
+        }
+        let surface_density = (metric.exported_symbols as f64) / (metric.loc as f64);
+        let passthrough_ratio = (metric.passthrough_fns as f64) / (metric.total_fns as f64);
+        if surface_density > 0.20 && passthrough_ratio >= 0.60 {
+            findings.push(format!(
+                "[shallow-module] {rel}: {} exports in {} LOC ({:.0}% passthrough wrappers)",
+                metric.exported_symbols,
+                metric.loc,
+                passthrough_ratio * 100.0
+            ));
+            shallow_count += 1;
+        }
+    }
 }
 
 /// Evaluate `deslop-please` 4 deep-module architectural rules over runtime CSR edges & metrics:
@@ -165,104 +315,121 @@ pub fn deep_module_findings(
     let mut neighbor_dirs: Vec<FxHashSet<String>> = vec![FxHashSet::default(); source_rels.len()];
 
     for (src, dst) in runtime_edges {
-        if let (Some(&u), Some(&v)) = (id_of.get(src.as_str()), id_of.get(dst.as_str()))
-            && u != v
+        if let (Some(&src_id), Some(&dst_id)) = (id_of.get(src.as_str()), id_of.get(dst.as_str()))
+            && src_id != dst_id
         {
-            csr_edges.push((u, v));
-            fan_out[u as usize] += 1;
-            fan_in[v as usize] += 1;
-            neighbor_dirs[u as usize].insert(dir_of(dst));
-            neighbor_dirs[v as usize].insert(dir_of(src));
+            csr_edges.push((src_id, dst_id));
+            fan_out[src_id as usize] += 1;
+            fan_in[dst_id as usize] += 1;
+            neighbor_dirs[src_id as usize].insert(dir_of(dst));
+            neighbor_dirs[dst_id as usize].insert(dir_of(src));
         }
     }
 
-    // Rule 1: module-cycle
-    let csr = CsrGraph::from_edges(source_rels.len(), &csr_edges);
-    let mut cycles: Vec<Vec<&str>> = csr
-        .pearce_scc()
-        .into_iter()
-        .filter(|c| c.len() >= 2)
-        .map(|c| {
-            let mut files: Vec<&str> = c.into_iter().map(|id| source_rels[id as usize].as_str()).collect();
-            files.sort_unstable();
-            files
-        })
-        .collect();
-    cycles.sort();
-    for cyc in cycles.into_iter().take(12) {
-        let preview = cyc.iter().take(4).copied().collect::<Vec<_>>().join(" <-> ");
-        findings.push(format!("[module-cycle] {preview} ({} files)", cyc.len()));
-    }
-
-    // Rule 2: tangle
-    for (idx, rel) in source_rels.iter().enumerate() {
-        let fi = fan_in[idx];
-        let fo = fan_out[idx];
-        if fi >= 6 && fo >= 6 && neighbor_dirs[idx].len() >= 2 {
-            let instability = (fo as f64) / ((fi + fo) as f64);
-            if (0.35..=0.65).contains(&instability) {
-                findings.push(format!(
-                    "[tangle] {rel}: fan_in={fi}, fan_out={fo}, instability={instability:.2} across {} dirs",
-                    neighbor_dirs[idx].len()
-                ));
-            }
-        }
-    }
-
-    // Rule 3: field-leak
-    let mut field_readers: FxHashMap<&str, FxHashSet<usize>> = FxHashMap::default();
-    for (idx, rel) in source_rels.iter().enumerate() {
-        if let Some(m) = metrics.get(rel) {
-            for f in &m.field_reads {
-                field_readers.entry(f.as_str()).or_default().insert(idx);
-            }
-        }
-    }
-    let mut leak_count = 0usize;
-    for (idx, rel) in source_rels.iter().enumerate() {
-        if leak_count >= 12 {
-            break;
-        }
-        let Some(m) = metrics.get(rel) else { continue };
-        for pf in &m.pub_fields {
-            let ext_readers = field_readers
-                .get(pf.as_str())
-                .map(|set| set.iter().filter(|&&r| r != idx).count())
-                .unwrap_or(0);
-            if ext_readers >= 2 {
-                findings.push(format!(
-                    "[field-leak] {rel}: public field `.{pf}` accessed directly by {ext_readers} external modules"
-                ));
-                leak_count += 1;
-                break;
-            }
-        }
-    }
-
-    // Rule 4: shallow-module
-    let mut shallow_count = 0usize;
-    for rel in source_rels {
-        if shallow_count >= 12 {
-            break;
-        }
-        let Some(m) = metrics.get(rel) else { continue };
-        if m.exported_symbols >= 4 && m.total_fns >= 3 && m.loc > 0 {
-            let surface_density = (m.exported_symbols as f64) / (m.loc as f64);
-            let passthrough_ratio = (m.passthrough_fns as f64) / (m.total_fns as f64);
-            if surface_density > 0.20 && passthrough_ratio >= 0.60 {
-                findings.push(format!(
-                    "[shallow-module] {rel}: {} exports in {} LOC ({:.0}% passthrough wrappers)",
-                    m.exported_symbols,
-                    m.loc,
-                    passthrough_ratio * 100.0
-                ));
-                shallow_count += 1;
-            }
-        }
-    }
+    append_cycle_findings(source_rels, &csr_edges, &mut findings);
+    append_tangle_findings(source_rels, &fan_in, &fan_out, &neighbor_dirs, &mut findings);
+    append_field_leak_findings(source_rels, metrics, &mut findings);
+    append_shallow_module_findings(source_rels, metrics, &mut findings);
 
     findings.truncate(40);
     findings
+}
+
+fn record_stem_hits(
+    base: &str,
+    tidx: usize,
+    stem_to_srcs: &FxHashMap<&str, Vec<usize>>,
+    matched_by_src: &mut [BTreeSet<usize>],
+) {
+    if let Some(srcs) = stem_to_srcs.get(base) {
+        for &sidx in srcs {
+            matched_by_src[sidx].insert(tidx);
+        }
+    }
+}
+
+fn match_single_test_stem(
+    test_stem: &str,
+    tidx: usize,
+    stem_to_srcs: &FxHashMap<&str, Vec<usize>>,
+    matched_by_src: &mut [BTreeSet<usize>],
+) {
+    if let Some(base) = test_stem.strip_prefix("test_") {
+        record_stem_hits(base, tidx, stem_to_srcs, matched_by_src);
+    }
+    for suffix in ["_test", ".test", ".spec"] {
+        if let Some(base) = test_stem.strip_suffix(suffix) {
+            record_stem_hits(base, tidx, stem_to_srcs, matched_by_src);
+        }
+    }
+    for (pos, byte) in test_stem.bytes().enumerate() {
+        if byte == b'_' && pos + 1 < test_stem.len() {
+            record_stem_hits(&test_stem[pos + 1..], tidx, stem_to_srcs, matched_by_src);
+        }
+    }
+}
+
+fn collect_unmatched_lookups<'a>(
+    source_files: &'a [String],
+    pymod_to_src: &'a FxHashMap<String, Vec<usize>>,
+    matched_by_src: &[BTreeSet<usize>],
+) -> (FxHashMap<&'a str, Vec<usize>>, FxHashMap<&'a str, Vec<usize>>) {
+    let mut needed_stems: FxHashMap<&'a str, Vec<usize>> = FxHashMap::default();
+    let mut needed_pymods: FxHashMap<&'a str, Vec<usize>> = FxHashMap::default();
+    for (sidx, src) in source_files.iter().enumerate() {
+        if !matched_by_src[sidx].is_empty() {
+            continue;
+        }
+        let stem = stem_of(Path::new(src));
+        if stem.len() >= 3 {
+            needed_stems.entry(stem).or_default().push(sidx);
+        }
+    }
+    for (pymod, srcs) in pymod_to_src {
+        let unmatched: Vec<usize> = srcs
+            .iter()
+            .copied()
+            .filter(|&sidx| {
+                matched_by_src[sidx].is_empty() && stem_of(Path::new(&source_files[sidx])).len() >= 3
+            })
+            .collect();
+        if !unmatched.is_empty() {
+            needed_pymods.insert(pymod.as_str(), unmatched);
+        }
+    }
+    (needed_stems, needed_pymods)
+}
+
+fn match_test_bodies_pass(
+    repo_root: &Path,
+    test_files: &[String],
+    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
+    needed_stems: &FxHashMap<&str, Vec<usize>>,
+    needed_pymods: &FxHashMap<&str, Vec<usize>>,
+    matched_by_src: &mut [BTreeSet<usize>],
+) {
+    if needed_stems.is_empty() && needed_pymods.is_empty() {
+        return;
+    }
+    let scan_one = |(tidx, tf): (usize, &String)| -> (usize, Vec<usize>) {
+        let Some(txt) = read_text(repo_root, tf, preloaded) else {
+            return (tidx, Vec::new());
+        };
+        let hits = scan_test_body_hits(&txt, needed_stems, needed_pymods);
+        (tidx, hits)
+    };
+
+    let postings: Vec<(usize, Vec<usize>)> = if crate::platform::budget().is_constrained() {
+        test_files.iter().enumerate().map(scan_one).collect()
+    } else {
+        test_files.par_iter().enumerate().map(scan_one).collect()
+    };
+
+    for (tidx, hits) in postings {
+        for sidx in hits {
+            matched_by_src[sidx].insert(tidx);
+        }
+    }
 }
 
 /// Inverted-posting test matcher replacing the O(|S|*|T|) body scan with zero retained test bodies.
@@ -288,82 +455,20 @@ pub fn match_tests_inverted(
         }
     }
 
-    // Pass 1: O(|T|) filename stem matching (exact parity with `stem_matches`).
     for (tidx, tf) in test_files.iter().enumerate() {
-        let ts = stem_of(Path::new(tf));
-        if let Some(base) = ts.strip_prefix("test_")
-            && let Some(srcs) = stem_to_srcs.get(base)
-        {
-            for &sidx in srcs {
-                matched_by_src[sidx].insert(tidx);
-            }
-        }
-        for suffix in ["_test", ".test", ".spec"] {
-            if let Some(base) = ts.strip_suffix(suffix)
-                && let Some(srcs) = stem_to_srcs.get(base)
-            {
-                for &sidx in srcs {
-                    matched_by_src[sidx].insert(tidx);
-                }
-            }
-        }
-        for (pos, b) in ts.bytes().enumerate() {
-            if b == b'_' && pos + 1 < ts.len() {
-                let tail = &ts[pos + 1..];
-                if let Some(srcs) = stem_to_srcs.get(tail) {
-                    for &sidx in srcs {
-                        matched_by_src[sidx].insert(tidx);
-                    }
-                }
-            }
-        }
+        match_single_test_stem(stem_of(Path::new(tf)), tidx, &stem_to_srcs, &mut matched_by_src);
     }
 
-    // Build filtered inverted lookup for unmatched sources with stem.len() >= 3.
-    let mut needed_stems: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
-    let mut needed_pymods: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
-    for (sidx, src) in source_files.iter().enumerate() {
-        if !matched_by_src[sidx].is_empty() {
-            continue;
-        }
-        let stem = stem_of(Path::new(src));
-        if stem.len() >= 3 {
-            needed_stems.entry(stem).or_default().push(sidx);
-        }
-    }
-    for (pymod, srcs) in &pymod_to_src {
-        let unmatched: Vec<usize> = srcs
-            .iter()
-            .copied()
-            .filter(|&sidx| matched_by_src[sidx].is_empty() && stem_of(Path::new(&source_files[sidx])).len() >= 3)
-            .collect();
-        if !unmatched.is_empty() {
-            needed_pymods.insert(pymod.as_str(), unmatched);
-        }
-    }
-
-    // Pass 2: Stream each test file ONCE, extract only hit source IDs, drop body immediately.
-    if !needed_stems.is_empty() || !needed_pymods.is_empty() {
-        let scan_one = |(tidx, tf): (usize, &String)| -> (usize, Vec<usize>) {
-            let Some(txt) = read_text(repo_root, tf, preloaded) else {
-                return (tidx, Vec::new());
-            };
-            let hits = scan_test_body_hits(&txt, &needed_stems, &needed_pymods);
-            (tidx, hits)
-        };
-
-        let postings: Vec<(usize, Vec<usize>)> = if crate::platform::budget().is_constrained() {
-            test_files.iter().enumerate().map(scan_one).collect()
-        } else {
-            test_files.par_iter().enumerate().map(scan_one).collect()
-        };
-
-        for (tidx, hits) in postings {
-            for sidx in hits {
-                matched_by_src[sidx].insert(tidx);
-            }
-        }
-    }
+    let (needed_stems, needed_pymods) =
+        collect_unmatched_lookups(source_files, &pymod_to_src, &matched_by_src);
+    match_test_bodies_pass(
+        repo_root,
+        test_files,
+        preloaded,
+        &needed_stems,
+        &needed_pymods,
+        &mut matched_by_src,
+    );
 
     let mut map = HashMap::with_capacity(source_files.len());
     for (sidx, src) in source_files.iter().enumerate() {
@@ -377,6 +482,82 @@ pub fn match_tests_inverted(
     map
 }
 
+fn scan_slash_stem(
+    body: &str,
+    bytes: &[u8],
+    start: usize,
+    needed_stems: &FxHashMap<&str, Vec<usize>>,
+    hit_set: &mut FxHashSet<usize>,
+) -> usize {
+    let mut end = start;
+    while end < bytes.len() && ident_byte(bytes[end]) {
+        end += 1;
+    }
+    if let Some(srcs) = needed_stems.get(&body[start..end]) {
+        hit_set.extend(srcs.iter().copied());
+    }
+    end
+}
+
+fn record_dotted_pymod_hits(
+    span: &str,
+    needed_pymods: &FxHashMap<&str, Vec<usize>>,
+    hit_set: &mut FxHashSet<usize>,
+) {
+    if let Some(srcs) = needed_pymods.get(span) {
+        hit_set.extend(srcs.iter().copied());
+    }
+    let mut dot_scan = span;
+    while let Some((head, _)) = dot_scan.rsplit_once('.') {
+        if let Some(srcs) = needed_pymods.get(head) {
+            hit_set.extend(srcs.iter().copied());
+        }
+        dot_scan = head;
+    }
+}
+
+fn record_py_import_stem_hit(
+    body: &str,
+    bytes: &[u8],
+    mut pos: usize,
+    needed_stems: &FxHashMap<&str, Vec<usize>>,
+    hit_set: &mut FxHashSet<usize>,
+) {
+    while pos < bytes.len() && bytes[pos] == b' ' {
+        pos += 1;
+    }
+    let id_start = pos;
+    while pos < bytes.len() && ident_byte(bytes[pos]) {
+        pos += 1;
+    }
+    if pos > id_start
+        && let Some(srcs) = needed_stems.get(&body[id_start..pos])
+    {
+        hit_set.extend(srcs.iter().copied());
+    }
+}
+
+fn scan_ident_or_pymod(
+    body: &str,
+    bytes: &[u8],
+    start: usize,
+    needed_stems: &FxHashMap<&str, Vec<usize>>,
+    needed_pymods: &FxHashMap<&str, Vec<usize>>,
+    hit_set: &mut FxHashSet<usize>,
+) -> usize {
+    let mut end = start;
+    while end < bytes.len() && (ident_byte(bytes[end]) || bytes[end] == b'.') {
+        end += 1;
+    }
+    let span = &body[start..end];
+    if span.contains('.') {
+        record_dotted_pymod_hits(span, needed_pymods, hit_set);
+    } else if matches!(span, "import" | "from") {
+        record_py_import_stem_hit(body, bytes, end, needed_stems, hit_set);
+    }
+    end
+}
+
 fn scan_test_body_hits(
     body: &str,
     needed_stems: &FxHashMap<&str, Vec<usize>>,
@@ -384,60 +565,17 @@ fn scan_test_body_hits(
 ) -> Vec<usize> {
     let mut hit_set = FxHashSet::default();
     let bytes = body.as_bytes();
-    let mut i = 0usize;
+    let mut pos = 0usize;
 
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'/' && i + 1 < bytes.len() && ident_byte(bytes[i + 1]) {
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() && ident_byte(bytes[end]) {
-                end += 1;
-            }
-            if let Some(srcs) = needed_stems.get(&body[start..end]) {
-                hit_set.extend(srcs.iter().copied());
-            }
-            i = end;
-            continue;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte == b'/' && pos + 1 < bytes.len() && ident_byte(bytes[pos + 1]) {
+            pos = scan_slash_stem(body, bytes, pos + 1, needed_stems, &mut hit_set);
+        } else if byte.is_ascii_alphabetic() || byte == b'_' {
+            pos = scan_ident_or_pymod(body, bytes, pos, needed_stems, needed_pymods, &mut hit_set);
+        } else {
+            pos += 1;
         }
-        if b.is_ascii_alphabetic() || b == b'_' {
-            let start = i;
-            let mut end = start;
-            while end < bytes.len() && (ident_byte(bytes[end]) || bytes[end] == b'.') {
-                end += 1;
-            }
-            let span = &body[start..end];
-            if span.contains('.') {
-                if let Some(srcs) = needed_pymods.get(span) {
-                    hit_set.extend(srcs.iter().copied());
-                }
-                // Check prefix dotted modules (e.g. `pkg.root_core.fn_name` -> `pkg.root_core`).
-                let mut dot_scan = span;
-                while let Some((head, _)) = dot_scan.rsplit_once('.') {
-                    if let Some(srcs) = needed_pymods.get(head) {
-                        hit_set.extend(srcs.iter().copied());
-                    }
-                    dot_scan = head;
-                }
-            } else if matches!(span, "import" | "from") {
-                let mut k = end;
-                while k < bytes.len() && bytes[k] == b' ' {
-                    k += 1;
-                }
-                let id_start = k;
-                while k < bytes.len() && ident_byte(bytes[k]) {
-                    k += 1;
-                }
-                if k > id_start
-                    && let Some(srcs) = needed_stems.get(&body[id_start..k])
-                {
-                    hit_set.extend(srcs.iter().copied());
-                }
-            }
-            i = end;
-            continue;
-        }
-        i += 1;
     }
 
     hit_set.into_iter().collect()

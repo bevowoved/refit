@@ -1334,6 +1334,7 @@ dependencies = [
 name = "refit"
 version = "0.5.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "axum",
  "blake3",
@@ -1353,8 +1354,10 @@ dependencies = [
  "rayon",
  "reqwest",
  "rustc-hash",
+ "semver",
  "serde",
  "serde_json",
+ "shlex",
  "similar",
  "strsim",
  "tikv-jemalloc-ctl",
@@ -1364,6 +1367,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wait-timeout",
  "windows-sys 0.61.2",
  "zstd",

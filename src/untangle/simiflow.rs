@@ -112,6 +112,129 @@ fn extract_domain_token_hashes(body: &str, filter_syntax: bool) -> Vec<u64> {
     toks
 }
 
+fn collect_token_df(
+    items: &[SimiItem],
+    filter_syntax: bool,
+) -> (Vec<Vec<u64>>, FxHashMap<u64, u32>) {
+    let n = items.len();
+    let mut tok_df: FxHashMap<u64, u32> =
+        FxHashMap::with_capacity_and_hasher(n * 8 + 64, Default::default());
+    let mut raw_doc_toks: Vec<Vec<u64>> = Vec::with_capacity(n);
+
+    for item in items {
+        let toks = extract_domain_token_hashes(&item.body, filter_syntax);
+        for &hash in &toks {
+            *tok_df.entry(hash).or_insert(0) += 1;
+        }
+        raw_doc_toks.push(toks);
+    }
+    (raw_doc_toks, tok_df)
+}
+
+fn build_weighted_doc(
+    toks: Vec<u64>,
+    tok_df: &FxHashMap<u64, u32>,
+    df_stop_cap: u32,
+    n_f: f64,
+) -> Vec<(u64, f32)> {
+    let mut weighted: Vec<(u64, f32)> = Vec::with_capacity(toks.len());
+    for hash in toks {
+        let df = tok_df.get(&hash).copied().unwrap_or(1);
+        if df > df_stop_cap {
+            continue;
+        }
+        let idf = ((n_f / ((df as f64) + 1.0)).ln() + 1.0) as f32;
+        weighted.push((hash, idf));
+    }
+    weighted
+}
+
+fn build_idf_simhash_bands(
+    raw_doc_toks: Vec<Vec<u64>>,
+    tok_df: &FxHashMap<u64, u32>,
+    n: usize,
+) -> (Vec<Vec<(u64, f32)>>, Vec<u64>, Vec<Vec<Vec<usize>>>) {
+    let df_stop_cap = (n / 10).max(8) as u32;
+    let mut bands: Vec<Vec<Vec<usize>>> = (0..N_BANDS).map(|_| vec![Vec::new(); 256]).collect();
+    let mut doc_vecs: Vec<Vec<(u64, f32)>> = Vec::with_capacity(n);
+    let mut fps: Vec<u64> = Vec::with_capacity(n);
+    let n_f = (n as f64) + 1.0;
+
+    for (idx, toks) in raw_doc_toks.into_iter().enumerate() {
+        let weighted = build_weighted_doc(toks, tok_df, df_stop_cap, n_f);
+        let fp = if weighted.len() >= 3 {
+            let hash_fp = simhash64_idf(&weighted);
+            for (band_idx, table) in bands.iter_mut().enumerate() {
+                let key = ((hash_fp.rotate_left((band_idx * 4) as u32)) & 0xff) as usize;
+                table[key].push(idx);
+            }
+            hash_fp
+        } else {
+            0
+        };
+        fps.push(fp);
+        doc_vecs.push(weighted);
+    }
+    (doc_vecs, fps, bands)
+}
+
+fn add_bucket_candidates(
+    bucket: &[usize],
+    fps: &[u64],
+    lsh_cands: &mut FxHashSet<(usize, usize)>,
+) {
+    for i in 0..bucket.len() {
+        let first = bucket[i];
+        for &other in &bucket[i + 1..] {
+            let (lo, hi) = if first < other { (first, other) } else { (other, first) };
+            if (fps[lo] ^ fps[hi]).count_ones() <= HAMMING_MAX {
+                lsh_cands.insert((lo, hi));
+            }
+        }
+    }
+}
+
+fn collect_lsh_candidates(
+    bands: &[Vec<Vec<usize>>],
+    fps: &[u64],
+) -> (FxHashSet<(usize, usize)>, usize) {
+    let mut lsh_cands: FxHashSet<(usize, usize)> = FxHashSet::default();
+    let mut hot_buckets_capped = 0usize;
+    for table in bands {
+        for bucket in table {
+            if bucket.len() < 2 {
+                continue;
+            }
+            if bucket.len() > B_MAX {
+                hot_buckets_capped += 1;
+                continue;
+            }
+            add_bucket_candidates(bucket, fps, &mut lsh_cands);
+        }
+    }
+    (lsh_cands, hot_buckets_capped)
+}
+
+fn verify_lsh_matches(
+    items: &[SimiItem],
+    doc_vecs: &[Vec<(u64, f32)>],
+    lsh_cands: &FxHashSet<(usize, usize)>,
+) -> Vec<SimiMatch> {
+    let mut matched_pairs: Vec<SimiMatch> = Vec::new();
+    for &(lo, hi) in lsh_cands {
+        let wj = weighted_jaccard(&doc_vecs[lo], &doc_vecs[hi]);
+        if wj < WEIGHTED_JACCARD_MIN {
+            continue;
+        }
+        let jw = jaro_winkler(&items[lo].name, &items[hi].name);
+        if jw >= JARO_WINKLER_MIN || wj >= STRONG_BODY_JACCARD {
+            matched_pairs.push(SimiMatch { a: lo, b: hi });
+        }
+    }
+    matched_pairs.sort_by_key(|m| (m.a, m.b));
+    matched_pairs
+}
+
 /// Core 4-stage SimiFlow matcher (`df > 10%` stop filter + IDF SimHash + 16-band LSH `B_max=32`
 /// + exact Weighted Jaccard `>= 0.55` + `strsim::jaro_winkler >= 0.80`).
 pub fn find_similar_items(items: &[SimiItem], filter_syntax: bool) -> SimiStats {
@@ -124,85 +247,13 @@ pub fn find_similar_items(items: &[SimiItem], filter_syntax: bool) -> SimiStats 
         };
     }
 
-    let df_stop_cap = (n / 10).max(8) as u32;
-    let mut tok_df: FxHashMap<u64, u32> =
-        FxHashMap::with_capacity_and_hasher(n * 8 + 64, Default::default());
-    let mut raw_doc_toks: Vec<Vec<u64>> = Vec::with_capacity(n);
-
-    for item in items {
-        let toks = extract_domain_token_hashes(&item.body, filter_syntax);
-        for &h in &toks {
-            *tok_df.entry(h).or_insert(0) += 1;
-        }
-        raw_doc_toks.push(toks);
-    }
-
-    let mut bands: Vec<Vec<Vec<usize>>> = (0..N_BANDS).map(|_| vec![Vec::new(); 256]).collect();
-    let mut doc_vecs: Vec<Vec<(u64, f32)>> = Vec::with_capacity(n);
-    let mut fps: Vec<u64> = Vec::with_capacity(n);
-    let n_f = (n as f64) + 1.0;
-
-    for (idx, toks) in raw_doc_toks.into_iter().enumerate() {
-        let mut weighted: Vec<(u64, f32)> = Vec::with_capacity(toks.len());
-        for h in toks {
-            let df = tok_df.get(&h).copied().unwrap_or(1);
-            if df > df_stop_cap {
-                continue;
-            }
-            let idf = ((n_f / ((df as f64) + 1.0)).ln() + 1.0) as f32;
-            weighted.push((h, idf));
-        }
-        let fp = if weighted.len() >= 3 {
-            let f = simhash64_idf(&weighted);
-            for (b, table) in bands.iter_mut().enumerate() {
-                let key = ((f.rotate_left((b * 4) as u32)) & 0xff) as usize;
-                table[key].push(idx);
-            }
-            f
-        } else {
-            0
-        };
-        fps.push(fp);
-        doc_vecs.push(weighted);
-    }
-
-    let mut lsh_cands: FxHashSet<(usize, usize)> = FxHashSet::default();
-    let mut hot_buckets_capped = 0usize;
-    for table in &bands {
-        for bucket in table {
-            if bucket.len() < 2 {
-                continue;
-            }
-            if bucket.len() > B_MAX {
-                hot_buckets_capped += 1;
-                continue;
-            }
-            for i in 0..bucket.len() {
-                let a = bucket[i];
-                for &c in &bucket[i + 1..] {
-                    let (lo, hi) = if a < c { (a, c) } else { (c, a) };
-                    if (fps[lo] ^ fps[hi]).count_ones() <= HAMMING_MAX {
-                        lsh_cands.insert((lo, hi));
-                    }
-                }
-            }
-        }
-    }
-
-    let mut matched_pairs: Vec<SimiMatch> = Vec::new();
-    for &(lo, hi) in &lsh_cands {
-        let wj = weighted_jaccard(&doc_vecs[lo], &doc_vecs[hi]);
-        if wj >= WEIGHTED_JACCARD_MIN {
-            let jw = jaro_winkler(&items[lo].name, &items[hi].name);
-            if jw >= JARO_WINKLER_MIN || wj >= STRONG_BODY_JACCARD {
-                matched_pairs.push(SimiMatch { a: lo, b: hi });
-            }
-        }
-    }
-    matched_pairs.sort_by_key(|m| (m.a, m.b));
+    let (raw_doc_toks, tok_df) = collect_token_df(items, filter_syntax);
+    let (doc_vecs, fps, bands) = build_idf_simhash_bands(raw_doc_toks, &tok_df, n);
+    let (lsh_cands, hot_buckets_capped) = collect_lsh_candidates(&bands, &fps);
+    let matches = verify_lsh_matches(items, &doc_vecs, &lsh_cands);
 
     SimiStats {
-        matches: matched_pairs,
+        matches,
         lsh_candidates: lsh_cands.len(),
         hot_buckets_capped,
     }

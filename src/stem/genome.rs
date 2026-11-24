@@ -130,6 +130,99 @@ fn first_doc_sentence(src: &str) -> Option<String> {
     None
 }
 
+#[derive(Default)]
+struct NpmiCounts {
+    path_to_id: FxHashMap<String, usize>,
+    id_to_path: Vec<String>,
+    file_commits: Vec<u32>,
+    co_counts: FxHashMap<u64, u32>,
+    valid_commits: u32,
+}
+
+impl NpmiCounts {
+    fn intern_path(&mut self, path: &str) -> usize {
+        if let Some(&existing) = self.path_to_id.get(path) {
+            return existing;
+        }
+        let next_id = self.id_to_path.len();
+        self.id_to_path.push(path.to_string());
+        self.file_commits.push(0);
+        self.path_to_id.insert(path.to_string(), next_id);
+        next_id
+    }
+
+    fn record_commit(
+        &mut self,
+        raw: &[String],
+        live_files: Option<&FxHashSet<&str>>,
+        commit_ids: &mut Vec<usize>,
+    ) {
+        if raw.len() >= BULK_COMMIT_LIMIT {
+            return;
+        }
+        commit_ids.clear();
+        for path in raw {
+            if is_ignored_cochange_path(path) {
+                continue;
+            }
+            if live_files.is_some_and(|live| !live.contains(path.as_str())) {
+                continue;
+            }
+            let id = self.intern_path(path);
+            commit_ids.push(id);
+        }
+        commit_ids.sort_unstable();
+        commit_ids.dedup();
+        if commit_ids.len() < 2 {
+            return;
+        }
+        self.valid_commits += 1;
+        for &id in commit_ids.iter() {
+            self.file_commits[id] += 1;
+        }
+        for i in 0..commit_ids.len() {
+            for j in (i + 1)..commit_ids.len() {
+                let key = ((commit_ids[i] as u64) << 32) | (commit_ids[j] as u64);
+                *self.co_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
+fn score_npmi_pair(
+    counts: &NpmiCounts,
+    key: u64,
+    c_xy: u32,
+    min_support: u32,
+    n_f: f64,
+) -> Option<CochangePair> {
+    if c_xy < min_support {
+        return None;
+    }
+    let idx_a = (key >> 32) as usize;
+    let idx_b = (key & 0xffff_ffff) as usize;
+    let p_xy = (c_xy as f64) / n_f;
+    let p_x = (counts.file_commits[idx_a] as f64) / n_f;
+    let p_y = (counts.file_commits[idx_b] as f64) / n_f;
+    if p_x <= 0.0 || p_y <= 0.0 || p_xy <= 0.0 {
+        return None;
+    }
+    let pmi = (p_xy / (p_x * p_y)).ln();
+    let denom = (-p_xy.ln()).max(1e-9);
+    let npmi = (pmi / denom).clamp(-1.0, 1.0);
+    if npmi <= 0.05 {
+        return None;
+    }
+    let path_a = &counts.id_to_path[idx_a];
+    let path_b = &counts.id_to_path[idx_b];
+    let (file_a, file_b) = if path_a <= path_b {
+        (path_a.clone(), path_b.clone())
+    } else {
+        (path_b.clone(), path_a.clone())
+    };
+    Some(CochangePair { file_a, file_b, npmi, commits: c_xy })
+}
+
 /// Pure-function NPMI engine over canonicalized commit file lists (newest-to-oldest).
 /// Filters `>= 40`-file housekeeping commits, lockfiles, and pairs below `min_support`.
 pub fn compute_npmi_commits(
@@ -137,97 +230,51 @@ pub fn compute_npmi_commits(
     live_files: Option<&FxHashSet<&str>>,
     min_support: u32,
 ) -> GenomeSummary {
-    let mut path_to_id: FxHashMap<String, usize> = FxHashMap::default();
-    let mut id_to_path: Vec<String> = Vec::new();
-    let mut file_commits: Vec<u32> = Vec::new();
-    let mut co_counts: FxHashMap<u64, u32> = FxHashMap::default();
-    let mut valid_commits = 0u32;
+    let mut counts = NpmiCounts::default();
     let mut commit_ids: Vec<usize> = Vec::with_capacity(BULK_COMMIT_LIMIT);
-
     for raw in commits {
-        if raw.len() >= BULK_COMMIT_LIMIT {
-            continue;
-        }
-        commit_ids.clear();
-        for p in raw {
-            if is_ignored_cochange_path(p) {
-                continue;
-            }
-            if let Some(live) = live_files
-                && !live.contains(p.as_str())
-            {
-                continue;
-            }
-            let id = if let Some(&existing) = path_to_id.get(p) {
-                existing
-            } else {
-                let next_id = id_to_path.len();
-                id_to_path.push(p.clone());
-                file_commits.push(0);
-                path_to_id.insert(p.clone(), next_id);
-                next_id
-            };
-            commit_ids.push(id);
-        }
-        commit_ids.sort_unstable();
-        commit_ids.dedup();
-        if commit_ids.len() < 2 {
-            continue;
-        }
-        valid_commits += 1;
-        for &id in &commit_ids {
-            file_commits[id] += 1;
-        }
-        for i in 0..commit_ids.len() {
-            for j in (i + 1)..commit_ids.len() {
-                let key = ((commit_ids[i] as u64) << 32) | (commit_ids[j] as u64);
-                *co_counts.entry(key).or_insert(0) += 1;
-            }
-        }
+        counts.record_commit(raw, live_files, &mut commit_ids);
     }
 
-    let n_f = valid_commits.max(1) as f64;
-    let mut pairs = Vec::new();
-    for (key, c_xy) in co_counts {
-        if c_xy < min_support {
-            continue;
-        }
-        let a = (key >> 32) as usize;
-        let b = (key & 0xffff_ffff) as usize;
-        let p_xy = (c_xy as f64) / n_f;
-        let p_x = (file_commits[a] as f64) / n_f;
-        let p_y = (file_commits[b] as f64) / n_f;
-        if p_x <= 0.0 || p_y <= 0.0 || p_xy <= 0.0 {
-            continue;
-        }
-        let pmi = (p_xy / (p_x * p_y)).ln();
-        let denom = (-p_xy.ln()).max(1e-9);
-        let npmi = (pmi / denom).clamp(-1.0, 1.0);
-        if npmi > 0.05 {
-            let (fa, fb) = if id_to_path[a] <= id_to_path[b] {
-                (id_to_path[a].clone(), id_to_path[b].clone())
-            } else {
-                (id_to_path[b].clone(), id_to_path[a].clone())
-            };
-            pairs.push(CochangePair {
-                file_a: fa,
-                file_b: fb,
-                npmi,
-                commits: c_xy,
-            });
-        }
-    }
+    let n_f = counts.valid_commits.max(1) as f64;
+    let mut pairs: Vec<CochangePair> = counts
+        .co_counts
+        .iter()
+        .filter_map(|(&key, &c_xy)| score_npmi_pair(&counts, key, c_xy, min_support, n_f))
+        .collect();
 
-    pairs.sort_by(|x, y| {
-        y.npmi
-            .partial_cmp(&x.npmi)
+    pairs.sort_by(|lhs, rhs| {
+        rhs.npmi
+            .partial_cmp(&lhs.npmi)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| y.commits.cmp(&x.commits))
-            .then_with(|| x.file_a.cmp(&y.file_a))
-            .then_with(|| x.file_b.cmp(&y.file_b))
+            .then_with(|| rhs.commits.cmp(&lhs.commits))
+            .then_with(|| lhs.file_a.cmp(&rhs.file_a))
+            .then_with(|| lhs.file_b.cmp(&rhs.file_b))
     });
 
     GenomeSummary { pairs }
+}
+
+fn parse_git_status_line(
+    trimmed: &str,
+    rename_map: &mut FxHashMap<String, String>,
+    current: &mut Vec<String>,
+) {
+    let mut cols = trimmed.split('\t');
+    let status = cols.next().unwrap_or("");
+    if status.starts_with('R') {
+        if let (Some(old_p), Some(new_p)) = (cols.next(), cols.next()) {
+            let old_norm = old_p.replace('\\', "/");
+            let new_norm = new_p.replace('\\', "/");
+            let canon = rename_map.get(&new_norm).cloned().unwrap_or(new_norm);
+            rename_map.insert(old_norm, canon.clone());
+            current.push(canon);
+        }
+    } else if let Some(path) = cols.next() {
+        let norm = path.replace('\\', "/");
+        let canon = rename_map.get(&norm).cloned().unwrap_or(norm);
+        current.push(canon);
+    }
 }
 
 /// Stream up to 2,500 non-merge commits from `git log --no-merges --name-status -M`
@@ -262,7 +309,7 @@ pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeS
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|dur| dur.as_secs())
         .unwrap_or(0);
     let mut reader = BufReader::with_capacity(64 * 1024, stdout);
     let mut line = String::new();
@@ -288,21 +335,7 @@ pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeS
                 let _decay = recency_decay(now_secs.saturating_sub(ts));
             }
         } else if !trimmed.is_empty() {
-            let mut cols = trimmed.split('\t');
-            let status = cols.next().unwrap_or("");
-            if status.starts_with('R') {
-                if let (Some(old_p), Some(new_p)) = (cols.next(), cols.next()) {
-                    let old_norm = old_p.replace('\\', "/");
-                    let new_norm = new_p.replace('\\', "/");
-                    let canon = rename_map.get(&new_norm).cloned().unwrap_or(new_norm);
-                    rename_map.insert(old_norm, canon.clone());
-                    current.push(canon);
-                }
-            } else if let Some(p) = cols.next() {
-                let norm = p.replace('\\', "/");
-                let canon = rename_map.get(&norm).cloned().unwrap_or(norm);
-                current.push(canon);
-            }
+            parse_git_status_line(trimmed, &mut rename_map, &mut current);
         }
         line.clear();
     }
