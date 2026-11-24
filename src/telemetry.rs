@@ -1,9 +1,10 @@
-use crate::platform::{write_atomic, now_ms};
+use crate::platform::{now_ms, write_atomic};
 use crate::state::RunState;
-use crate::types::{RunSummary, TelemetryEvent};
+use crate::types::{ModuleUnit, RunSummary, TelemetryEvent};
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -12,7 +13,30 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 
+pub use crate::platform::redact_secrets;
+
 const MAX_HISTORY: usize = 2048;
+
+#[derive(Default)]
+pub struct EventSpec {
+    pub data: Option<Value>,
+    pub summary: Option<RunSummary>,
+    pub uncached_tpm: Option<u64>,
+    pub module_id: Option<String>,
+    pub layer: Option<usize>,
+    pub wave: Option<usize>,
+}
+
+impl EventSpec {
+    pub fn unit(u: &ModuleUnit) -> Self {
+        Self {
+            module_id: Some(u.id.clone()),
+            layer: Some(u.layer),
+            wave: Some(u.wave),
+            ..Self::default()
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct TelemetryHub {
@@ -41,6 +65,7 @@ impl TelemetryHub {
             fs::create_dir_all(p)
                 .with_context(|| format!("create telemetry dir {}", p.display()))?;
         }
+
         let mut opts = OpenOptions::new();
         opts.create(true).write(true);
         if append {
@@ -48,10 +73,11 @@ impl TelemetryHub {
         } else {
             opts.truncate(true);
         }
+
         let file = opts
             .open(&jsonl_path)
             .with_context(|| format!("open telemetry {}", jsonl_path.display()))?;
-        let (tx, _rx) = broadcast::channel(2048);
+        let (tx, _rx) = broadcast::channel(MAX_HISTORY);
 
         Ok(Self {
             inner: Arc::new(TelemetryInner {
@@ -80,95 +106,107 @@ impl TelemetryHub {
         self.inner.bytes_written.load(Ordering::Relaxed)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn emit(
-        &self,
-        kind: &str,
-        module_id: Option<String>,
-        layer: Option<usize>,
-        wave: Option<usize>,
-        uncached_tpm: Option<u64>,
-        data: Option<serde_json::Value>,
-        summary: Option<RunSummary>,
-    ) {
-        if matches!(kind, "llm_stream" | "wave_dispatch" | "heartbeat") {
-            if let Some(ref mid) = module_id {
-                let extra = data
-                    .as_ref()
-                    .and_then(|d| d.get("attempt"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let sig = fast_sig(kind, uncached_tpm.unwrap_or(0) ^ extra.rotate_left(19));
-                let prev = self.inner.last_unit_sig.insert(mid.clone(), sig);
-                if prev == Some(sig) {
-                    self.inner.dedup_skipped.fetch_add(1, Ordering::Relaxed);
-                    if let Some(st) = self.inner.shared_state.lock().as_ref() {
-                        st.count_dedup(1);
-                    }
-                    return;
-                }
-            }
+    pub fn emit_data(&self, kind: &str, data: Value) {
+        self.emit(kind, EventSpec { data: Some(data), ..EventSpec::default() });
+    }
+
+    pub fn emit_unit(&self, kind: &str, unit: &ModuleUnit, data: Value) {
+        self.emit(kind, EventSpec { data: Some(data), ..EventSpec::unit(unit) });
+    }
+
+    fn skip_dedup(&self, kind: &str, spec: &EventSpec) -> bool {
+        if !matches!(kind, "llm_stream" | "wave_dispatch" | "heartbeat") {
+            return false;
+        }
+        let Some(id) = spec.module_id.as_deref() else { return false };
+
+        let extra = spec
+            .data
+            .as_ref()
+            .and_then(|d| d.get("attempt"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let tpm = spec.uncached_tpm.unwrap_or(0);
+        let sig = fast_sig(kind, tpm ^ extra.rotate_left(19));
+        if self.inner.last_unit_sig.insert(id.to_string(), sig) != Some(sig) {
+            return false;
         }
 
-        let redacted_data = data.map(redact_json);
+        self.inner.dedup_skipped.fetch_add(1, Ordering::Relaxed);
+        if let Some(st) = self.inner.shared_state.lock().as_ref() {
+            st.count_dedup(1);
+        }
+        true
+    }
+
+    fn write_line(&self, kind: &str, ev: &TelemetryEvent) {
+        let Ok(raw) = serde_json::to_string(ev) else { return };
+        let line = redact_secrets(raw);
+        let mut w = self.inner.writer.lock();
+
+        if w.write_all(line.as_bytes()).is_err() || w.write_all(b"\n").is_err() {
+            return;
+        }
+        self.inner
+            .bytes_written
+            .fetch_add((line.len() + 1) as u64, Ordering::Relaxed);
+
+        let sync = matches!(
+            kind,
+            "run_start"
+                | "dag_ready"
+                | "mvcc_commit"
+                | "run_end"
+                | "circuit_state"
+                | "unit_blocked"
+        );
+        if sync {
+            let _ = w.flush();
+        }
+    }
+
+    pub fn emit(&self, kind: &str, spec: EventSpec) {
+        if self.skip_dedup(kind, &spec) {
+            return;
+        }
+
         let ev = TelemetryEvent {
             seq: self.inner.seq.fetch_add(1, Ordering::Relaxed),
             ts_ms: now_ms(),
             kind: kind.to_string(),
-            module_id: module_id.map(redact_secrets),
-            layer,
-            wave,
-            uncached_tpm,
-            data: redacted_data,
-            summary,
+            module_id: spec.module_id.map(redact_secrets),
+            layer: spec.layer,
+            wave: spec.wave,
+            uncached_tpm: spec.uncached_tpm,
+            data: spec.data.map(redact_json),
+            summary: spec.summary,
         };
 
-        if let Ok(mut line) = serde_json::to_string(&ev) {
-            line = redact_secrets(line);
-            let mut w = self.inner.writer.lock();
-            if w.write_all(line.as_bytes()).is_ok() && w.write_all(b"\n").is_ok() {
-                self.inner
-                    .bytes_written
-                    .fetch_add((line.len() + 1) as u64, Ordering::Relaxed);
-                if matches!(
-                    kind,
-                    "run_start"
-                        | "dag_ready"
-                        | "mvcc_commit"
-                        | "run_end"
-                        | "circuit_state"
-                        | "unit_blocked"
-                ) {
-                    let _ = w.flush();
-                }
-            }
-        }
+        self.write_line(kind, &ev);
 
-        {
-            let mut hist = self.inner.history.lock();
-            if hist.len() >= MAX_HISTORY {
-                hist.pop_front();
-            }
-            hist.push_back(ev.clone());
+        let mut hist = self.inner.history.lock();
+        if hist.len() >= MAX_HISTORY {
+            hist.pop_front();
         }
+        hist.push_back(ev.clone());
+        drop(hist);
 
         let _ = self.inner.tx.send(ev);
     }
 
     pub fn flush_zstd(&self) -> Result<(PathBuf, u64, u64)> {
-        {
-            let mut w = self.inner.writer.lock();
-            w.flush()?;
-        }
+        self.inner.writer.lock().flush()?;
         let raw = fs::read(&self.inner.jsonl_path)?;
         let raw_len = raw.len() as u64;
-        let compressed = zstd::stream::encode_all(raw.as_slice(), 6)
+
+        let zst = zstd::stream::encode_all(raw.as_slice(), 6)
             .context("zstd compress telemetry")?;
-        let zst_len = compressed.len() as u64;
-        let zst_path = self.inner.jsonl_path.with_extension("jsonl.zst");
-        write_atomic(&zst_path, &compressed)
-            .with_context(|| format!("write compact zstd {}", zst_path.display()))?;
-        Ok((zst_path, raw_len, zst_len))
+        let zst_len = zst.len() as u64;
+        let path = self.inner.jsonl_path.with_extension("jsonl.zst");
+
+        write_atomic(&path, &zst)
+            .with_context(|| format!("write compact zstd {}", path.display()))?;
+        Ok((path, raw_len, zst_len))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TelemetryEvent> {
@@ -176,19 +214,16 @@ impl TelemetryHub {
     }
 
     pub fn snapshot_events(&self) -> Vec<TelemetryEvent> {
-        self.inner.history.lock().iter().cloned().collect()
+        let hist = self.inner.history.lock();
+        hist.iter().cloned().collect()
     }
 }
 
-pub use crate::platform::redact_secrets;
-
-fn redact_json(v: serde_json::Value) -> serde_json::Value {
+fn redact_json(v: Value) -> Value {
     match v {
-        serde_json::Value::String(s) => serde_json::Value::String(redact_secrets(s)),
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(redact_json).collect())
-        }
-        serde_json::Value::Object(map) => serde_json::Value::Object(
+        Value::String(s) => Value::String(redact_secrets(s)),
+        Value::Array(arr) => Value::Array(arr.into_iter().map(redact_json).collect()),
+        Value::Object(map) => Value::Object(
             map.into_iter()
                 .map(|(k, val)| (k, redact_json(val)))
                 .collect(),
@@ -209,59 +244,51 @@ fn fast_sig(kind: &str, val: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempRepo;
+    use serde_json::json;
 
     #[test]
-    fn probe_41_telemetry_zstd() {
-        let tmp = std::env::temp_dir().join(format!(
-            "refit_tel_test_{}_{}.jsonl",
-            std::process::id(),
-            now_ms()
-        ));
-        let hub = TelemetryHub::new(tmp.clone()).unwrap();
+    fn test_telemetry_dedup_zstd_and_resume() {
+        let dir = TempRepo::new("tel_all");
+        let log = dir.join("run.jsonl");
+        let hub = TelemetryHub::new(log.clone()).unwrap();
 
         for _ in 0..8 {
-            hub.emit("llm_stream", Some("mod_01".into()), Some(0), Some(0), Some(24000), None, None);
+            hub.emit("llm_stream", EventSpec {
+                module_id: Some("mod_01".into()), layer: Some(0), wave: Some(0),
+                uncached_tpm: Some(24000), ..EventSpec::default()
+            });
         }
         assert_eq!(hub.dedup_skipped(), 7);
 
         let fake_csk = ["csk", "-", "dummy000000000000"].concat();
         let fake_keen = ["keen", "_", "dummy000000000000"].concat();
-        hub.emit(
-            "run_start",
-            None,
-            None,
-            None,
-            Some(0),
-            Some(serde_json::json!({
-                "a": fake_csk,
-                "b": fake_keen
-            })),
-            None,
-        );
+        hub.emit_data("run_start", json!({ "a": fake_csk, "b": fake_keen }));
+
         for i in 0..30 {
-            hub.emit(
-                "mvcc_commit",
-                Some(format!("mod_{i:02}")),
-                Some(i / 10),
-                Some(i / 10),
-                Some(32000),
-                Some(serde_json::json!({"head_rev": i + 1, "ruff_errors": 0, "ty_errors": 0})),
-                None,
-            );
+            let payload = json!({"head_rev": i + 1, "ruff_errors": 0, "ty_errors": 0});
+            hub.emit("mvcc_commit", EventSpec {
+                module_id: Some(format!("mod_{i:02}")), layer: Some(i / 10), wave: Some(i / 10),
+                uncached_tpm: Some(32000), data: Some(payload), ..EventSpec::default()
+            });
         }
 
-        let (zst_path, raw_len, zst_len) = hub.flush_zstd().unwrap();
-        let disk_text = fs::read_to_string(&tmp).unwrap();
-        assert!(!disk_text.contains("csk-"));
-        assert!(!disk_text.contains("keen_"));
+        let (_zst, raw_len, zst_len) = hub.flush_zstd().unwrap();
         assert!(zst_len < raw_len / 2);
+        drop(hub);
 
-        let _ = fs::remove_file(&tmp);
-        let _ = fs::remove_file(&zst_path);
+        let h2 = TelemetryHub::open_hub(log, true).unwrap();
+        h2.emit("run_end", EventSpec { uncached_tpm: Some(0), ..EventSpec::default() });
+        let (zst2, raw2, zst_len2) = h2.flush_zstd().unwrap();
+        assert!(raw2 > raw_len && zst_len2 > 0 && zst2.exists());
+
+        let disk = dir.read("run.jsonl");
+        assert!(!disk.contains("csk-") && !disk.contains("keen_"));
+        assert!(disk.contains("run_start") && disk.contains("run_end"));
     }
 
     #[test]
-    fn probe_42_redact_multi() {
+    fn test_redact_multi_secrets() {
         let line = format!(
             "first={} mid={} second={} tail={}",
             ["csk", "-", "aaa111222333"].concat(),
@@ -270,29 +297,7 @@ mod tests {
             ["keen", "_", "ddd000111222"].concat()
         );
         let clean = redact_secrets(line);
-        assert!(!clean.contains("csk-"));
-        assert!(!clean.contains("keen_"));
-        assert_eq!(clean.matches("REDACTED_CSK_").count(), 2);
-        assert_eq!(clean.matches("REDACTED_KEEN_").count(), 2);
-    }
-
-    #[test]
-    fn probe_68_telemetry_resume() {
-        let tmp = std::env::temp_dir().join(format!("refit_tel68_{}_{}.jsonl", std::process::id(), now_ms()));
-        {
-            let h1 = TelemetryHub::new(tmp.clone()).unwrap();
-            h1.emit("run_start", None, None, None, Some(0), None, None);
-            let _ = h1.flush_zstd().unwrap();
-        }
-        {
-            let h2 = TelemetryHub::open_hub(tmp.clone(), true).unwrap();
-            h2.emit("run_end", None, None, None, Some(0), None, None);
-            let (zst, raw_len, zst_len) = h2.flush_zstd().unwrap();
-            assert!(raw_len > 0 && zst_len > 0);
-            let text = fs::read_to_string(&tmp).unwrap();
-            assert!(text.contains("run_start") && text.contains("run_end"));
-            let _ = fs::remove_file(&zst);
-        }
-        let _ = fs::remove_file(&tmp);
+        assert!(!clean.contains("csk-") && !clean.contains("keen_"));
+        assert_eq!((clean.matches("REDACTED_CSK_").count(), clean.matches("REDACTED_KEEN_").count()), (2, 2));
     }
 }

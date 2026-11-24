@@ -39,6 +39,7 @@ pub struct SteerState {
     pub skipped_units: Vec<String>,
 }
 
+#[derive(Default)]
 pub struct RunState {
     units: DashMap<String, UnitState>,
     committed_units: AtomicU64,
@@ -49,7 +50,7 @@ pub struct RunState {
     telemetry_dedup_skipped: AtomicU64,
     research_queries: AtomicU64,
     research_cache_hits: AtomicU64,
-    // Event-driven live steering controls (zero polling via Notify).
+
     paused: AtomicBool,
     abort_requested: AtomicBool,
     k_override: AtomicUsize,
@@ -59,25 +60,19 @@ pub struct RunState {
     steer_notify: Notify,
 }
 
+fn sub_atomic(counter: &AtomicU64, delta: u64) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(delta))
+    });
+}
+
 impl RunState {
     pub fn new(initial_loc: usize) -> Arc<Self> {
+        let loc = initial_loc as u64;
         Arc::new(Self {
-            units: DashMap::new(),
-            committed_units: AtomicU64::new(0),
-            in_flight_units: AtomicU64::new(0),
-            loc_before: AtomicU64::new(initial_loc as u64),
-            loc_after: AtomicU64::new(initial_loc as u64),
-            stage_hardlinked_files: AtomicU64::new(0),
-            telemetry_dedup_skipped: AtomicU64::new(0),
-            research_queries: AtomicU64::new(0),
-            research_cache_hits: AtomicU64::new(0),
-            paused: AtomicBool::new(false),
-            abort_requested: AtomicBool::new(false),
-            k_override: AtomicUsize::new(0),
-            priority_units: Mutex::new(VecDeque::new()),
-            skipped_units: DashMap::new(),
-            blocked_units: DashMap::new(),
-            steer_notify: Notify::new(),
+            loc_before: AtomicU64::new(loc),
+            loc_after: AtomicU64::new(loc),
+            ..Self::default()
         })
     }
 
@@ -95,8 +90,7 @@ impl RunState {
     }
 
     pub fn steer_k(&self, k: Option<usize>) {
-        self.k_override
-            .store(k.unwrap_or(0).min(64), Ordering::Release);
+        self.k_override.store(k.unwrap_or(0).min(64), Ordering::Release);
         self.steer_notify.notify_waiters();
     }
 
@@ -104,6 +98,7 @@ impl RunState {
         if unit_id.is_empty() {
             return;
         }
+
         let mut q = self.priority_units.lock();
         if !q.contains(&unit_id) {
             q.push_back(unit_id);
@@ -120,9 +115,9 @@ impl RunState {
     }
 
     pub async fn await_resume(&self) {
-        while self.paused.load(Ordering::Acquire) && !self.abort_requested.load(Ordering::Acquire) {
+        while self.paused.load(Ordering::Acquire) && !self.abort_asked() {
             let notified = self.steer_notify.notified();
-            if !self.paused.load(Ordering::Acquire) || self.abort_requested.load(Ordering::Acquire) {
+            if !self.paused.load(Ordering::Acquire) || self.abort_asked() {
                 break;
             }
             notified.await;
@@ -145,19 +140,14 @@ impl RunState {
         self.priority_units.lock().pop_front()
     }
 
-    /// Pop the first queued priority unit that is currently ready, preserving unready requests.
     pub fn pop_ready<F: Fn(&str) -> bool>(&self, is_ready: F) -> Option<String> {
         let mut q = self.priority_units.lock();
-        if let Some(pos) = q.iter().position(|uid| is_ready(uid)) {
-            q.remove(pos)
-        } else {
-            None
-        }
+        let pos = q.iter().position(|uid| is_ready(uid))?;
+        q.remove(pos)
     }
 
     pub fn mark_blocked(&self, unit_id: &str, reason: &str) {
-        self.blocked_units
-            .insert(unit_id.to_string(), reason.to_string());
+        self.blocked_units.insert(unit_id.to_string(), reason.to_string());
     }
 
     pub fn blocked_count(&self) -> usize {
@@ -169,13 +159,20 @@ impl RunState {
     }
 
     pub fn steering_snapshot(&self) -> SteerState {
-        let mut skipped: Vec<String> = self.skipped_units.iter().map(|e| e.key().clone()).collect();
+        let mut skipped: Vec<String> = self
+            .skipped_units
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
         skipped.sort();
+
+        let queue = self.priority_units.lock();
+        let priority_queue = queue.iter().cloned().collect();
         SteerState {
             paused: self.paused.load(Ordering::Acquire),
-            abort_requested: self.abort_requested.load(Ordering::Acquire),
+            abort_requested: self.abort_asked(),
             k_override: self.k_override(),
-            priority_queue: self.priority_units.lock().iter().cloned().collect(),
+            priority_queue,
             skipped_units: skipped,
         }
     }
@@ -199,15 +196,9 @@ impl RunState {
 
     pub fn step_inflight(&self, delta: i64) {
         if delta >= 0 {
-            self.in_flight_units
-                .fetch_add(delta as u64, Ordering::Relaxed);
+            self.in_flight_units.fetch_add(delta as u64, Ordering::Relaxed);
         } else {
-            let sub = (-delta) as u64;
-            let _ = self
-                .in_flight_units
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(sub))
-                });
+            sub_atomic(&self.in_flight_units, (-delta) as u64);
         }
     }
 
@@ -222,16 +213,12 @@ impl RunState {
     ) {
         self.committed_units.fetch_add(1, Ordering::Relaxed);
         if loc_after < loc_before {
-            let saved = (loc_before - loc_after) as u64;
-            let _ = self
-                .loc_after
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(saved))
-                });
+            sub_atomic(&self.loc_after, (loc_before - loc_after) as u64);
         } else if loc_after > loc_before {
-            self.loc_after
-                .fetch_add((loc_after - loc_before) as u64, Ordering::Relaxed);
+            let extra = (loc_after - loc_before) as u64;
+            self.loc_after.fetch_add(extra, Ordering::Relaxed);
         }
+
         self.units.insert(
             unit_id.to_string(),
             UnitState {
@@ -247,15 +234,13 @@ impl RunState {
 
     pub fn add_hardlinks(&self, count: u64) {
         if count > 0 {
-            self.stage_hardlinked_files
-                .fetch_add(count, Ordering::Relaxed);
+            self.stage_hardlinked_files.fetch_add(count, Ordering::Relaxed);
         }
     }
 
     pub fn count_dedup(&self, count: u64) {
         if count > 0 {
-            self.telemetry_dedup_skipped
-                .fetch_add(count, Ordering::Relaxed);
+            self.telemetry_dedup_skipped.fetch_add(count, Ordering::Relaxed);
         }
     }
 
@@ -267,17 +252,18 @@ impl RunState {
     }
 
     pub fn digest(&self) -> StateDigest {
+        let r = Ordering::Relaxed;
         StateDigest {
             tracked_units: self.units.len(),
-            committed_units: self.committed_units.load(Ordering::Relaxed),
-            in_flight_units: self.in_flight_units.load(Ordering::Relaxed),
+            committed_units: self.committed_units.load(r),
+            in_flight_units: self.in_flight_units.load(r),
             blocked_units: self.blocked_units.len(),
-            loc_before: self.loc_before.load(Ordering::Relaxed),
-            loc_after: self.loc_after.load(Ordering::Relaxed),
-            stage_hardlinked_files: self.stage_hardlinked_files.load(Ordering::Relaxed),
-            telemetry_dedup_skipped: self.telemetry_dedup_skipped.load(Ordering::Relaxed),
-            research_queries: self.research_queries.load(Ordering::Relaxed),
-            research_cache_hits: self.research_cache_hits.load(Ordering::Relaxed),
+            loc_before: self.loc_before.load(r),
+            loc_after: self.loc_after.load(r),
+            stage_hardlinked_files: self.stage_hardlinked_files.load(r),
+            telemetry_dedup_skipped: self.telemetry_dedup_skipped.load(r),
+            research_queries: self.research_queries.load(r),
+            research_cache_hits: self.research_cache_hits.load(r),
         }
     }
 }
@@ -288,15 +274,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn probe_43_state_counters() {
+    fn test_state_concurrent_counters() {
         let st = RunState::new(1000);
         std::thread::scope(|s| {
             for i in 0..8usize {
                 let c = st.clone();
                 s.spawn(move || {
+                    let mid = format!("mod_{i}");
                     c.step_inflight(1);
-                    c.set_phase(&format!("mod_{i}"), "streaming", 1, 100);
-                    c.record_commit(&format!("mod_{i}"), 1, 100, 80, 0.92, format!("h{i}"));
+                    c.set_phase(&mid, "streaming", 1, 100);
+                    c.record_commit(&mid, 1, 100, 80, 0.92, format!("h{i}"));
                     c.step_inflight(-1);
                     c.add_hardlinks(10);
                     c.count_search(i % 2 == 0);
@@ -305,18 +292,13 @@ mod tests {
         });
 
         let d = st.digest();
-        assert_eq!(d.tracked_units, 8);
-        assert_eq!(d.committed_units, 8);
-        assert_eq!(d.in_flight_units, 0);
-        assert_eq!(d.loc_before, 1000);
-        assert_eq!(d.loc_after, 840);
-        assert_eq!(d.stage_hardlinked_files, 80);
-        assert_eq!(d.research_queries, 8);
-        assert_eq!(d.research_cache_hits, 4);
+        assert_eq!((d.tracked_units, d.committed_units, d.in_flight_units), (8, 8, 0));
+        assert_eq!((d.loc_before, d.loc_after, d.stage_hardlinked_files), (1000, 840, 80));
+        assert_eq!((d.research_queries, d.research_cache_hits), (8, 4));
     }
 
     #[tokio::test]
-    async fn probe_65_steer_bus() {
+    async fn test_state_steering_and_priority() {
         let st = RunState::new(500);
         st.steer_pause(true);
         st.steer_k(Some(6));
@@ -324,9 +306,7 @@ mod tests {
         st.steer_skip("legacy_mod".into());
 
         let snap = st.steering_snapshot();
-        assert!(snap.paused);
-        assert_eq!(snap.k_override, Some(6));
-        assert!(st.is_skipped("legacy_mod"));
+        assert!(snap.paused && snap.k_override == Some(6) && st.is_skipped("legacy_mod"));
         assert_eq!(st.pop_prio().as_deref(), Some("hot_mod"));
 
         let st_c = st.clone();
@@ -336,25 +316,14 @@ mod tests {
         });
         let t0 = Instant::now();
         st.await_resume().await;
-        assert!(t0.elapsed() < Duration::from_secs(1));
-        assert!(!st.steering_snapshot().paused);
-    }
+        assert!(t0.elapsed() < Duration::from_secs(1) && !st.steering_snapshot().paused);
 
-    #[test]
-    fn probe_78_prio_preserve() {
-        let st = RunState::new(100);
         st.steer_prioritize("blocked_child".into());
         st.steer_prioritize("ready_leaf".into());
-        assert_eq!(
-            st.pop_ready(|uid| uid == "ready_leaf").as_deref(),
-            Some("ready_leaf")
-        );
-        // Unready unit must remain queued until its dependencies become ready.
+        let pop = |want: &str| st.pop_ready(|u| u == want);
+        assert_eq!(pop("ready_leaf").as_deref(), Some("ready_leaf"));
         assert_eq!(st.pop_ready(|_| false), None);
-        assert_eq!(
-            st.pop_ready(|uid| uid == "blocked_child").as_deref(),
-            Some("blocked_child")
-        );
+        assert_eq!(pop("blocked_child").as_deref(), Some("blocked_child"));
         st.mark_blocked("orphan_u", "dependency skipped");
         assert_eq!(st.blocked_count(), 1);
     }

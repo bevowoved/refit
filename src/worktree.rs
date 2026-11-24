@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
+use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 #[derive(Debug, Clone)]
 pub struct Worktree {
@@ -10,9 +11,56 @@ pub struct Worktree {
     pub carried_dirty_changes: bool,
 }
 
-#[cfg(test)]
-pub fn make_worktree(repo_root: &Path, run_id: &str) -> Result<Worktree> {
-    open_worktree(repo_root, run_id, false)
+fn git_run(dir: &Path, args: &[&str]) -> Result<Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = git_run(dir, args).ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn capture_dirty(repo_root: &Path) -> Option<String> {
+    let status = git_stdout(repo_root, &["status", "--porcelain"])?;
+    if status.is_empty() {
+        return None;
+    }
+
+    let oid = git_stdout(repo_root, &["stash", "create", "refit-worktree-carryover"])?;
+    (!oid.is_empty()).then_some(oid)
+}
+
+fn copy_untracked(repo_root: &Path, wt_path: &Path) -> bool {
+    let Some(list) = git_stdout(repo_root, &["ls-files", "--others", "--exclude-standard"])
+    else {
+        return false;
+    };
+
+    let mut copied = false;
+    for line in list.lines() {
+        let rel = line.trim().replace('\\', "/");
+        if rel.is_empty() || !crate::platform::check_rel(&rel) {
+            continue;
+        }
+
+        let src = repo_root.join(&rel);
+        let dst = wt_path.join(&rel);
+        if !src.is_file() {
+            continue;
+        }
+
+        if let Some(p) = dst.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        copied |= std::fs::copy(&src, &dst).is_ok();
+    }
+    copied
 }
 
 pub fn open_worktree(
@@ -20,192 +68,86 @@ pub fn open_worktree(
     run_id: &str,
     include_dirty: bool,
 ) -> Result<Worktree> {
-    let git_check = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(repo_root)
-        .output()
-        .context("check git worktree support")?;
-    if !git_check.status.success() {
-        anyhow::bail!(
-            "{} is not a git repository; cannot create isolated --worktree",
-            repo_root.display()
-        );
+    if !git_run(repo_root, &["rev-parse", "--is-inside-work-tree"])?.status.success() {
+        anyhow::bail!("{} is not a git repository", repo_root.display());
     }
 
-    let safe_id: String = run_id
+    let safe: String = run_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect();
-    let mut branch = format!("refit/{safe_id}");
     let parent = repo_root.parent().unwrap_or_else(|| Path::new("."));
-    let repo_name = repo_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("repo");
-    let mut worktree_path = parent.join(format!(".{repo_name}-worktree-{safe_id}"));
+    let name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
 
-    if worktree_path.exists() {
-        let _ = Command::new("git")
-            .args(["worktree", "prune"])
-            .current_dir(repo_root)
-            .output();
+    let mut branch = format!("refit/{safe}");
+    let mut wt_path = parent.join(format!(".{name}-worktree-{safe}"));
+    if wt_path.exists() {
+        let _ = git_run(repo_root, &["worktree", "prune"]);
         let suffix = crate::platform::now_ms();
-        branch = format!("refit/{safe_id}-{suffix}");
-        worktree_path = parent.join(format!(".{repo_name}-worktree-{safe_id}-{suffix}"));
+        branch = format!("refit/{safe}-{suffix}");
+        wt_path = parent.join(format!(".{name}-worktree-{safe}-{suffix}"));
     }
 
-    // Check for dirty working tree so uncommitted work is handled explicitly.
-    let dirty_patch = if include_dirty {
-        let status = Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(repo_root)
-            .output()
-            .ok();
-        let is_dirty = status
-            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-            .unwrap_or(false);
-        if is_dirty {
-            // Non-destructive `git stash create` captures tracked edits without modifying core working tree.
-            Command::new("git")
-                .args(["stash", "create", "refit-worktree-carryover"])
-                .current_dir(repo_root)
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let out = Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            &worktree_path.display().to_string(),
-            "HEAD",
-        ])
-        .current_dir(repo_root)
-        .output()
-        .context("run git worktree add")?;
-
-    if !out.status.success() {
-        anyhow::bail!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    let dirty_oid = include_dirty.then(|| capture_dirty(repo_root)).flatten();
+    let wt_str = wt_path.display().to_string();
+    let add = git_run(repo_root, &["worktree", "add", "-b", &branch, &wt_str, "HEAD"])?;
+    if !add.status.success() {
+        anyhow::bail!("git worktree add failed: {}", String::from_utf8_lossy(&add.stderr).trim());
     }
 
-    let mut carried_dirty_changes = false;
-    if let Some(stash_oid) = dirty_patch {
-        let apply = Command::new("git")
-            .args(["stash", "apply", "--quiet", &stash_oid])
-            .current_dir(&worktree_path)
-            .output()
-            .context("apply dirty worktree carryover stash")?;
-        if !apply.status.success() {
-            anyhow::bail!(
-                "failed to carry over dirty tracked changes to worktree: {}",
-                String::from_utf8_lossy(&apply.stderr).trim()
-            );
-        }
-        carried_dirty_changes = true;
-    }
-    if include_dirty {
-        // Also carry over non-ignored untracked files (`git ls-files --others --exclude-standard`).
-        if let Ok(untracked) = Command::new("git")
-            .args(["ls-files", "--others", "--exclude-standard"])
-            .current_dir(repo_root)
-            .output()
-        {
-            if untracked.status.success() {
-                for line in String::from_utf8_lossy(&untracked.stdout).lines() {
-                    let rel = line.trim().replace('\\', "/");
-                    if rel.is_empty() || !crate::platform::check_rel(&rel) {
-                        continue;
-                    }
-                    let src = repo_root.join(&rel);
-                    let dst = worktree_path.join(&rel);
-                    if src.is_file() {
-                        if let Some(p) = dst.parent() {
-                            let _ = std::fs::create_dir_all(p);
-                        }
-                        if std::fs::copy(&src, &dst).is_ok() {
-                            carried_dirty_changes = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(Worktree {
+    let wt = Worktree {
         core_repo: repo_root.to_path_buf(),
-        worktree_path,
+        worktree_path: wt_path,
         branch,
-        carried_dirty_changes,
-    })
+        carried_dirty_changes: false,
+    };
+    let mut guard = DropGuard::new(wt, |w| {
+        let _ = remove_worktree(&w);
+    });
+
+    if let Some(oid) = dirty_oid {
+        let apply = git_run(&guard.worktree_path, &["stash", "apply", "--quiet", &oid])?;
+        if !apply.status.success() {
+            let err = String::from_utf8_lossy(&apply.stderr);
+            anyhow::bail!("dirty carryover failed: {}", err.trim());
+        }
+        guard.carried_dirty_changes = true;
+    }
+
+    if include_dirty {
+        guard.carried_dirty_changes |= copy_untracked(repo_root, &guard.worktree_path);
+    }
+    Ok(DropGuard::dismiss(guard))
 }
 
 pub fn diffstat(wt: &Worktree) -> String {
-    Command::new("git")
-        .args(["diff", "--stat"])
-        .current_dir(&wt.worktree_path)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    git_stdout(&wt.worktree_path, &["diff", "--stat"]).unwrap_or_default()
 }
 
 pub fn list_worktrees(repo_root: &Path) -> Vec<String> {
-    let Ok(out) = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_root)
-        .output()
-    else {
+    let Some(text) = git_stdout(repo_root, &["worktree", "list", "--porcelain"]) else {
         return Vec::new();
     };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut results = Vec::new();
-    let mut cur_path: Option<String> = None;
+
+    let mut out = Vec::new();
+    let mut cur_path: Option<&str> = None;
     for line in text.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            cur_path = Some(p.trim().to_string());
-        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
-            if b.starts_with("refit/") {
-                if let Some(ref p) = cur_path {
-                    results.push(format!("{} ({})", b.trim(), p));
-                }
-            }
+            cur_path = Some(p.trim());
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/")
+            && let Some(p) = cur_path.filter(|_| b.starts_with("refit/"))
+        {
+            out.push(format!("{} ({p})", b.trim()));
         }
     }
-    results
+    out
 }
 
-#[allow(dead_code)]
 pub fn remove_worktree(wt: &Worktree) -> Result<()> {
-    let _ = Command::new("git")
-        .args([
-            "worktree",
-            "remove",
-            "--force",
-            &wt.worktree_path.display().to_string(),
-        ])
-        .current_dir(&wt.core_repo)
-        .output();
+    let wt_str = wt.worktree_path.display().to_string();
+    let _ = git_run(&wt.core_repo, &["worktree", "remove", "--force", &wt_str]);
     if wt.branch.starts_with("refit/") {
-        let _ = Command::new("git")
-            .args(["branch", "-D", &wt.branch])
-            .current_dir(&wt.core_repo)
-            .output();
+        let _ = git_run(&wt.core_repo, &["branch", "-D", &wt.branch]);
     }
     Ok(())
 }
@@ -213,91 +155,30 @@ pub fn remove_worktree(wt: &Worktree) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempRepo;
     use std::fs;
 
     #[test]
-    fn probe_44_worktree_iso() {
-        let base = std::env::temp_dir().join(format!(
-            "refit_wt_test_{}_{}",
-            std::process::id(),
-            crate::platform::now_ms()
-        ));
-        let core = base.join("core_repo");
-        fs::create_dir_all(&core).unwrap();
+    fn test_worktree_isolation_and_dirty_carryover() {
+        let orig = "def greet() -> str:\n    return 'core'\n";
+        let repo = TempRepo::git("wt_all", "core_repo", &[("app.py", orig)]);
 
-        let run_git = |args: &[&str], dir: &Path| {
-            let o = Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("git installed");
-            assert!(
-                o.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&o.stderr)
-            );
-        };
+        let wt = open_worktree(repo.path(), "test-run-42", false).unwrap();
+        assert!(wt.worktree_path.exists() && wt.branch == "refit/test-run-42");
+        fs::write(wt.worktree_path.join("app.py"), "def greet() -> str:\n    return 'ref'\n").unwrap();
+        assert_eq!(repo.read("app.py"), orig);
+        assert!(diffstat(&wt).contains("app.py"));
 
-        run_git(&["init", "-b", "main"], &core);
-        run_git(&["config", "user.email", "refit@local.test"], &core);
-        run_git(&["config", "user.name", "refit-test"], &core);
+        repo.write("app.py", "X = 99\n");
+        let dirty = open_worktree(repo.path(), "dirty-run", true).unwrap();
+        assert!(dirty.carried_dirty_changes);
+        let text = fs::read_to_string(dirty.worktree_path.join("app.py")).unwrap();
+        assert_eq!(text.replace("\r\n", "\n"), "X = 99\n");
+        assert!(list_worktrees(repo.path()).iter().any(|s| s.contains("refit/dirty-run")));
 
-        let core_file = core.join("app.py");
-        fs::write(&core_file, "def greet() -> str:\n    return 'core'\n").unwrap();
-        run_git(&["add", "app.py"], &core);
-        run_git(&["commit", "-m", "init core"], &core);
-
-        let wt = make_worktree(&core, "test-run-42").unwrap();
-        assert!(wt.worktree_path.exists());
-        assert_eq!(wt.branch, "refit/test-run-42");
-
-        let wt_file = wt.worktree_path.join("app.py");
-        fs::write(&wt_file, "def greet() -> str:\n    return 'refactored'\n").unwrap();
-
-        let core_after = fs::read_to_string(&core_file).unwrap();
-        assert_eq!(core_after, "def greet() -> str:\n    return 'core'\n");
-        let stat = diffstat(&wt);
-        assert!(stat.contains("app.py"));
-
-        remove_worktree(&wt).unwrap();
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn probe_90_worktree_dirty() {
-        let base = std::env::temp_dir().join(format!(
-            "refit_wt90_{}_{}",
-            std::process::id(),
-            crate::platform::now_ms()
-        ));
-        let core = base.join("core_repo");
-        fs::create_dir_all(&core).unwrap();
-        let run_git = |args: &[&str], dir: &Path| {
-            let o = Command::new("git").args(args).current_dir(dir).output().unwrap();
-            assert!(o.status.success());
-        };
-        run_git(&["init", "-b", "main"], &core);
-        run_git(&["config", "user.email", "refit@local.test"], &core);
-        run_git(&["config", "user.name", "refit-test"], &core);
-        fs::write(core.join("app.py"), "X = 1\n").unwrap();
-        run_git(&["add", "app.py"], &core);
-        run_git(&["commit", "-m", "init"], &core);
-
-        // Dirty uncommitted change in core repo.
-        fs::write(core.join("app.py"), "X = 99\n").unwrap();
-        let wt = open_worktree(&core, "dirty-run", true).unwrap();
-        assert!(wt.carried_dirty_changes);
-        assert_eq!(
-            fs::read_to_string(wt.worktree_path.join("app.py"))
-                .unwrap()
-                .replace("\r\n", "\n"),
-            "X = 99\n"
-        );
-        let listed = list_worktrees(&core);
-        assert!(listed.iter().any(|s| s.contains("refit/dirty-run")));
-        remove_worktree(&wt).unwrap();
-        assert!(!wt.worktree_path.exists());
-        let _ = fs::remove_dir_all(&base);
+        for item in [&wt, &dirty] {
+            remove_worktree(item).unwrap();
+            assert!(!item.worktree_path.exists());
+        }
     }
 }

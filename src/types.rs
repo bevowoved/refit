@@ -88,7 +88,7 @@ pub struct AsrfHunk {
     pub replace: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GateVerdict {
     pub passed: bool,
     pub failed_gate: Option<String>,
