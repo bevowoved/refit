@@ -3,7 +3,7 @@ use crate::graph::{apply_patches, hash_abi, impacted_tests, parse_patches};
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::{CommitOutcome, MvccStore};
 use crate::net::{json_path, json_str};
-use crate::platform::{check_rel, now_ms, write_atomic};
+use crate::platform::{check_target_in_repo, now_ms, write_atomic};
 use crate::source::{count_lines, work_dir};
 use crate::types::{ModuleUnit, PatchOp};
 use dashmap::DashMap;
@@ -91,26 +91,7 @@ pub fn check_txid(handle: &str) -> bool {
 }
 
 pub fn check_target(repo_root: &Path, rel: &str) -> bool {
-    if !check_rel(rel) {
-        return false;
-    }
-    let Ok(root) = fs::canonicalize(repo_root) else {
-        return true;
-    };
-
-    let cand = repo_root.join(rel);
-    if cand.exists() {
-        return fs::canonicalize(&cand).is_ok_and(|c| c.starts_with(&root));
-    }
-
-    let mut anc = cand.parent();
-    while let Some(dir) = anc {
-        if dir.exists() {
-            return fs::canonicalize(dir).is_ok_and(|c| c.starts_with(&root));
-        }
-        anc = dir.parent();
-    }
-    false
+    check_target_in_repo(repo_root, rel)
 }
 
 fn sweep_txs(tx_root: &Path, now: u64) -> usize {
@@ -578,4 +559,30 @@ fn build_unit(
         allow_abi_change: allow_abi,
     };
     (unit, cands, deleted, base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempRepo;
+
+    #[test]
+    fn check_target_is_fail_closed() {
+        let missing_root = std::env::temp_dir().join("refit_nonexistent_root_fail_closed_99999");
+        let _ = fs::remove_dir_all(&missing_root);
+        assert!(
+            !check_target(&missing_root, "src/main.rs"),
+            "check_target MUST fail closed when repo_root cannot be canonicalized"
+        );
+
+        let repo = TempRepo::with_files("tx_fail_closed", &[("src/ok.rs", "fn main() {}\n")]);
+        assert!(check_target(repo.path(), "src/ok.rs"));
+        assert!(check_target(repo.path(), "src/new_sub/file.rs"));
+        assert!(!check_target(repo.path(), "../escape.rs"));
+        assert!(!check_target(repo.path(), ".git/config"));
+        assert!(!check_target(repo.path(), ".gi\u{0307}t/HEAD"));
+        assert!(!check_target(repo.path(), "src/CON.rs"));
+        assert!(!check_target(repo.path(), "src/a.rs:ads"));
+        assert!(!check_target(repo.path(), "src/bad. "));
+    }
 }

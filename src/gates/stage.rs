@@ -109,6 +109,33 @@ pub fn decode_lsp(raw: &[u8]) -> Option<(serde_json::Value, usize)> {
     Some((serde_json::from_slice(&raw[hdr_end + 4..end]).ok()?, end))
 }
 
+fn link_or_copy_file(src: &Path, dst: &Path) -> Result<(u64, u64)> {
+    match fs::hard_link(src, dst) {
+        Ok(()) => Ok((1, 0)),
+        Err(link_err) => match fs::copy(src, dst) {
+            Ok(_) => Ok((0, 1)),
+            Err(copy_err) => anyhow::bail!(
+                "stage materialize failed for {} -> {} (hard_link: {link_err}; copy: {copy_err})",
+                src.display(),
+                dst.display()
+            ),
+        },
+    }
+}
+
+fn link_or_copy_pairs(pairs: &[(PathBuf, PathBuf)]) -> Result<(u64, u64)> {
+    pairs
+        .par_iter()
+        .try_fold(
+            || (0u64, 0u64),
+            |(hl, cp), (src, dst)| {
+                let (dh, dc) = link_or_copy_file(src, dst)?;
+                Ok((hl + dh, cp + dc))
+            },
+        )
+        .try_reduce(|| (0u64, 0u64), |a, b| Ok((a.0 + b.0, a.1 + b.1)))
+}
+
 pub(super) fn materialize_stage(
     repo_root: &Path,
     candidates: &BTreeMap<String, String>,
@@ -121,6 +148,9 @@ pub(super) fn materialize_stage(
 
     let stage_dir = stages_dir(repo_root).join(format!("tx-{}-{seq}", now_ms()));
     fs::create_dir_all(&stage_dir)?;
+    let guard = DropGuard::new(stage_dir, |dir| {
+        let _ = fs::remove_dir_all(dir);
+    });
     let del_set: BTreeSet<String> = deleted.iter().map(|s| s.replace('\\', "/")).collect();
 
     let to_link: Vec<(PathBuf, PathBuf)> = walk_files(repo_root, None)
@@ -130,27 +160,17 @@ pub(super) fn materialize_stage(
             if candidates.contains_key(&rel) || del_set.contains(&rel) {
                 return None;
             }
-            Some((path, stage_dir.join(&rel)))
+            Some((path, guard.join(&rel)))
         })
         .collect();
 
     let parents: BTreeSet<&Path> = to_link.iter().filter_map(|(_, d)| d.parent()).collect();
     for p in parents {
-        let _ = fs::create_dir_all(p);
+        fs::create_dir_all(p)
+            .with_context(|| format!("create staged parent dir {}", p.display()))?;
     }
 
-    let (hl, cp): (u64, u64) = to_link
-        .par_iter()
-        .map(|(src, dst)| {
-            if fs::hard_link(src, dst).is_ok() {
-                (1, 0)
-            } else if fs::copy(src, dst).is_ok() {
-                (0, 1)
-            } else {
-                (0, 0)
-            }
-        })
-        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let (hl, cp) = link_or_copy_pairs(&to_link)?;
 
     if hl > 0 {
         STAGE_HARDLINKS_TOTAL.fetch_add(hl, Ordering::Relaxed);
@@ -160,14 +180,47 @@ pub(super) fn materialize_stage(
     }
 
     for (rel, content) in candidates {
-        let dst = stage_dir.join(rel);
+        let dst = guard.join(rel);
         if let Some(p) = dst.parent() {
             fs::create_dir_all(p)?;
         }
         fs::write(&dst, content.as_bytes())
             .with_context(|| format!("write staged candidate {}", dst.display()))?;
     }
-    Ok(DropGuard::new(stage_dir, |dir| {
-        let _ = fs::remove_dir_all(dir);
-    }))
+    Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempRepo;
+    use std::io::Read;
+
+    #[test]
+    fn stage_copy_failure_propagates_and_sentinel_guard() {
+        let tmp = TempRepo::with_files("stage_err", &[("src/a.rs", "pub fn ok() -> u8 { 42 }\n")]);
+        let dst_dir = tmp.join("out_stage");
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        // Missing source: BOTH hard_link and copy must fail and propagate Err (not silent (0, 0)).
+        let missing = tmp.join("src/does_not_exist.rs");
+        let err = link_or_copy_pairs(&[(missing, dst_dir.join("target.rs"))]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stage materialize failed"), "unexpected error: {msg}");
+
+        // Destination collision with an existing directory: BOTH hard_link and copy fail -> Err.
+        let occupied = dst_dir.join("occupied_dir");
+        fs::create_dir_all(&occupied).unwrap();
+        let err2 = link_or_copy_pairs(&[(tmp.join("src/a.rs"), occupied)]).unwrap_err();
+        assert!(err2.to_string().contains("stage materialize failed"));
+
+        // 0xFF blanking sentinel verification on successful materialization.
+        let empty = BTreeMap::new();
+        let stage = materialize_stage(tmp.path(), &empty, &[]).unwrap();
+        let staged_file = stage.join("src/a.rs");
+        let mut buf = [0xFFu8; 64];
+        let n = fs::File::open(&staged_file).unwrap().read(&mut buf).unwrap();
+        assert!(n > 0 && &buf[..n] == b"pub fn ok() -> u8 { 42 }\n");
+        assert!(buf[n..].iter().all(|&b| b == 0xFF));
+    }
 }

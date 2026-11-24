@@ -76,27 +76,31 @@ pub fn open_worktree(
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect();
-    let parent = repo_root.parent().unwrap_or_else(|| Path::new("."));
-    let name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let canonical_repo = crate::platform::paths::canonical_root(repo_root);
+    let parent = canonical_repo
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = canonical_repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
 
     let mut branch = format!("refit/{safe}");
     let mut wt_path = parent.join(format!(".{name}-worktree-{safe}"));
     if wt_path.exists() {
-        let _ = git_run(repo_root, &["worktree", "prune"]);
+        let _ = git_run(&canonical_repo, &["worktree", "prune"]);
         let suffix = crate::platform::now_ms();
         branch = format!("refit/{safe}-{suffix}");
         wt_path = parent.join(format!(".{name}-worktree-{safe}-{suffix}"));
     }
 
-    let dirty_oid = include_dirty.then(|| capture_dirty(repo_root)).flatten();
+    let dirty_oid = include_dirty.then(|| capture_dirty(&canonical_repo)).flatten();
     let wt_str = wt_path.display().to_string();
-    let add = git_run(repo_root, &["worktree", "add", "-b", &branch, &wt_str, "HEAD"])?;
+    let add = git_run(&canonical_repo, &["worktree", "add", "-b", &branch, &wt_str, "HEAD"])?;
     if !add.status.success() {
         anyhow::bail!("git worktree add failed: {}", String::from_utf8_lossy(&add.stderr).trim());
     }
 
     let wt = Worktree {
-        core_repo: repo_root.to_path_buf(),
+        core_repo: canonical_repo.clone(),
         worktree_path: wt_path,
         branch,
         carried_dirty_changes: false,
@@ -180,5 +184,11 @@ mod tests {
             remove_worktree(item).unwrap();
             assert!(!item.worktree_path.exists());
         }
+
+        // Verify relative `.` canonicalizes to a real path with non-empty parent & repo name.
+        let dot = crate::platform::paths::canonical_root(Path::new("."));
+        assert!(dot.is_absolute());
+        assert!(dot.parent().is_some_and(|p| !p.as_os_str().is_empty()));
+        assert!(dot.file_name().is_some());
     }
 }

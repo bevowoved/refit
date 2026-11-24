@@ -3,9 +3,15 @@ use serde_json::{Value, json};
 use std::future::Future;
 use std::time::{Duration, SystemTime};
 
+/// Classify HTTP `432` as permanent billing/quota exhaustion (non-retryable, distinct from `429`).
+#[inline]
+pub fn is_quota_exhausted(status: u16) -> bool {
+    status == 432
+}
+
 #[inline]
 pub fn is_retryable(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+    !is_quota_exhausted(status) && matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 pub fn retry_ms(header_val: &str, max_cap_ms: u64) -> Option<u64> {

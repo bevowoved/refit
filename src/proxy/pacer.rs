@@ -168,6 +168,9 @@ impl PacerState {
             self.rpm_cap = ((v as f64) * 0.80).round().max(30.0) as u64;
         }
 
+        if crate::net::is_quota_exhausted(status) {
+            return Some(self.on_432());
+        }
         if status == 429 {
             return self.on_429(retry_after.unwrap_or(5));
         }
@@ -178,6 +181,13 @@ impl PacerState {
             return self.on_2xx();
         }
         None
+    }
+
+    fn on_432(&mut self) -> Value {
+        self.circuit_state = "PERMANENT_OPEN".into();
+        self.circuit_open_until = None;
+        self.circuit_pauses += 1;
+        json!({"state": "PERMANENT_OPEN", "status": 432, "reason": "quota_exhausted"})
     }
 
     fn on_429(&mut self, retry_after: u64) -> Option<Value> {
@@ -262,7 +272,7 @@ impl PacerState {
         in_flight: u64,
         due_fn: fn(u64, u64, u64, u64, u32, u32, bool) -> bool,
     ) -> bool {
-        if self.circuit_state == "OPEN" {
+        if self.circuit_state == "OPEN" || self.circuit_state == "PERMANENT_OPEN" {
             return false;
         }
         let Some(last) = self.keep_warm.last_activity else { return false };
@@ -294,4 +304,24 @@ fn push_sample(q: &mut VecDeque<f64>, val: f64) {
         q.pop_front();
     }
     q.push_back(val);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacer_classifies_432_permanent_distinct_from_429() {
+        let mut p = PacerState::new();
+        let ev429 = p.apply_status(429, None, None, Some(2));
+        assert!(ev429.is_none());
+        assert_eq!(p.snapshot().circuit_state, "CLOSED");
+        assert_eq!(p.snapshot().http_429_count, 1);
+
+        let ev432 = p.apply_status(432, None, None, None).unwrap();
+        assert_eq!(ev432["state"], "PERMANENT_OPEN");
+        assert_eq!(ev432["reason"], "quota_exhausted");
+        assert_eq!(p.snapshot().circuit_state, "PERMANENT_OPEN");
+        assert_eq!(p.snapshot().circuit_pauses, 1);
+    }
 }

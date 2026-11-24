@@ -1,8 +1,18 @@
 use crate::lex::eq_ws;
-use crate::platform::check_rel;
+use crate::platform::{check_rel, normalize_rel, strip_utf8_bom};
 use crate::types::{AsrfHunk, PatchOp};
 use anyhow::Result;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+
+#[inline]
+fn normalize_lf(s: &str) -> Cow<'_, str> {
+    if s.contains("\r\n") {
+        Cow::Owned(s.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct AppliedPatch {
@@ -15,7 +25,7 @@ pub struct AppliedPatch {
 /// Parse ASRF hunks supporting `edit`, `create`, `delete`, and `rename`.
 pub fn parse_patches(content: &str) -> Vec<AsrfHunk> {
     let mut hunks = Vec::new();
-    let norm = content.replace("\r\n", "\n");
+    let norm = normalize_lf(strip_utf8_bom(content));
     let mut cursor = 0usize;
 
     while let Some(rel_start) = norm[cursor..].find("<<<REFIT_PATCH") {
@@ -137,25 +147,28 @@ pub fn apply_patches(
 }
 
 fn apply_one(patch: &mut AppliedPatch, h: &AsrfHunk, idx: usize) -> Result<()> {
+    let norm_path = normalize_rel(&h.path).unwrap_or_else(|| h.path.clone());
     match h.op {
         PatchOp::Create => {
-            patch.updated.insert(h.path.clone(), h.replace.replace("\r\n", "\n"));
-            push_unique(&mut patch.created, &h.path);
-            patch.deleted.retain(|d| d != &h.path);
+            patch.updated.insert(norm_path.clone(), normalize_lf(&h.replace).into_owned());
+            push_unique(&mut patch.created, &norm_path);
+            patch.deleted.retain(|d| d != &norm_path);
         }
         PatchOp::Delete => {
-            let key = match_target(&patch.updated, &h.path, idx, false)?;
+            let key = match_target(&patch.updated, &norm_path, idx, false)?;
             patch.updated.remove(&key);
             patch.created.retain(|c| c != &key);
             push_unique(&mut patch.deleted, &key);
         }
         PatchOp::Rename => {
-            let key = match_target(&patch.updated, &h.path, idx, false)?;
-            let dest = h
+            let key = match_target(&patch.updated, &norm_path, idx, false)?;
+            let raw_dest = h
                 .new_path
-                .clone()
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("Hunk #{idx} rename missing new_path"))?;
-            let mut body = patch.updated.remove(&key).unwrap_or_default().replace("\r\n", "\n");
+            let dest = normalize_rel(raw_dest).unwrap_or_else(|| raw_dest.to_string());
+            let removed = patch.updated.remove(&key).unwrap_or_default();
+            let mut body = normalize_lf(&removed).into_owned();
             if !h.search.is_empty() {
                 body = apply_hunk(&body, &h.search, &h.replace, idx, &key)?;
             }
@@ -168,10 +181,10 @@ fn apply_one(patch: &mut AppliedPatch, h: &AsrfHunk, idx: usize) -> Result<()> {
             patch.updated.insert(dest, body);
         }
         PatchOp::Edit => {
-            let key = match_target(&patch.updated, &h.path, idx, true)?;
+            let key = match_target(&patch.updated, &norm_path, idx, true)?;
             let raw = patch.updated.get(&key).map_or("", String::as_str);
-            let cur = raw.replace("\r\n", "\n");
-            let next = apply_hunk(&cur, &h.search, &h.replace, idx, &key)?;
+            let cur = normalize_lf(raw);
+            let next = apply_hunk(cur.as_ref(), &h.search, &h.replace, idx, &key)?;
             patch.updated.insert(key, next);
         }
     }
@@ -207,28 +220,28 @@ fn match_target(
 }
 
 fn apply_hunk(cur: &str, search: &str, replace: &str, idx: usize, key: &str) -> Result<String> {
-    let s_norm = search.replace("\r\n", "\n");
-    let r_norm = replace.replace("\r\n", "\n");
+    let s_norm = normalize_lf(search);
+    let r_norm = normalize_lf(replace);
 
-    let mut exact = cur.match_indices(&s_norm).map(|(p, _)| p);
+    let mut exact = cur.match_indices(s_norm.as_ref()).map(|(p, _)| p);
     if let Some(pos) = exact.next() {
         if exact.next().is_some() {
             anyhow::bail!("Hunk #{idx} ambiguous SEARCH block in `{key}`; add context lines");
         }
         let mut next = String::with_capacity(cur.len() + r_norm.len());
         next.push_str(&cur[..pos]);
-        next.push_str(&r_norm);
+        next.push_str(r_norm.as_ref());
         next.push_str(&cur[pos + s_norm.len()..]);
         return Ok(next);
     }
 
-    if let Some(next) = replace_window(cur, &s_norm, &r_norm, |a, b| a.trim() == b.trim()) {
+    if let Some(next) = replace_window(cur, s_norm.as_ref(), r_norm.as_ref(), |a, b| a.trim() == b.trim()) {
         return Ok(next);
     }
-    if let Some(next) = replace_elided(cur, &s_norm, &r_norm) {
+    if let Some(next) = replace_elided(cur, s_norm.as_ref(), r_norm.as_ref()) {
         return Ok(next);
     }
-    if let Some(next) = replace_window(cur, &s_norm, &r_norm, eq_ws) {
+    if let Some(next) = replace_window(cur, s_norm.as_ref(), r_norm.as_ref(), eq_ws) {
         return Ok(next);
     }
 
@@ -336,4 +349,29 @@ fn replace_elided(doc: &str, search: &str, replace: &str) -> Option<String> {
             &d_lines[t_end..],
         ],
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn patch_cow_lf_fast_path_and_cross_os_path_guard() {
+        assert!(matches!(normalize_lf("let x = 1;\n"), Cow::Borrowed(_)));
+        assert!(matches!(normalize_lf("let x = 1;\r\n"), Cow::Owned(_)));
+
+        let base = BTreeMap::from([("src/a.rs".to_string(), "pub fn a() -> u8 { 1 }\n".to_string())]);
+        for bad_path in ["src/CON.rs", "src/a.rs:ads", ".git/config", ".gi\u{0307}t/HEAD", "src/bad. "] {
+            let hunks = parse_patches(&format!(
+                "<<<REFIT_PATCH path=\"{bad_path}\" op=\"create\">>>\n<<<REPLACE>>>\nx\n<<<END>>>"
+            ));
+            assert!(apply_patches(&base, &hunks).is_err(), "apply_patches must reject `{bad_path}`");
+        }
+
+        let ok_hunks = parse_patches(
+            "<<<REFIT_PATCH path=\"./src\\a.rs\">>>\n<<<SEARCH>>>\npub fn a() -> u8 { 1 }\n<<<REPLACE>>>\npub fn a() -> u8 { 2 }\n<<<END>>>",
+        );
+        let applied = apply_patches(&base, &ok_hunks).unwrap();
+        assert_eq!(applied.updated["src/a.rs"], "pub fn a() -> u8 { 2 }\n");
+    }
 }
