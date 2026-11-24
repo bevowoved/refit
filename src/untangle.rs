@@ -1,13 +1,14 @@
+mod clones;
 mod infra;
+mod simiflow;
 
 use crate::graph::dag_from;
 use crate::hygiene::HygieneScorer;
 use crate::platform::{walk_tree, write_atomic};
-use crate::source::{count_lines, entrypoint, ext_of, rel_norm, source_rel, stem_of, supported_ext};
-use crate::stem::index_repo;
+use crate::source::{count_lines, entrypoint, ext_of, rel_norm, source_rel, supported_ext};
+use crate::stem::{csr, genome, index_repo};
 use crate::types::{
-    AuditReport, CloneCluster, GodFileScore, InfraFinding, RoleCluster, SustainFiles, TriageEntry,
-    UnusedDep,
+    AuditReport, GodFileScore, InfraFinding, RoleCluster, SustainFiles, TriageEntry, UnusedDep,
 };
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -23,15 +24,21 @@ pub fn scan_infra(repo_root: &Path) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>
 pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditReport> {
     let (source_rels, preloaded) = load_sources(repo_root);
     let (discovery, snap) = index_repo(repo_root, Some(&preloaded));
-    let plan = dag_from(repo_root, discovery, hygiene, Some(&preloaded))?;
+    // Pre-warm hygiene cache via scheduled batch scoring BEFORE `dag_from` so cold audit
+    // never falls back to sequential per-unit scoring inside `build_unit`.
     let (hygiene_median, hygiene_p10, per_file_h) =
         hygiene.score_files(repo_root, &source_rels, Some(&preloaded));
+    let plan = dag_from(repo_root, discovery, hygiene, Some(&preloaded))?;
 
-    let clone_clusters = find_clones(&source_rels, &preloaded);
+    let clone_clusters = clones::find_clones(&source_rels, &preloaded);
     let (god_files, orphan_files) = rank_files(&source_rels, &preloaded, &per_file_h, &snap);
-    let capability_clusters = dup_roles(&source_rels);
+    let capability_clusters = simiflow::find_capability_clusters(&source_rels, &preloaded);
     let (total_infra_files, unused_deps, infra_findings) =
         infra::scan_parts(repo_root, Some(&preloaded));
+    let genome_summary = genome::analyze_git_cochange(repo_root, &source_rels);
+    let genome_twins = genome::format_genome_twins(&genome_summary, 25);
+    let deep_module_findings =
+        csr::deep_module_findings(&source_rels, &snap.runtime_edges, &snap.metrics_by_file);
 
     let triage_plan = build_triage(
         &infra_findings,
@@ -56,6 +63,8 @@ pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditR
         unused_deps,
         infra_findings,
         triage_plan,
+        genome_twins,
+        deep_module_findings,
     })
 }
 
@@ -174,167 +183,6 @@ fn build_triage(
     plan
 }
 
-fn find_clones(
-    source_rels: &[String],
-    preloaded: &BTreeMap<String, Vec<u8>>,
-) -> Vec<CloneCluster> {
-    let mut windows: HashMap<String, (String, Vec<(String, usize)>)> = HashMap::new();
-    for rel in source_rels {
-        let Some(bytes) = preloaded.get(rel) else { continue };
-        let lines = norm_lines(&String::from_utf8_lossy(bytes));
-        for w in lines.windows(4) {
-            let mut h = blake3::Hasher::new();
-            for (k, (_, line)) in w.iter().enumerate() {
-                if k > 0 {
-                    h.update(b"\n");
-                }
-                h.update(line.as_bytes());
-            }
-            let fp = h.finalize().to_hex()[..12].to_string();
-            let entry = windows.entry(fp).or_insert_with(|| (w[0].1.clone(), Vec::new()));
-            if !entry.1.iter().any(|(f, _)| f == rel) {
-                entry.1.push((rel.clone(), w[0].0));
-            }
-        }
-    }
-
-    let mut clusters: Vec<CloneCluster> = windows
-        .into_iter()
-        .filter(|(_, (_, occ))| occ.len() >= 2)
-        .map(|(fp, (sample, mut occ))| {
-            occ.sort();
-            CloneCluster {
-                fingerprint: fp,
-                line_count: 4,
-                sample_line: sample.chars().take(100).collect(),
-                occurrences: occ,
-            }
-        })
-        .collect();
-
-    clusters.sort_by(|a, b| {
-        b.occurrences
-            .len()
-            .cmp(&a.occurrences.len())
-            .then_with(|| a.occurrences.cmp(&b.occurrences))
-            .then_with(|| a.fingerprint.cmp(&b.fingerprint))
-    });
-
-    dedup_clones(clusters)
-}
-
-fn norm_lines(text: &str) -> Vec<(usize, String)> {
-    text.lines()
-        .enumerate()
-        .filter_map(|(idx, l)| {
-            let t = l.trim();
-            let skip = t.len() < 12
-                || t.starts_with("//")
-                || t.starts_with('#')
-                || t.starts_with("import ")
-                || t.starts_with("from ")
-                || t.starts_with("use ");
-            if skip {
-                return None;
-            }
-            let norm: Vec<&str> = t.split_whitespace().collect();
-            Some((idx + 1, norm.join(" ")))
-        })
-        .collect()
-}
-
-fn dedup_clones(clusters: Vec<CloneCluster>) -> Vec<CloneCluster> {
-    let mut out: Vec<CloneCluster> = Vec::new();
-    for c in clusters {
-        let overlaps = out.iter().any(|prev| {
-            prev.occurrences.len() == c.occurrences.len()
-                && prev
-                    .occurrences
-                    .iter()
-                    .zip(&c.occurrences)
-                    .all(|((pf, pl), (cf, cl))| pf == cf && pl.abs_diff(*cl) <= 4)
-        });
-        if !overlaps {
-            out.push(c);
-            if out.len() >= 25 {
-                break;
-            }
-        }
-    }
-    out
-}
-
-fn split_ident(s: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-
-    for ch in s.chars() {
-        let camel = ch.is_ascii_uppercase()
-            && cur.chars().last().is_some_and(|c| c.is_ascii_lowercase());
-        if !ch.is_ascii_alphanumeric() {
-            if !cur.is_empty() {
-                tokens.push(cur.to_ascii_lowercase());
-                cur.clear();
-            }
-        } else if camel {
-            tokens.push(cur.to_ascii_lowercase());
-            cur.clear();
-            cur.push(ch);
-        } else {
-            cur.push(ch);
-        }
-    }
-
-    if !cur.is_empty() {
-        tokens.push(cur.to_ascii_lowercase());
-    }
-    tokens
-}
-
-fn dup_roles(source_rels: &[String]) -> Vec<RoleCluster> {
-    const DOMAINS: &[(&str, &[&str])] = &[
-        ("auth", &["auth", "jwt", "oauth", "session", "login"]),
-        ("http_client", &["http", "fetch", "client", "request"]),
-        ("database", &["db", "database", "prisma", "sql", "store", "repo"]),
-        ("config", &["config", "settings", "env"]),
-        ("logging", &["log", "logger", "telemetry"]),
-    ];
-
-    let mut out = Vec::new();
-    for &(cap, keywords) in DOMAINS {
-        let mut matched: Vec<String> = source_rels
-            .iter()
-            .filter(|rel| role_matches(Path::new(rel), keywords))
-            .cloned()
-            .collect();
-        matched.sort();
-
-        if matched.len() >= 2 {
-            let msg = format!(
-                "Detected {} separate `{cap}` modules; consolidate into one canonical module",
-                matched.len()
-            );
-            out.push(RoleCluster {
-                capability: cap.into(),
-                recommendation: msg,
-                files: matched,
-            });
-        }
-    }
-    out
-}
-
-fn role_matches(p: &Path, keywords: &[&str]) -> bool {
-    let stem = stem_of(p);
-    let mut toks = split_ident(stem);
-    if matches!(stem, "index" | "mod" | "lib" | "main")
-        && let Some(dir) = p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str())
-    {
-        toks.extend(split_ident(dir));
-    }
-    keywords.iter().any(|k| toks.iter().any(|t| t == k))
-}
-
 pub fn render_audit(report: &AuditReport) -> String {
     let mut md = format!(
         concat!(
@@ -376,6 +224,22 @@ pub fn render_audit(report: &AuditReport) -> String {
                 "- `{}` — {} LOC, hygiene `{:.3}`, fan-in `{}`, fan-out `{}`, risk `{:.2}` -> **{}**\n",
                 g.file, g.loc, g.hygiene_score, g.fan_in, g.fan_out, g.risk_score, g.recommendation
             ));
+        }
+        md.push('\n');
+    }
+
+    if !report.deep_module_findings.is_empty() {
+        md.push_str("## Deep-Module Architectural Findings\n\n");
+        for f in report.deep_module_findings.iter().take(15) {
+            md.push_str(&format!("- {f}\n"));
+        }
+        md.push('\n');
+    }
+
+    if !report.genome_twins.is_empty() {
+        md.push_str("## Top Git Co-Change Twins (Clean-Room NPMI)\n\n");
+        for tw in report.genome_twins.iter().take(15) {
+            md.push_str(&format!("- {tw}\n"));
         }
         md.push('\n');
     }

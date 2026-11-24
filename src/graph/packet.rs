@@ -222,7 +222,7 @@ pub(crate) fn slice_anchored(
             out.push('\n');
             chars += chunk_c + 1;
         } else {
-            if let Some(first) = lines.get(start).filter(|l| top_decl(l)) {
+            if let Some(first) = lines[start..end].iter().find(|l| top_decl(l)) {
                 let stub = format!("// stub: {}\n", char_prefix(first.trim(), 120));
                 chars += stub.chars().count();
                 out.push_str(&stub);
@@ -233,25 +233,66 @@ pub(crate) fn slice_anchored(
     out
 }
 
-fn split_blocks(lines: &[&str], diag_lines: &HashSet<usize>) -> Vec<(usize, usize, bool)> {
-    let mut header_end = 0usize;
-    while header_end < lines.len() {
-        if top_decl(lines[header_end]) && header_end > 0 {
+fn is_leading_meta(line: &str) -> bool {
+    if line.starts_with([' ', '\t']) {
+        return false;
+    }
+    let t = line.trim();
+    t.starts_with("#[")
+        || t.starts_with('@')
+        || t.starts_with("///")
+        || t.starts_with("/**")
+        || t.starts_with("* ")
+        || t.starts_with("*/")
+        || t.starts_with("//")
+}
+
+fn attach_leading_meta(lines: &[&str], decl_idx: usize, min_idx: usize) -> usize {
+    let mut start = decl_idx;
+    while start > min_idx {
+        let prev = lines[start - 1];
+        if prev.trim().is_empty() || !is_leading_meta(prev) {
             break;
         }
-        header_end += 1;
+        start -= 1;
+    }
+    start
+}
+
+fn split_blocks(lines: &[&str], diag_lines: &HashSet<usize>) -> Vec<(usize, usize, bool)> {
+    let mut decl_starts = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if top_decl(line) {
+            decl_starts.push(idx);
+        }
+    }
+    if decl_starts.is_empty() {
+        return vec![(0, lines.len(), true)];
     }
 
-    let mut blocks = vec![(0, header_end, true)];
-    let mut i = header_end;
-    while i < lines.len() {
-        let start = i;
-        i += 1;
-        while i < lines.len() && !top_decl(lines[i]) {
-            i += 1;
-        }
-        let hot = is_hot(&lines[start..i], start, i, diag_lines);
-        blocks.push((start, i, hot));
+    let first_start = attach_leading_meta(lines, decl_starts[0], 0);
+    let mut blocks = Vec::with_capacity(decl_starts.len() + 1);
+    if first_start > 0 {
+        blocks.push((0, first_start, true));
+    }
+
+    let mut block_starts = Vec::with_capacity(decl_starts.len());
+    let mut min_bound = first_start;
+    for (k, &d_idx) in decl_starts.iter().enumerate() {
+        let s = if k == 0 {
+            first_start
+        } else {
+            attach_leading_meta(lines, d_idx, min_bound)
+        };
+        block_starts.push(s);
+        min_bound = d_idx + 1;
+    }
+
+    for k in 0..block_starts.len() {
+        let start = block_starts[k];
+        let end = block_starts.get(k + 1).copied().unwrap_or(lines.len());
+        let hot = is_hot(&lines[start..end], start, end, diag_lines);
+        blocks.push((start, end, hot));
     }
     blocks
 }
@@ -283,30 +324,43 @@ pub fn deps_context(unit: &ModuleUnit, all_units: &[ModuleUnit], repo_root: &Pat
     }
 
     let by_id: HashMap<&str, &ModuleUnit> = all_units.iter().map(|u| (u.id.as_str(), u)).collect();
-    let dep_units: Vec<ModuleUnit> = unit
-        .deps
-        .iter()
-        .filter_map(|id| by_id.get(id.as_str()).map(|u| (*u).clone()))
-        .collect();
-    abi_summary(
+    let mut fan_in_by_file: HashMap<&str, usize> = HashMap::new();
+    let mut dep_units = Vec::new();
+    for id in &unit.deps {
+        if let Some(&u) = by_id.get(id.as_str()) {
+            for rel in &u.files {
+                fan_in_by_file.insert(rel.as_str(), u.dependents.len());
+            }
+            dep_units.push(u.clone());
+        }
+    }
+    abi_summary_enriched(
         "UPSTREAM DEPENDENCY ABI (read-only imports used by this unit):",
         &dep_units,
         repo_root,
         2400,
+        Some(&fan_in_by_file),
     )
 }
 
 #[cfg(test)]
 pub fn wave_context(wave_units: &[ModuleUnit], repo_root: &Path) -> String {
-    abi_summary(
+    abi_summary_enriched(
         "WAVE SHARED ABI PREFIX (read-only across wave siblings):",
         wave_units,
         repo_root,
         1200,
+        None,
     )
 }
 
-fn abi_summary(header: &str, units: &[ModuleUnit], repo_root: &Path, max_chars: usize) -> String {
+fn abi_summary_enriched(
+    header: &str,
+    units: &[ModuleUnit],
+    repo_root: &Path,
+    max_chars: usize,
+    fan_in_by_file: Option<&HashMap<&str, usize>>,
+) -> String {
     let rels: Vec<&str> = units
         .iter()
         .flat_map(|u| u.files.iter().map(String::as_str))
@@ -317,6 +371,12 @@ fn abi_summary(header: &str, units: &[ModuleUnit], repo_root: &Path, max_chars: 
     let extract = |rel: &&str| {
         let src = fs::read_to_string(repo_root.join(rel)).ok()?;
         let sigs = file_heads(&src);
+        if let Some(fi_map) = fan_in_by_file {
+            let fi = fi_map.get(*rel).copied().unwrap_or(0);
+            let is_new = crate::stem::genome::is_recent_48h(repo_root, rel);
+            let summary = crate::stem::genome::synthetic_summary(rel, &src, &sigs, fi, is_new, None);
+            return Some(format!("- {summary}"));
+        }
         (!sigs.is_empty()).then(|| format!("- {rel}: {}", sigs.join(" | ")))
     };
     let lines: Vec<String> = if crate::platform::budget().is_constrained() {

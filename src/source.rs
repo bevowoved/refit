@@ -217,20 +217,160 @@ fn npm_deps(txt: &str, out: &mut Vec<ManifestDep>) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CargoDepKind {
+    Normal,
+    Dev,
+    Build,
+    Target,
+    Workspace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoDepDetail {
+    pub key: String,
+    pub package: String,
+    pub kind: CargoDepKind,
+    pub is_local: bool,
+    pub workspace_inherited: bool,
+    pub target_cfg: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CargoManifest {
+    package: Option<toml::Value>,
+    #[serde(default)]
+    dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default, rename = "dev-dependencies")]
+    dev_dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default, rename = "build-dependencies")]
+    build_dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default)]
+    workspace: Option<CargoWorkspaceSection>,
+    #[serde(default)]
+    target: BTreeMap<String, CargoTargetSection>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CargoWorkspaceSection {
+    #[serde(default)]
+    dependencies: BTreeMap<String, CargoDepSpec>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CargoTargetSection {
+    #[serde(default)]
+    dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default, rename = "dev-dependencies")]
+    dev_dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default, rename = "build-dependencies")]
+    build_dependencies: BTreeMap<String, CargoDepSpec>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum CargoDepSpec {
+    Detailed(CargoDepTable),
+    Simple(String),
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CargoDepTable {
+    package: Option<String>,
+    path: Option<String>,
+    #[serde(default)]
+    workspace: bool,
+}
+
+fn push_cargo_table(
+    tbl: &BTreeMap<String, CargoDepSpec>,
+    kind: CargoDepKind,
+    target_cfg: Option<&str>,
+    ws_locals: &std::collections::BTreeSet<String>,
+    out: &mut Vec<CargoDepDetail>,
+) {
+    for (key, spec) in tbl {
+        let (package, is_local, workspace_inherited) = match spec {
+            CargoDepSpec::Simple(ver) => (key.clone(), ver.trim().is_empty(), false),
+            CargoDepSpec::Detailed(d) => {
+                let pkg = d.package.clone().unwrap_or_else(|| key.clone());
+                let inherited_local = d.workspace && ws_locals.contains(key);
+                (pkg, d.path.is_some() || inherited_local, d.workspace)
+            }
+        };
+        out.push(CargoDepDetail {
+            key: key.clone(),
+            package,
+            kind,
+            is_local,
+            workspace_inherited,
+            target_cfg: target_cfg.map(str::to_string),
+        });
+    }
+}
+
+fn parse_cargo_manifest_details(manifest: &CargoManifest) -> Vec<CargoDepDetail> {
+    let mut ws_locals = std::collections::BTreeSet::new();
+    if let Some(ws) = manifest.workspace.as_ref() {
+        for (k, spec) in &ws.dependencies {
+            if let CargoDepSpec::Detailed(d) = spec
+                && d.path.is_some()
+            {
+                ws_locals.insert(k.clone());
+            }
+        }
+    }
+
+    let mut details = Vec::new();
+    push_cargo_table(&manifest.dependencies, CargoDepKind::Normal, None, &ws_locals, &mut details);
+    push_cargo_table(&manifest.dev_dependencies, CargoDepKind::Dev, None, &ws_locals, &mut details);
+    push_cargo_table(&manifest.build_dependencies, CargoDepKind::Build, None, &ws_locals, &mut details);
+    if let Some(ws) = manifest.workspace.as_ref() {
+        push_cargo_table(&ws.dependencies, CargoDepKind::Workspace, None, &ws_locals, &mut details);
+    }
+    for (cfg, sec) in &manifest.target {
+        push_cargo_table(&sec.dependencies, CargoDepKind::Target, Some(cfg), &ws_locals, &mut details);
+        push_cargo_table(&sec.dev_dependencies, CargoDepKind::Dev, Some(cfg), &ws_locals, &mut details);
+        push_cargo_table(&sec.build_dependencies, CargoDepKind::Build, Some(cfg), &ws_locals, &mut details);
+    }
+    details
+}
+
+/// Parse all Cargo dependency tables including `[workspace.dependencies]`, `.workspace = true`,
+/// renamed `alias = { package = "..." }`, `[dev-dependencies]`, `[build-dependencies]`,
+/// and target-gated `[target.'cfg(...)'.dependencies]`.
+#[cfg(test)]
+pub fn parse_cargo_deps_detailed(txt: &str) -> Vec<CargoDepDetail> {
+    let Ok(manifest) = toml::from_str::<CargoManifest>(txt) else {
+        return Vec::new();
+    };
+    parse_cargo_manifest_details(&manifest)
+}
+
 fn cargo_deps(txt: &str, out: &mut Vec<ManifestDep>) {
-    let mut in_deps = false;
-    for line in txt.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_deps = line == "[dependencies]";
+    let Ok(manifest) = toml::from_str::<CargoManifest>(txt) else {
+        return;
+    };
+    let is_virtual_workspace = manifest.package.is_none();
+    let details = parse_cargo_manifest_details(&manifest);
+    let mut seen = std::collections::BTreeSet::new();
+    for dep in details {
+        let include = match dep.kind {
+            CargoDepKind::Normal => true,
+            CargoDepKind::Target => dep.target_cfg.as_deref().is_some_and(|c| !c.is_empty()),
+            CargoDepKind::Workspace => is_virtual_workspace,
+            CargoDepKind::Dev | CargoDepKind::Build => false,
+        };
+        if !include {
             continue;
         }
-        let Some((k, val)) = in_deps.then(|| line.split_once('=')).flatten() else {
-            continue;
+        let emit_name = if dep.workspace_inherited && dep.package.is_empty() {
+            dep.key.as_str()
+        } else {
+            dep.package.as_str()
         };
-        let pkg = k.trim();
-        if !pkg.is_empty() && !pkg.starts_with('#') {
-            let local = val.contains("path =") || val.contains("path=");
-            push_dep(out, "cargo", pkg, local);
+        if !emit_name.is_empty() && seen.insert(emit_name.to_string()) {
+            push_dep(out, "cargo", emit_name, dep.is_local);
         }
     }
 }
@@ -293,5 +433,71 @@ fn go_deps(txt: &str, out: &mut Vec<ManifestDep>) {
         if let Some(m) = b.split_whitespace().next().filter(|s| !s.is_empty()) {
             push_dep(out, "go", m, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cargo_deps_toml_workspace_aliases_dev_and_target() {
+        let member_toml = r#"
+[package]
+name = "my-crate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = "1.0"
+tokio.workspace = true
+blake3 = { workspace = true }
+local_core = { path = "../core" }
+http_old = { package = "http", version = "0.2" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[build-dependencies]
+cc = "1.2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["process"] }
+"#;
+
+        let deps = parse_deps("Cargo.toml", member_toml);
+        let pkgs: Vec<(&str, bool)> = deps.iter().map(|d| (d.package.as_str(), d.is_local)).collect();
+        assert!(pkgs.contains(&("serde", false)));
+        assert!(pkgs.contains(&("tokio", false)));
+        assert!(pkgs.contains(&("blake3", false)));
+        assert!(pkgs.contains(&("local_core", true)));
+        assert!(pkgs.contains(&("http", false)));
+        assert!(pkgs.contains(&("nix", false)));
+        assert!(!pkgs.iter().any(|(p, _)| p.contains(".workspace")));
+        assert!(!pkgs.iter().any(|(p, _)| *p == "criterion" || *p == "cc"));
+
+        let detailed = parse_cargo_deps_detailed(member_toml);
+        let tokio_dep = detailed.iter().find(|d| d.key == "tokio").unwrap();
+        assert_eq!(tokio_dep.kind, CargoDepKind::Normal);
+        assert!(tokio_dep.workspace_inherited);
+        let alias_dep = detailed.iter().find(|d| d.key == "http_old").unwrap();
+        assert_eq!(alias_dep.package, "http");
+        let dev_dep = detailed.iter().find(|d| d.key == "criterion").unwrap();
+        assert_eq!(dev_dep.kind, CargoDepKind::Dev);
+        let target_dep = detailed.iter().find(|d| d.key == "nix").unwrap();
+        assert_eq!(target_dep.kind, CargoDepKind::Target);
+        assert_eq!(target_dep.target_cfg.as_deref(), Some("cfg(unix)"));
+
+        let virtual_ws = r#"
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+internal_util = { path = "crates/util" }
+"#;
+        let ws_deps = parse_deps("Cargo.toml", virtual_ws);
+        assert!(ws_deps.iter().any(|d| d.package == "anyhow" && !d.is_local));
+        assert!(ws_deps.iter().any(|d| d.package == "internal_util" && d.is_local));
     }
 }
