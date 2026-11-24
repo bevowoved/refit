@@ -146,8 +146,8 @@ pub fn run_gates(
         verdict.gate1_skipped_reason = Some("no_matching_tests_or_manifest_found".into());
     }
 
-    let hints = score_gate2(cfg, unit, &working, hygiene, &mut verdict);
-    finalize_verdict(cfg, working, acc, hints, &mut verdict);
+    let (hints, strict_veto) = score_gate2(cfg, unit, &working, hygiene, &mut verdict);
+    finalize_verdict(cfg, working, acc, hints, strict_veto, &mut verdict);
     Ok(verdict)
 }
 
@@ -510,19 +510,50 @@ fn run_js_tests(
     }
 }
 
+fn strict_hygiene_enabled() -> bool {
+    std::env::var("REFIT_STRICT_HYGIENE")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+}
+
 fn score_gate2(
     cfg: &GateConfig,
     unit: &ModuleUnit,
     working: &BTreeMap<String, String>,
     hygiene: &HygieneScorer,
     verdict: &mut GateVerdict,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     let t = Instant::now();
-    let (mut sum, mut hints) = (0.0f64, Vec::new());
+    let strict = strict_hygiene_enabled();
+    let (mut sum, mut hints, mut has_veto) = (0.0f64, Vec::new(), false);
 
     for (rel, txt) in working {
-        let h = hygiene.score_content(rel, txt);
-        sum += h.score;
+        let h = if strict {
+            hygiene.score_content_strict(rel, txt)
+        } else {
+            hygiene.score_content(rel, txt)
+        };
+        let eff_score = if strict { h.strict_score.unwrap_or(h.score) } else { h.score };
+        sum += eff_score;
+        if strict && !h.triggered_vetoes.is_empty() {
+            has_veto = true;
+            let before = fs::read_to_string(cfg.repo_root.join(rel)).unwrap_or_default();
+            let audit = crate::hygiene::strict::audit_anti_gaming(rel, &before, txt);
+            if !audit.passed {
+                hints.push(format!(
+                    "codehygiene-strict `{}` veto (cap {:.2}, indent {}:{}, before={} after={} new={})",
+                    audit.path,
+                    audit.veto_cap,
+                    audit.indent_mode,
+                    audit.indent_quantum,
+                    audit.before_vetoes.len(),
+                    audit.after_vetoes.len(),
+                    audit.introduced_vetoes.len(),
+                ));
+            }
+            for veto in h.triggered_vetoes.iter().take(4) {
+                hints.push(format!("codehygiene-strict `{rel}`: {veto}"));
+            }
+        }
         for sq in h.squiggles.iter().take(6) {
             let msg = format!(
                 "codehygiene `{rel}` L{}: {} ({:.2}) {}",
@@ -538,7 +569,7 @@ fn score_gate2(
         sum / (working.len() as f64)
     };
     verdict.gate2_ms = t.elapsed().as_millis() as u64;
-    hints
+    (hints, has_veto)
 }
 
 fn finalize_verdict(
@@ -546,6 +577,7 @@ fn finalize_verdict(
     working: BTreeMap<String, String>,
     acc: RunAccum,
     hints: Vec<String>,
+    strict_veto: bool,
     v: &mut GateVerdict,
 ) {
     if acc.pt_exit != 0 || v.gate1_tests_failed > 0 {
@@ -566,9 +598,10 @@ fn finalize_verdict(
         v.diagnostics.extend(acc.ty_diags.into_iter().take(6));
     }
 
-    let improved =
-        v.gate2_score_after >= v.gate2_score_before + 0.12 && v.gate2_score_after >= 0.72;
-    if v.gate2_score_after < cfg.min_hygiene_target && !improved {
+    let improved = !strict_veto
+        && v.gate2_score_after >= v.gate2_score_before + 0.12
+        && v.gate2_score_after >= 0.72;
+    if strict_veto || (v.gate2_score_after < cfg.min_hygiene_target && !improved) {
         v.failed_gate.get_or_insert_with(|| "gate2_hygiene".into());
         v.diagnostics.push(format!(
             "Gate 2 codehygiene too low: {:.3} (before {:.3}, target >= {:.2})",
