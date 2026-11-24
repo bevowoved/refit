@@ -1,20 +1,25 @@
 use super::ops::{
-    ActiveSpans, AttnWeights, CompactCells, RIBBON_GUARD, RibbonCtx, active_spans, axis_conv,
-    encode_grid, excl_prefix, fuse_cells, linear_sparse, norm_sketch, ribbon_conv,
-    ribbon_positions, sigmoid_f64, sink_attention, sparse_parts,
+    EvalScratch, MAX_COLS, PEAK_WINDOW, RIBBON_GUARD, axis_conv_row, encode_grid_into,
+    eval_span_block01_scalar, norm_sketch, sigmoid_f64, sink_attention_scalar,
 };
-use super::weights::{HygieneWeights, v07_weights};
+#[cfg(target_arch = "x86_64")]
+use super::ops::{eval_span_block01_avx2, sink_attention_avx2};
+use super::simd::{linear_sparse_direct_csr, sparse_parts_direct_csr};
+#[cfg(target_arch = "x86_64")]
+use super::simd::{linear_sparse_width_gated_avx2, sparse_parts_width_gated_avx2};
+use super::weights::ResolvedWeights;
 use crate::types::{HygieneResult, Squiggle};
-use std::collections::HashMap;
+use std::cell::RefCell;
 
 const PRIOR_LINES: f64 = 16.0;
-const PEAK_WINDOW: usize = 32;
 const PEAK_MIN_GATE: f32 = 10.0;
 const PEAK_PRIOR: f32 = 6.0;
 const SPAN_CONT_WEIGHT: f32 = 0.25;
 const SQUIGGLE_THRESHOLD: f32 = 0.55;
+const SQUIGGLE_LOGIT_PREFILTER: f32 = 0.20067;
+const SCRATCH_SHRINK_LINES: usize = 2048;
 
-const SQUIGGLE_SPEC: [(&str, &str, f64); 6] = [
+pub(super) const SQUIGGLE_SPEC: [(&str, &str, f64); 6] = [
     ("deep_nesting", "Deep nesting pyramid; flatten with guard clauses or helpers", 0.42),
     ("dense_line", "Wide line, packed statements, call train, or nested ternary", 0.10),
     ("cramped_layout", "Unbroken statement wall or ragged off-grid indentation", 0.08),
@@ -23,256 +28,444 @@ const SQUIGGLE_SPEC: [(&str, &str, f64); 6] = [
     ("comment_echo", "Comment echoes adjacent code or leaves commented-out code", 0.18),
 ];
 
-pub(super) fn score_v07(content: &str) -> HygieneResult {
-    let params = v07_weights();
-    let (grid, num_lines) = encode_grid(content);
-    let spans = active_spans(&grid, num_lines);
-    let (col_sums, conv3, conv7, mut sketch) = encode_lines(params, &grid, &spans, num_lines);
-
-    let hidden = build_hidden(params, &col_sums, &conv3, &conv7, num_lines);
-    let lmlp2 = params.mat("lmlp2_w");
-    let stats = linear_sparse(&hidden, num_lines, lmlp2, Some(params.vec("lmlp2_b")), false);
-
-    let sk_cols = params.conv("sketch_w").cols;
-    norm_sketch(&mut sketch, num_lines, sk_cols);
-
-    let dim = lmlp2.cols + sk_cols;
-    let mut state = vec![0.0f32; num_lines * dim];
-    for row in 0..num_lines {
-        let (dst, ls, sk) = (row * dim, row * lmlp2.cols, row * sk_cols);
-        state[dst..dst + lmlp2.cols].copy_from_slice(&stats[ls..ls + lmlp2.cols]);
-        state[dst + lmlp2.cols..dst + dim].copy_from_slice(&sketch[sk..sk + sk_cols]);
-    }
-
-    run_context(params, &mut state, num_lines);
-
-    let sq_l = linear_sparse(&state, num_lines, params.mat("sq_w"), Some(params.vec("sq_b")), false);
-    let g_l = linear_sparse(
-        &state,
-        num_lines,
-        params.mat("pool_gate_w"),
-        Some(params.vec("pool_gate_b")),
-        false,
-    );
-    let gate: Vec<f32> = g_l.iter().map(|&v| sigmoid_f64(v as f64) as f32).collect();
-
-    let doc_v = pool_doc(&state, &gate, num_lines, dim);
-    let doc_h = linear_sparse(&doc_v, 1, params.mat("doc1_w"), Some(params.vec("doc1_b")), true);
-    let doc_l = linear_sparse(&doc_h, 1, params.mat("doc2_w"), Some(params.vec("doc2_b")), false);
-    let score = (sigmoid_f64(doc_l[0] as f64) * 10000.0).round() / 10000.0;
-
-    HygieneResult {
-        score,
-        squiggles: extract_squiggles(&sq_l, num_lines),
-        cached: false,
-        latency_us: 1,
-    }
+thread_local! {
+    static EVAL_SCRATCH: RefCell<EvalScratch> = RefCell::new(EvalScratch::new());
 }
 
-fn encode_lines(
-    p: &HygieneWeights,
-    grid: &[u8],
-    spans: &ActiveSpans,
-    n: usize,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    if spans.total == 0 {
-        return (
-            vec![0.0; n * p.mat("col_sum_proj").cols],
-            vec![0.0; n * p.conv("conv3_w").cols],
-            vec![0.0; n * p.conv("conv7_w").cols],
-            vec![0.0; n * p.conv("sketch_w").cols],
-        );
-    }
+pub(super) fn score_v07_with_weights(content: &str, w: &ResolvedWeights) -> HygieneResult {
+    EVAL_SCRATCH.with(|cell| {
+        let mut sc_guard = cell.borrow_mut();
+        let sc = &mut *sc_guard;
+        sc.ensure_span_buffers(w);
+        let num_lines = encode_grid_into(content, &mut sc.grid, &mut sc.row_lens);
 
-    let cells = fuse_cells(p, grid, spans);
-    let hc = p.mat("col_fuse_w").cols;
-    let mut cell_sums = vec![0.0f32; n * hc];
-    for (cell, &row) in spans.cell_rows.iter().enumerate().take(spans.total) {
-        let (dst, src) = (row * hc, cell * hc);
-        for ch in 0..hc {
-            cell_sums[dst + ch] += cells[src + ch];
+        let res = dispatch_eval(w, num_lines, sc);
+        sc.shrink_if_oversized(num_lines, SCRATCH_SHRINK_LINES);
+        res
+    })
+}
+
+#[cfg(test)]
+pub(super) fn score_v07_scalar_only(content: &str, w: &ResolvedWeights) -> HygieneResult {
+    EVAL_SCRATCH.with(|cell| {
+        let mut sc_guard = cell.borrow_mut();
+        let sc = &mut *sc_guard;
+        sc.ensure_span_buffers(w);
+        let num_lines = encode_grid_into(content, &mut sc.grid, &mut sc.row_lens);
+        let res = eval_file_scalar(w, num_lines, sc);
+        sc.shrink_if_oversized(num_lines, SCRATCH_SHRINK_LINES);
+        res
+    })
+}
+
+fn dispatch_eval(w: &ResolvedWeights, num_lines: usize, sc: &mut EvalScratch) -> HygieneResult {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: `is_x86_feature_detected!("avx2")` confirmed AVX2 support on this CPU.
+        return unsafe { eval_file_avx2(w, num_lines, sc) };
+    }
+    eval_file_scalar(w, num_lines, sc)
+}
+
+fn prepare_file_buffers(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
+    let cs_len = n * w.col_sum_proj.cols as usize;
+    let c3_len = n * w.conv3_w.cols;
+    let c7_len = n * w.conv7_w.cols;
+    let sk_len = n * w.sketch_w.cols;
+    let dl_len = n * w.ml_proj.cols as usize;
+    let st_len = n * w.state_dim;
+
+    resize_zero(&mut sc.col_sums, cs_len);
+    resize_zero(&mut sc.conv3, c3_len);
+    resize_zero(&mut sc.conv7, c7_len);
+    resize_zero(&mut sc.sketch, sk_len);
+    resize_zero(&mut sc.deltas, dl_len);
+    resize_zero(&mut sc.state, st_len);
+    resize_zero(&mut sc.gate, n);
+}
+
+#[inline]
+fn resize_zero(buf: &mut Vec<f32>, needed: usize) {
+    if buf.len() < needed {
+        buf.resize(needed, 0.0);
+    }
+    buf[..needed].fill(0.0);
+}
+
+fn eval_file_scalar(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneResult {
+    prepare_file_buffers(w, n, sc);
+
+    let mut first_nb: Option<(usize, usize)> = None;
+    let mut paired_done = false;
+    for row in 0..n {
+        let raw_len = sc.row_lens[row] as usize;
+        if raw_len == 0 {
+            continue;
+        }
+        let slen = (raw_len + RIBBON_GUARD).min(MAX_COLS);
+        if !paired_done {
+            if let Some((row0, slen0)) = first_nb {
+                eval_span_block01_scalar(w, row0, slen0, Some((row, slen)), true, sc);
+                paired_done = true;
+            } else {
+                first_nb = Some((row, slen));
+            }
+        } else {
+            eval_span_block01_scalar(w, row, slen, None, false, sc);
         }
     }
-
-    let col_sums = linear_sparse(&cell_sums, n, p.mat("col_sum_proj"), None, false);
-    let (rib_pos, rib_len) = ribbon_positions(spans, RIBBON_GUARD);
-    let mut cell_at = vec![-1i32; rib_len];
-    for (cell, &rp) in rib_pos.iter().enumerate() {
-        cell_at[rp] = cell as i32;
+    if !paired_done
+        && let Some((row0, slen0)) = first_nb
+    {
+        eval_span_block01_scalar(w, row0, slen0, None, true, sc);
     }
 
-    let fuse_b = p.vec("col_fuse_b");
-    let pad_fill: Vec<f32> = fuse_b.iter().map(|&v| v.max(0.0)).collect();
-    let sc = compact_cells(&cells, spans.total, hc);
-    let rctx = RibbonCtx {
-        rib_pos: &rib_pos,
-        cell_at: &cell_at,
-        pad_fill: &pad_fill,
-        cells: &sc,
-        spans,
-        num_lines: n,
-    };
-
-    let c3 = ribbon_conv(&rctx, p.conv("conv3_w"), p.vec("conv3_b"));
-    let c7 = ribbon_conv(&rctx, p.conv("conv7_w"), p.vec("conv7_b"));
-    let sk = ribbon_conv(&rctx, p.conv("sketch_w"), p.vec("sketch_b"));
-    (col_sums, c3, c7, sk)
+    build_state_scalar(w, n, sc);
+    run_context_scalar(w, n, sc);
+    finish_heads(w, n, sc)
 }
 
-fn compact_cells(cells: &[f32], total: usize, hc: usize) -> CompactCells {
-    let (mut offsets, mut chans, mut vals) = (vec![0; total + 1], Vec::new(), Vec::new());
-    for (cell, off) in offsets.iter_mut().enumerate().take(total) {
-        *off = chans.len();
-        let base = cell * hc;
-        for ch in 0..hc {
-            let v = cells[base + ch];
-            if v != 0.0 {
-                chans.push(ch);
-                vals.push(v);
+// SAFETY: Caller must guarantee AVX2 is available on the executing x86_64 CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn eval_file_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneResult {
+    prepare_file_buffers(w, n, sc);
+
+    let mut first_nb: Option<(usize, usize)> = None;
+    let mut paired_done = false;
+    for row in 0..n {
+        let raw_len = sc.row_lens[row] as usize;
+        if raw_len == 0 {
+            continue;
+        }
+        let slen = (raw_len + RIBBON_GUARD).min(MAX_COLS);
+        if !paired_done {
+            if let Some((row0, slen0)) = first_nb {
+                // SAFETY: AVX2 is active in this function.
+                unsafe {
+                    eval_span_block01_avx2(w, row0, slen0, Some((row, slen)), true, sc);
+                }
+                paired_done = true;
+            } else {
+                first_nb = Some((row, slen));
+            }
+        } else {
+            // SAFETY: AVX2 is active in this function.
+            unsafe {
+                eval_span_block01_avx2(w, row, slen, None, false, sc);
             }
         }
     }
-    offsets[total] = chans.len();
-    CompactCells { offsets, chans, vals }
+    if !paired_done
+        && let Some((row0, slen0)) = first_nb
+    {
+        // SAFETY: AVX2 is active in this function.
+        unsafe {
+            eval_span_block01_avx2(w, row0, slen0, None, true, sc);
+        }
+    }
+
+    // SAFETY: AVX2 is active in this function.
+    unsafe {
+        build_state_avx2(w, n, sc);
+        run_context_avx2(w, n, sc);
+    }
+    finish_heads(w, n, sc)
 }
 
-fn build_hidden(
-    p: &HygieneWeights,
-    col_sums: &[f32],
-    c3: &[f32],
-    c7: &[f32],
-    n: usize,
-) -> Vec<f32> {
-    let cc = p.mat("col_sum_proj").cols;
-    let c3c = p.conv("conv3_w").cols;
-    let c7c = p.conv("conv7_w").cols;
-    let ml_proj = p.mat("ml_proj");
+fn fill_ml_tile(w: &ResolvedWeights, n: usize, row_start: usize, b: usize, sc: &mut EvalScratch) {
+    let ml_cols = w.ml_proj.cols as usize;
+    let paren_cols = w.ml_paren_w.cols;
 
-    let deltas = sparse_parts(&[(col_sums, cc), (c3, c3c), (c7, c7c)], n, ml_proj, None, false);
-    let saw = linear_sparse(
-        &excl_prefix(&deltas, ml_proj.cols),
-        n,
-        p.mat("ml_gate_w"),
-        Some(p.vec("ml_gate_b")),
+    for lane in 0..b {
+        let row = row_start + lane;
+        let d_off = row * ml_cols;
+        let e_off = lane * ml_cols;
+        for ch in 0..ml_cols {
+            let d = sc.deltas[d_off + ch];
+            let next = sc.running_delta[ch] + d;
+            sc.excl_tile[e_off + ch] = next - d;
+            sc.running_delta[ch] = next;
+        }
+        axis_conv_row(
+            &sc.deltas,
+            n,
+            row,
+            w,
+            &mut sc.paren_tile[lane * paren_cols..(lane + 1) * paren_cols],
+        );
+    }
+    linear_sparse_direct_csr(
+        &sc.excl_tile[..b * ml_cols],
+        b,
+        ml_cols,
+        &w.ml_gate_w,
+        Some(&w.ml_gate_b),
         true,
+        &mut sc.saw_tile[..b * w.ml_gate_w.cols as usize],
     );
-    let paren = axis_conv(&deltas, n, p.conv("ml_paren_w"), p.vec("ml_paren_b"));
+}
 
-    sparse_parts(
-        &[
-            (col_sums, cc),
-            (c3, c3c),
-            (c7, c7c),
-            (&saw, p.mat("ml_gate_w").cols),
-            (&paren, p.conv("ml_paren_w").cols),
-        ],
+fn copy_tile_into_state(w: &ResolvedWeights, row_start: usize, b: usize, sc: &mut EvalScratch) {
+    let ls_cols = w.lmlp2_w.cols as usize;
+    let sk_cols = w.sketch_w.cols;
+    let dim = w.state_dim;
+    for lane in 0..b {
+        let row = row_start + lane;
+        let dst = row * dim;
+        let ls = lane * ls_cols;
+        let sk = row * sk_cols;
+        sc.state[dst..dst + ls_cols].copy_from_slice(&sc.stats_tile[ls..ls + ls_cols]);
+        sc.state[dst + ls_cols..dst + dim].copy_from_slice(&sc.sketch[sk..sk + sk_cols]);
+    }
+}
+
+fn build_state_scalar(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
+    let cc = w.col_sum_proj.cols as usize;
+    let c3c = w.conv3_w.cols;
+    let c7c = w.conv7_w.cols;
+    let ml_cols = w.ml_proj.cols as usize;
+    let saw_cols = w.ml_gate_w.cols as usize;
+    let paren_cols = w.ml_paren_w.cols;
+    let h_cols = w.lmlp1_w.cols as usize;
+    let ls_cols = w.lmlp2_w.cols as usize;
+
+    norm_sketch(&mut sc.sketch, n, w.sketch_w.cols);
+    sparse_parts_direct_csr(
+        &[&sc.col_sums[..n * cc], &sc.conv3[..n * c3c], &sc.conv7[..n * c7c]],
+        &w.ml_proj_ranges,
         n,
-        p.mat("lmlp1_w"),
-        Some(p.vec("lmlp1_b")),
-        true,
-    )
-}
+        &w.ml_proj,
+        None,
+        false,
+        &mut sc.deltas[..n * ml_cols],
+    );
+    sc.running_delta[..ml_cols].fill(0.0);
 
-fn run_context(p: &HygieneWeights, state: &mut [f32], n: usize) {
-    for layer in ["1", "2"] {
-        let weights = AttnWeights {
-            wq: p.mats.get(&format!("attn{layer}_wq")),
-            wk: p.mats.get(&format!("attn{layer}_wk")),
-            wv: p.mat(&format!("attn{layer}_wv")),
-            wo: p.mat(&format!("attn{layer}_wo")),
-            b_rel: p.vec(&format!("attn{layer}_brel")),
-            b_sink: p.vec(&format!("attn{layer}_bsink")),
-        };
-        let attn = sink_attention(state, n, &weights);
-        for (s, a) in state.iter_mut().zip(attn.iter()) {
-            *s += *a;
-        }
-
-        let h = linear_sparse(
-            state,
-            n,
-            p.mat(&format!("cmlp{layer}_w")),
-            Some(p.vec(&format!("cmlp{layer}_b"))),
+    let mut row_start = 0usize;
+    while row_start < n {
+        let b = (n - row_start).min(8);
+        fill_ml_tile(w, n, row_start, b, sc);
+        let row_end = row_start + b;
+        sparse_parts_direct_csr(
+            &[
+                &sc.col_sums[row_start * cc..row_end * cc],
+                &sc.conv3[row_start * c3c..row_end * c3c],
+                &sc.conv7[row_start * c7c..row_end * c7c],
+                &sc.saw_tile[..b * saw_cols],
+                &sc.paren_tile[..b * paren_cols],
+            ],
+            &w.lmlp1_ranges,
+            b,
+            &w.lmlp1_w,
+            Some(&w.lmlp1_b),
             true,
+            &mut sc.hidden_tile[..b * h_cols],
         );
-        let o = linear_sparse(
-            &h,
-            n,
-            p.mat(&format!("cmlp{layer}_2_w")),
-            Some(p.vec(&format!("cmlp{layer}_2_b"))),
+        linear_sparse_direct_csr(
+            &sc.hidden_tile[..b * h_cols],
+            b,
+            h_cols,
+            &w.lmlp2_w,
+            Some(&w.lmlp2_b),
             false,
+            &mut sc.stats_tile[..b * ls_cols],
         );
-        for (s, c) in state.iter_mut().zip(o.iter()) {
-            *s += *c;
+        copy_tile_into_state(w, row_start, b, sc);
+        row_start = row_end;
+    }
+}
+
+// SAFETY: Caller must guarantee AVX2 is available on the executing x86_64 CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn build_state_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
+    let cc = w.col_sum_proj.cols as usize;
+    let c3c = w.conv3_w.cols;
+    let c7c = w.conv7_w.cols;
+    let ml_cols = w.ml_proj.cols as usize;
+    let saw_cols = w.ml_gate_w.cols as usize;
+    let paren_cols = w.ml_paren_w.cols;
+    let h_cols = w.lmlp1_w.cols as usize;
+    let ls_cols = w.lmlp2_w.cols as usize;
+
+    norm_sketch(&mut sc.sketch, n, w.sketch_w.cols);
+    // SAFETY: AVX2 is active in this function.
+    unsafe {
+        sparse_parts_width_gated_avx2(
+            &[&sc.col_sums[..n * cc], &sc.conv3[..n * c3c], &sc.conv7[..n * c7c]],
+            &w.ml_proj_ranges,
+            n,
+            &w.ml_proj,
+            None,
+            false,
+            &mut sc.deltas[..n * ml_cols],
+            &mut sc.tile_in,
+            &mut sc.tile_acc,
+        );
+    }
+    sc.running_delta[..ml_cols].fill(0.0);
+
+    let mut row_start = 0usize;
+    while row_start < n {
+        let b = (n - row_start).min(8);
+        fill_ml_tile(w, n, row_start, b, sc);
+        let row_end = row_start + b;
+        // SAFETY: AVX2 is active in this function.
+        unsafe {
+            sparse_parts_width_gated_avx2(
+                &[
+                    &sc.col_sums[row_start * cc..row_end * cc],
+                    &sc.conv3[row_start * c3c..row_end * c3c],
+                    &sc.conv7[row_start * c7c..row_end * c7c],
+                    &sc.saw_tile[..b * saw_cols],
+                    &sc.paren_tile[..b * paren_cols],
+                ],
+                &w.lmlp1_ranges,
+                b,
+                &w.lmlp1_w,
+                Some(&w.lmlp1_b),
+                true,
+                &mut sc.hidden_tile[..b * h_cols],
+                &mut sc.tile_in,
+                &mut sc.tile_acc,
+            );
+            linear_sparse_width_gated_avx2(
+                &sc.hidden_tile[..b * h_cols],
+                b,
+                h_cols,
+                &w.lmlp2_w,
+                Some(&w.lmlp2_b),
+                false,
+                &mut sc.stats_tile[..b * ls_cols],
+                &mut sc.tile_in,
+                &mut sc.tile_acc,
+            );
+        }
+        copy_tile_into_state(w, row_start, b, sc);
+        row_start = row_end;
+    }
+}
+
+fn run_context_scalar(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
+    let dim = w.state_dim;
+    for layer in &w.ctx_layers {
+        sink_attention_scalar(&layer.attn, n, dim, sc);
+        for idx in 0..n * dim {
+            sc.state[idx] += sc.attn_out[idx];
+        }
+        let h_cols = layer.cmlp_w.cols as usize;
+        let mut row_start = 0usize;
+        while row_start < n {
+            let b = (n - row_start).min(8);
+            let lo = row_start * dim;
+            let hi = (row_start + b) * dim;
+            linear_sparse_direct_csr(
+                &sc.state[lo..hi],
+                b,
+                dim,
+                &layer.cmlp_w,
+                Some(&layer.cmlp_b),
+                true,
+                &mut sc.ctx_h_tile[..b * h_cols],
+            );
+            linear_sparse_direct_csr(
+                &sc.ctx_h_tile[..b * h_cols],
+                b,
+                h_cols,
+                &layer.cmlp2_w,
+                Some(&layer.cmlp2_b),
+                false,
+                &mut sc.ctx_o_tile[..b * dim],
+            );
+            for idx in 0..b * dim {
+                sc.state[lo + idx] += sc.ctx_o_tile[idx];
+            }
+            row_start += b;
         }
     }
 }
 
-fn pool_doc(state: &[f32], gate: &[f32], n: usize, dim: usize) -> Vec<f32> {
-    let mut doc = vec![0.0f32; dim * 2];
-    let mut mean_acc = vec![0.0f64; dim];
-    let mut g_sum = PRIOR_LINES;
-
-    for (row, &gv) in gate.iter().enumerate().take(n) {
-        let g = gv as f64;
-        g_sum += g;
-        let base = row * dim;
-        for ch in 0..dim {
-            mean_acc[ch] += (state[base + ch] as f64) * g;
+// SAFETY: Caller must guarantee AVX2 is available on the executing x86_64 CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn run_context_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
+    let dim = w.state_dim;
+    for layer in &w.ctx_layers {
+        // SAFETY: AVX2 is active in this function.
+        unsafe {
+            sink_attention_avx2(&layer.attn, n, dim, sc);
+        }
+        for idx in 0..n * dim {
+            sc.state[idx] += sc.attn_out[idx];
+        }
+        let h_cols = layer.cmlp_w.cols as usize;
+        let mut row_start = 0usize;
+        while row_start < n {
+            let b = (n - row_start).min(8);
+            let lo = row_start * dim;
+            let hi = (row_start + b) * dim;
+            // SAFETY: AVX2 is active in this function.
+            unsafe {
+                linear_sparse_width_gated_avx2(
+                    &sc.state[lo..hi],
+                    b,
+                    dim,
+                    &layer.cmlp_w,
+                    Some(&layer.cmlp_b),
+                    true,
+                    &mut sc.ctx_h_tile[..b * h_cols],
+                    &mut sc.tile_in,
+                    &mut sc.tile_acc,
+                );
+                linear_sparse_width_gated_avx2(
+                    &sc.ctx_h_tile[..b * h_cols],
+                    b,
+                    h_cols,
+                    &layer.cmlp2_w,
+                    Some(&layer.cmlp2_b),
+                    false,
+                    &mut sc.ctx_o_tile[..b * dim],
+                    &mut sc.tile_in,
+                    &mut sc.tile_acc,
+                );
+            }
+            for idx in 0..b * dim {
+                sc.state[lo + idx] += sc.ctx_o_tile[idx];
+            }
+            row_start += b;
         }
     }
-    for ch in 0..dim {
-        doc[ch] = (mean_acc[ch] / g_sum) as f32;
-    }
-
-    let pos = build_pos(state, gate, n, dim);
-    let mut pref_w = vec![0.0f32; (n + 1) * dim];
-    let mut pref_g = vec![0.0f32; n + 1];
-    for row in 0..n {
-        pref_g[row + 1] = pref_g[row] + gate[row];
-        for ch in 0..dim {
-            pref_w[(row + 1) * dim + ch] = pref_w[row * dim + ch] + pos[row * dim + ch];
-        }
-    }
-
-    let mut peak = vec![f32::NEG_INFINITY; dim];
-    for hi in 1..=n {
-        let lo = hi.saturating_sub(PEAK_WINDOW);
-        let denom = (pref_g[hi] - pref_g[lo]).max(PEAK_MIN_GATE) + PEAK_PRIOR;
-        for ch in 0..dim {
-            let val = (pref_w[hi * dim + ch] - pref_w[lo * dim + ch]) / denom;
-            peak[ch] = peak[ch].max(val);
-        }
-    }
-    doc[dim..].copy_from_slice(&peak);
-    doc
 }
 
-fn build_pos(state: &[f32], gate: &[f32], n: usize, dim: usize) -> Vec<f32> {
-    let mut pos = vec![0.0f32; n * dim];
-    for row in 0..n {
-        for ch in 0..dim {
-            let raw = state[row * dim + ch].max(0.0) * gate[row];
-            let p1 = if row >= 1 { state[(row - 1) * dim + ch].max(0.0) * gate[row - 1] } else { 0.0 };
-            let p2 = if row >= 2 { state[(row - 2) * dim + ch].max(0.0) * gate[row - 2] } else { 0.0 };
-            let ov = if n > 1 { raw.min(p1.max(p2)) } else { 0.0 };
-            pos[row * dim + ch] = raw - (1.0 - SPAN_CONT_WEIGHT) * ov;
-        }
-    }
-    pos
-}
-
-fn extract_squiggles(sq_logits: &[f32], n: usize) -> Vec<Squiggle> {
-    let nk = SQUIGGLE_SPEC.len();
+fn finish_heads(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneResult {
+    let dim = w.state_dim;
     let mut ranked = Vec::new();
+    let mut total_squiggles = 0usize;
+    let mut event_load = 0.0f64;
+    let mut prev_line = [-10isize; 6];
+    let mut span_len = [1usize; 6];
+    let prob_span = (1.0f64 - SQUIGGLE_THRESHOLD as f64).max(1e-6);
+
+    let mut sq_row = [0.0f32; 6];
+    let mut gate_row = [0.0f32; 1];
 
     for row in 0..n {
-        let base = row * nk;
-        let (mut best_k, mut best_p) = (0usize, sigmoid_f64(sq_logits[base] as f64) as f32);
-        for k in 1..nk {
-            let p = sigmoid_f64(sq_logits[base + k] as f64) as f32;
-            if p > best_p {
-                best_p = p;
+        let slice = &sc.state[row * dim..(row + 1) * dim];
+        linear_sparse_direct_csr(slice, 1, dim, &w.pool_gate_w, Some(&w.pool_gate_b), false, &mut gate_row);
+        sc.gate[row] = sigmoid_f64(gate_row[0] as f64) as f32;
+
+        linear_sparse_direct_csr(slice, 1, dim, &w.sq_w, Some(&w.sq_b), false, &mut sq_row);
+        let max_logit = sq_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if max_logit < SQUIGGLE_LOGIT_PREFILTER {
+            continue;
+        }
+
+        let (mut best_k, mut best_p) = (0usize, sigmoid_f64(sq_row[0] as f64) as f32);
+        for (k, &logit) in sq_row.iter().enumerate().skip(1) {
+            let prob_f32 = sigmoid_f64(logit as f64) as f32;
+            if prob_f32 > best_p {
+                best_p = prob_f32;
                 best_k = k;
             }
         }
@@ -280,28 +473,125 @@ fn extract_squiggles(sq_logits: &[f32], n: usize) -> Vec<Squiggle> {
             continue;
         }
 
+        total_squiggles += 1;
+        let line_no = row + 1;
         let (kind, msg, sev) = SQUIGGLE_SPEC[best_k];
+        let excess = (((best_p as f64) - SQUIGGLE_THRESHOLD as f64) / prob_span).clamp(0.0, 1.0);
+        let conf_weight = 0.35 + 0.65 * excess;
+        let span_mult = if (line_no as isize) - prev_line[best_k] <= 2 {
+            span_len[best_k] += 1;
+            let cur = span_len[best_k] as f64;
+            0.25 * (cur / (cur - 1.0)).ln()
+        } else {
+            span_len[best_k] = 1;
+            1.0
+        };
+        prev_line[best_k] = line_no as isize;
+        event_load += sev * conf_weight * span_mult;
+
         let prob = ((best_p as f64) * 10000.0).round() / 10000.0;
-        let sq = Squiggle { line: row + 1, kind: kind.into(), probability: prob, message: msg.into() };
-        ranked.push((sev * prob, kind, sq));
+        let sq = Squiggle {
+            line: line_no,
+            kind: kind.into(),
+            probability: prob,
+            message: msg.into(),
+        };
+        ranked.push((sev * prob, best_k, sq));
     }
-    rank_squiggles(ranked)
+
+    let doc_v = pool_doc_ring(n, dim, sc);
+    let mut doc_h = vec![0.0f32; w.doc1_w.cols as usize];
+    linear_sparse_direct_csr(&doc_v, 1, dim * 2, &w.doc1_w, Some(&w.doc1_b), true, &mut doc_h);
+    let mut doc_l = [0.0f32; 1];
+    linear_sparse_direct_csr(
+        &doc_h,
+        1,
+        w.doc1_w.cols as usize,
+        &w.doc2_w,
+        Some(&w.doc2_b),
+        false,
+        &mut doc_l,
+    );
+    let score = (sigmoid_f64(doc_l[0] as f64) * 10000.0).round() / 10000.0;
+    let rounded_load = (event_load * 10000.0).round() / 10000.0;
+
+    HygieneResult {
+        score,
+        squiggles: rank_squiggles(ranked),
+        cached: false,
+        latency_us: 1,
+        strict_score: None,
+        veto_cap: None,
+        total_squiggles: Some(total_squiggles),
+        event_load: Some(rounded_load),
+        triggered_vetoes: Vec::new(),
+    }
 }
 
-fn rank_squiggles(mut ranked: Vec<(f64, &'static str, Squiggle)>) -> Vec<Squiggle> {
-    let cmp = |a: &(f64, &str, Squiggle), b: &(f64, &str, Squiggle)| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.2.line.cmp(&b.2.line))
+/// 33-row L1-resident circular ring-buffer `pool_doc` (bit-exact with full `(n + 1) * dim` prefix).
+fn pool_doc_ring(n: usize, dim: usize, sc: &mut EvalScratch) -> Vec<f32> {
+    const RING_LEN: usize = PEAK_WINDOW + 1;
+    let mut doc = vec![0.0f32; dim * 2];
+    sc.mean_acc[..dim].fill(0.0);
+    sc.ring_w[..dim].fill(0.0);
+    sc.ring_g[0] = 0.0;
+    sc.prev1_raw[..dim].fill(0.0);
+    sc.prev2_raw[..dim].fill(0.0);
+    sc.peak[..dim].fill(f32::NEG_INFINITY);
+    let mut g_sum = PRIOR_LINES;
+
+    for row in 0..n {
+        let hi = row + 1;
+        let hi_slot = hi % RING_LEN;
+        let prev_slot = row % RING_LEN;
+        let lo = hi.saturating_sub(PEAK_WINDOW);
+        let lo_slot = lo % RING_LEN;
+
+        let gv = sc.gate[row];
+        let g64 = gv as f64;
+        g_sum += g64;
+        sc.ring_g[hi_slot] = sc.ring_g[prev_slot] + gv;
+        let denom = (sc.ring_g[hi_slot] - sc.ring_g[lo_slot]).max(PEAK_MIN_GATE) + PEAK_PRIOR;
+
+        let st_base = row * dim;
+        let prev_w_base = prev_slot * dim;
+        let hi_w_base = hi_slot * dim;
+        let lo_w_base = lo_slot * dim;
+        for ch in 0..dim {
+            let st = sc.state[st_base + ch];
+            sc.mean_acc[ch] += (st as f64) * g64;
+
+            let raw = st.max(0.0) * gv;
+            let ov = if n > 1 { raw.min(sc.prev1_raw[ch].max(sc.prev2_raw[ch])) } else { 0.0 };
+            let pos = raw - (1.0 - SPAN_CONT_WEIGHT) * ov;
+            sc.prev2_raw[ch] = sc.prev1_raw[ch];
+            sc.prev1_raw[ch] = raw;
+
+            let pw = sc.ring_w[prev_w_base + ch] + pos;
+            sc.ring_w[hi_w_base + ch] = pw;
+            let val = (pw - sc.ring_w[lo_w_base + ch]) / denom;
+            sc.peak[ch] = sc.peak[ch].max(val);
+        }
+    }
+
+    for ch in 0..dim {
+        doc[ch] = (sc.mean_acc[ch] / g_sum) as f32;
+    }
+    doc[dim..].copy_from_slice(&sc.peak[..dim]);
+    doc
+}
+
+fn rank_squiggles(mut ranked: Vec<(f64, usize, Squiggle)>) -> Vec<Squiggle> {
+    let cmp = |a: &(f64, usize, Squiggle), b: &(f64, usize, Squiggle)| {
+        b.0.total_cmp(&a.0).then_with(|| a.2.line.cmp(&b.2.line))
     };
     ranked.sort_by(cmp);
 
-    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    let mut counts = [0usize; 6];
     let (mut selected, mut overflow) = (Vec::with_capacity(48), Vec::new());
     for item in ranked {
-        let cnt = counts.entry(item.1).or_insert(0);
-        if *cnt < 4 {
-            *cnt += 1;
+        if counts[item.1] < 4 {
+            counts[item.1] += 1;
             selected.push(item);
         } else {
             overflow.push(item);
@@ -312,5 +602,5 @@ fn rank_squiggles(mut ranked: Vec<(f64, &'static str, Squiggle)>) -> Vec<Squiggl
     selected.extend(overflow.into_iter().take(need));
     selected.sort_by(cmp);
     selected.truncate(48);
-    selected.into_iter().map(|(_, _, s)| s).collect()
+    selected.into_iter().map(|(_, _, sq)| sq).collect()
 }

@@ -36,6 +36,16 @@ pub struct HygieneResult {
     pub cached: bool,
     #[serde(default)]
     pub latency_us: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub veto_cap: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_squiggles: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_load: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggered_vetoes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
