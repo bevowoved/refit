@@ -1,9 +1,13 @@
+pub mod budget;
+pub mod memgate;
 mod proc;
 mod redact;
 
 pub use crate::net::backoff_ms;
 #[cfg(test)]
 use crate::net::{is_retryable, retry_ms};
+pub use budget::{allocator_name, budget, collect_os_memory, init_allocator, under_memory_pressure};
+pub use memgate::{MemGate, TangoCreditRing};
 pub use proc::{run_cmd, self_metrics};
 pub use redact::{find_secret, redact_secrets};
 
@@ -18,7 +22,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CLOCK_ANCHOR: OnceLock<(u64, Instant)> = OnceLock::new();
@@ -34,7 +38,8 @@ const SANDBOX_VARS: &[&str] = &[
     "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP",
     "TMPDIR", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA",
     "APPDATA", "LANG", "LC_ALL", "RUSTUP_HOME", "CARGO_HOME", "GOPATH",
-    "GOROOT", "GOCACHE", "VIRTUAL_ENV", "NODE_PATH",
+    "GOROOT", "GOCACHE", "VIRTUAL_ENV", "NODE_PATH", "RUSTC_WRAPPER",
+    "SCCACHE_DIR", "CARGO_BUILD_RUSTC_WRAPPER",
 ];
 
 pub fn os_tag() -> String {
@@ -246,11 +251,12 @@ fn replace_file(src_path: &Path, dst_path: &Path, _parent: &Path) -> Result<()> 
 
     let mut last_err = None;
     for attempt in 0..5 {
+        // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 buffers alive for this call.
         if unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), flags) } != 0 {
             return Ok(());
         }
         last_err = Some(std::io::Error::last_os_error());
-        std::thread::sleep(Duration::from_millis(10 * (attempt + 1)));
+        std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
     }
 
     let _ = fs::remove_file(src_path);
@@ -273,11 +279,12 @@ fn replace_file(src_path: &Path, dst_path: &Path, parent: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::testutil::TempRepo;
+    use std::time::Duration;
 
     #[test]
     fn test_http_retry_and_backoff() {
-        assert!(new_http("refit-probe/0.4.0", 30, 16).is_ok());
-        assert!(stream_http("refit-stream/0.4.0", 15, 600, 16).is_ok());
+        assert!(new_http(concat!("refit-probe/", env!("CARGO_PKG_VERSION")), 30, 16).is_ok());
+        assert!(stream_http(concat!("refit-stream/", env!("CARGO_PKG_VERSION")), 15, 600, 16).is_ok());
 
         for code in [200, 201, 204, 400, 401, 403, 404, 422] {
             assert!(!is_retryable(code), "code={code}");

@@ -60,10 +60,16 @@ pub fn dag_from(
     let scc_ids = assign_ids(&scc_files);
     let bctx = BuildCtx { repo_root, preloaded, hygiene, scc_ids: &scc_ids, mod_tests: &mod_tests };
 
-    let built: Result<Vec<ModuleUnit>> = (0..scc_files.len())
-        .into_par_iter()
-        .map(|i| build_unit(&bctx, &scc_files[i], &scc_deps[i], &scc_dependents[i], wave_of[i], i))
-        .collect();
+    let built: Result<Vec<ModuleUnit>> = if crate::platform::budget().is_constrained() {
+        (0..scc_files.len())
+            .map(|i| build_unit(&bctx, &scc_files[i], &scc_deps[i], &scc_dependents[i], wave_of[i], i))
+            .collect()
+    } else {
+        (0..scc_files.len())
+            .into_par_iter()
+            .map(|i| build_unit(&bctx, &scc_files[i], &scc_deps[i], &scc_dependents[i], wave_of[i], i))
+            .collect()
+    };
 
     let mut units = built?;
     let total_loc: usize = units.iter().map(|u| u.loc).sum();
@@ -89,15 +95,27 @@ fn match_tests(
     test_files: &[String],
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> HashMap<String, Vec<String>> {
-    let contents: Vec<(&str, String)> = test_files
-        .par_iter()
-        .map(|tf| {
-            let txt = read_text(repo_root, tf, preloaded)
-                .map(|c| c.into_owned())
-                .unwrap_or_default();
-            (tf.as_str(), txt)
-        })
-        .collect();
+    let contents: Vec<(&str, String)> = if crate::platform::budget().is_constrained() {
+        test_files
+            .iter()
+            .map(|tf| {
+                let txt = read_text(repo_root, tf, preloaded)
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
+                (tf.as_str(), txt)
+            })
+            .collect()
+    } else {
+        test_files
+            .par_iter()
+            .map(|tf| {
+                let txt = read_text(repo_root, tf, preloaded)
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
+                (tf.as_str(), txt)
+            })
+            .collect()
+    };
 
     let mut map = HashMap::with_capacity(source_files.len());
     for src in source_files {

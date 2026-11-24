@@ -314,14 +314,16 @@ fn abi_summary(header: &str, units: &[ModuleUnit], repo_root: &Path, max_chars: 
         .into_iter()
         .collect();
 
-    let lines: Vec<String> = rels
-        .par_iter()
-        .filter_map(|rel| {
-            let src = fs::read_to_string(repo_root.join(rel)).ok()?;
-            let sigs = file_heads(&src);
-            (!sigs.is_empty()).then(|| format!("- {rel}: {}", sigs.join(" | ")))
-        })
-        .collect();
+    let extract = |rel: &&str| {
+        let src = fs::read_to_string(repo_root.join(rel)).ok()?;
+        let sigs = file_heads(&src);
+        (!sigs.is_empty()).then(|| format!("- {rel}: {}", sigs.join(" | ")))
+    };
+    let lines: Vec<String> = if crate::platform::budget().is_constrained() {
+        rels.iter().filter_map(extract).collect()
+    } else {
+        rels.par_iter().filter_map(extract).collect()
+    };
     if lines.is_empty() {
         return String::new();
     }

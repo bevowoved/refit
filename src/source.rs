@@ -31,7 +31,8 @@ pub fn rel_norm(root: &Path, abs: &Path) -> Option<String> {
 }
 
 pub fn work_dir(repo_root: &Path, dot_name: &str, tmp_name: &str) -> PathBuf {
-    let parent = repo_root.parent().filter(|p| !p.as_os_str().is_empty());
+    let resolved = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let parent = resolved.parent().filter(|p| !p.as_os_str().is_empty());
     match parent {
         Some(p) => p.join(dot_name),
         None => std::env::temp_dir().join(tmp_name),

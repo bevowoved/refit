@@ -5,19 +5,26 @@ edition = "2024"
 rust-version = "1.100"
 description = "Pure-Rust cross-platform polyglot refactoring engine for Kimi K3.1 Pro on Cerebras + unpatched OpenClaw + native 10 req/s KeenAble ROI search"
 
+[features]
+default = ["alloc-mimalloc"]
+alloc-mimalloc = ["dep:mimalloc"]
+alloc-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+
 [dependencies]
 anyhow = "1.0.105"
 axum = "0.8.9"
 blake3 = "1.8.7"
 bytes = "1.12.2"
 clap = { version = "4.6.9", features = ["derive"] }
+constant_time_eq = "0.4.2"
 dashmap = "6.2.1"
+dunce = "1.0.5"
 flate2 = "1.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc", "std"] }
 governor = { version = "0.10.4", default-features = false, features = ["std"] }
 httpdate = "1.0"
 ignore = "0.4.35"
-mimalloc = "0.1.52"
+mimalloc = { version = "0.1.52", optional = true }
 parking_lot = "0.12"
 petgraph = "0.8.3"
 rayon = "1.12.0"
@@ -30,7 +37,11 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt"] }
 wait-timeout = "0.2"
-zstd = "0.14.4"
+zstd = { version = "0.14.4", features = ["with-rust-allocator"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["process", "signal", "resource"] }
@@ -40,6 +51,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_JobObjects",
   "Win32_System_ProcessStatus",
+  "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_Storage_FileSystem",
 ] }

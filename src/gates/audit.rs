@@ -3,7 +3,7 @@ use super::stage::CargoSlot;
 use crate::graph::build_dag;
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::MvccStore;
-use crate::platform::{read_zstd, run_cmd, sandbox_env, walk_files, write_zstd};
+use crate::platform::{budget, collect_os_memory, read_zstd, run_cmd, sandbox_env, walk_files, write_zstd};
 use crate::source::{ext_lang, ext_str, rel_norm, source_rel, stem_of, supported_ext};
 use crate::types::DagPlan;
 use anyhow::Result;
@@ -121,14 +121,25 @@ fn read_tree(repo_root: &Path) -> TreeSnap {
     supported.sort_by(|a, b| a.0.cmp(&b.0));
     source_rels.sort();
 
-    let loaded: Vec<_> = supported
-        .par_iter()
-        .map(|(rel, abs)| {
-            let bytes = fs::read(abs).unwrap_or_default();
-            let h = MvccStore::hash_bytes(&bytes);
-            (rel.clone(), bytes, h)
-        })
-        .collect();
+    let loaded: Vec<_> = if budget().is_constrained() {
+        supported
+            .iter()
+            .map(|(rel, abs)| {
+                let bytes = fs::read(abs).unwrap_or_default();
+                let h = MvccStore::hash_bytes(&bytes);
+                (rel.clone(), bytes, h)
+            })
+            .collect()
+    } else {
+        supported
+            .par_iter()
+            .map(|(rel, abs)| {
+                let bytes = fs::read(abs).unwrap_or_default();
+                let h = MvccStore::hash_bytes(&bytes);
+                (rel.clone(), bytes, h)
+            })
+            .collect()
+    };
 
     let (mut preloaded, mut hashes) = (BTreeMap::new(), BTreeMap::new());
     let mut fp = blake3::Hasher::new();
@@ -188,22 +199,33 @@ pub fn scan_cached(
         None => snap.source_rels.clone(),
     };
 
-    let (plan_res, audit_res) = std::thread::scope(|s| {
-        let h_plan = s.spawn(|| build_dag(repo_root, None, scorer, Some(&snap.preloaded)));
-        let h_audit = s.spawn(|| {
-            let partial = use_cache && skip_tests && prev.is_some() && !changed.is_empty();
-            let targets = if partial { &changed } else { &snap.source_rels };
-            let mut fresh =
-                audit_files(&gate_cfg, targets, scorer, Some(&snap.preloaded), skip_tests)?;
-            if let Some(ref p) = prev.filter(|_| partial) {
-                merge_partial(repo_root, &gate_cfg, scorer, &snap, &changed, p, &mut fresh);
-            }
-            Ok::<AuditStats, anyhow::Error>(fresh)
-        });
-        (h_plan.join().expect("dag"), h_audit.join().expect("audit"))
-    });
+    let run_audit = || {
+        let partial = use_cache && skip_tests && prev.is_some() && !changed.is_empty();
+        let targets = if partial { &changed } else { &snap.source_rels };
+        let mut fresh =
+            audit_files(&gate_cfg, targets, scorer, Some(&snap.preloaded), skip_tests)?;
+        if let Some(ref p) = prev.filter(|_| partial) {
+            merge_partial(repo_root, &gate_cfg, scorer, &snap, &changed, p, &mut fresh);
+        }
+        Ok::<AuditStats, anyhow::Error>(fresh)
+    };
+
+    // Pre-warm hygiene once before `build_dag` so `dag_from` hits warm cache with zero
+    // cross-thread contention on constrained hosts.
+    let (plan_res, audit_res) = if budget().is_constrained() {
+        let audit_res = run_audit();
+        let plan_res = build_dag(repo_root, None, scorer, Some(&snap.preloaded));
+        (plan_res, audit_res)
+    } else {
+        std::thread::scope(|s| {
+            let h_plan = s.spawn(|| build_dag(repo_root, None, scorer, Some(&snap.preloaded)));
+            let h_audit = s.spawn(run_audit);
+            (h_plan.join().expect("dag"), h_audit.join().expect("audit"))
+        })
+    };
 
     scorer.flush_cache();
+    collect_os_memory();
     let bundle = ScanCache {
         version: "0.5.0".into(),
         repo_fingerprint: snap.fingerprint,
@@ -350,17 +372,24 @@ pub fn audit_files(
     let py_files = py_rels(rel_files);
     let base_env = sandbox_env(&[]);
 
-    let ((med, p10, per_h), py_audit, poly_diags) = std::thread::scope(|s| {
-        let h_hyg = s.spawn(|| hygiene.score_files(&cfg.repo_root, rel_files, preloaded));
-        let h_py = (!py_files.is_empty())
-            .then(|| s.spawn(|| audit_python(cfg, &py_files, &base_env, skip_tests)));
-        let h_poly = s.spawn(|| audit_polyglot(cfg, rel_files, &base_env, skip_tests));
-        (
-            h_hyg.join().expect("hygiene"),
-            h_py.map(|h| h.join().expect("python")),
-            h_poly.join().expect("polyglot"),
-        )
-    });
+    let ((med, p10, per_h), py_audit, poly_diags) = if budget().is_constrained() {
+        let h = hygiene.score_files(&cfg.repo_root, rel_files, preloaded);
+        let py = (!py_files.is_empty()).then(|| audit_python(cfg, &py_files, &base_env, skip_tests));
+        let poly = audit_polyglot(cfg, rel_files, &base_env, skip_tests);
+        (h, py, poly)
+    } else {
+        std::thread::scope(|s| {
+            let h_hyg = s.spawn(|| hygiene.score_files(&cfg.repo_root, rel_files, preloaded));
+            let h_py = (!py_files.is_empty())
+                .then(|| s.spawn(|| audit_python(cfg, &py_files, &base_env, skip_tests)));
+            let h_poly = s.spawn(|| audit_polyglot(cfg, rel_files, &base_env, skip_tests));
+            (
+                h_hyg.join().expect("hygiene"),
+                h_py.map(|h| h.join().expect("python")),
+                h_poly.join().expect("polyglot"),
+            )
+        })
+    };
 
     let mut stats = AuditStats { hygiene_median: med, hygiene_p10: p10, ..AuditStats::default() };
     for (file_k, msg) in poly_diags {
@@ -383,39 +412,53 @@ pub fn audit_files(
     Ok(stats)
 }
 
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 fn audit_python(
     cfg: &GateConfig,
     py_files: &[String],
     base_env: &[(String, String)],
     skip_tests: bool,
 ) -> Result<PyAudit> {
-    let (pt_res, ruff_res, ty_res) = std::thread::scope(|s| {
-        let t_pt = (!skip_tests && cfg.repo_root.join("tests").exists()).then(|| {
-            s.spawn(|| {
-                let env = sandbox_env(&[("PYTHONPATH".into(), cfg.repo_root.display().to_string())]);
-                run_cmd(&cfg.pytest_bin, &["-q".into(), "--tb=line".into()], &cfg.repo_root, &env, true, 30_000)
-            })
-        });
-        let t_ruff = s.spawn(|| {
-            let mut args = vec!["check".into(), "--output-format=json".into()];
-            args.extend(py_files.iter().cloned());
-            run_cmd(&cfg.ruff_bin, &args, &cfg.repo_root, base_env, true, 15_000)
-        });
-        let t_ty = s.spawn(|| {
-            let mut args = vec!["check".into(), "--error-on-warning".into()];
-            args.extend(py_files.iter().cloned());
-            run_cmd(&cfg.ty_bin, &args, &cfg.repo_root, base_env, true, 20_000)
-        });
-        (
-            t_pt.map(|h| h.join().expect("pytest")),
-            t_ruff.join().expect("ruff"),
-            t_ty.join().expect("ty"),
-        )
-    });
+    let run_pt = || {
+        let env = sandbox_env(&[("PYTHONPATH".into(), cfg.repo_root.display().to_string())]);
+        run_cmd(&cfg.pytest_bin, &["-q".into(), "--tb=line".into()], &cfg.repo_root, &env, true, 30_000)
+    };
+    let run_rf = || {
+        let mut args = vec!["check".into(), "--output-format=json".into()];
+        args.extend(py_files.iter().cloned());
+        run_cmd(&cfg.ruff_bin, &args, &cfg.repo_root, base_env, true, 15_000)
+    };
+    let run_ty_cmd = || {
+        let mut args = vec!["check".into(), "--error-on-warning".into()];
+        args.extend(py_files.iter().cloned());
+        run_cmd(&cfg.ty_bin, &args, &cfg.repo_root, base_env, true, 20_000)
+    };
+
+    let want_pt = !skip_tests && cfg.repo_root.join("tests").exists();
+    let (pt_res, ruff_res, ty_res) = if budget().is_constrained() {
+        (want_pt.then(run_pt), run_rf(), run_ty_cmd())
+    } else {
+        std::thread::scope(|s| {
+            let t_pt = want_pt.then(|| s.spawn(run_pt));
+            let t_ruff = s.spawn(run_rf);
+            let t_ty = s.spawn(run_ty_cmd);
+            (
+                t_pt.map(|h| h.join().expect("pytest")),
+                t_ruff.join().expect("ruff"),
+                t_ty.join().expect("ty"),
+            )
+        })
+    };
 
     let (passed, failed, failed_lines) = match pt_res {
-        Some(pr) => {
-            let pt = pr?;
+        Some(Ok(pt)) => {
             let (p, f) = parse_pytest(&pt.stdout, &pt.stderr, pt.exit_code);
             let mut fl = Vec::new();
             for line in pt.stdout.lines() {
@@ -425,12 +468,27 @@ fn audit_python(
             }
             (p, f, fl)
         }
+        Some(Err(e)) if !cfg.strict_polyglot_tools && is_not_found(&e) => (0, 0, Vec::new()),
+        Some(Err(e)) => return Err(e),
         None => (0, 0, Vec::new()),
     };
 
-    let ruff_items = ruff_map(&ruff_res?.stdout, &cfg.repo_root);
-    let ty_out = ty_res?;
-    let ty_lines = if ty_out.exit_code == 0 { Vec::new() } else { parse_ty(&ty_out.stdout, &ty_out.stderr) };
+    let ruff_items = match ruff_res {
+        Ok(out) => ruff_map(&out.stdout, &cfg.repo_root),
+        Err(e) if !cfg.strict_polyglot_tools && is_not_found(&e) => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let ty_lines = match ty_res {
+        Ok(ty_out) => {
+            if ty_out.exit_code == 0 {
+                Vec::new()
+            } else {
+                parse_ty(&ty_out.stdout, &ty_out.stderr)
+            }
+        }
+        Err(e) if !cfg.strict_polyglot_tools && is_not_found(&e) => Vec::new(),
+        Err(e) => return Err(e),
+    };
     Ok((passed, failed, failed_lines, ruff_items, ty_lines))
 }
 

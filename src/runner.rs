@@ -148,7 +148,8 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
         String::new()
     };
 
-    let client = stream_http("refit-runner/0.5.0", 15, 600, 32)?;
+    let pool_max = crate::platform::budget().http_pool_max;
+    let client = stream_http("refit-runner/0.5.0", 15, 600, pool_max)?;
     let (chat_url, chat_bearer, chat_model, via_oc) =
         chat_endpoint(&client, &opts, &client_tok).await;
 

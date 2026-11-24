@@ -37,6 +37,7 @@ async fn forward_sse(
 ) -> (Option<Value>, Option<Value>) {
     let mut byte_stream = upstream.bytes_stream();
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let line_cap = crate::platform::budget().sse_line_cap_bytes;
     let (mut last_usage, mut last_time) = (None, None);
     let watchdog = Duration::from_millis(idle_ms.max(50));
 
@@ -59,6 +60,10 @@ async fn forward_sse(
 
         buf.extend_from_slice(&chunk);
         drain_sse(&mut buf, false, |v| capture_meta(&v, &mut last_usage, &mut last_time));
+        if buf.len() > line_cap {
+            buf.clear();
+            buf.shrink_to(4096);
+        }
         if tx.send(Ok(chunk)).await.is_err() {
             break;
         }

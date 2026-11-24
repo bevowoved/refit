@@ -20,8 +20,20 @@ mod types;
 mod untangle;
 mod worktree;
 
+#[cfg(all(feature = "alloc-mimalloc", feature = "alloc-jemalloc"))]
+compile_error!("features `alloc-mimalloc` and `alloc-jemalloc` are mutually exclusive");
+
+#[cfg(feature = "alloc-mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc")))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8] = b"dirty_decay_ms:50,muzzy_decay_ms:50,narenas:2\0";
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -269,8 +281,8 @@ fn cmd_scan(repo: &Path, no_cache: bool, fast: bool) -> Result<()> {
     let style = hygiene::repo_style(repo);
 
     print_json(&json!({
-        "version": "0.5.0",
-        "allocator": "mimalloc",
+        "version": env!("CARGO_PKG_VERSION"),
+        "allocator": platform::allocator_name(),
         "pure_rust_hygiene": "codehygiene_v0.7.0_exact",
         "scan_cache_hit": hit,
         "fast_mode": fast,
@@ -376,22 +388,59 @@ async fn cmd_probe(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .init();
+        .try_init();
+}
 
-    match Cli::parse().command {
-        Commands::Scan { repo, no_cache, fast } => cmd_scan(&repo, no_cache, fast),
-        Commands::Audit { repo, markdown, research } => cmd_audit(&repo, markdown, research).await,
+fn build_rt(multi: bool) -> Result<tokio::runtime::Runtime> {
+    let b = platform::budget();
+    let mut builder = if multi && !b.is_constrained() {
+        let mut mt = tokio::runtime::Builder::new_multi_thread();
+        mt.worker_threads(b.effective_vcpus.clamp(1, 2));
+        mt
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    builder.enable_all().build().context("build tokio runtime")
+}
+
+fn cmd_audit_sync(repo: &Path, markdown: bool, do_research: bool) -> Result<()> {
+    if !do_research {
+        let scorer = hygiene::HygieneScorer::open_persistent(repo);
+        let report = untangle::untangle_repo(repo, &scorer)?;
+        platform::collect_os_memory();
+        if markdown {
+            println!("{}", untangle::render_audit(&report));
+            return Ok(());
+        }
+        return print_json(&json!({ "audit": report, "dependency_research": Vec::<serde_json::Value>::new() }));
+    }
+    build_rt(false)?.block_on(cmd_audit(repo, markdown, true))
+}
+
+fn main() -> Result<()> {
+    let b = platform::budget();
+    platform::init_allocator(b);
+
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Scan { repo, no_cache, fast } => {
+            let res = cmd_scan(&repo, no_cache, fast);
+            platform::collect_os_memory();
+            res
+        }
+        Commands::Audit { repo, markdown, research } => cmd_audit_sync(&repo, markdown, research),
         Commands::Sustain { repo, dry_run } => {
             let scorer = hygiene::HygieneScorer::open_persistent(&repo);
             let rep = untangle::untangle_repo(&repo, &scorer)?;
-            print_json(&untangle::write_sustain(&repo, &rep, dry_run)?)
+            let out = untangle::write_sustain(&repo, &rep, dry_run)?;
+            platform::collect_os_memory();
+            print_json(&out)
         }
         Commands::Gc { repo, keep_revs } => {
             let store = mvcc::MvccStore::open(&repo, "gc")?;
@@ -402,15 +451,26 @@ async fn main() -> Result<()> {
             }))
         }
         Commands::Probe { upstream, model, api_key_file, openclaw_url, openclaw_token } => {
-            cmd_probe(upstream, model, api_key_file, openclaw_url, openclaw_token).await
+            init_tracing();
+            build_rt(false)?.block_on(cmd_probe(
+                upstream,
+                model,
+                api_key_file,
+                openclaw_url,
+                openclaw_token,
+            ))
         }
         Commands::Run { args, resume } => {
+            init_tracing();
             let key = read_key(args.api_key_file.as_ref())?;
-            print_json(&runner::execute_run(run_opts(args, key, resume)).await?)
+            let out = build_rt(true)?.block_on(runner::execute_run(run_opts(args, key, resume)))?;
+            print_json(&out)
         }
         Commands::Resume { args } => {
+            init_tracing();
             let key = read_key(args.api_key_file.as_ref())?;
-            print_json(&runner::execute_run(run_opts(args, key, true)).await?)
+            let out = build_rt(true)?.block_on(runner::execute_run(run_opts(args, key, true)))?;
+            print_json(&out)
         }
         Commands::Bench { before, after, script, cmd, pairs } => {
             let res = if let Some(c) = cmd {
@@ -427,42 +487,51 @@ async fn main() -> Result<()> {
             listen, upstream, model, ui_index, telemetry_out, repo,
             auth_token, api_key_file, cache_retention, keep_warm,
         } => {
+            init_tracing();
             let key = read_key(api_key_file.as_ref())?;
-            let tel = telemetry::TelemetryHub::new(telemetry_out)?;
-            let mode = proxy::CacheMode::parse_mode(cache_retention.as_deref());
-            let mut cfg = proxy::ProxyConfig::new(listen.clone(), upstream, key, model);
-            cfg.ui_index_path = ui_index;
-            cfg.cache_retention = mode;
-            cfg.keep_warm = keep_warm;
-            cfg.auth_token = auth_token;
-            let (state, handle) = proxy::start_proxy(cfg, tel).await?;
-            if let Some(r) = repo {
-                state.bind_repo(r);
-            }
-            tracing::info!("refit proxy + HUD listening on http://{listen}");
-            handle.await?;
-            Ok(())
+            build_rt(true)?.block_on(async move {
+                let tel = telemetry::TelemetryHub::new(telemetry_out)?;
+                let mode = proxy::CacheMode::parse_mode(cache_retention.as_deref());
+                let mut cfg = proxy::ProxyConfig::new(listen.clone(), upstream, key, model);
+                cfg.ui_index_path = ui_index;
+                cfg.cache_retention = mode;
+                cfg.keep_warm = keep_warm;
+                cfg.auth_token = auth_token;
+                let (state, handle) = proxy::start_proxy(cfg, tel).await?;
+                if let Some(r) = repo {
+                    state.bind_repo(r);
+                }
+                tracing::info!("refit proxy + HUD listening on http://{listen}");
+                handle.await?;
+                Ok(())
+            })
         }
-        Commands::Mcp { repo } => mcp::serve_mcp(repo).await,
+        Commands::Mcp { repo } => {
+            init_tracing();
+            build_rt(false)?.block_on(mcp::serve_mcp(repo))
+        }
         Commands::Research { lang, repo, max_results, queries } => {
-            let client = match repo {
-                Some(ref r) => research::WebClient::for_repo(r, None),
-                None => research::WebClient::from_env(None),
-            };
-            let expanded = match lang {
-                Some(l) => queries
-                    .into_iter()
-                    .map(|q| format!("best native {l} library for {q} benchmark 2026"))
-                    .collect(),
-                None => queries,
-            };
-            let results = client.research_batch(expanded, max_results).await;
-            print_json(&json!({
-                "online": client.is_online(),
-                "rate_limit_rps": 10,
-                "cache_entries": client.cache_len(),
-                "results": results
-            }))
+            init_tracing();
+            build_rt(false)?.block_on(async move {
+                let client = match repo {
+                    Some(ref r) => research::WebClient::for_repo(r, None),
+                    None => research::WebClient::from_env(None),
+                };
+                let expanded = match lang {
+                    Some(l) => queries
+                        .into_iter()
+                        .map(|q| format!("best native {l} library for {q} benchmark 2026"))
+                        .collect(),
+                    None => queries,
+                };
+                let results = client.research_batch(expanded, max_results).await;
+                print_json(&json!({
+                    "online": client.is_online(),
+                    "rate_limit_rps": 10,
+                    "cache_entries": client.cache_len(),
+                    "results": results
+                }))
+            })
         }
     }
 }

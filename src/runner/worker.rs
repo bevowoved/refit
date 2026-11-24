@@ -351,6 +351,9 @@ async fn verify_unit(
     let (cfg, hyg, unit_b) = (ctx.gate_cfg.clone(), ctx.hygiene.clone(), unit.clone());
 
     let verdict = tokio::task::spawn_blocking(move || {
+        let gate = crate::platform::MemGate::global();
+        let reserve = (4 * 1024 * 1024).min(gate.capacity());
+        let _mem = gate.reserve_or_wait(reserve, std::time::Duration::from_secs(10)).ok();
         run_gates(&cfg, &unit_b, &updated, &deleted, &hyg)
     })
     .await

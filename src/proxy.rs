@@ -59,6 +59,10 @@ pub struct ProxyState {
     ui_cache: Mutex<Option<(u64, String)>>,
 }
 
+fn eq_token(got: &str, expected: &str) -> bool {
+    constant_time_eq::constant_time_eq(got.trim().as_bytes(), expected.as_bytes())
+}
+
 impl ProxyState {
     fn new(
         cfg: ProxyConfig,
@@ -109,7 +113,7 @@ impl ProxyState {
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
-            .is_some_and(|tok| tok.trim() == expected)
+            .is_some_and(|tok| eq_token(tok, expected))
     }
 
     async fn await_budget(&self, req_id: u64, est_unc: u64, est_tot: u64) {
@@ -157,7 +161,8 @@ pub async fn start_proxy(
     cfg: ProxyConfig,
     telemetry: TelemetryHub,
 ) -> Result<(Arc<ProxyState>, tokio::task::JoinHandle<()>)> {
-    let client = stream_http("cerebras-cloud-sdk/1.91.0 (refit/0.5.0)", 15, 600, 32)?;
+    let pool_max = crate::platform::budget().http_pool_max;
+    let client = stream_http("cerebras-cloud-sdk/1.91.0 (refit/0.5.0)", 15, 600, pool_max)?;
     let state = Arc::new(ProxyState::new(
         cfg.clone(),
         client,
@@ -387,7 +392,7 @@ async fn serve_events(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let query_ok = state.cfg.auth_token.as_deref().is_none_or(|exp| {
-        exp.is_empty() || params.get("token").is_some_and(|t| t.trim() == exp)
+        exp.is_empty() || params.get("token").is_some_and(|t| eq_token(t, exp))
     });
     if !state.is_authorized(&headers) && !query_ok {
         return err_401();

@@ -167,11 +167,16 @@ fn check_py0(ctx: &StageCtx<'_>) -> Option<(String, String)> {
 }
 
 fn check_js0(ctx: &StageCtx<'_>, strict: bool) -> Option<(String, String)> {
-    ctx.paths.js.par_iter().find_map_any(|js| {
+    let check_one = |js: &String| {
         let lbl = format!("node --check for `{js}`");
         let args = ["--check".into(), js.clone()];
         check_g0("gate0_syntax", &lbl, &ctx.cmd("node", &args, 5_000), strict, false)
-    })
+    };
+    if crate::platform::budget().is_constrained() {
+        ctx.paths.js.iter().find_map(check_one)
+    } else {
+        ctx.paths.js.par_iter().find_map_any(check_one)
+    }
 }
 
 fn check_rs0(ctx: &StageCtx<'_>, slot: &CargoSlot, strict: bool) -> Option<(String, String)> {
@@ -194,25 +199,54 @@ fn run_gate0(
     }
 
     let strict = ctx.cfg.strict_polyglot_tools;
+    let check_ts = || {
+        let args = ["--noEmit".into()];
+        let cmd = ctx.cmd("tsc", &args, 20_000);
+        check_g0("gate0_ts_check", "tsc --noEmit", &cmd, strict, true)
+    };
+    let check_go = || {
+        let args = ["vet".into(), "./...".into()];
+        let cmd = ctx.cmd("go", &args, 20_000);
+        check_g0("gate0_go_vet", "go vet", &cmd, strict, false)
+    };
+    let want_ts = !ctx.paths.ts.is_empty() && ctx.root.join("tsconfig.json").exists();
+    let want_go = !ctx.paths.go.is_empty() && ctx.root.join("go.mod").exists();
+
+    if crate::platform::budget().is_constrained() {
+        if !ctx.paths.py.is_empty()
+            && let Some(err) = check_py0(ctx)
+        {
+            return Some(err);
+        }
+        if !ctx.paths.js.is_empty()
+            && let Some(err) = check_js0(ctx, strict)
+        {
+            return Some(err);
+        }
+        if let Some(slot) = ctx.slot
+            && let Some(err) = check_rs0(ctx, slot, strict)
+        {
+            return Some(err);
+        }
+        if want_ts
+            && let Some(err) = check_ts()
+        {
+            return Some(err);
+        }
+        if want_go
+            && let Some(err) = check_go()
+        {
+            return Some(err);
+        }
+        return None;
+    }
+
     std::thread::scope(|s| {
         let h_py = (!ctx.paths.py.is_empty()).then(|| s.spawn(|| check_py0(ctx)));
         let h_js = (!ctx.paths.js.is_empty()).then(|| s.spawn(|| check_js0(ctx, strict)));
         let h_rs = ctx.slot.map(|slot| s.spawn(move || check_rs0(ctx, slot, strict)));
-        let h_ts = (!ctx.paths.ts.is_empty() && ctx.root.join("tsconfig.json").exists())
-            .then(|| {
-                s.spawn(|| {
-                    let args = ["--noEmit".into()];
-                    let cmd = ctx.cmd("tsc", &args, 20_000);
-                    check_g0("gate0_ts_check", "tsc --noEmit", &cmd, strict, true)
-                })
-            });
-        let h_go = (!ctx.paths.go.is_empty() && ctx.root.join("go.mod").exists()).then(|| {
-            s.spawn(|| {
-                let args = ["vet".into(), "./...".into()];
-                let cmd = ctx.cmd("go", &args, 20_000);
-                check_g0("gate0_go_vet", "go vet", &cmd, strict, false)
-            })
-        });
+        let h_ts = want_ts.then(|| s.spawn(check_ts));
+        let h_go = want_go.then(|| s.spawn(check_go));
 
         for h in [h_py, h_js, h_rs, h_ts, h_go].into_iter().flatten() {
             if let Some(err) = h.join().ok().flatten() {
@@ -312,33 +346,40 @@ fn run_py(
     acc: &mut RunAccum,
 ) {
     let has_tests = !unit.test_files.is_empty() || ctx.root.join("tests").exists();
-    let (ty_res, pt_res, g1_ms) = std::thread::scope(|s| {
-        let h_ty = s.spawn(|| {
-            let mut args = vec!["check".into(), "--error-on-warning".into()];
-            args.extend(ctx.paths.py.iter().cloned());
-            run_cmd(&ctx.cfg.ty_bin, &args, ctx.root, ctx.env, true, 10_000)
-        });
-        let h_pt = has_tests.then(|| {
-            s.spawn(|| {
-                let t = Instant::now();
-                let mut args = vec!["-q".into(), "--tb=short".into()];
-                if unit.test_files.is_empty() {
-                    args.push("tests".into());
-                } else {
-                    args.extend(unit.test_files.iter().cloned());
-                }
-                let env = sandbox_env(&[("PYTHONPATH".into(), ctx.root.display().to_string())]);
-                let res = run_cmd(&ctx.cfg.pytest_bin, &args, ctx.root, &env, true, 15_000);
-                (res, t.elapsed().as_millis() as u64)
-            })
-        });
-        let r_ty = h_ty.join().expect("ty");
-        let (r_pt, ms) = h_pt.map_or((None, 0), |h| {
-            let (r, m) = h.join().expect("pytest");
-            (Some(r), m)
-        });
+    let run_ty = || {
+        let mut args = vec!["check".into(), "--error-on-warning".into()];
+        args.extend(ctx.paths.py.iter().cloned());
+        run_cmd(&ctx.cfg.ty_bin, &args, ctx.root, ctx.env, true, 10_000)
+    };
+    let run_pt = || {
+        let t = Instant::now();
+        let mut args = vec!["-q".into(), "--tb=short".into()];
+        if unit.test_files.is_empty() {
+            args.push("tests".into());
+        } else {
+            args.extend(unit.test_files.iter().cloned());
+        }
+        let env = sandbox_env(&[("PYTHONPATH".into(), ctx.root.display().to_string())]);
+        let res = run_cmd(&ctx.cfg.pytest_bin, &args, ctx.root, &env, true, 15_000);
+        (res, t.elapsed().as_millis() as u64)
+    };
+
+    let (ty_res, pt_res, g1_ms) = if crate::platform::budget().is_constrained() {
+        let r_ty = run_ty();
+        let (r_pt, ms) = has_tests.then(run_pt).map_or((None, 0), |(r, m)| (Some(r), m));
         (r_ty, r_pt, ms)
-    });
+    } else {
+        std::thread::scope(|s| {
+            let h_ty = s.spawn(run_ty);
+            let h_pt = has_tests.then(|| s.spawn(run_pt));
+            let r_ty = h_ty.join().expect("ty");
+            let (r_pt, ms) = h_pt.map_or((None, 0), |h| {
+                let (r, m) = h.join().expect("pytest");
+                (Some(r), m)
+            });
+            (r_ty, r_pt, ms)
+        })
+    };
 
     apply_py_res(ctx.cfg.strict_polyglot_tools, ty_res, pt_res, g1_ms, verdict, acc);
 }

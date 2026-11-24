@@ -28,6 +28,7 @@ struct McpCtx {
     gate_cfg: GateConfig,
     research: Arc<WebClient>,
     out_tx: tokio::sync::mpsc::Sender<String>,
+    blocking_sem: Arc<tokio::sync::Semaphore>,
 }
 
 /// Run the concurrent JSON-RPC 2.0 MCP server over stdio with a serialized writer task.
@@ -45,12 +46,14 @@ pub async fn serve_mcp(repo_root: PathBuf) -> Result<()> {
         }
     });
 
+    let permits = crate::platform::budget().mcp_blocking_permits;
     let ctx = Arc::new(McpCtx {
         hygiene: HygieneScorer::open_persistent(&repo_root),
         gate_cfg: read_gates(&repo_root),
         research: WebClient::for_repo(&repo_root, None),
         repo_root,
         out_tx,
+        blocking_sem: Arc::new(tokio::sync::Semaphore::new(permits)),
     });
     let mut tasks = tokio::task::JoinSet::new();
 
@@ -103,8 +106,12 @@ fn spawn_call(tasks: &mut tokio::task::JoinSet<()>, id: Option<Value>, req: &Val
             let cap = args["capability"].as_str().unwrap_or("rate limiter");
             ok_json(c.research.check_library(lang, cap).await)
         } else {
+            let _sem_permit = c.blocking_sem.acquire().await.ok();
             let cc = c.clone();
             tokio::task::spawn_blocking(move || {
+                let gate = crate::platform::MemGate::global();
+                let reserve = (2 * 1024 * 1024).min(gate.capacity());
+                let _mem = gate.reserve_or_wait(reserve, std::time::Duration::from_secs(5)).ok();
                 dispatch_tool(&name, &args, &cc.repo_root, &cc.hygiene, &cc.gate_cfg)
             })
             .await

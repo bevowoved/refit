@@ -4,34 +4,24 @@ mod weights;
 
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
-use crate::platform::{read_zstd, write_zstd};
+use crate::platform::{
+    MemGate, TangoCreditRing, budget, collect_os_memory, read_zstd, under_memory_pressure,
+    write_zstd,
+};
 use crate::source::{quantile, read_text};
 use crate::types::HygieneResult;
 use dashmap::DashMap;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
-use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-static NEURAL_PERMITS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
-
-fn acquire_permit() -> DropGuard<(), impl FnOnce(())> {
-    let pair = NEURAL_PERMITS.get_or_init(|| (Mutex::new(4), Condvar::new()));
-    let mut avail = pair.0.lock();
-    while *avail == 0 {
-        pair.1.wait(&mut avail);
-    }
-    *avail -= 1;
-    drop(avail);
-
-    DropGuard::new((), move |()| {
-        *pair.0.lock() += 1;
-        pair.1.notify_one();
-    })
+fn estimate_neural_bytes(content: &str) -> usize {
+    let lines = content.as_bytes().iter().filter(|&&b| b == b'\n').count() + 1;
+    (lines.saturating_mul(2048)).clamp(64 * 1024, 16 * 1024 * 1024)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,7 +175,10 @@ impl HygieneScorer {
             return res;
         }
 
-        let permit = acquire_permit();
+        let est = estimate_neural_bytes(content);
+        let gate = MemGate::global();
+        let req = est.min(gate.capacity());
+        let permit = gate.reserve_or_wait(req, Duration::from_secs(5)).ok();
         let started = Instant::now();
         let mut res = model::score_v07(content);
         res.latency_us = started.elapsed().as_micros().max(1) as u64;
@@ -195,6 +188,9 @@ impl HygieneScorer {
         drop(permit);
         drop(guard);
         self.in_flight.remove_if(&key, |_, v| Arc::ptr_eq(v, &lock));
+        if content.len() > 128 * 1024 {
+            collect_os_memory();
+        }
         res
     }
 
@@ -204,13 +200,59 @@ impl HygieneScorer {
         rel_paths: &[String],
         preloaded: Option<&BTreeMap<String, Vec<u8>>>,
     ) -> (f64, f64, HashMap<String, HygieneResult>) {
-        let results: Vec<(String, HygieneResult)> = rel_paths
-            .par_iter()
-            .map(|rel| {
-                let text = read_text(repo_root, rel, preloaded).unwrap_or_default();
-                (rel.clone(), self.score_content(rel, &text))
-            })
-            .collect();
+        let was_dirty = self.dirty.load(Ordering::Acquire);
+        let b = budget();
+        let results: Vec<(String, HygieneResult)> = if b.is_constrained() {
+            rel_paths
+                .iter()
+                .map(|rel| {
+                    let text = read_text(repo_root, rel, preloaded).unwrap_or_default();
+                    (rel.clone(), self.score_content(rel, &text))
+                })
+                .collect()
+        } else if b.rayon_threads <= 2 && rel_paths.len() > 8 {
+            // Bounded 2-lane credit ring scheduling (zero Rayon oversubscription on 2-vCPU hosts).
+            let ring = TangoCreditRing::<usize, 64>::new();
+            let out = Mutex::new(Vec::with_capacity(rel_paths.len()));
+            let done = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let r_ref = &ring;
+                let o_ref = &out;
+                let d_ref = &done;
+                let worker = s.spawn(move || {
+                    loop {
+                        if let Some(idx) = r_ref.try_pop() {
+                            let rel = &rel_paths[idx];
+                            let text = read_text(repo_root, rel, preloaded).unwrap_or_default();
+                            let res = self.score_content(rel, &text);
+                            o_ref.lock().push((rel.clone(), res));
+                        } else if d_ref.load(Ordering::Acquire) {
+                            break;
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                });
+                for (idx, rel) in rel_paths.iter().enumerate() {
+                    if r_ref.try_push(idx).is_err() {
+                        let text = read_text(repo_root, rel, preloaded).unwrap_or_default();
+                        let res = self.score_content(rel, &text);
+                        o_ref.lock().push((rel.clone(), res));
+                    }
+                }
+                d_ref.store(true, Ordering::Release);
+                let _ = worker.join();
+            });
+            out.into_inner()
+        } else {
+            rel_paths
+                .par_iter()
+                .map(|rel| {
+                    let text = read_text(repo_root, rel, preloaded).unwrap_or_default();
+                    (rel.clone(), self.score_content(rel, &text))
+                })
+                .collect()
+        };
 
         let mut per_file = HashMap::with_capacity(results.len());
         let mut scores = Vec::with_capacity(results.len());
@@ -224,7 +266,11 @@ impl HygieneScorer {
         }
         let median = quantile(&mut scores, 0.5);
         let p10 = quantile(&mut scores, 0.10);
+        let scored_cold = self.dirty.load(Ordering::Acquire) && !was_dirty;
         self.flush_cache();
+        if scored_cold || under_memory_pressure() {
+            collect_os_memory();
+        }
         (median, p10, per_file)
     }
 }

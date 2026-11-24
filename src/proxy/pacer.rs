@@ -60,8 +60,8 @@ impl PacerState {
     }
 
     fn prune(&mut self) {
-        let cutoff = Instant::now() - Duration::from_secs(60);
-        while self.window.front().is_some_and(|e| e.at < cutoff) {
+        let window = Duration::from_secs(60);
+        while self.window.front().is_some_and(|e| e.at.elapsed() >= window) {
             self.window.pop_front();
         }
     }
@@ -70,8 +70,8 @@ impl PacerState {
         self.prune();
         let (mut unc, mut tot) = (0u64, 0u64);
         for e in &self.window {
-            unc += e.uncached;
-            tot += e.total;
+            unc = unc.saturating_add(e.uncached);
+            tot = tot.saturating_add(e.total);
         }
         (unc, tot, self.window.len() as u64)
     }
@@ -118,7 +118,7 @@ impl PacerState {
         if let Some(until) = self.circuit_open_until {
             let now = Instant::now();
             if now < until {
-                return Some(until - now);
+                return Some(until.saturating_duration_since(now));
             }
             self.circuit_open_until = None;
             self.circuit_state = "HALF_OPEN".into();
@@ -130,8 +130,8 @@ impl PacerState {
         let req_tot = est_tot.min(self.total_tpm_cap);
         let empty = self.window.is_empty();
 
-        let fits_unc = unc + req_unc <= self.uncached_tpm_cap || empty;
-        let fits_tot = tot + req_tot <= self.total_tpm_cap || empty;
+        let fits_unc = unc.saturating_add(req_unc) <= self.uncached_tpm_cap || empty;
+        let fits_tot = tot.saturating_add(req_tot) <= self.total_tpm_cap || empty;
         if fits_unc && fits_tot && rpm < self.rpm_cap {
             let entry = RollingEntry { req_id, at: Instant::now(), uncached: req_unc, total: req_tot };
             self.window.push_back(entry);
@@ -218,14 +218,15 @@ impl PacerState {
     }
 
     pub(super) fn record_usage(&mut self, req_id: u64, m: &LlmCallMetrics) -> u64 {
-        self.total_prompt_tokens += m.prompt_tokens;
-        self.total_cached_tokens += m.cached_tokens;
-        self.total_completion_tokens += m.completion_tokens;
-        self.total_uncached_tokens += m.uncached_tokens;
+        self.total_prompt_tokens = self.total_prompt_tokens.saturating_add(m.prompt_tokens);
+        self.total_cached_tokens = self.total_cached_tokens.saturating_add(m.cached_tokens);
+        self.total_completion_tokens =
+            self.total_completion_tokens.saturating_add(m.completion_tokens);
+        self.total_uncached_tokens = self.total_uncached_tokens.saturating_add(m.uncached_tokens);
         push_sample(&mut self.queue_ms_samples, m.queue_ms);
         push_sample(&mut self.decode_tps_samples, m.decode_tps);
 
-        let actual_tot = m.prompt_tokens + m.completion_tokens;
+        let actual_tot = m.prompt_tokens.saturating_add(m.completion_tokens);
         if let Some(slot) = self.window.iter_mut().find(|e| e.req_id == req_id) {
             slot.uncached = m.uncached_tokens;
             slot.total = actual_tot;

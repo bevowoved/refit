@@ -10,18 +10,32 @@ pub fn self_metrics() -> SelfMetrics {
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
+    // SAFETY: `GetCurrentProcess` returns the pseudo-handle for this process; both memory
+    // counter structs and `FILETIME` outputs are zeroed POD with exact struct byte sizes.
     unsafe {
         let proc_h = GetCurrentProcess();
-        let mut pmc: PROCESS_MEMORY_COUNTERS = zeroed();
-        pmc.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        let rss_bytes = if GetProcessMemoryInfo(proc_h, &mut pmc, pmc.cb) != 0 {
-            pmc.WorkingSetSize as u64
+        let mut ex2: PROCESS_MEMORY_COUNTERS_EX2 = zeroed();
+        ex2.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+        let rss_bytes = if GetProcessMemoryInfo(
+            proc_h,
+            &mut ex2 as *mut PROCESS_MEMORY_COUNTERS_EX2 as *mut PROCESS_MEMORY_COUNTERS,
+            ex2.cb,
+        ) != 0
+            && ex2.PrivateWorkingSetSize > 0
+        {
+            ex2.PrivateWorkingSetSize as u64
         } else {
-            0
+            let mut pmc: PROCESS_MEMORY_COUNTERS = zeroed();
+            pmc.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            if GetProcessMemoryInfo(proc_h, &mut pmc, pmc.cb) != 0 {
+                pmc.WorkingSetSize as u64
+            } else {
+                0
+            }
         };
 
         let (mut cr, mut ex, mut kn, mut us): (FILETIME, FILETIME, FILETIME, FILETIME) =
@@ -49,11 +63,9 @@ pub fn self_metrics() -> SelfMetrics {
         .unwrap_or(0);
 
     #[cfg(target_os = "linux")]
-    let rss_bytes = std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages * 4096)
-        .unwrap_or(0);
+    let rss_bytes = linux_uss_bytes().unwrap_or_else(|| {
+        usage.map(|u| u.max_rss().max(0) as u64 * 1024).unwrap_or(0)
+    });
 
     #[cfg(not(target_os = "linux"))]
     let rss_bytes = usage.map(|u| u.max_rss().max(0) as u64).unwrap_or(0);
@@ -61,11 +73,54 @@ pub fn self_metrics() -> SelfMetrics {
     SelfMetrics { rss_bytes, cpu_ms }
 }
 
-fn spawn_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+#[cfg(target_os = "linux")]
+fn linux_uss_bytes() -> Option<u64> {
+    if let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+        let mut dirty_kb = 0u64;
+        let mut clean_kb = 0u64;
+        let mut lazy_kb = 0u64;
+        let mut found = false;
+        for line in rollup.lines() {
+            if let Some(rest) = line.strip_prefix("Private_Dirty:") {
+                dirty_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                found = true;
+            } else if let Some(rest) = line.strip_prefix("Private_Clean:") {
+                clean_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                found = true;
+            } else if let Some(rest) = line.strip_prefix("LazyFree:") {
+                lazy_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+        }
+        if found {
+            return Some(dirty_kb.saturating_add(clean_kb).saturating_sub(lazy_kb) * 1024);
+        }
+    }
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+fn spawn_pipe<R: Read + Send + 'static>(pipe: Option<R>, cap_bytes: usize) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut p) = pipe {
-            let _ = p.read_to_end(&mut buf);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if buf.len() < cap_bytes {
+                            let keep = (cap_bytes - buf.len()).min(n);
+                            buf.extend_from_slice(&chunk[..keep]);
+                        }
+                    }
+                }
+            }
         }
         String::from_utf8_lossy(&buf).into_owned()
     })
@@ -106,8 +161,9 @@ pub fn run_cmd(
     #[cfg(windows)]
     let job_handle = attach_job(&child);
 
-    let out_thread = spawn_pipe(child.stdout.take());
-    let err_thread = spawn_pipe(child.stderr.take());
+    let cap = super::budget::budget().pipe_cap_bytes;
+    let out_thread = spawn_pipe(child.stdout.take(), cap);
+    let err_thread = spawn_pipe(child.stderr.take(), cap);
 
     let deadline = Duration::from_millis(timeout_ms.max(100));
     let mut timed_out = false;
@@ -146,6 +202,7 @@ pub fn run_cmd(
 #[cfg(windows)]
 fn kill_child(child: &mut Child, job: Option<windows_sys::Win32::Foundation::HANDLE>) {
     if let Some(h) = job {
+        // SAFETY: `h` is a valid Job Object handle owned by this `run_cmd` invocation.
         unsafe {
             windows_sys::Win32::System::JobObjects::TerminateJobObject(h, 1);
         }
@@ -157,6 +214,7 @@ fn kill_child(child: &mut Child, job: Option<windows_sys::Win32::Foundation::HAN
 #[cfg(unix)]
 fn set_pgid(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
+    // SAFETY: `setpgid(0, 0)` is async-signal-safe and runs solely in the forked child.
     unsafe {
         cmd.pre_exec(|| {
             let zero = nix::unistd::Pid::from_raw(0);
@@ -192,6 +250,8 @@ fn attach_job(child: &Child) -> Option<windows_sys::Win32::Foundation::HANDLE> {
         SetInformationJobObject,
     };
 
+    // SAFETY: Win32 Job Object creation/assignment with zeroed POD struct and valid child handle;
+    // any failure path closes the handle before returning `None`.
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
@@ -226,6 +286,8 @@ fn close_job(job_handle: Option<windows_sys::Win32::Foundation::HANDLE>) -> (u64
     };
 
     let Some(job) = job_handle else { return (0, 0) };
+    // SAFETY: `job` is a valid owned Job Object handle queried with exact POD buffer sizes and
+    // unconditionally closed via `CloseHandle` before returning.
     unsafe {
         let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
         let a_ptr = &mut acct as *mut _ as *mut core::ffi::c_void;
