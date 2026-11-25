@@ -834,9 +834,16 @@ fn select_top_blocks(scores: &[(f64, u16)], k_sel: usize, out: &mut [u16; LSA_TO
 
 fn merge_engram_blocks(sel: &mut [u16; LSA_TOP_K], mut sel_cnt: usize, k_sel: usize, eng: &[u16]) -> usize {
     let cap = k_sel.min(LSA_TOP_K);
+    let mut overwrite = cap;
     for &eb in eng {
         if sel[..sel_cnt].contains(&eb) { continue; }
-        if sel_cnt < cap { sel[sel_cnt] = eb; sel_cnt += 1; } else if cap > 0 { sel[cap - 1] = eb; }
+        if sel_cnt < cap {
+            sel[sel_cnt] = eb;
+            sel_cnt += 1;
+        } else if overwrite > 0 {
+            overwrite -= 1;
+            sel[overwrite] = eb;
+        }
     }
     sel_cnt
 }
@@ -882,7 +889,7 @@ fn select_banded_far_blocks(
     tel.engram_far_hits += eng_cnt;
     if ctx.reuse_mli {
         let cached = sp.banded_mli.get(ctx.q);
-        let take = cached.len().min(LSA_TOP_K);
+        let take = cached.len().min(2);
         sel[..take].copy_from_slice(&cached[..take]);
         if take > 0 { tel.mli_reused = true; tel.mli_reuse_hits += 1; }
         return merge_engram_blocks(sel, take, LSA_TOP_K, &eng_blks[..eng_cnt]);
@@ -1162,6 +1169,9 @@ pub(super) unsafe fn sink_attention_with<K: HygieneKernel>(
         );
     }
 
+    if layer_idx == 0 && let Some(sp) = sc.sparse.as_mut() {
+        for cache in &mut sp.dense_mli { cache.n_rows = 0; }
+    }
     let mut banded_mli_ready = false;
     for (head_idx, head) in layer.heads.iter().enumerate() {
         let hr = HeadRef { layer, head };

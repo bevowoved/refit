@@ -645,8 +645,10 @@ fn classify_rust_cfg_attr(inner: &[u8]) -> (bool, bool) {
     }
     let compact = &buf[..len];
     let is_test = compact == b"cfg(test)"
-        || compact.starts_with(b"cfg(all(test,")
-        || compact.ends_with(b",test))");
+        || (compact.starts_with(b"cfg(all(")
+            && (compact.starts_with(b"cfg(all(test,")
+                || compact.ends_with(b",test))")
+                || compact.windows(6).any(|w| w == b",test,")));
     let is_os = compact == b"cfg(windows)"
         || compact == b"cfg(unix)"
         || compact == b"cfg(any(windows,unix))"
@@ -1330,6 +1332,14 @@ mod tests {
             vec![b"let".as_slice(), b"foo_1", b"bar2"]
         );
         assert_eq!(extract_comment_body("rs", "  /// hello world"), Some("hello world"));
+        let rs_any = "#[cfg(any(feature = \"mcp-v2\", test))]\npub fn prod_feat() {}\n#[cfg(all(unix, test))]\nfn unix_test() {}\n";
+        let (mut prod_in_test, mut all_in_test) = (false, false);
+        let mut c2 = LexCursor::new(LangKind::Rust, rs_any.as_bytes());
+        while let Some(tok) = c2.next_token() {
+            if tok.kind == LexKind::Ident && tok.as_str() == "prod_feat" { prod_in_test = tok.flags.in_test(); }
+            if tok.kind == LexKind::Ident && tok.as_str() == "unix_test" { all_in_test = tok.flags.in_test(); }
+        }
+        assert!(!prod_in_test && all_in_test);
         assert_eq!(extract_comment_body("py", "  # py note"), Some("py note"));
     }
 }

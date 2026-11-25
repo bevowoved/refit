@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -88,19 +88,7 @@ fn json_style(repo_root: &Path, cfg: &mut StyleConfig) -> bool {
     false
 }
 
-fn write_str_u16(out: &mut Vec<u8>, text: &str) {
-    let bytes = text.as_bytes();
-    let len = bytes.len().min(u16::MAX as usize);
-    let _ = out.write_u16::<LittleEndian>(len as u16);
-    out.extend_from_slice(&bytes[..len]);
-}
-
-fn read_str_u16(rd: &mut Cursor<&[u8]>) -> Option<String> {
-    let len = rd.read_u16::<LittleEndian>().ok()? as usize;
-    let mut buf = vec![0u8; len];
-    rd.read_exact(&mut buf).ok()?;
-    String::from_utf8(buf).ok()
-}
+use crate::platform::{read_u16_str as read_str_u16, write_u16_str as write_str_u16};
 
 fn write_opt_f64(out: &mut Vec<u8>, v: Option<f64>) {
     if let Some(x) = v { let _ = out.write_f64::<LittleEndian>(x); }
@@ -360,8 +348,9 @@ impl HygieneScorer {
         content: &str,
         opts: EvalOptions,
     ) -> (HygieneResult, Option<SparseAttnTelemetry>) {
-        let line_count = content.as_bytes().iter().filter(|&&b| b == b'\n').count() + 1;
+        let line_count = crate::source::count_lines(content.as_bytes()).max(1);
         let approx_active = opts.approx_long && line_count > opts.approx_threshold;
+        let eval_opts = EvalOptions { approx_long: approx_active, ..opts };
         let namespace = if approx_active { "v07-approx" } else { "v07" };
         let key = format!(
             "{namespace}:{}:{}",
@@ -392,7 +381,7 @@ impl HygieneScorer {
         let req = est.min(gate.capacity());
         let permit = gate.reserve_or_wait(req, Duration::from_secs(5)).ok();
         let started = Instant::now();
-        let (mut res, telemetry) = model::score_v07_with_opts(content, self.active_weights(), opts);
+        let (mut res, telemetry) = model::score_v07_with_opts(content, self.active_weights(), eval_opts);
         res.latency_us = started.elapsed().as_micros().max(1) as u64;
         let weight = hygiene_entry_weight(&key, &res);
         self.cache.insert(key.clone(), res.clone(), weight);

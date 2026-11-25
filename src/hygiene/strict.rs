@@ -458,7 +458,7 @@ fn audit_source_full(
         }
         check_line_tails_blanks_and_comments(&lines, &mut metrics, &mut findings);
         let pub_fields = if slang != StrictLang::Script {
-            analyze_functions_and_blocks(&tokens, slang == StrictLang::Go, &mut metrics, &mut block, &mut findings)
+            analyze_functions_and_blocks(&tokens, &lines, slang == StrictLang::Go, &mut metrics, &mut block, &mut findings)
         } else { 0 };
         block.impl_loc = metrics.prod_lines;
         finalize_block_metrics(&mut block, pub_fields, ego);
@@ -1122,7 +1122,7 @@ struct FnAnalyzer<'a> {
 impl<'a> FnAnalyzer<'a> {
     fn clear_bool_op(&mut self) { if let Some(cur) = self.fn_stack.last_mut() { cur.last_bool_op = None; } }
 
-    fn handle_lbrace(&mut self, tok_idx: usize, tokens: &[StrictTok<'a>]) {
+    fn handle_lbrace(&mut self, tok_idx: usize, tokens: &[StrictTok<'a>], lines: &[LineScan<'_>]) {
         let tok = &tokens[tok_idx];
         if let Some(pfn) = self.pending_fn.take() {
             if pfn.paren_depth == self.paren_depth && pfn.bracket_depth == self.bracket_depth {
@@ -1144,7 +1144,7 @@ impl<'a> FnAnalyzer<'a> {
             p.paren_depth == self.paren_depth && p.bracket_depth == self.bracket_depth
         });
         if match_cf && let Some(pcf) = self.pending_cf.pop() {
-            self.push_cf_brace(pcf, tok, tokens);
+            self.push_cf_brace(pcf, tok, lines);
             return;
         }
         let match_cl = self.pending_closure.last()
@@ -1162,7 +1162,7 @@ impl<'a> FnAnalyzer<'a> {
         self.clear_bool_op();
     }
 
-    fn push_cf_brace(&mut self, pcf: PendingCf, tok: &StrictTok<'a>, tokens: &[StrictTok<'a>]) {
+    fn push_cf_brace(&mut self, pcf: PendingCf, tok: &StrictTok<'a>, lines: &[LineScan<'_>]) {
         let parent_cf = self.brace_stack.iter().rev()
             .take_while(|f| f.kind != BraceKind::FnBody)
             .find(|f| f.kind == BraceKind::ControlFlow);
@@ -1182,7 +1182,7 @@ impl<'a> FnAnalyzer<'a> {
             if compressed { cur.indent_compressed += 1; }
             let cnt = cur.cf_opens_by_line.entry(tok.line).or_insert(0);
             *cnt += 1;
-            let semis = tokens.iter().filter(|t| t.line == tok.line && t.kind == LexKind::Semi).count();
+            let semis = lines.get(tok.line).map_or(0, |l| l.total_semis);
             if same_ln >= 3 || (*cnt >= 3 && (same_ln >= 2 || semis >= 2)) { cur.packed_cf_line = true; }
             cur.last_bool_op = None;
         }
@@ -1260,7 +1260,7 @@ fn count_pub_struct_fields(tokens: &[StrictTok<'_>], struct_idx: usize) -> usize
 }
 
 fn analyze_functions_and_blocks(
-    tokens: &[StrictTok<'_>], is_go: bool, metrics: &mut StrictMetrics,
+    tokens: &[StrictTok<'_>], lines: &[LineScan<'_>], is_go: bool, metrics: &mut StrictMetrics,
     block: &mut BlockModuleMetrics, findings: &mut Vec<StrictFinding>,
 ) -> usize {
     let (mut state, mut pub_fields) = (FnAnalyzer::default(), 0usize);
@@ -1275,7 +1275,7 @@ fn analyze_functions_and_blocks(
             LexKind::LBracket => state.bracket_depth += 1,
             LexKind::RBracket => state.bracket_depth = state.bracket_depth.saturating_sub(1),
             LexKind::Semi | LexKind::Comma | LexKind::FatArrow => state.clear_bool_op(),
-            LexKind::LBrace => state.handle_lbrace(idx, tokens),
+            LexKind::LBrace => state.handle_lbrace(idx, tokens, lines),
             LexKind::RBrace => {
                 if let Some(popped) = state.brace_stack.pop() {
                     if popped.kind == BraceKind::FnBody {

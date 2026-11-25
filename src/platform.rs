@@ -368,14 +368,14 @@ pub fn save_stat_cache(path: &Path, map: &BTreeMap<String, StatEntry>) -> Result
     write_atomic(path, &zstd::bulk::compress(&encode_stat_map(map), 1)?)
 }
 
-fn write_u16_str(out: &mut Vec<u8>, s: &str) {
+pub fn write_u16_str(out: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
     let n = b.len().min(u16::MAX as usize);
     let _ = out.write_u16::<LittleEndian>(n as u16);
     out.extend_from_slice(&b[..n]);
 }
 
-fn read_u16_str(rd: &mut Cursor<&[u8]>) -> Option<String> {
+pub fn read_u16_str(rd: &mut Cursor<&[u8]>) -> Option<String> {
     let n = rd.read_u16::<LittleEndian>().ok()? as usize;
     let mut buf = vec![0u8; n];
     rd.read_exact(&mut buf).ok()?;

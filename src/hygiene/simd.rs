@@ -1,6 +1,7 @@
 use super::weights::{CompactConv, CompactCsr, PadTap, PartRange};
 
 /// Empirical L1D width gate: 8-line AVX2 tiling wins when `out_cols <= 128`.
+#[cfg(target_arch = "x86_64")]
 pub(super) const WIDE_OUT_GATE: usize = 128;
 pub(super) const MAX_SPAN_LEN: usize = 256;
 pub(super) const BK_ANTI_ALIAS: usize = 252;
