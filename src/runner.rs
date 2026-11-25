@@ -156,7 +156,11 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
     let (chat_url, chat_bearer, chat_model, via_oc) =
         chat_endpoint(&client, &opts, &client_tok).await;
 
-    let (rewind_index, file_to_unit) = build_rewind_index(&active_repo, &bundle, &gate_cfg);
+    let (rewind_index, file_to_unit) = if cfg!(any(feature = "live-rewind", test)) {
+        build_rewind_index(&active_repo, &bundle, &gate_cfg)
+    } else {
+        (InvertedRewindIndex::default(), HashMap::new())
+    };
 
     let ctx = Arc::new(WorkerCtx {
         run_id,

@@ -193,6 +193,12 @@ pub fn mkdir_private(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn os_random_bytes<const N: usize>() -> Result<[u8; N]> {
+    let mut buf = [0u8; N];
+    getrandom::fill(&mut buf).map_err(|err| anyhow::anyhow!("OS CSPRNG failed: {err}"))?;
+    Ok(buf)
+}
+
 pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
     let parent = target
         .parent()
@@ -202,8 +208,9 @@ pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("create parent dir {}", parent.display()))?;
 
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nonce = u32::from_le_bytes(os_random_bytes::<4>().unwrap_or([0; 4]));
     let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
-    let tmp_path = parent.join(format!(".refit.tmp.{}.{seq}.{name}", std::process::id()));
+    let tmp_path = parent.join(format!(".refit.tmp.{}.{seq}.{nonce:08x}.{name}", std::process::id()));
 
     let mut f = File::create(&tmp_path)
         .with_context(|| format!("create temp file {}", tmp_path.display()))?;

@@ -1224,6 +1224,23 @@ fn is_pub_item_decl(trimmed: &str) -> bool {
         || trimmed.starts_with("export class ")
 }
 
+fn matching_paren_close(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (rel, byte) in text[open..].bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + rel);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_fn_param_arity(trimmed: &str) -> Option<(usize, usize, bool)> {
     let is_fn_line = trimmed.starts_with("fn ")
         || trimmed.starts_with("pub fn ")
@@ -1241,7 +1258,7 @@ fn parse_fn_param_arity(trimmed: &str) -> Option<(usize, usize, bool)> {
         return None;
     }
     let open = trimmed.find('(')?;
-    let close = trimmed[open + 1..].find(')')? + open + 1;
+    let close = matching_paren_close(trimmed, open)?;
     let params_str = trimmed[open + 1..close].trim();
     let has_self = params_str.contains("&self") || params_str.contains("&mut self");
     if params_str.is_empty() {
@@ -1534,6 +1551,7 @@ pub struct CalibrationAudit {
     pub engram_hits: usize,
     pub engram_bytes: usize,
     pub mli_reused: bool,
+    pub mli_reuse_hits: usize,
     pub raw_v07: f64,
     pub delta_block: f64,
     pub delta_cross: f64,
@@ -1676,9 +1694,18 @@ pub fn score_multiscale(
         engram_hits,
         engram_bytes,
         engram_risk,
+        index_cache.reuse_hits,
         weight_zero_ratio,
     );
 
+    if audit.veto_cap < 1.0 {
+        result.veto_cap = Some(result.veto_cap.map_or(audit.veto_cap, |c| c.min(audit.veto_cap)));
+        for rule in &block_metrics.structural_rules {
+            if !result.triggered_vetoes.iter().any(|v| v == rule) {
+                result.triggered_vetoes.push(rule.clone());
+            }
+        }
+    }
     result.multiscale_score = Some(audit.final_score);
     result.calibration_log = serde_json::to_string(&audit).ok();
     audit
@@ -1693,6 +1720,7 @@ fn build_calibration_audit(
     engram_hits: usize,
     engram_bytes: usize,
     engram_risk: f64,
+    mli_reuse_hits: usize,
     weight_zero_ratio: f64,
 ) -> CalibrationAudit {
     let raw_v07 = result.score;
@@ -1735,6 +1763,7 @@ fn build_calibration_audit(
         engram_hits,
         engram_bytes,
         mli_reused: layer2.mli_reused,
+        mli_reuse_hits,
         raw_v07,
         delta_block,
         delta_cross,

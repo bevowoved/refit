@@ -338,7 +338,7 @@ pub(super) fn merged_rust_cargo_env(
 ) -> Vec<(String, String)> {
     let mut env = rust_cargo_env(target_dir);
     for (k, v) in extra {
-        if let Some(entry) = env.iter_mut().find(|(ek, _)| ek == &k) {
+        if let Some(entry) = env.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(&k)) {
             entry.1 = v;
         } else {
             env.push((k, v));

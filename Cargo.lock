@@ -1391,6 +1391,7 @@ dependencies = [
  "fixedbitset",
  "flate2",
  "futures-util",
+ "getrandom 0.4.3",
  "globset",
  "governor",
  "httpdate",

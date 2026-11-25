@@ -594,25 +594,28 @@ fn audit_polyglot(
     let has_rs = rel_files.iter().any(|f| f.ends_with(".rs"));
     let has_ts = rel_files.iter().any(|f| f.ends_with(".ts") || f.ends_with(".tsx"));
     let has_go = rel_files.iter().any(|f| f.ends_with(".go"));
+    let run_rs = has_rs && cfg.repo_root.join("Cargo.toml").exists();
+    let run_ts = has_ts && cfg.repo_root.join("tsconfig.json").exists();
+    let run_go = has_go && cfg.repo_root.join("go.mod").exists();
     let mut out = Vec::new();
 
+    if budget().is_constrained() {
+        if run_rs && let Some(item) = probe_cargo(&cfg.repo_root) {
+            out.push(item);
+        }
+        if run_ts && let Some(item) = probe_ts(&cfg.repo_root, base_env) {
+            out.push(item);
+        }
+        if run_go && let Some(item) = probe_go(&cfg.repo_root, base_env) {
+            out.push(item);
+        }
+        return out;
+    }
+
     std::thread::scope(|s| {
-        let h_rs = (has_rs && cfg.repo_root.join("Cargo.toml").exists())
-            .then(|| s.spawn(|| probe_cargo(&cfg.repo_root)));
-        let h_ts = (has_ts && cfg.repo_root.join("tsconfig.json").exists()).then(|| {
-            s.spawn(|| {
-                let (prog, args, label) = detect_cold_ts_checker();
-                let cmd = CmdSpec::new(prog, &args, &cfg.repo_root, base_env, 20_000);
-                poly_probe(&cmd, "tsconfig.json", label, true)
-            })
-        });
-        let h_go = (has_go && cfg.repo_root.join("go.mod").exists()).then(|| {
-            s.spawn(|| {
-                let args = ["vet".into(), "./...".into()];
-                let cmd = CmdSpec::new("go", &args, &cfg.repo_root, base_env, 20_000);
-                poly_probe(&cmd, "go.mod", "go vet", false)
-            })
-        });
+        let h_rs = run_rs.then(|| s.spawn(|| probe_cargo(&cfg.repo_root)));
+        let h_ts = run_ts.then(|| s.spawn(|| probe_ts(&cfg.repo_root, base_env)));
+        let h_go = run_go.then(|| s.spawn(|| probe_go(&cfg.repo_root, base_env)));
 
         for h in [h_rs, h_ts, h_go].into_iter().flatten() {
             if let Some(item) = h.join().ok().flatten() {
@@ -621,6 +624,18 @@ fn audit_polyglot(
         }
     });
     out
+}
+
+fn probe_ts(root: &Path, base_env: &[(String, String)]) -> Option<(String, String)> {
+    let (prog, args, label) = detect_cold_ts_checker();
+    let cmd = CmdSpec::new(prog, &args, root, base_env, 20_000);
+    poly_probe(&cmd, "tsconfig.json", label, true)
+}
+
+fn probe_go(root: &Path, base_env: &[(String, String)]) -> Option<(String, String)> {
+    let args = ["vet".into(), "./...".into()];
+    let cmd = CmdSpec::new("go", &args, root, base_env, 20_000);
+    poly_probe(&cmd, "go.mod", "go vet", false)
 }
 
 fn probe_cargo(root: &Path) -> Option<(String, String)> {

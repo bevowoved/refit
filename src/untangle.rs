@@ -23,26 +23,40 @@ pub fn scan_infra(repo_root: &Path) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>
 
 /// Audit clones, dead symbols, large files, duplicate roles, unused deps, and infra configs.
 pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditReport> {
-    let (source_rels, preloaded) = load_sources(repo_root);
-    let (discovery, snap) = index_repo(repo_root, Some(&preloaded));
+    let constrained = crate::platform::budget().is_constrained();
+    let (source_rels, mut preloaded) = load_sources(repo_root, constrained);
+    let preload_opt = (!constrained).then_some(&preloaded);
+    let (discovery, snap) = index_repo(repo_root, preload_opt);
     // Pre-warm hygiene cache via scheduled batch scoring BEFORE `dag_from` so cold audit
     // never falls back to sequential per-unit scoring inside `build_unit`.
     let (hygiene_median, hygiene_p10, per_file_h) =
-        hygiene.score_files(repo_root, &source_rels, Some(&preloaded));
-    let plan = dag_from(repo_root, discovery, hygiene, Some(&preloaded))?;
+        hygiene.score_files(repo_root, &source_rels, preload_opt);
+    let plan = dag_from(repo_root, discovery, hygiene, preload_opt)?;
+    if constrained {
+        crate::platform::collect_os_memory();
+        preloaded = load_bounded_bytes(repo_root, &source_rels);
+    }
 
     let clone_clusters = clones::find_clones(&source_rels, &preloaded);
     let (god_files, orphan_files) = rank_files(&source_rels, &preloaded, &per_file_h, &snap);
     let capability_clusters = simiflow::find_capability_clusters(&source_rels, &preloaded);
-    let (total_infra_files, unused_deps, infra_findings) =
-        infra::scan_parts(repo_root, Some(&preloaded));
+    let doc_drift_findings = if cfg!(any(feature = "doc-drift", test)) {
+        let known_symbols = drift::collect_known_symbols(&snap, &preloaded);
+        drift::scan_doc_drift(repo_root, &source_rels, &preloaded, &known_symbols)
+    } else {
+        Vec::new()
+    };
+    let (total_infra_files, unused_deps, infra_findings) = if constrained {
+        preloaded.clear();
+        crate::platform::collect_os_memory();
+        infra::scan_parts(repo_root, None)
+    } else {
+        infra::scan_parts(repo_root, Some(&preloaded))
+    };
     let genome_summary = genome::analyze_git_cochange(repo_root, &source_rels);
     let genome_twins = genome::format_genome_twins(&genome_summary, 25);
     let deep_module_findings =
         csr::deep_module_findings(&source_rels, &snap.runtime_edges, &snap.metrics_by_file);
-    let known_symbols = drift::collect_known_symbols(&snap, &preloaded);
-    let doc_drift_findings =
-        drift::scan_doc_drift(repo_root, &source_rels, &preloaded, &known_symbols);
 
     let triage_plan = build_triage(
         &infra_findings,
@@ -73,7 +87,7 @@ pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditR
     })
 }
 
-fn load_sources(repo_root: &Path) -> (Vec<String>, BTreeMap<String, Vec<u8>>) {
+fn load_sources(repo_root: &Path, constrained: bool) -> (Vec<String>, BTreeMap<String, Vec<u8>>) {
     let mut preloaded = BTreeMap::new();
     let mut source_rels = Vec::new();
 
@@ -82,16 +96,31 @@ fn load_sources(repo_root: &Path) -> (Vec<String>, BTreeMap<String, Vec<u8>>) {
             continue;
         }
         let Some(rel) = rel_norm(repo_root, &path) else { continue };
-        let Ok(bytes) = fs::read(&path) else { continue };
-
         if source_rel(&rel) {
             source_rels.push(rel.clone());
         }
-        preloaded.insert(rel, bytes);
+        if !constrained && let Ok(bytes) = fs::read(&path) {
+            preloaded.insert(rel, bytes);
+        }
     }
 
     source_rels.sort();
     (source_rels, preloaded)
+}
+
+fn load_bounded_bytes(repo_root: &Path, source_rels: &[String]) -> BTreeMap<String, Vec<u8>> {
+    const MAX_CONSTRAINED_FILE_BYTES: u64 = 1024 * 1024;
+    let mut map = BTreeMap::new();
+    for rel in source_rels {
+        let path = repo_root.join(rel);
+        let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if len <= MAX_CONSTRAINED_FILE_BYTES
+            && let Ok(bytes) = fs::read(&path)
+        {
+            map.insert(rel.clone(), bytes);
+        }
+    }
+    map
 }
 
 fn rank_files(

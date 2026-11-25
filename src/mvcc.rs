@@ -117,7 +117,7 @@ impl MvccStore {
             let seq = if disk_len == cursor.0 && cursor.1 > 0 {
                 cursor.1
             } else {
-                wal_next_seq(&self.wal_path)
+                wal_next_seq(&self.wal_path)?
             };
             let new_len = append_framed_record(&self.wal_path, seq, payload.as_bytes())?;
             *cursor = (new_len, seq + 1);

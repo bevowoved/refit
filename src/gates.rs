@@ -557,7 +557,11 @@ fn score_gate2(
         } else {
             hygiene.score_content(rel, txt)
         };
-        let eff_score = if strict { h.strict_score.unwrap_or(h.score) } else { h.score };
+        let eff_score = if strict {
+            h.multiscale_score.or(h.strict_score).unwrap_or(h.score)
+        } else {
+            h.score
+        };
         sum += eff_score;
         if strict && !h.triggered_vetoes.is_empty() {
             has_veto = true;

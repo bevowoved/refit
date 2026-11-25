@@ -438,6 +438,16 @@ fn check_gha_sink_line(
     }
 }
 
+fn gha_key_column(indent: usize, trimmed: &str) -> usize {
+    if let Some(after_dash) = trimmed.strip_prefix('-') {
+        let ws = after_dash.bytes().take_while(|&b| b == b' ').count();
+        if ws > 0 {
+            return indent + 1 + ws;
+        }
+    }
+    indent
+}
+
 fn scan_gha(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
     let mut in_run_block = false;
     let mut run_indent = 0usize;
@@ -491,7 +501,7 @@ fn scan_gha(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
             if let Some(rhs) = extract_gha_sink_rhs(trimmed) {
                 if is_yaml_block_scalar(rhs) {
                     in_run_block = true;
-                    run_indent = indent;
+                    run_indent = gha_key_column(indent, trimmed);
                 } else {
                     check_gha_sink_line(rel, ln, rhs, inline_ign.as_deref(), prev_ignore.as_deref(), out);
                 }
@@ -1112,6 +1122,11 @@ mod tests {
             "        if: ${{ github.event.pull_request.number > 0 }}\n",
             "        run: echo \"$TITLE\" ${{ github.event.pull_request.number }}\n",
             "      # never do echo ${{ github.event.issue.title }}\n",
+            "      - run: |\n",
+            "          echo \"$SAFE_TITLE\"\n",
+            "        env:\n",
+            "          SAFE_TITLE: ${{ github.event.issue.title }}\n",
+            "          SAFE_TOKEN: ${{ secrets.DEPLOY_TOKEN }}\n",
             "      - run: echo ${{ github.event.comment.body }} # refit: ignore[gha_script_injection]\n",
         );
         let gha_unsafe = concat!(

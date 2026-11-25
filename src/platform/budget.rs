@@ -127,6 +127,17 @@ pub fn init_allocator(b: &ResourceBudget) {
     let _ = b.effective_mem_bytes;
 }
 
+#[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+unsafe extern "C" {
+    fn _rjem_mallctl(
+        name: *const core::ffi::c_char,
+        oldp: *mut core::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut core::ffi::c_void,
+        newlen: usize,
+    ) -> core::ffi::c_int;
+}
+
 /// Release purged allocator pages back to the OS at coarse phase boundaries.
 pub fn collect_os_memory() {
     #[cfg(feature = "alloc-mimalloc")]
@@ -139,7 +150,23 @@ pub fn collect_os_memory() {
     }
     #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
     {
-        let _ = tikv_jemalloc_ctl::raw::write(b"arenas.all.purge\0", ());
+        let _ = tikv_jemalloc_ctl::epoch::advance();
+        let _ = purge_jemalloc_all_arenas();
+    }
+}
+
+#[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+fn purge_jemalloc_all_arenas() -> core::ffi::c_int {
+    // SAFETY: `arena.4096.purge\0` (`MALLCTL_ARENAS_ALL = 4096`) is a valid NUL-terminated
+    // jemalloc void mallctl requiring NULL `oldp`/`newp` and 0 `newlen`.
+    unsafe {
+        _rjem_mallctl(
+            b"arena.4096.purge\0".as_ptr().cast(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            0,
+        )
     }
 }
 
@@ -406,5 +433,11 @@ mod tests {
         let bal = ResourceBudget::from_limits(8, 8 * 1024 * MIB);
         assert_eq!(bal.mode, ExecMode::BoundedBalanced);
         assert!(bal.rayon_threads >= 4);
+    }
+
+    #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+    #[test]
+    fn jemalloc_all_arenas_purge_returns_zero() {
+        assert_eq!(purge_jemalloc_all_arenas(), 0);
     }
 }

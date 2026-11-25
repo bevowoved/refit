@@ -126,8 +126,8 @@ impl MrtrSigner {
         {
             return Self::from_seed(secret.trim().as_bytes());
         }
-        let seed = format!("refit-local-mrtr:{}", repo_root.display());
-        Self::from_seed(seed.as_bytes())
+        let key = load_or_create_mrtr_key(repo_root);
+        Self { key }
     }
 
     pub fn sign(&self, payload: &ContinuationPayload) -> Result<String> {
@@ -158,6 +158,36 @@ impl MrtrSigner {
         }
         Ok(payload)
     }
+}
+
+fn load_or_create_mrtr_key(repo_root: &Path) -> [u8; 32] {
+    let key_path = repo_root.join(".refit").join(".mrtr.key");
+    if let Ok(bytes) = fs::read(&key_path)
+        && bytes.len() >= 32
+    {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes[..32]);
+        return key;
+    }
+    let key = crate::platform::os_random_bytes::<32>().unwrap_or_else(|_| {
+        let fallback = format!("ephemeral-{}-{}", std::process::id(), now_ms());
+        blake3::derive_key("refit mcp-v2 mrtr ephemeral fallback v1", fallback.as_bytes())
+    });
+    let _ = persist_private_key(&key_path, &key);
+    key
+}
+
+fn persist_private_key(key_path: &Path, key: &[u8; 32]) -> Result<()> {
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_atomic(key_path, key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(key_path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -196,6 +226,7 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
 /// Durable atomic `.refit/tasks/<id>.json` store with cooperative cancellation tokens.
 pub struct TaskStore {
     dir: PathBuf,
+    state_lock: Mutex<()>,
     cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
@@ -203,6 +234,7 @@ impl TaskStore {
     pub fn for_repo(repo_root: &Path) -> Self {
         Self {
             dir: repo_root.join(".refit").join("tasks"),
+            state_lock: Mutex::new(()),
             cancel_flags: Mutex::new(HashMap::new()),
         }
     }
@@ -261,6 +293,7 @@ impl TaskStore {
     }
 
     pub fn cancel(&self, task_id: &str) -> std::result::Result<TaskRecord, String> {
+        let _guard = self.state_lock.lock();
         let mut rec = self.load(task_id).ok_or_else(|| format!("unknown taskId `{task_id}`"))?;
         if let Some(flag) = self.cancel_flags.lock().remove(task_id) {
             flag.store(true, Ordering::Release);
@@ -282,6 +315,7 @@ impl TaskStore {
         message: Option<String>,
         continuation: Option<String>,
     ) -> std::result::Result<TaskRecord, String> {
+        let _guard = self.state_lock.lock();
         let mut rec = self.load(task_id).ok_or_else(|| format!("unknown taskId `{task_id}`"))?;
         if rec.status.is_terminal() {
             return Err(format!("task `{task_id}` is already in terminal state {:?}", rec.status));
@@ -307,9 +341,10 @@ impl TaskStore {
     }
 
     pub fn finish(&self, task_id: &str, outcome: std::result::Result<Value, String>) {
+        let _guard = self.state_lock.lock();
         self.clear_flag(task_id);
         let Some(mut rec) = self.load(task_id) else { return };
-        if rec.status == TaskState::Cancelled {
+        if rec.status.is_terminal() {
             return;
         }
         rec.updated_ms = now_ms();
@@ -651,6 +686,17 @@ async fn handle_mrtr_resume(
         }
     };
 
+    if let Some(req_tool) = params.get("name").and_then(Value::as_str)
+        && req_tool != payload.tool
+    {
+        let err_id = id.unwrap_or(Value::Null);
+        let msg = format!(
+            "HeaderMismatchError: params.name `{req_tool}` does not match continuation token tool `{}`",
+            payload.tool
+        );
+        return (StatusCode::BAD_REQUEST, Some(rpc_err(err_id, ERR_HEADER_MISMATCH, msg)));
+    }
+
     let Some(confirmed) = parse_confirm_response(&params["inputResponses"]) else {
         let err_id = id.unwrap_or(Value::Null);
         let msg = "missing boolean `confirm` inside `inputResponses`";
@@ -763,39 +809,22 @@ fn spawn_durable_task(
     let task_id = record.task_id.clone();
     let tasks_store = state.tasks.clone();
     let ctx_clone = state.ctx.clone();
+    #[cfg(test)]
     let delay_ms = args["_test_delay_ms"].as_u64().unwrap_or(0).min(5_000);
+    #[cfg(not(test))]
+    let delay_ms = 0u64;
 
     tokio::spawn(async move {
         let _held_permit = mem_permit;
-        if delay_ms > 0 {
-            let mut waited = 0u64;
-            while waited < delay_ms {
-                if cancel_flag.load(Ordering::Acquire) {
-                    tasks_store.clear_flag(&task_id);
-                    return;
-                }
-                let step = 10u64.min(delay_ms - waited);
-                tokio::time::sleep(std::time::Duration::from_millis(step)).await;
-                waited += step;
-            }
+        if delay_ms > 0 && !sleep_cancellable(delay_ms, &cancel_flag).await {
+            tasks_store.clear_flag(&task_id);
+            return;
         }
         if cancel_flag.load(Ordering::Acquire) {
             tasks_store.clear_flag(&task_id);
             return;
         }
-        let _sem = ctx_clone.blocking_sem.acquire().await.ok();
-        if cancel_flag.load(Ordering::Acquire) {
-            tasks_store.clear_flag(&task_id);
-            return;
-        }
-        let cc = ctx_clone.clone();
-        let tool_name = name.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            dispatch_tool(&tool_name, &args, &cc.repo_root, &cc.hygiene, &cc.gate_cfg)
-        })
-        .await
-        .map_err(|e| format!("task join error: {e}"));
-
+        let outcome = execute_task_tool(&name, args, &ctx_clone, &cancel_flag).await;
         if cancel_flag.load(Ordering::Acquire) {
             tasks_store.clear_flag(&task_id);
             return;
@@ -810,6 +839,43 @@ fn spawn_durable_task(
         "task": record,
     });
     (StatusCode::OK, Some(rpc_ok(id, res)))
+}
+
+async fn sleep_cancellable(delay_ms: u64, cancel_flag: &AtomicBool) -> bool {
+    let mut waited = 0u64;
+    while waited < delay_ms {
+        if cancel_flag.load(Ordering::Acquire) {
+            return false;
+        }
+        let step = 10u64.min(delay_ms - waited);
+        tokio::time::sleep(std::time::Duration::from_millis(step)).await;
+        waited += step;
+    }
+    true
+}
+
+async fn execute_task_tool(
+    name: &str,
+    args: Value,
+    ctx: &Arc<McpCtx>,
+    cancel_flag: &AtomicBool,
+) -> std::result::Result<Value, String> {
+    if name == "refit_search" {
+        let lang = args["language"].as_str().unwrap_or("Rust");
+        let cap = args["capability"].as_str().unwrap_or("rate limiter");
+        return Ok(ok_json(ctx.research.check_library(lang, cap).await));
+    }
+    let _sem = ctx.blocking_sem.acquire().await.ok();
+    if cancel_flag.load(Ordering::Acquire) {
+        return Err("cancelled before execution".into());
+    }
+    let cc = ctx.clone();
+    let tool_name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        dispatch_tool(&tool_name, &args, &cc.repo_root, &cc.hygiene, &cc.gate_cfg)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))
 }
 
 fn task_id_param(params: &Value) -> &str {
@@ -829,9 +895,19 @@ fn handle_tasks_get(state: &Arc<McpV2State>, id: Option<Value>, params: &Value) 
 
 fn handle_tasks_update(state: &Arc<McpV2State>, id: Option<Value>, params: &Value) -> Value {
     let tid = task_id_param(params);
-    let next_status: Option<TaskState> = params
-        .get("status")
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let next_status: Option<TaskState> = match params.get("status") {
+        None => None,
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(st) => Some(st),
+            Err(err) => {
+                return rpc_err(
+                    id.unwrap_or(Value::Null),
+                    ERR_INVALID_PARAMS,
+                    format!("invalid task status: {err}"),
+                );
+            }
+        },
+    };
     let progress = params.get("progress").and_then(Value::as_f64);
     let message = params
         .get("statusMessage")
@@ -1268,8 +1344,55 @@ mod tests {
         )
         .await;
         assert_eq!(upd1.unwrap()["result"]["status"], json!("input_required"));
+        let (_, bad_upd) = handle_v2_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 25,
+                "method": "tasks/update",
+                "params": { "taskId": rec.task_id, "status": "bogus_state" }
+            }),
+        )
+        .await;
+        assert_eq!(bad_upd.unwrap()["error"]["code"], json!(ERR_INVALID_PARAMS));
         state.tasks.finish(&rec.task_id, Err("simulated failure".into()));
         assert_eq!(state.tasks.load(&rec.task_id).unwrap().status, TaskState::Failed);
+    }
+
+    #[tokio::test]
+    async fn mrtr_rejects_forged_repo_path_key_and_tool_confusion() {
+        let (dir, state) = test_state("mcp_v2_sec", &[("src/lib.rs", "pub fn x() {}\n")]);
+        assert!(dir.path().join(".refit/.mrtr.key").is_file());
+
+        // Forged key derived from public repo_root must fail verification.
+        let forged = MrtrSigner::from_seed(format!("refit-local-mrtr:{}", dir.path().display()).as_bytes());
+        let now = now_ms();
+        let payload = ContinuationPayload {
+            tool: "refit_tx_delete".into(),
+            arguments: json!({"path": "src/lib.rs"}),
+            prompt: "confirm".into(),
+            issued_ms: now,
+            expires_ms: now + 60_000,
+            nonce: 99,
+        };
+        let forged_tok = forged.sign(&payload).unwrap();
+        assert!(state.signer.verify(&forged_tok, now_ms()).is_err());
+
+        // Tool confusion: token for `refit_tx_delete` resumed with `params.name = refit_read`.
+        let real_tok = state.signer.sign(&payload).unwrap();
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "refit_read",
+                "continuationToken": real_tok,
+                "inputResponses": { "confirm": true }
+            }
+        });
+        let (status, resp) = handle_v2_request(&state, &req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(resp.unwrap()["error"]["code"], json!(ERR_HEADER_MISMATCH));
     }
 
     #[test]

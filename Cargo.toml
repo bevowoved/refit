@@ -40,6 +40,7 @@ dunce = "1.0.5"
 fixedbitset = "0.5.9"
 flate2 = "1.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc", "std"] }
+getrandom = "0.4.3"
 globset = "0.4.22"
 governor = { version = "0.10.4", default-features = false, features = ["std"] }
 httpdate = "1.0"

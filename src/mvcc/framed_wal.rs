@@ -311,7 +311,7 @@ fn parse_framed_step(
     let nl_ok = buf[frame_end] == b'\n';
     let seq_ok = check_monotonic_seq(seq, valid_records, last_framed_seq);
     if actual_crc != expected_crc || !nl_ok {
-        if frame_end + 1 < buf.len() {
+        if frame_end + 1 < buf.len() && !is_all_zero(&buf[frame_end + 1..]) {
             return Err(WalHaltError::MidFileCorruption(cursor));
         }
         return Ok(StepOutcome::StopAtTornTail);
@@ -433,6 +433,7 @@ pub fn scan_wal_file(path: &Path, mut on_rec: impl FnMut(WalRecord)) -> Result<W
 }
 
 /// Determine the next dense sequence number for appending a new framed record.
-pub fn wal_next_seq(path: &Path) -> u64 {
-    scan_wal_file(path, |_| {}).map_or(1, |stats| stats.next_seq.max(1))
+pub fn wal_next_seq(path: &Path) -> Result<u64> {
+    let stats = scan_wal_file(path, |_| {})?;
+    Ok(stats.next_seq.max(1))
 }

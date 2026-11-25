@@ -92,6 +92,9 @@ impl CargoSlot {
 
 impl Drop for CargoSlot {
     fn drop(&mut self) {
+        // Release the OS sidecar lock BEFORE returning the slot index to the pool so
+        // waiting threads can immediately re-acquire the same slot without contention.
+        self._lock = None;
         if self.pooled {
             if let Some(pool) = CARGO_SLOT_POOL.get() {
                 pool.lock().push(self.slot);
@@ -164,6 +167,15 @@ fn link_or_copy_file(src: &Path, dst: &Path) -> Result<(u64, u64)> {
 }
 
 fn link_or_copy_pairs(pairs: &[(PathBuf, PathBuf)]) -> Result<(u64, u64)> {
+    if crate::platform::budget().is_constrained() {
+        let (mut hl, mut cp) = (0u64, 0u64);
+        for (src, dst) in pairs {
+            let (dh, dc) = link_or_copy_file(src, dst)?;
+            hl += dh;
+            cp += dc;
+        }
+        return Ok((hl, cp));
+    }
     pairs
         .par_iter()
         .try_fold(
@@ -185,7 +197,7 @@ pub(super) fn materialize_stage(
     ensure_cache_dirs_tagged(repo_root);
     if seq == 1 || seq.is_multiple_of(64) {
         let _ = sweep_stages(repo_root, 1800);
-        let _ = prune_cache_lru(&stages_dir(repo_root), DEFAULT_CACHE_CAP_BYTES);
+        let _ = prune_cache_lru(&repo_root.join(".refit").join("cache"), DEFAULT_CACHE_CAP_BYTES);
     }
 
     let stage_dir = stages_dir(repo_root).join(format!("tx-{}-{seq}", now_ms()));

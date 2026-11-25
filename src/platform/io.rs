@@ -360,8 +360,15 @@ fn is_lock_unsupported(err: &io::Error) -> bool {
     }
     #[cfg(unix)]
     {
-        if matches!(err.raw_os_error(), Some(95 | 37 | 45 | 77)) {
-            return true;
+        if let Some(code) = err.raw_os_error() {
+            let errno = nix::errno::Errno::from_raw(code);
+            if errno == nix::errno::Errno::EOPNOTSUPP
+                || errno == nix::errno::Errno::ENOTSUP
+                || errno == nix::errno::Errno::ENOLCK
+                || errno == nix::errno::Errno::ENOSYS
+            {
+                return true;
+            }
         }
     }
     false
@@ -397,7 +404,32 @@ fn acquire_excl_fallback(lock_path: &Path) -> Result<SidecarLock> {
     anyhow::bail!("timed out waiting for O_EXCL fallback lock {}", lock_path.display())
 }
 
+fn excl_holder_alive(lease: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(raw) = fs::read_to_string(lease) else { return false };
+        let Some(pid) = raw.split_whitespace().next().and_then(|s| s.parse::<i32>().ok()) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        return matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Ok(()) | Err(nix::errno::Errno::EPERM)
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lease;
+        false
+    }
+}
+
 fn reap_stale_excl(lease: &Path) {
+    if excl_holder_alive(lease) {
+        return;
+    }
     let Ok(meta) = fs::metadata(lease) else { return };
     let stale = meta
         .modified()

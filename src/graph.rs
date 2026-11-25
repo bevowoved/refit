@@ -2,9 +2,9 @@ mod abi;
 mod packet;
 mod patch;
 
-pub use abi::{InterfaceCutoff, check_interface_cutoff, hash_abi};
+pub use abi::{InterfaceCutoff, check_interface_cutoff_digests, hash_abi};
 #[cfg(test)]
-pub use abi::python_abi;
+pub use abi::{check_interface_cutoff, python_abi};
 pub use packet::{build_packet, deps_context};
 #[cfg(test)]
 pub use packet::wave_context;
@@ -77,6 +77,7 @@ pub fn dag_from(
     };
 
     let mut units = built?;
+    refresh_package_abis(&units);
     let total_loc: usize = units.iter().map(|u| u.loc).sum();
     let max_wave = units.iter().fold(0usize, |m, u| m.max(u.wave));
     sort_units(&mut units);
@@ -229,7 +230,6 @@ fn build_unit(
     let (mut base, mut abi, mut tests) = (BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
     let (mut loc, mut score_sum) = (0usize, 0.0f64);
 
-    let mut abi_inputs: Vec<(String, String)> = Vec::with_capacity(files.len());
     for rel in files {
         let content = if let Some(txt) = read_text(ctx.repo_root, rel, ctx.preloaded) {
             txt
@@ -242,25 +242,10 @@ fn build_unit(
         loc += count_lines(content.as_bytes());
         base.insert(rel.clone(), MvccStore::hash_bytes(content.as_bytes()));
         abi.insert(rel.clone(), hash_abi(rel, &content));
-        abi_inputs.push((rel.clone(), content.into_owned()));
-        score_sum += ctx.hygiene.score_content(rel, &abi_inputs.last().map_or("", |(_, s)| s)).score;
+        score_sum += ctx.hygiene.score_content(rel, &content).score;
         if let Some(ts) = ctx.mod_tests.get(rel) {
             tests.extend(ts.iter().cloned());
         }
-    }
-    if let Some(first_rel) = files.first() {
-        let pkg_id = crate::stem::sst::pkg_id_for_rel(first_rel);
-        let refs: Vec<(&str, &str)> = abi_inputs.iter().map(|(r, s)| (r.as_str(), s.as_str())).collect();
-        let cutoff = crate::stem::sst::FrozenPkgCache::global()
-            .lock()
-            .refresh_package_interface(&pkg_id, &refs, crate::platform::EpochRegistry::global());
-        tracing::trace!(
-            pkg = %cutoff.pkg_id,
-            iface = %cutoff.interface_blake3,
-            changed = cutoff.changed,
-            epoch = cutoff.epoch,
-            "Salsa interface cutoff evaluated"
-        );
     }
 
     Ok(ModuleUnit {
@@ -277,6 +262,28 @@ fn build_unit(
         baseline_hygiene: score_sum / (files.len().max(1) as f64),
         allow_abi_change: files.len() > 1 && files.len() <= 4,
     })
+}
+
+fn refresh_package_abis(units: &[ModuleUnit]) {
+    let mut by_pkg: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
+    for unit in units {
+        for (rel, abi) in &unit.abi_hash {
+            let pkg_id = crate::stem::sst::pkg_id_for_rel(rel);
+            by_pkg.entry(pkg_id).or_default().push((rel.as_str(), abi.as_str()));
+        }
+    }
+    let reg = crate::platform::EpochRegistry::global();
+    let mut cache = crate::stem::sst::FrozenPkgCache::global().lock();
+    for (pkg_id, pairs) in by_pkg {
+        let cutoff = cache.refresh_package_abi_digests(&pkg_id, &pairs, reg);
+        tracing::trace!(
+            pkg = %cutoff.pkg_id,
+            iface = %cutoff.interface_blake3,
+            changed = cutoff.changed,
+            epoch = cutoff.epoch,
+            "Salsa interface cutoff evaluated"
+        );
+    }
 }
 
 fn collect_ids(set: &BTreeSet<usize>, scc_ids: &[String]) -> Vec<String> {

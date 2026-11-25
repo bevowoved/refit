@@ -24,12 +24,9 @@ pub fn hash_abi(rel_path: &str, source: &str) -> String {
     }
 }
 
-/// Compute a deterministic Salsa-style package `interface_blake3` over sorted `(rel, hash_abi)` pairs.
-pub fn interface_blake3(files: &[(&str, &str)]) -> String {
-    let mut items: Vec<(&str, String)> = files
-        .iter()
-        .map(|&(rel, src)| (rel, hash_abi(rel, src)))
-        .collect();
+/// Compute a deterministic Salsa-style package `interface_blake3` from precomputed `(rel, abi_hash)` pairs.
+pub fn interface_blake3_from_digests(digests: &[(&str, &str)]) -> String {
+    let mut items: Vec<(&str, &str)> = digests.to_vec();
     items.sort_by(|lhs, rhs| lhs.0.cmp(rhs.0));
 
     let mut hasher = blake3::Hasher::new();
@@ -42,15 +39,15 @@ pub fn interface_blake3(files: &[(&str, &str)]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Salsa early-cutoff helper wired to `hash_abi` and `EpochRegistry`.
+/// Salsa early-cutoff helper over precomputed `(rel, abi_hash)` pairs wired to `EpochRegistry`.
 /// Preserves the current epoch with zero invalidations when `interface_blake3` is unchanged.
-pub fn check_interface_cutoff(
+pub fn check_interface_cutoff_digests(
     pkg_id: &str,
-    files: &[(&str, &str)],
+    digests: &[(&str, &str)],
     prev_interface_blake3: Option<&str>,
     registry: &EpochRegistry,
 ) -> InterfaceCutoff {
-    let next_hash = interface_blake3(files);
+    let next_hash = interface_blake3_from_digests(digests);
     if prev_interface_blake3 == Some(next_hash.as_str()) {
         let epoch = registry
             .try_read(pkg_id)
@@ -70,6 +67,22 @@ pub fn check_interface_cutoff(
         changed: true,
         epoch,
     }
+}
+
+/// Salsa early-cutoff helper wired to `hash_abi` and `EpochRegistry`.
+#[cfg(test)]
+pub fn check_interface_cutoff(
+    pkg_id: &str,
+    files: &[(&str, &str)],
+    prev_interface_blake3: Option<&str>,
+    registry: &EpochRegistry,
+) -> InterfaceCutoff {
+    let owned: Vec<(&str, String)> = files
+        .iter()
+        .map(|&(rel, src)| (rel, hash_abi(rel, src)))
+        .collect();
+    let refs: Vec<(&str, &str)> = owned.iter().map(|(r, a)| (*r, a.as_str())).collect();
+    check_interface_cutoff_digests(pkg_id, &refs, prev_interface_blake3, registry)
 }
 
 /// Compute the Python exported ABI hash across multi-line defs, classes, and `__all__`.

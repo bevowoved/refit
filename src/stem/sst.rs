@@ -3,7 +3,9 @@
 
 use super::genome::check_wipe_guard;
 use super::parse::FileSymbols;
-use crate::graph::{InterfaceCutoff, check_interface_cutoff};
+use crate::graph::{InterfaceCutoff, check_interface_cutoff_digests};
+#[cfg(test)]
+use crate::graph::check_interface_cutoff;
 use crate::mvcc::framed_wal::crc32c;
 use crate::platform::io::sync_file_barrier;
 use crate::platform::{EpochRegistry, ensure_cachedir_tag, replace_file_pub};
@@ -247,13 +249,19 @@ fn next_block_end(entries: &[(&[u8], &[u8])], start: usize, key_only: bool) -> u
     end
 }
 
+fn sst_authenticated_crc(raw: &[u8]) -> u32 {
+    let mut combined = Vec::with_capacity(26 + raw.len().saturating_sub(SST_HEADER_LEN));
+    combined.extend_from_slice(&raw[0..26]);
+    combined.extend_from_slice(&raw[SST_HEADER_LEN..]);
+    crc32c(&combined)
+}
+
 fn write_sst_header(
     raw: &mut [u8],
     key_only: bool,
     block_count: usize,
     entry_count: usize,
     index_offset: u64,
-    checksum: u32,
 ) {
     raw[0..8].copy_from_slice(SST_MAGIC);
     raw[8] = if key_only { MODE_KEYS_ONLY } else { MODE_KEY_VALUE };
@@ -261,6 +269,7 @@ fn write_sst_header(
     raw[10..14].copy_from_slice(&(block_count as u32).to_le_bytes());
     raw[14..18].copy_from_slice(&(entry_count as u32).to_le_bytes());
     raw[18..26].copy_from_slice(&index_offset.to_le_bytes());
+    let checksum = sst_authenticated_crc(raw);
     raw[26..30].copy_from_slice(&checksum.to_le_bytes());
 }
 
@@ -282,6 +291,9 @@ fn parse_sst_anchors(raw: &[u8], index_offset: usize, block_count: usize) -> Opt
             return None;
         }
         anchors.push(BlockAnchor { first_key, offset, len });
+    }
+    if pos != raw.len() {
+        return None;
     }
     Some(anchors)
 }
@@ -316,8 +328,7 @@ impl SstTable {
             raw.extend_from_slice(&anchor.len.to_le_bytes());
         }
 
-        let checksum = crc32c(&raw[SST_HEADER_LEN..]);
-        write_sst_header(&mut raw, key_only, anchors.len(), entries.len(), index_offset, checksum);
+        write_sst_header(&mut raw, key_only, anchors.len(), entries.len(), index_offset);
         Self {
             raw,
             anchors,
@@ -346,7 +357,7 @@ impl SstTable {
         if index_offset < SST_HEADER_LEN || index_offset > raw.len() {
             return None;
         }
-        if crc32c(&raw[SST_HEADER_LEN..]) != expected_crc {
+        if sst_authenticated_crc(&raw) != expected_crc {
             return None;
         }
         let anchors = parse_sst_anchors(&raw, index_offset, block_count)?;
@@ -693,7 +704,30 @@ impl FrozenPkgCache {
         self.summaries.get(pkg_id)
     }
 
+    /// Salsa `interface_blake3` early-cutoff refresh from precomputed `(rel, abi_hash)` digests.
+    pub fn refresh_package_abi_digests(
+        &mut self,
+        pkg_id: &str,
+        digests: &[(&str, &str)],
+        registry: &EpochRegistry,
+    ) -> InterfaceCutoff {
+        let prev = self.summaries.get(pkg_id).map(|sum| sum.interface_blake3.as_str());
+        let cutoff = check_interface_cutoff_digests(pkg_id, digests, prev, registry);
+        let entry = self.summaries.entry(pkg_id.to_string()).or_insert_with(|| ExportSummary {
+            pkg_id: pkg_id.to_string(),
+            interface_blake3: cutoff.interface_blake3.clone(),
+            exported_count: 0,
+            file_count: digests.len() as u32,
+            epoch: cutoff.epoch,
+        });
+        entry.interface_blake3 = cutoff.interface_blake3.clone();
+        entry.file_count = digests.len() as u32;
+        entry.epoch = cutoff.epoch;
+        cutoff
+    }
+
     /// Salsa `interface_blake3` early-cutoff refresh wired to `graph/abi.rs::hash_abi` and `EpochRegistry`.
+    #[cfg(test)]
     pub fn refresh_package_interface(
         &mut self,
         pkg_id: &str,
@@ -792,36 +826,34 @@ pub fn save_symbol_sst(
     Ok(written)
 }
 
-/// Refresh `FrozenPkgCache` summaries & hybrid postings from the latest indexed `FileSymbols`.
+/// Refresh `FrozenPkgCache` hot symbol details & hybrid postings without clobbering ABI `interface_blake3`.
 pub fn update_frozen_pkg_cache(files: &BTreeMap<String, FileSymbols>) {
-    let mut by_pkg: BTreeMap<String, (Vec<String>, HybridPostings, blake3::Hasher)> = BTreeMap::new();
+    let mut by_pkg: BTreeMap<String, (Vec<String>, HybridPostings)> = BTreeMap::new();
     for (idx, (rel, sym)) in files.iter().enumerate() {
         let pkg_id = pkg_id_for_rel(rel);
         let entry = by_pkg
             .entry(pkg_id)
-            .or_insert_with(|| (Vec::new(), HybridPostings::new(), blake3::Hasher::new()));
+            .or_insert_with(|| (Vec::new(), HybridPostings::new()));
         entry.0.extend(sym.defs.iter().cloned());
         entry.1.insert(idx as u32);
-        entry.2.update(rel.as_bytes());
-        entry.2.update(sym.blake3.as_bytes());
     }
 
     let reg = EpochRegistry::global();
     let mut cache = FrozenPkgCache::global().lock();
-    for (pkg_id, (exported_symbols, file_ids, hasher)) in by_pkg {
-        let iface_hash = hasher.finalize().to_hex().to_string();
+    for (pkg_id, (exported_symbols, file_ids)) in by_pkg {
+        let existing_iface = cache
+            .summary(&pkg_id)
+            .map(|sum| sum.interface_blake3.clone())
+            .unwrap_or_default();
         let prev_epoch = reg.try_read(&pkg_id).map_or_else(|| reg.global_epoch(), |(ep, _)| ep);
         let detail = PkgDetail {
             pkg_id: pkg_id.clone(),
-            interface_blake3: iface_hash,
+            interface_blake3: existing_iface,
             exported_symbols,
             file_ids,
             epoch: prev_epoch,
         };
-        let changed = cache.put_package(detail);
-        if changed {
-            let _ = reg.publish(&pkg_id, cache.summary_len() as u64);
-        }
+        let _ = cache.put_package(detail);
         if let Some(hot) = cache.get_hot(&pkg_id) {
             tracing::trace!(
                 pkg = %hot.pkg_id,

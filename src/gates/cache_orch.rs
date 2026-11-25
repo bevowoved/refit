@@ -448,19 +448,55 @@ fn prune_cache_dirs_lru(dirs: &[PathBuf], max_bytes: u64) -> Result<CacheGcStats
     })
 }
 
+fn is_protected_stage_entry(path: &Path, name: &str, meta: &fs::Metadata) -> bool {
+    if name == "CACHEDIR.TAG" {
+        return true;
+    }
+    if name == "cargo-slots" && cargo_slots_has_active_lock(path) {
+        return true;
+    }
+    if name.starts_with("tx-") && meta.is_dir() {
+        let young = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age.as_secs() < 600);
+        if young {
+            return true;
+        }
+    }
+    false
+}
+
+fn cargo_slots_has_active_lock(slots_dir: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(slots_dir) else { return false };
+    for item in rd.flatten() {
+        let name = item.file_name();
+        let lossy = name.to_string_lossy();
+        if lossy.starts_with("slot-") && lossy.ends_with(".lock") {
+            let p = item.path();
+            if matches!(crate::platform::io::SidecarLock::try_acquire(&p), Ok(None)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn collect_lru_entries(dir: &Path, out: &mut Vec<LruEntry>) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
     let rd = fs::read_dir(dir).with_context(|| format!("read cache dir {}", dir.display()))?;
     for item in rd.flatten() {
-        if item.file_name().to_string_lossy() == "CACHEDIR.TAG" {
-            continue;
-        }
+        let name = item.file_name().to_string_lossy().into_owned();
         let path = item.path();
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
         };
+        if is_protected_stage_entry(&path, &name, &meta) {
+            continue;
+        }
         let is_dir = meta.is_dir();
         let (size, mtime_ns) = if is_dir {
             measure_dir_tree(&path, system_time_ns(meta.modified().ok()))

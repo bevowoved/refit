@@ -84,7 +84,9 @@ pub(super) struct EvalScratch {
     pub(super) base_p2: Vec<f32>,
     pub(super) line_sum0: Vec<f32>,
     pub(super) line_sum1: Vec<f32>,
+    #[cfg(target_arch = "x86_64")]
     pub(super) tile_in: Vec<[f32; 8]>,
+    #[cfg(target_arch = "x86_64")]
     pub(super) tile_acc: Vec<[f32; 8]>,
     // 8-row streaming tile buffers for build_hidden & cmlp
     pub(super) excl_tile: Vec<f32>,
