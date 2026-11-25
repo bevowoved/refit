@@ -1,3 +1,7 @@
+use super::cache_orch::{
+    CloneOutcome, DEFAULT_CACHE_CAP_BYTES, build_rust_cache_env, clone_or_copy,
+    ensure_cache_dirs_tagged, prune_cache_lru,
+};
 use crate::platform::{SidecarLock, ensure_cachedir_tag, now_ms, walk_files};
 use crate::source::{rel_norm, work_dir};
 use anyhow::{Context, Result};
@@ -76,6 +80,14 @@ impl CargoSlot {
         let _ = fs::create_dir_all(&dir);
         Self { slot, pooled, dir, _lock: lock }
     }
+
+    pub(super) fn rust_cache_env(
+        &self,
+        repo_root: &Path,
+        ephemeral_stage: bool,
+    ) -> Vec<(String, String)> {
+        build_rust_cache_env(repo_root, &self.dir, ephemeral_stage)
+    }
 }
 
 impl Drop for CargoSlot {
@@ -140,16 +152,14 @@ pub fn decode_lsp(raw: &[u8]) -> Option<(serde_json::Value, usize)> {
 }
 
 fn link_or_copy_file(src: &Path, dst: &Path) -> Result<(u64, u64)> {
-    match fs::hard_link(src, dst) {
-        Ok(()) => Ok((1, 0)),
-        Err(link_err) => match fs::copy(src, dst) {
-            Ok(_) => Ok((0, 1)),
-            Err(copy_err) => anyhow::bail!(
-                "stage materialize failed for {} -> {} (hard_link: {link_err}; copy: {copy_err})",
-                src.display(),
-                dst.display()
-            ),
-        },
+    match clone_or_copy(src, dst) {
+        Ok(CloneOutcome::Reflinked | CloneOutcome::HardLinked) => Ok((1, 0)),
+        Ok(CloneOutcome::Copied) => Ok((0, 1)),
+        Err(err) => anyhow::bail!(
+            "stage materialize failed for {} -> {}: {err}",
+            src.display(),
+            dst.display()
+        ),
     }
 }
 
@@ -172,8 +182,10 @@ pub(super) fn materialize_stage(
     deleted: &[String],
 ) -> Result<DropGuard<PathBuf, impl FnOnce(PathBuf)>> {
     let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    ensure_cache_dirs_tagged(repo_root);
     if seq == 1 || seq.is_multiple_of(64) {
         let _ = sweep_stages(repo_root, 1800);
+        let _ = prune_cache_lru(&stages_dir(repo_root), DEFAULT_CACHE_CAP_BYTES);
     }
 
     let stage_dir = stages_dir(repo_root).join(format!("tx-{}-{seq}", now_ms()));

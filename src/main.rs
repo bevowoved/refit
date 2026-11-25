@@ -147,11 +147,13 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Prune unreferenced CAS blobs and expired stage directories.
+    /// Prune unreferenced CAS blobs, expired stage directories, and bounded disk caches.
     Gc {
         repo: PathBuf,
         #[arg(long, default_value_t = 32)]
         keep_revs: usize,
+        #[arg(long, default_value_t = 600)]
+        cache_max_mb: u64,
     },
     /// Run parallel DAG refactoring with formatters, Gates 0 to 3.5, and MVCC WAL.
     Run {
@@ -442,12 +444,18 @@ fn main() -> Result<()> {
             platform::collect_os_memory();
             print_json(&out)
         }
-        Commands::Gc { repo, keep_revs } => {
+        Commands::Gc { repo, keep_revs, cache_max_mb } => {
             let store = mvcc::MvccStore::open(&repo, "gc")?;
+            let pruned_cas_blobs = store.gc_cas(keep_revs)?;
+            let swept_orphan_stages = gates::sweep_stages(&repo, 0);
+            let max_bytes = cache_max_mb.saturating_mul(1024 * 1024);
+            let cache_gc = gates::cache_orch::prune_repo_caches(&repo, max_bytes)?;
             print_json(&json!({
-                "pruned_cas_blobs": store.gc_cas(keep_revs)?,
-                "swept_orphan_stages": gates::sweep_stages(&repo, 0),
-                "active_refit_worktrees": worktree::list_worktrees(&repo)
+                "pruned_cas_blobs": pruned_cas_blobs,
+                "swept_orphan_stages": swept_orphan_stages,
+                "active_refit_worktrees": worktree::list_worktrees(&repo),
+                "cache_max_mb": cache_max_mb,
+                "cache_gc": cache_gc
             }))
         }
         Commands::Probe { upstream, model, api_key_file, openclaw_url, openclaw_token } => {
