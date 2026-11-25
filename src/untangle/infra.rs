@@ -1,12 +1,21 @@
-use crate::lex::{ident_byte, left_bound};
-use crate::platform::{find_secret, walk_tree};
-use crate::source::{ext_of, ext_str, parse_deps, rel_norm, supported_ext};
+use crate::lex::{find_ascii_ci, ident_byte, left_bound, quoted_lit, scan_code};
+use crate::platform::find_secret;
+#[cfg(test)]
+use crate::platform::walk_tree;
+use crate::source::{RepoSnapshot, ext_of, parse_deps, supported_ext};
+#[cfg(test)]
+use crate::source::{ext_str, rel_norm};
 use crate::types::{InfraFinding, UnusedDep};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use fixedbitset::FixedBitSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::ops::ControlFlow;
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Eco {
@@ -206,19 +215,8 @@ fn push_finding(
     });
 }
 
-fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
-    let hbytes = haystack.as_bytes();
-    let nbytes = needle.as_bytes();
-    if nbytes.is_empty() || nbytes.len() > hbytes.len() {
-        return None;
-    }
-    hbytes
-        .windows(nbytes.len())
-        .position(|win| win.eq_ignore_ascii_case(nbytes))
-}
-
 fn parse_ignore_directive(raw_line: &str) -> Option<Vec<String>> {
-    let pos = find_ascii_ci(raw_line, "refit:")?;
+    let pos = find_ascii_ci(raw_line.as_bytes(), b"refit:")?;
     let rest = raw_line[pos + 6..].trim_start();
     if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("ignore") {
         return None;
@@ -244,7 +242,59 @@ fn is_suppressed(rule_id: &str, inline: Option<&[String]>, prev: Option<&[String
     inline.is_some_and(matches_list) || prev.is_some_and(matches_list)
 }
 
+/// Snapshot-backed infra & unused-dependency scan sharing the single `RepoSnapshot` tree walk.
+pub fn scan_parts_snap(
+    repo_root: &Path,
+    snap: &RepoSnapshot,
+) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>) {
+    let mut infra_count = 0usize;
+    let mut findings = Vec::new();
+    let mut manifests = Vec::new();
+
+    for (rel, fname, abs) in &snap.manifest_rels {
+        if let Ok(txt) = fs::read_to_string(abs) {
+            manifests.push((rel.clone(), fname.clone(), txt));
+        }
+    }
+    for (rel, abs) in &snap.infra_rels {
+        let fname = abs.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let ext_lo = ext_of(abs);
+        let Some(kind) = infra_kind(rel, fname, &ext_lo) else { continue };
+        infra_count += 1;
+        let Ok(txt) = fs::read_to_string(abs) else { continue };
+        scan_file(rel, kind, &txt, &mut findings);
+    }
+
+    let unused = if manifests.is_empty() {
+        Vec::new()
+    } else {
+        let (parsed, mut matchers) = collect_manifest_deps(&manifests);
+        for rel in &snap.all_rels {
+            let ext = ext_of(rel);
+            if !supported_ext(&ext) {
+                continue;
+            }
+            let eco = Eco::from_ext(&ext);
+            let Some(m) = matchers[eco.idx()].as_mut() else { continue };
+            if m.is_complete() {
+                continue;
+            }
+            if let Some(bytes) = snap.preloaded.get(rel) {
+                m.scan_bytes(bytes);
+            } else if let Ok(bytes) = fs::read(repo_root.join(rel)) {
+                m.scan_bytes(&bytes);
+            }
+            if all_matchers_complete(&matchers) {
+                break;
+            }
+        }
+        collect_unused_from_matchers(parsed, &matchers)
+    };
+    (infra_count, unused, findings)
+}
+
 /// Scan Terraform, Dockerfiles, GitHub Actions, SQL, and unused manifest dependencies.
+#[cfg(test)]
 pub fn scan_parts(
     repo_root: &Path,
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
@@ -328,23 +378,15 @@ fn scan_file(rel: &str, kind: Option<Kind>, txt: &str, out: &mut Vec<InfraFindin
 
 fn strip_yaml_inline_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    for idx in 0..bytes.len() {
-        let cur = bytes[idx];
-        if cur == b'\'' && !in_double {
-            in_single = !in_single;
-        } else if cur == b'"' && !in_single {
-            in_double = !in_double;
-        } else if cur == b'#'
-            && !in_single
-            && !in_double
-            && (idx == 0 || bytes[idx - 1].is_ascii_whitespace())
-        {
-            return &line[..idx];
+    let mut cut = bytes.len();
+    scan_code(bytes, b"'\"", |idx, cur| {
+        if cur == b'#' && (idx == 0 || bytes[idx - 1].is_ascii_whitespace()) {
+            cut = idx;
+            return ControlFlow::Break(());
         }
-    }
-    line
+        ControlFlow::Continue(())
+    });
+    &line[..cut]
 }
 
 fn extract_gha_uses(code: &str) -> Option<&str> {
@@ -644,13 +686,11 @@ fn has_baked(trimmed: &str, up: &str) -> bool {
 fn strip_hcl_line(raw: &str, in_block_comment: &mut bool) -> String {
     let bytes = raw.as_bytes();
     let mut out = String::with_capacity(bytes.len());
-    let mut in_quote = false;
     let mut pos = 0usize;
 
     while pos < bytes.len() {
-        let cur = bytes[pos];
         if *in_block_comment {
-            if cur == b'*' && bytes.get(pos + 1) == Some(&b'/') {
+            if bytes.get(pos..pos + 2) == Some(b"*/") {
                 *in_block_comment = false;
                 pos += 2;
             } else {
@@ -658,29 +698,20 @@ fn strip_hcl_line(raw: &str, in_block_comment: &mut bool) -> String {
             }
             continue;
         }
-        if in_quote {
-            out.push(cur as char);
-            if cur == b'\\' && pos + 1 < bytes.len() {
-                pos += 1;
-                out.push(bytes[pos] as char);
-            } else if cur == b'"' {
-                in_quote = false;
-            }
-            pos += 1;
-            continue;
-        }
+        let cur = bytes[pos];
         if cur == b'"' {
-            in_quote = true;
-            out.push('"');
-            pos += 1;
-        } else if cur == b'#' || (cur == b'/' && bytes.get(pos + 1) == Some(&b'/')) {
+            let end = quoted_lit(bytes, pos, true, true).0;
+            out.push_str(&raw[pos..end]);
+            pos = end;
+        } else if cur == b'#' || bytes.get(pos..pos + 2) == Some(b"//") {
             break;
-        } else if cur == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+        } else if bytes.get(pos..pos + 2) == Some(b"/*") {
             *in_block_comment = true;
             pos += 2;
         } else {
-            out.push(cur as char);
-            pos += 1;
+            let Some(ch) = raw[pos..].chars().next() else { break };
+            out.push(ch);
+            pos += ch.len_utf8();
         }
     }
     out
@@ -736,28 +767,15 @@ fn classify_tf_block(header: &str) -> TfBlockKind {
 }
 
 fn count_hcl_braces(code: &str) -> (usize, usize) {
-    let bytes = code.as_bytes();
-    let (mut opens, mut closes, mut in_quote) = (0usize, 0usize, false);
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        let cur = bytes[pos];
-        if in_quote {
-            if cur == b'\\' && pos + 1 < bytes.len() {
-                pos += 2;
-                continue;
-            }
-            if cur == b'"' {
-                in_quote = false;
-            }
-        } else if cur == b'"' {
-            in_quote = true;
-        } else if cur == b'{' {
+    let (mut opens, mut closes) = (0usize, 0usize);
+    scan_code(code.as_bytes(), b"\"", |_, cur| {
+        if cur == b'{' {
             opens += 1;
         } else if cur == b'}' {
             closes += 1;
         }
-        pos += 1;
-    }
+        ControlFlow::Continue(())
+    });
     (opens, closes)
 }
 
@@ -932,16 +950,15 @@ fn track_tf_provider(
 
 fn strip_sql_comment(raw: &str) -> &str {
     let bytes = raw.as_bytes();
-    let mut in_single = false;
-    for idx in 0..bytes.len() {
-        let cur = bytes[idx];
-        if cur == b'\'' {
-            in_single = !in_single;
-        } else if !in_single && cur == b'-' && bytes.get(idx + 1) == Some(&b'-') {
-            return &raw[..idx];
+    let mut cut = bytes.len();
+    scan_code(bytes, b"'", |idx, cur| {
+        if cur == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+            cut = idx;
+            return ControlFlow::Break(());
         }
-    }
-    raw
+        ControlFlow::Continue(())
+    });
+    &raw[..cut]
 }
 
 fn normalize_sql_upper(code: &str) -> String {
@@ -1045,6 +1062,7 @@ fn all_matchers_complete(matchers: &[Option<EcoMatcher>; 4]) -> bool {
     matchers.iter().all(|m| m.as_ref().is_none_or(EcoMatcher::is_complete))
 }
 
+#[cfg(test)]
 fn scan_sources_for_deps(
     matchers: &mut [Option<EcoMatcher>; 4],
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
@@ -1077,17 +1095,10 @@ fn scan_sources_for_deps(
     }
 }
 
-fn find_unused_deps(
-    manifests: &[(String, String, String)],
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
-    source_paths: &[(Eco, PathBuf)],
+fn collect_unused_from_matchers(
+    parsed: Vec<ParsedDep>,
+    matchers: &[Option<EcoMatcher>; 4],
 ) -> Vec<UnusedDep> {
-    if manifests.is_empty() {
-        return Vec::new();
-    }
-    let (parsed, mut matchers) = collect_manifest_deps(manifests);
-    scan_sources_for_deps(&mut matchers, preloaded, source_paths);
-
     let mut unused = Vec::new();
     for dep in parsed {
         let used = matchers[dep.eco.idx()]
@@ -1102,6 +1113,20 @@ fn find_unused_deps(
         }
     }
     unused
+}
+
+#[cfg(test)]
+fn find_unused_deps(
+    manifests: &[(String, String, String)],
+    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
+    source_paths: &[(Eco, PathBuf)],
+) -> Vec<UnusedDep> {
+    if manifests.is_empty() {
+        return Vec::new();
+    }
+    let (parsed, mut matchers) = collect_manifest_deps(manifests);
+    scan_sources_for_deps(&mut matchers, preloaded, source_paths);
+    collect_unused_from_matchers(parsed, &matchers)
 }
 
 #[cfg(test)]

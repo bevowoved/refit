@@ -181,16 +181,10 @@ pub fn is_technical_code_token(span: &str) -> bool {
 
 /// Mask valid backticked Technical Nouns as `CODETOK` and unwrap disguised prose spans.
 pub fn mask_code_spans(input: &str) -> (String, bool) {
-    let (mut out, mut rest, mut disguised) = (String::with_capacity(input.len()), input, false);
-    while let Some(open) = rest.find('`') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('`') else {
-            out.push(' ');
-            out.push_str(after);
-            return (out, disguised);
-        };
-        let span = &after[..close];
+    let (mut out, mut last, mut disguised) = (String::with_capacity(input.len()), 0usize, false);
+    for (open, close) in crate::lex::iter_backtick_ranges(input) {
+        out.push_str(&input[last..open]);
+        let span = &input[open + 1..close];
         if is_technical_code_token(span) {
             out.push_str(" CODETOK ");
         } else {
@@ -199,9 +193,16 @@ pub fn mask_code_spans(input: &str) -> (String, bool) {
             out.push_str(span);
             out.push(' ');
         }
-        rest = &after[close + 1..];
+        last = close + 1;
     }
-    out.push_str(rest);
+    let tail = &input[last..];
+    if let Some(unclosed) = tail.find('`') {
+        out.push_str(&tail[..unclosed]);
+        out.push(' ');
+        out.push_str(&tail[unclosed + 1..]);
+    } else {
+        out.push_str(tail);
+    }
     (out, disguised)
 }
 

@@ -1,3 +1,4 @@
+use smallvec::{SmallVec, smallvec};
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -48,10 +49,35 @@ impl LangKind {
             Self::Other
         }
     }
+}
 
-    #[inline]
-    pub fn is_js_like(self) -> bool {
-        matches!(self, Self::Js | Self::Jsx)
+/// Static per-language scanner rules shared across all crate consumers.
+#[derive(Debug, Clone, Copy)]
+pub struct LangSpec {
+    pub nested_block_comments: bool,
+    pub hash_line_comments: bool,
+    pub slash_comments: bool,
+    pub backtick_raw_str: bool,
+    pub js_templates_regex: bool,
+    pub jsx_text: bool,
+    pub rust_raw_and_cfg: bool,
+}
+
+impl LangSpec {
+    pub const fn for_lang(kind: LangKind) -> Self {
+        let is_rs = matches!(kind, LangKind::Rust);
+        let is_go = matches!(kind, LangKind::Go);
+        let is_py = matches!(kind, LangKind::Python);
+        let is_js = matches!(kind, LangKind::Js | LangKind::Jsx);
+        Self {
+            nested_block_comments: is_rs,
+            hash_line_comments: is_py,
+            slash_comments: !is_py,
+            backtick_raw_str: is_go,
+            js_templates_regex: is_js,
+            jsx_text: matches!(kind, LangKind::Jsx),
+            rust_raw_and_cfg: is_rs,
+        }
     }
 }
 
@@ -61,14 +87,94 @@ pub enum LexMode {
     JsxText,
     JsxExpr { brace_depth: usize },
     Template { brace_depth: usize },
-    RegexLiteral,
     PyFString { quote: u8, triple: bool, brace_depth: usize },
-    RustCfgTest {
-        bracket_depth: usize,
-        paren_depth: usize,
-        brace_depth: usize,
-        in_braced_item: bool,
-    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LexKind {
+    Ident,
+    Number,
+    StrLit,
+    CharLit,
+    LineComment,
+    BlockComment,
+    LBrace,
+    RBrace,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    Semi,
+    Comma,
+    Colon,
+    Dot,
+    Hash,
+    Bang,
+    Eq,
+    Lt,
+    Gt,
+    Pipe,
+    FatArrow,
+    AndAnd,
+    OrOr,
+    Arrow,
+    DoubleColon,
+    Punct,
+    Newline,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokFlags(u8);
+
+impl TokFlags {
+    pub const IN_TEST: u8 = 1 << 0;
+    pub const IN_OS_CFG: u8 = 1 << 1;
+    pub const IN_ATTR: u8 = 1 << 2;
+    pub const DOC_COMMENT: u8 = 1 << 3;
+    pub const SAFETY_COMMENT: u8 = 1 << 4;
+    pub const MULTILINE: u8 = 1 << 5;
+
+    #[inline]
+    pub const fn with(self, bit: u8) -> Self {
+        Self(self.0 | bit)
+    }
+
+    #[inline]
+    pub const fn has(self, bit: u8) -> bool {
+        (self.0 & bit) != 0
+    }
+
+    #[inline]
+    pub const fn in_test(self) -> bool {
+        self.has(Self::IN_TEST)
+    }
+
+    #[inline]
+    pub const fn in_attr(self) -> bool {
+        self.has(Self::IN_ATTR)
+    }
+
+    #[inline]
+    pub const fn is_doc_comment(self) -> bool {
+        self.has(Self::DOC_COMMENT)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LexTok<'a> {
+    pub kind: LexKind,
+    pub slice: &'a [u8],
+    pub start: usize,
+    pub end: usize,
+    pub line: u32,
+    pub flags: TokFlags,
+}
+
+impl<'a> LexTok<'a> {
+    #[inline]
+    pub fn as_str(&self) -> &'a str {
+        std::str::from_utf8(self.slice).unwrap_or("")
+    }
 }
 
 /// 1:1 byte-aligned lexing view where comment bytes and Rust `#[cfg(test)]` items are
@@ -190,6 +296,74 @@ pub fn to_eol(bytes: &[u8], i: usize) -> usize {
     }
 }
 
+/// Zero-copy ASCII case-insensitive substring search.
+pub fn find_ascii_ci(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|win| win.eq_ignore_ascii_case(needle))
+}
+
+/// Zero-copy iterator yielding byte `(open, close)` indices of paired backtick spans.
+pub fn iter_backtick_ranges(line: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut offset = 0usize;
+    std::iter::from_fn(move || {
+        let rest = line.get(offset..)?;
+        let open = rest.find('`')?;
+        let abs_open = offset + open;
+        let after = &line[abs_open + 1..];
+        let close = after.find('`')?;
+        let abs_close = abs_open + 1 + close;
+        offset = abs_close + 1;
+        Some((abs_open, abs_close))
+    })
+}
+
+/// Zero-copy iterator yielding trimmed non-empty inline backtick spans.
+pub fn iter_backtick_spans(line: &str) -> impl Iterator<Item = &str> {
+    iter_backtick_ranges(line).filter_map(|(open, close)| {
+        let span = line[open + 1..close].trim();
+        (!span.is_empty()).then_some(span)
+    })
+}
+
+/// Zero-copy ASCII identifier slice iterator (`[A-Za-z_][A-Za-z0-9_]*`).
+pub fn iter_idents(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        while pos < bytes.len() {
+            let b = bytes[pos];
+            if b.is_ascii_alphabetic() || b == b'_' {
+                let start = pos;
+                pos += 1;
+                while pos < bytes.len() && ident_byte(bytes[pos]) {
+                    pos += 1;
+                }
+                return Some(&bytes[start..pos]);
+            }
+            pos += 1;
+        }
+        None
+    })
+}
+
+/// Extract trimmed comment text from a single source line across Python/Rust/JS/TS/Go.
+pub fn extract_comment_body<'a>(ext: &str, line: &'a str) -> Option<&'a str> {
+    let t = line.trim();
+    if ext == "py" {
+        return t.strip_prefix('#').map(str::trim);
+    }
+    t.strip_prefix("///")
+        .or_else(|| t.strip_prefix("//!"))
+        .or_else(|| t.strip_prefix("//"))
+        .or_else(|| t.strip_prefix("/**").map(|r| r.trim_end_matches("*/")))
+        .or_else(|| t.strip_prefix("/*").map(|r| r.trim_end_matches("*/")))
+        .or_else(|| t.strip_prefix("* "))
+        .map(str::trim)
+}
+
 /// Scan `/* ... */` starting at `i`. Returns `(end, newlines, closed)`.
 pub fn block_comment(bytes: &[u8], mut i: usize, nested: bool) -> (usize, usize, bool) {
     i += 2;
@@ -227,11 +401,11 @@ pub fn char_end(bytes: &[u8], i: usize) -> Option<usize> {
 
     let ch = std::str::from_utf8(&bytes[i + 1..]).ok()?.chars().next()?;
     let next = i + 1 + ch.len_utf8();
-    (next < bytes.len() && bytes[next] == b'\'' && ch != '\n').then_some(next + 1)
+    (next < bytes.len() && bytes[next] == b'\'' && ch != '\n' && ch != '\'').then_some(next + 1)
 }
 
 pub enum RawStr {
-    Closed { end: usize, newlines: usize },
+    Closed { end: usize },
     Unterminated,
 }
 
@@ -259,12 +433,9 @@ pub fn raw_str(bytes: &[u8], i: usize) -> Option<RawStr> {
     }
 
     p += 1;
-    let mut newlines = 0usize;
     while p < bytes.len() {
-        if bytes[p] == b'\n' {
-            newlines += 1;
-        } else if bytes[p] == b'"' && has_hashes(bytes, p + 1, hashes) {
-            return Some(RawStr::Closed { end: p + 1 + hashes, newlines });
+        if bytes[p] == b'"' && has_hashes(bytes, p + 1, hashes) {
+            return Some(RawStr::Closed { end: p + 1 + hashes });
         }
         p += 1;
     }
@@ -291,6 +462,9 @@ pub fn quoted_lit(
     while i < bytes.len() {
         let c = bytes[i];
         if escapes && c == b'\\' {
+            if bytes.get(i + 1) == Some(&b'\n') {
+                nl += 1;
+            }
             i = (i + 2).min(bytes.len());
             continue;
         }
@@ -374,9 +548,64 @@ fn next_json(b: &[u8], mut k: usize) -> Option<u8> {
 }
 
 // ============================================================================
-// Unified Pushdown Stateful Byte Lexer (Standard / JsxText / JsxExpr /
-// Template / RegexLiteral / PyFString / RustCfgTest)
+// Unified Zero-Copy Pushdown LexCursor<'a>
 // ============================================================================
+
+#[inline]
+fn utf8_char_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first < 0xE0 {
+        2
+    } else if first < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+#[inline]
+fn next_unicode_char(bytes: &[u8], pos: usize) -> Option<(char, usize)> {
+    let slice = bytes.get(pos..)?;
+    if slice.is_empty() {
+        return None;
+    }
+    if slice[0] < 0x80 {
+        return Some((slice[0] as char, 1));
+    }
+    let ch = std::str::from_utf8(slice).ok()?.chars().next()?;
+    Some((ch, ch.len_utf8()))
+}
+
+#[inline]
+fn is_unicode_ident_start(bytes: &[u8], pos: usize) -> bool {
+    let Some(&b) = bytes.get(pos) else { return false };
+    if b < 0x80 {
+        return b == b'_' || b.is_ascii_alphabetic();
+    }
+    next_unicode_char(bytes, pos).is_some_and(|(ch, _)| ch.is_alphabetic())
+}
+
+#[inline]
+fn scan_unicode_ident_end(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() {
+        let b = bytes[pos];
+        if b < 0x80 {
+            if ident_byte(b) {
+                pos += 1;
+            } else {
+                break;
+            }
+        } else if let Some((ch, len)) = next_unicode_char(bytes, pos)
+            && ch.is_alphanumeric()
+        {
+            pos += len;
+        } else {
+            break;
+        }
+    }
+    pos
+}
 
 #[inline]
 fn blank_range(out: &mut [u8], start: usize, end: usize) {
@@ -439,35 +668,53 @@ fn lookahead_jsx_text(bytes: &[u8], start: usize) -> bool {
     saw_alpha && look < bytes.len()
 }
 
-/// Match `#[cfg(test)]` or `#[cfg(all(test, ...))]` (allowing internal ASCII whitespace).
-/// Returns byte end right after the closing `]`.
-fn match_rust_cfg_test_attr(bytes: &[u8], i: usize) -> Option<usize> {
-    if bytes.get(i..i + 2) != Some(b"#[") {
-        return None;
-    }
-    let mut p = i + 2;
-    let mut depth = 1usize;
-    while p < bytes.len() && depth > 0 {
-        match bytes[p] {
-            b'[' => depth += 1,
-            b']' => depth -= 1,
-            b'"' => {
-                p = quoted_lit(bytes, p, true, true).0;
-                continue;
-            }
-            _ => {}
+fn find_matching_bracket_bytes(bytes: &[u8], open_idx: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut pos = open_idx;
+    while pos < bytes.len() {
+        let b = bytes[pos];
+        if b == b'"' {
+            pos = quoted_lit(bytes, pos, true, true).0;
+            continue;
         }
-        p += 1;
+        if bytes.get(pos..pos + 2) == Some(b"//") {
+            pos = to_eol(bytes, pos + 2);
+            continue;
+        }
+        if b == b'[' {
+            depth += 1;
+        } else if b == b']' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(pos);
+            }
+        }
+        pos += 1;
     }
-    if depth != 0 {
-        return None;
+    None
+}
+
+fn classify_rust_cfg_attr(inner: &[u8]) -> (bool, bool) {
+    let mut buf = [0u8; 64];
+    let mut len = 0usize;
+    for &b in inner {
+        if !b.is_ascii_whitespace() {
+            if len >= buf.len() {
+                return (false, false);
+            }
+            buf[len] = b;
+            len += 1;
+        }
     }
-    let inner = std::str::from_utf8(&bytes[i + 2..p - 1]).ok()?;
-    let compact: String = inner.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    let is_cfg_test = compact == "cfg(test)"
-        || compact.starts_with("cfg(all(test,")
-        || compact.ends_with(",test))");
-    is_cfg_test.then_some(p)
+    let compact = &buf[..len];
+    let is_test = compact == b"cfg(test)"
+        || compact.starts_with(b"cfg(all(test,")
+        || compact.ends_with(b",test))");
+    let is_os = compact == b"cfg(windows)"
+        || compact == b"cfg(unix)"
+        || compact == b"cfg(any(windows,unix))"
+        || compact == b"cfg(any(unix,windows))";
+    (is_test, is_os)
 }
 
 fn detect_py_fstring(bytes: &[u8], i: usize) -> Option<(usize, u8, bool)> {
@@ -509,698 +756,693 @@ fn skip_py_triple(bytes: &[u8], mut i: usize, q: u8) -> usize {
     i
 }
 
-struct SentinelLexer<'a> {
+#[derive(Clone, Copy, Default)]
+struct AttrScope {
+    armed: bool,
+    active: bool,
+    brace_depth: usize,
+    paren_depth: usize,
+    bracket_depth: usize,
+}
+
+impl AttrScope {
+    #[inline]
+    fn is_in_scope(&self) -> bool {
+        self.armed || self.active
+    }
+
+    fn arm(&mut self) {
+        if !self.active {
+            self.armed = true;
+            self.brace_depth = 0;
+            self.paren_depth = 0;
+            self.bracket_depth = 0;
+        }
+    }
+
+    fn step_before(&mut self, kind: LexKind) {
+        if self.armed
+            && !self.active
+            && self.paren_depth == 0
+            && self.bracket_depth == 0
+            && kind == LexKind::RBrace
+        {
+            self.armed = false;
+        }
+    }
+
+    fn step_after(&mut self, kind: LexKind) {
+        if self.active {
+            match kind {
+                LexKind::LBrace => self.brace_depth += 1,
+                LexKind::RBrace => {
+                    self.brace_depth = self.brace_depth.saturating_sub(1);
+                    if self.brace_depth == 0 {
+                        self.active = false;
+                        self.armed = false;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        if !self.armed {
+            return;
+        }
+        match kind {
+            LexKind::LParen => self.paren_depth += 1,
+            LexKind::RParen => self.paren_depth = self.paren_depth.saturating_sub(1),
+            LexKind::LBracket => self.bracket_depth += 1,
+            LexKind::RBracket => self.bracket_depth = self.bracket_depth.saturating_sub(1),
+            LexKind::LBrace if self.paren_depth == 0 && self.bracket_depth == 0 => {
+                self.active = true;
+                self.brace_depth = 1;
+            }
+            LexKind::Semi | LexKind::Comma if self.paren_depth == 0 && self.bracket_depth == 0 => {
+                self.armed = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn classify_punct(bytes: &[u8], pos: usize) -> (LexKind, usize) {
+    let b = bytes[pos];
+    let next = bytes.get(pos + 1).copied();
+    let third = bytes.get(pos + 2).copied();
+    match (b, next) {
+        (b'=', Some(b'>')) => (LexKind::FatArrow, 2),
+        (b'&', Some(b'&')) => (LexKind::AndAnd, 2),
+        (b'|', Some(b'|')) => (LexKind::OrOr, 2),
+        (b'-', Some(b'>')) => (LexKind::Arrow, 2),
+        (b':', Some(b':')) => (LexKind::DoubleColon, 2),
+        (b'=', Some(b'='))
+        | (b'!', Some(b'='))
+        | (b'<', Some(b'='))
+        | (b'>', Some(b'='))
+        | (b'+', Some(b'='))
+        | (b'-', Some(b'='))
+        | (b'*', Some(b'='))
+        | (b'/', Some(b'=')) => (LexKind::Punct, 2),
+        (b'.', Some(b'.')) if third == Some(b'=') => (LexKind::Punct, 3),
+        (b'.', Some(b'.')) => (LexKind::Punct, 2),
+        (b'{', _) => (LexKind::LBrace, 1),
+        (b'}', _) => (LexKind::RBrace, 1),
+        (b'(', _) => (LexKind::LParen, 1),
+        (b')', _) => (LexKind::RParen, 1),
+        (b'[', _) => (LexKind::LBracket, 1),
+        (b']', _) => (LexKind::RBracket, 1),
+        (b';', _) => (LexKind::Semi, 1),
+        (b',', _) => (LexKind::Comma, 1),
+        (b':', _) => (LexKind::Colon, 1),
+        (b'.', _) => (LexKind::Dot, 1),
+        (b'#', _) => (LexKind::Hash, 1),
+        (b'!', _) => (LexKind::Bang, 1),
+        (b'=', _) => (LexKind::Eq, 1),
+        (b'<', _) => (LexKind::Lt, 1),
+        (b'>', _) => (LexKind::Gt, 1),
+        (b'|', _) => (LexKind::Pipe, 1),
+        _ => (LexKind::Punct, utf8_char_len(b).min(bytes.len() - pos)),
+    }
+}
+
+/// Unified zero-copy pushdown byte lexer with stack-only `SmallVec<[LexMode; 8]>`.
+pub struct LexCursor<'a> {
     bytes: &'a [u8],
-    out: Vec<u8>,
-    test_spans: Vec<(usize, usize)>,
-    modes: Vec<LexMode>,
+    pos: usize,
+    line: u32,
+    col: u32,
+    spec: LangSpec,
+    modes: SmallVec<[LexMode; 8]>,
     brace_depth: usize,
     prev_sig: u8,
     prev_word: &'a [u8],
-    pos: usize,
-    is_rs: bool,
-    is_go: bool,
-    is_js: bool,
-    is_jsx: bool,
-    active_test_seg: Option<usize>,
+    cfg_test: AttrScope,
+    os_cfg: AttrScope,
+    attr_end: Option<usize>,
 }
 
-impl<'a> SentinelLexer<'a> {
-    fn new(lang: LangKind, bytes: &'a [u8]) -> Self {
+impl<'a> LexCursor<'a> {
+    pub fn new(lang: LangKind, src: &'a [u8]) -> Self {
         Self {
-            bytes,
-            out: bytes.to_vec(),
-            test_spans: Vec::new(),
-            modes: vec![LexMode::Standard],
+            bytes: src,
+            pos: 0,
+            line: 1,
+            col: 0,
+            spec: LangSpec::for_lang(lang),
+            modes: smallvec![LexMode::Standard],
             brace_depth: 0,
             prev_sig: b';',
             prev_word: b"",
-            pos: 0,
-            is_rs: lang == LangKind::Rust,
-            is_go: lang == LangKind::Go,
-            is_js: lang.is_js_like(),
-            is_jsx: lang == LangKind::Jsx,
-            active_test_seg: None,
+            cfg_test: AttrScope::default(),
+            os_cfg: AttrScope::default(),
+            attr_end: None,
         }
     }
 
-    fn flush_test_seg(&mut self, end: usize) {
-        if let Some(start) = self.active_test_seg.take()
-            && start < end
-        {
-            self.test_spans.push((start, end));
-        }
+    #[inline]
+    pub fn has_unclosed_template(&self) -> bool {
+        self.modes.iter().any(|m| matches!(m, LexMode::Template { .. }))
     }
 
-    fn try_blank_rust_literal(&mut self) -> bool {
-        if let Some(res) = raw_str(self.bytes, self.pos) {
-            let end = match res {
-                RawStr::Closed { end, .. } => end,
-                RawStr::Unterminated => self.bytes.len(),
-            };
-            blank_range(&mut self.out, self.pos, end);
-            self.pos = end;
-            return true;
+    #[inline]
+    fn base_flags(&self) -> TokFlags {
+        let mut f = TokFlags::default();
+        if self.cfg_test.is_in_scope() {
+            f = f.with(TokFlags::IN_TEST);
         }
-        let byte = self.bytes[self.pos];
-        if byte == b'\'' {
-            let end = char_end(self.bytes, self.pos).unwrap_or(self.pos + 1);
-            blank_range(&mut self.out, self.pos, end);
-            self.pos = end;
-            return true;
+        if self.os_cfg.is_in_scope() {
+            f = f.with(TokFlags::IN_OS_CFG);
         }
-        if byte == b'"' {
-            let end = quoted_lit(self.bytes, self.pos, true, true).0;
-            blank_range(&mut self.out, self.pos, end);
-            self.pos = end;
-            return true;
+        if self.attr_end.is_some() {
+            f = f.with(TokFlags::IN_ATTR);
         }
-        false
+        f
     }
 
-    fn step_rust_cfg_test(
+    fn advance_pos(&mut self, to: usize) {
+        let mut i = self.pos;
+        while i < to {
+            let b = self.bytes[i];
+            if b == b'\n' {
+                self.line += 1;
+                self.col = 0;
+                i += 1;
+            } else if b == b'\t' {
+                self.col += 4 - (self.col % 4);
+                i += 1;
+            } else if b == b'\r' {
+                i += 1;
+            } else if b < 0x80 {
+                self.col += 1;
+                i += 1;
+            } else {
+                let step = utf8_char_len(b);
+                self.col += 1;
+                i = (i + step).min(to);
+            }
+        }
+        self.pos = to;
+    }
+
+    fn make_tok(
         &mut self,
-        mut bracket_depth: usize,
-        mut paren_depth: usize,
-        mut cfg_braces: usize,
-        mut in_braced_item: bool,
-    ) {
-        if self.bytes.get(self.pos..self.pos + 2) == Some(b"//") {
-            self.flush_test_seg(self.pos);
-            let end = to_eol(self.bytes, self.pos + 2);
-            blank_range(&mut self.out, self.pos, end);
-            self.pos = end;
-            return;
+        kind: LexKind,
+        start: usize,
+        end: usize,
+        start_line: u32,
+        mut flags: TokFlags,
+    ) -> LexTok<'a> {
+        self.advance_pos(end);
+        if self.line > start_line {
+            flags = flags.with(TokFlags::MULTILINE);
         }
-        if self.bytes.get(self.pos..self.pos + 2) == Some(b"/*") {
-            self.flush_test_seg(self.pos);
-            let (end, _, _) = block_comment(self.bytes, self.pos, true);
-            blank_range(&mut self.out, self.pos, end);
-            self.pos = end;
-            return;
-        }
-        if self.active_test_seg.is_none() {
-            self.active_test_seg = Some(self.pos);
-        }
-        if self.try_blank_rust_literal() {
-            return;
-        }
-        let byte = self.bytes[self.pos];
-        blank_range(&mut self.out, self.pos, self.pos + 1);
-        let finished = advance_cfg_test_delim(
-            byte,
-            &mut bracket_depth,
-            &mut paren_depth,
-            &mut cfg_braces,
-            &mut in_braced_item,
-        );
-        self.pos += 1;
-        if finished {
-            self.flush_test_seg(self.pos);
-            self.modes.pop();
-        } else if let Some(slot) = self.modes.last_mut() {
-            *slot = LexMode::RustCfgTest {
-                bracket_depth,
-                paren_depth,
-                brace_depth: cfg_braces,
-                in_braced_item,
-            };
+        LexTok {
+            kind,
+            slice: &self.bytes[start..end],
+            start,
+            end,
+            line: start_line,
+            flags,
         }
     }
 
-    fn step_regex_literal(&mut self) {
-        if let Some(end) = scan_regex_literal(self.bytes, self.pos) {
-            self.pos = end;
-            self.prev_sig = b'0';
-            self.prev_word = b"";
-        } else {
-            self.pos += 1;
+    fn emit_lit(
+        &mut self,
+        kind: LexKind,
+        start: usize,
+        end: usize,
+        start_line: u32,
+        sig: u8,
+        extra_flag: u8,
+    ) -> LexTok<'a> {
+        self.prev_sig = sig;
+        self.prev_word = b"";
+        let mut flags = self.base_flags();
+        if extra_flag != 0 {
+            flags = flags.with(extra_flag);
         }
-        self.modes.pop();
+        self.make_tok(kind, start, end, start_line, flags)
     }
 
-    fn step_jsx_text(&mut self) {
+    pub fn next_token(&mut self) -> Option<LexTok<'a>> {
+        self.step_token(false).ok().flatten()
+    }
+
+    pub fn next_checked(&mut self) -> Result<Option<LexTok<'a>>, String> {
+        self.step_token(true)
+    }
+
+    fn skip_ws_same_line(&mut self) {
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b' ' => {
+                    self.col += 1;
+                    self.pos += 1;
+                }
+                b'\t' => {
+                    self.col += 4 - (self.col % 4);
+                    self.pos += 1;
+                }
+                b'\r' => self.pos += 1,
+                _ => break,
+            }
+        }
+    }
+
+    fn scan_template_segment(
+        &mut self,
+        start: usize,
+        scan_from: usize,
+        start_line: u32,
+        checked: bool,
+    ) -> Result<LexTok<'a>, String> {
+        let mut i = scan_from;
+        while i < self.bytes.len() {
+            let c = self.bytes[i];
+            if c == b'\\' {
+                i = (i + 2).min(self.bytes.len());
+                continue;
+            }
+            if self.bytes.get(i..i + 2) == Some(b"${") {
+                self.modes.push(LexMode::Template { brace_depth: self.brace_depth });
+                return Ok(self.emit_lit(LexKind::StrLit, start, i + 2, start_line, b'{', 0));
+            }
+            if c == b'`' {
+                return Ok(self.emit_lit(LexKind::StrLit, start, i + 1, start_line, b'`', 0));
+            }
+            i += 1;
+        }
+        if checked {
+            return Err(format!("unterminated template literal at L{start_line}"));
+        }
+        Ok(self.emit_lit(LexKind::StrLit, start, i, start_line, b'`', 0))
+    }
+
+    fn step_jsx_text(&mut self) -> LexTok<'a> {
+        let (start, start_line) = (self.pos, self.line);
         let byte = self.bytes[self.pos];
         if byte == b'<' {
             self.modes.pop();
-            self.prev_sig = b'<';
-            self.prev_word = b"";
-        } else if byte == b'{' {
+            return self.emit_lit(LexKind::Lt, start, start + 1, start_line, b'<', 0);
+        }
+        if byte == b'{' {
             let depth = self.brace_depth;
             self.brace_depth += 1;
             self.modes.push(LexMode::JsxExpr { brace_depth: depth });
-            self.prev_sig = b'{';
-            self.prev_word = b"";
+            return self.emit_lit(LexKind::LBrace, start, start + 1, start_line, b'{', 0);
         }
-        self.pos += 1;
+        if byte == b'\n' {
+            let flags = self.base_flags();
+            return self.make_tok(LexKind::Newline, start, start + 1, start_line, flags);
+        }
+        let mut end = start + 1;
+        while end < self.bytes.len() && !matches!(self.bytes[end], b'<' | b'{' | b'\n') {
+            end += 1;
+        }
+        let flags = self.base_flags();
+        self.make_tok(LexKind::StrLit, start, end, start_line, flags)
     }
 
-    fn try_step_trivia_or_rust(&mut self, byte: u8) -> bool {
-        if byte == b'\n' || byte.is_ascii_whitespace() {
-            self.pos += 1;
-            return true;
-        }
-        if self.bytes.get(self.pos..self.pos + 2) == Some(b"//") {
-            let end = to_eol(self.bytes, self.pos + 2);
-            blank_range(&mut self.out, self.pos, end);
-            self.pos = end;
-            return true;
-        }
-        if self.bytes.get(self.pos..self.pos + 2) == Some(b"/*") {
-            let (end, _, _) = block_comment(self.bytes, self.pos, self.is_rs);
-            blank_range(&mut self.out, self.pos, end);
-            self.pos = end;
-            return true;
-        }
-        if self.is_rs
-            && byte == b'#'
-            && let Some(attr_end) = match_rust_cfg_test_attr(self.bytes, self.pos)
-        {
-            blank_range(&mut self.out, self.pos, attr_end);
-            self.modes.push(LexMode::RustCfgTest {
-                bracket_depth: 0,
-                paren_depth: 0,
-                brace_depth: 0,
-                in_braced_item: false,
-            });
-            self.active_test_seg = None;
-            self.pos = attr_end;
-            return true;
-        }
-        if self.is_rs
-            && let Some(res) = raw_str(self.bytes, self.pos)
-        {
-            self.pos = match res {
-                RawStr::Closed { end, .. } => end,
-                RawStr::Unterminated => self.bytes.len(),
-            };
-            self.prev_sig = b'"';
-            self.prev_word = b"";
-            return true;
-        }
-        if self.is_rs && byte == b'\'' {
-            self.pos = char_end(self.bytes, self.pos).unwrap_or(self.pos + 1);
-            self.prev_sig = b'\'';
-            self.prev_word = b"";
-            return true;
-        }
-        false
-    }
-
-    fn try_step_js_or_quote(&mut self, byte: u8) -> bool {
-        if self.is_js
-            && byte == b'/'
-            && allow_regex(self.prev_sig, self.prev_word)
-            && scan_regex_literal(self.bytes, self.pos).is_some()
-        {
-            self.modes.push(LexMode::RegexLiteral);
-            return true;
-        }
-        if self.is_js && byte == b'`' {
-            self.pos = scan_template_sentinel(self.bytes, self.pos + 1, self.brace_depth, &mut self.modes);
-            self.prev_sig = b'`';
-            self.prev_word = b"";
-            return true;
-        }
-        if byte == b'"' || (!self.is_rs && byte == b'\'') || (self.is_go && byte == b'`') {
-            let (end, _, _) = quoted_lit(self.bytes, self.pos, byte != b'`', true);
-            self.pos = end;
-            self.prev_sig = byte;
-            self.prev_word = b"";
-            return true;
-        }
-        if self.is_jsx
-            && byte == b'>'
-            && self.prev_sig != b'='
-            && lookahead_jsx_text(self.bytes, self.pos + 1)
-        {
-            self.modes.push(LexMode::JsxText);
-            self.prev_sig = b'>';
-            self.prev_word = b"";
-            self.pos += 1;
-            return true;
-        }
-        if self.is_js && (byte.is_ascii_alphabetic() || byte == b'_') {
-            let start = self.pos;
-            while self.pos < self.bytes.len() && ident_byte(self.bytes[self.pos]) {
-                self.pos += 1;
+    fn step_py_fstring_text(&mut self, quote: u8, triple: bool) -> LexTok<'a> {
+        let (start, start_line) = (self.pos, self.line);
+        let mut i = start;
+        while i < self.bytes.len() {
+            let b = self.bytes[i];
+            if b == b'\\' {
+                i = (i + 2).min(self.bytes.len());
+                continue;
             }
-            self.prev_word = &self.bytes[start..self.pos];
-            self.prev_sig = self.bytes[self.pos - 1];
-            return true;
+            if self.bytes.get(i..i + 2) == Some(b"{{") || self.bytes.get(i..i + 2) == Some(b"}}") {
+                i += 2;
+                continue;
+            }
+            if b == b'{' {
+                if let Some(slot) = self.modes.last_mut() {
+                    *slot = LexMode::PyFString { quote, triple, brace_depth: 1 };
+                }
+                i += 1;
+                break;
+            }
+            if triple && self.bytes.get(i..i + 3) == Some(&[quote, quote, quote]) {
+                self.modes.pop();
+                i += 3;
+                break;
+            }
+            if !triple && b == quote {
+                self.modes.pop();
+                i += 1;
+                break;
+            }
+            i += 1;
         }
-        false
+        let flags = self.base_flags();
+        self.make_tok(LexKind::StrLit, start, i, start_line, flags)
     }
 
-    fn step_standard(&mut self, top: LexMode) {
-        let byte = self.bytes[self.pos];
-        if self.try_step_trivia_or_rust(byte) || self.try_step_js_or_quote(byte) {
+    fn peek_rust_attr(&mut self) {
+        if !self.spec.rust_raw_and_cfg || self.bytes[self.pos] != b'#' || self.attr_end.is_some() {
             return;
         }
-        self.prev_word = b"";
-        if byte == b'{' {
-            self.brace_depth += 1;
-        } else if byte == b'}' {
-            self.brace_depth = self.brace_depth.saturating_sub(1);
-            if let LexMode::JsxExpr { brace_depth: target } = top
-                && self.brace_depth == target
-            {
-                self.modes.pop();
+        let bracket_pos = if self.bytes.get(self.pos + 1) == Some(&b'[') {
+            Some((self.pos + 1, false))
+        } else if self.bytes.get(self.pos + 1..self.pos + 3) == Some(b"![") {
+            Some((self.pos + 2, true))
+        } else {
+            None
+        };
+        if let Some((open, is_inner)) = bracket_pos
+            && let Some(close) = find_matching_bracket_bytes(self.bytes, open)
+        {
+            if !is_inner {
+                let (is_test, is_os) = classify_rust_cfg_attr(&self.bytes[open + 1..close]);
+                if is_test {
+                    self.cfg_test.arm();
+                } else if is_os {
+                    self.os_cfg.arm();
+                }
             }
+            self.attr_end = Some(close);
         }
-        self.prev_sig = byte;
-        self.pos += 1;
     }
 
-    fn run(mut self) -> SentinelLex {
-        while self.pos < self.bytes.len() {
-            let top = *self.modes.last().unwrap_or(&LexMode::Standard);
-            match top {
-                LexMode::RustCfgTest {
-                    bracket_depth,
-                    paren_depth,
-                    brace_depth: cfg_braces,
-                    in_braced_item,
-                } => self.step_rust_cfg_test(bracket_depth, paren_depth, cfg_braces, in_braced_item),
-                LexMode::RegexLiteral => self.step_regex_literal(),
-                LexMode::JsxText => self.step_jsx_text(),
-                LexMode::Template { brace_depth: tpl_depth }
-                    if self.brace_depth == tpl_depth && self.bytes[self.pos] == b'}' =>
+    fn try_step_comment(
+        &mut self,
+        start: usize,
+        start_line: u32,
+        checked: bool,
+    ) -> Result<Option<LexTok<'a>>, String> {
+        let two = self.bytes.get(start..start + 2);
+        if self.spec.slash_comments && two == Some(b"//") {
+            let end = to_eol(self.bytes, start + 2);
+            let slice = &self.bytes[start..end];
+            let mut flags = self.base_flags();
+            if (slice.starts_with(b"///") && !slice.starts_with(b"////")) || slice.starts_with(b"//!") {
+                flags = flags.with(TokFlags::DOC_COMMENT);
+            }
+            if find_ascii_ci(slice, b"safety:").is_some() {
+                flags = flags.with(TokFlags::SAFETY_COMMENT);
+            }
+            return Ok(Some(self.make_tok(LexKind::LineComment, start, end, start_line, flags)));
+        }
+        if self.spec.slash_comments && two == Some(b"/*") {
+            let (end, _, closed) = block_comment(self.bytes, start, self.spec.nested_block_comments);
+            if checked && !closed {
+                return Err(format!("unterminated block comment at L{start_line}"));
+            }
+            let slice = &self.bytes[start..end];
+            let mut flags = self.base_flags();
+            if self.spec.rust_raw_and_cfg
+                && matches!(slice.get(2), Some(b'*' | b'!'))
+                && slice.get(3) != Some(&b'/')
+            {
+                flags = flags.with(TokFlags::DOC_COMMENT);
+            }
+            if find_ascii_ci(slice, b"safety:").is_some() {
+                flags = flags.with(TokFlags::SAFETY_COMMENT);
+            }
+            return Ok(Some(self.make_tok(LexKind::BlockComment, start, end, start_line, flags)));
+        }
+        if self.spec.hash_line_comments && self.bytes[start] == b'#' {
+            let end = to_eol(self.bytes, start + 1);
+            let flags = self.base_flags();
+            return Ok(Some(self.make_tok(LexKind::LineComment, start, end, start_line, flags)));
+        }
+        Ok(None)
+    }
+
+    fn try_step_rust_lit(
+        &mut self,
+        start: usize,
+        start_line: u32,
+        checked: bool,
+    ) -> Result<Option<LexTok<'a>>, String> {
+        let byte = self.bytes[start];
+        if let Some(res) = raw_str(self.bytes, start) {
+            let end = match res {
+                RawStr::Closed { end } => end,
+                RawStr::Unterminated if checked => {
+                    return Err(format!("unterminated Rust raw string at L{start_line}"));
+                }
+                RawStr::Unterminated => self.bytes.len(),
+            };
+            return Ok(Some(self.emit_lit(LexKind::StrLit, start, end, start_line, b'"', 0)));
+        }
+        if matches!(byte, b'b' | b'c') && self.bytes.get(start + 1) == Some(&b'"') && left_bound(self.bytes, start) {
+            let (end, _, closed) = quoted_lit(self.bytes, start + 1, true, true);
+            if checked && !closed {
+                return Err(format!("unterminated string literal at L{start_line}"));
+            }
+            return Ok(Some(self.emit_lit(LexKind::StrLit, start, end, start_line, b'"', 0)));
+        }
+        if byte == b'b' && left_bound(self.bytes, start)
+            && let Some(end) = char_end(self.bytes, start + 1)
+        {
+            return Ok(Some(self.emit_lit(LexKind::CharLit, start, end, start_line, b'\'', 0)));
+        }
+        if byte == b'\'' {
+            let (kind, end) = match char_end(self.bytes, start) {
+                Some(end) => (LexKind::CharLit, end),
+                None => (LexKind::Punct, start + 1),
+            };
+            return Ok(Some(self.emit_lit(kind, start, end, start_line, b'\'', 0)));
+        }
+        Ok(None)
+    }
+
+    fn try_step_script_lit(
+        &mut self,
+        start: usize,
+        start_line: u32,
+        checked: bool,
+    ) -> Result<Option<LexTok<'a>>, String> {
+        let byte = self.bytes[start];
+        if self.spec.hash_line_comments {
+            if let Some((after_open, quote, triple)) = detect_py_fstring(self.bytes, start) {
+                self.modes.push(LexMode::PyFString { quote, triple, brace_depth: 0 });
+                return Ok(Some(self.emit_lit(LexKind::StrLit, start, after_open, start_line, quote, 0)));
+            }
+            if matches!(byte, b'"' | b'\'') && self.bytes.get(start..start + 3) == Some(&[byte, byte, byte]) {
+                let end = skip_py_triple(self.bytes, start + 3, byte);
+                return Ok(Some(self.emit_lit(LexKind::StrLit, start, end, start_line, byte, TokFlags::DOC_COMMENT)));
+            }
+        }
+        if self.spec.js_templates_regex {
+            if byte == b'/'
+                && allow_regex(self.prev_sig, self.prev_word)
+                && let Some(end) = scan_regex_literal(self.bytes, start)
+            {
+                return Ok(Some(self.emit_lit(LexKind::StrLit, start, end, start_line, b'0', 0)));
+            }
+            if byte == b'`' {
+                return self.scan_template_segment(start, start + 1, start_line, checked).map(Some);
+            }
+        }
+        if self.spec.backtick_raw_str && byte == b'`' {
+            let (end, _, closed) = quoted_lit(self.bytes, start, false, true);
+            if checked && !closed {
+                return Err(format!("unterminated string literal at L{start_line}"));
+            }
+            return Ok(Some(self.emit_lit(LexKind::StrLit, start, end, start_line, b'`', 0)));
+        }
+        Ok(None)
+    }
+
+    fn try_step_literal(
+        &mut self,
+        start: usize,
+        start_line: u32,
+        checked: bool,
+    ) -> Result<Option<LexTok<'a>>, String> {
+        if self.spec.rust_raw_and_cfg
+            && let Some(tok) = self.try_step_rust_lit(start, start_line, checked)?
+        {
+            return Ok(Some(tok));
+        }
+        if let Some(tok) = self.try_step_script_lit(start, start_line, checked)? {
+            return Ok(Some(tok));
+        }
+        let byte = self.bytes[start];
+        if byte == b'"' || (!self.spec.rust_raw_and_cfg && byte == b'\'') {
+            let multiline = self.spec.rust_raw_and_cfg || (!checked && !self.spec.hash_line_comments);
+            let (end, _, closed) = quoted_lit(self.bytes, start, true, multiline);
+            if checked && !closed {
+                return Err(format!("unterminated string literal at L{start_line}"));
+            }
+            return Ok(Some(self.emit_lit(LexKind::StrLit, start, end, start_line, byte, 0)));
+        }
+        Ok(None)
+    }
+
+    fn step_code_or_punct(&mut self, top: LexMode, start: usize, start_line: u32) -> LexTok<'a> {
+        let byte = self.bytes[start];
+        if self.spec.rust_raw_and_cfg
+            && self.bytes.get(start..start + 2) == Some(b"r#")
+            && is_unicode_ident_start(self.bytes, start + 2)
+        {
+            let end = scan_unicode_ident_end(self.bytes, start + 2);
+            self.prev_word = &self.bytes[start..end];
+            self.prev_sig = self.bytes[end - 1];
+            let flags = self.base_flags();
+            return self.make_tok(LexKind::Ident, start, end, start_line, flags);
+        }
+        if is_unicode_ident_start(self.bytes, start) {
+            let end = scan_unicode_ident_end(self.bytes, start);
+            self.prev_word = &self.bytes[start..end];
+            self.prev_sig = self.bytes[end - 1];
+            let flags = self.base_flags();
+            return self.make_tok(LexKind::Ident, start, end, start_line, flags);
+        }
+        if byte.is_ascii_digit() {
+            let mut end = start + 1;
+            while end < self.bytes.len() && ident_byte(self.bytes[end]) {
+                end += 1;
+            }
+            return self.emit_lit(LexKind::Number, start, end, start_line, self.bytes[end - 1], 0);
+        }
+
+        let (kind, step) = classify_punct(self.bytes, start);
+        let in_attr = self.attr_end.is_some();
+        if !in_attr && self.spec.rust_raw_and_cfg {
+            self.cfg_test.step_before(kind);
+            self.os_cfg.step_before(kind);
+        }
+        let flags = self.base_flags();
+        if self.spec.jsx_text
+            && kind == LexKind::Gt
+            && self.prev_sig != b'='
+            && lookahead_jsx_text(self.bytes, start + 1)
+        {
+            self.modes.push(LexMode::JsxText);
+        }
+        match kind {
+            LexKind::LBrace => {
+                self.brace_depth += 1;
+                if let Some(LexMode::PyFString { brace_depth, .. }) = self.modes.last_mut() {
+                    *brace_depth += 1;
+                }
+            }
+            LexKind::RBrace => {
+                self.brace_depth = self.brace_depth.saturating_sub(1);
+                if let LexMode::JsxExpr { brace_depth: target } = top
+                    && self.brace_depth == target
                 {
                     self.modes.pop();
-                    self.pos = scan_template_sentinel(
-                        self.bytes,
-                        self.pos + 1,
-                        self.brace_depth,
-                        &mut self.modes,
-                    );
-                    self.prev_sig = b'`';
-                    self.prev_word = b"";
-                }
-                LexMode::Standard | LexMode::JsxExpr { .. } | LexMode::Template { .. } => {
-                    self.step_standard(top);
-                }
-                LexMode::PyFString { .. } => {
-                    self.modes.pop();
+                } else if let Some(LexMode::PyFString { brace_depth, .. }) = self.modes.last_mut() {
+                    *brace_depth = brace_depth.saturating_sub(1);
                 }
             }
+            _ => {}
         }
-        self.flush_test_seg(self.bytes.len());
-        SentinelLex { bytes: self.out, test_spans: self.test_spans }
+        if !in_attr && self.spec.rust_raw_and_cfg {
+            self.cfg_test.step_after(kind);
+            self.os_cfg.step_after(kind);
+        }
+        self.prev_word = b"";
+        self.prev_sig = self.bytes[start + step - 1];
+        self.make_tok(kind, start, start + step, start_line, flags)
+    }
+
+    fn step_token(&mut self, checked: bool) -> Result<Option<LexTok<'a>>, String> {
+        if self.pos >= self.bytes.len() {
+            return Ok(None);
+        }
+        let top = *self.modes.last().unwrap_or(&LexMode::Standard);
+        if matches!(top, LexMode::JsxText) {
+            return Ok(Some(self.step_jsx_text()));
+        }
+        if let LexMode::PyFString { quote, triple, brace_depth: 0 } = top {
+            return Ok(Some(self.step_py_fstring_text(quote, triple)));
+        }
+        self.skip_ws_same_line();
+        if self.pos >= self.bytes.len() {
+            return Ok(None);
+        }
+        if self.attr_end.is_some_and(|end| self.pos > end) {
+            self.attr_end = None;
+        }
+
+        let (start, start_line) = (self.pos, self.line);
+        let byte = self.bytes[start];
+        if byte == b'\n' {
+            let flags = self.base_flags();
+            return Ok(Some(self.make_tok(LexKind::Newline, start, start + 1, start_line, flags)));
+        }
+        if let LexMode::Template { brace_depth: tpl_depth } = top
+            && self.brace_depth == tpl_depth
+            && byte == b'}'
+        {
+            self.modes.pop();
+            return self.scan_template_segment(start, start + 1, start_line, checked).map(Some);
+        }
+        if let Some(tok) = self.try_step_comment(start, start_line, checked)? {
+            return Ok(Some(tok));
+        }
+        self.peek_rust_attr();
+        if let Some(tok) = self.try_step_literal(start, start_line, checked)? {
+            return Ok(Some(tok));
+        }
+        Ok(Some(self.step_code_or_punct(top, start, start_line)))
     }
 }
 
-fn advance_cfg_test_delim(
-    byte: u8,
-    bracket_depth: &mut usize,
-    paren_depth: &mut usize,
-    cfg_braces: &mut usize,
-    in_braced_item: &mut bool,
-) -> bool {
-    match byte {
-        b'[' => *bracket_depth += 1,
-        b']' => *bracket_depth = bracket_depth.saturating_sub(1),
-        b'(' => *paren_depth += 1,
-        b')' => *paren_depth = paren_depth.saturating_sub(1),
-        b'{' => {
-            if *bracket_depth == 0 && *paren_depth == 0 {
-                *in_braced_item = true;
-            }
-            *cfg_braces += 1;
-        }
-        b'}' => {
-            *cfg_braces = cfg_braces.saturating_sub(1);
-            return *in_braced_item && *cfg_braces == 0 && *bracket_depth == 0 && *paren_depth == 0;
-        }
-        b';' if !*in_braced_item && *bracket_depth == 0 && *paren_depth == 0 && *cfg_braces == 0 => {
-            return true;
-        }
-        _ => {}
-    }
-    false
-}
-
-/// Run the unified pushdown byte lexer in sentinel-blanking mode.
+/// Run the unified zero-copy `LexCursor<'a>` in sentinel-blanking mode.
 /// Preserves exact 1:1 byte length and `\n` offsets while capturing `#[cfg(test)]` spans.
 pub fn blank_noise_sentinel(ext: &str, content: &str) -> SentinelLex {
     let lang = LangKind::from_ext(ext);
     let bytes = content.as_bytes();
-    if lang == LangKind::Python {
-        let mut out = bytes.to_vec();
-        let mut modes = vec![LexMode::Standard];
-        lex_python_sentinel(bytes, &mut out, &mut modes);
-        return SentinelLex { bytes: out, test_spans: Vec::new() };
-    }
-    SentinelLexer::new(lang, bytes).run()
-}
+    let mut out = bytes.to_vec();
+    let mut test_spans = Vec::new();
+    let mut active_test: Option<(usize, usize)> = None;
+    let mut cursor = LexCursor::new(lang, bytes);
 
-fn scan_template_sentinel(
-    bytes: &[u8],
-    mut i: usize,
-    brace_depth: usize,
-    modes: &mut Vec<LexMode>,
-) -> usize {
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c == b'\\' {
-            i = (i + 2).min(bytes.len());
+    while let Some(tok) = cursor.next_token() {
+        let is_blanked_comment = matches!(tok.kind, LexKind::LineComment | LexKind::BlockComment)
+            || (lang == LangKind::Python && tok.kind == LexKind::StrLit && tok.flags.is_doc_comment());
+        if is_blanked_comment {
+            if let Some((s, e)) = active_test.take()
+                && s < e
+            {
+                test_spans.push((s, e));
+            }
+            blank_range(&mut out, tok.start, tok.end);
             continue;
         }
-        if bytes.get(i..i + 2) == Some(b"${") {
-            modes.push(LexMode::Template { brace_depth });
-            return i + 2;
-        }
-        if c == b'`' {
-            return i + 1;
-        }
-        i += 1;
-    }
-    i
-}
-
-fn step_py_fstring_text(
-    bytes: &[u8],
-    pos: usize,
-    quote: u8,
-    triple: bool,
-    modes: &mut Vec<LexMode>,
-) -> usize {
-    let byte = bytes[pos];
-    if byte == b'\\' {
-        return (pos + 2).min(bytes.len());
-    }
-    if bytes.get(pos..pos + 2) == Some(b"{{") || bytes.get(pos..pos + 2) == Some(b"}}") {
-        return pos + 2;
-    }
-    if byte == b'{' {
-        if let Some(slot) = modes.last_mut() {
-            *slot = LexMode::PyFString { quote, triple, brace_depth: 1 };
-        }
-        return pos + 1;
-    }
-    if triple && bytes.get(pos..pos + 3) == Some(&[quote, quote, quote]) {
-        modes.pop();
-        return pos + 3;
-    }
-    if !triple && byte == quote {
-        modes.pop();
-        return pos + 1;
-    }
-    pos + 1
-}
-
-fn step_py_fstring_expr(
-    bytes: &[u8],
-    out: &mut [u8],
-    pos: usize,
-    quote: u8,
-    triple: bool,
-    mut brace_depth: usize,
-    modes: &mut Vec<LexMode>,
-) -> usize {
-    let byte = bytes[pos];
-    if byte == b'#' {
-        let end = to_eol(bytes, pos + 1);
-        blank_range(out, pos, end);
-        return end;
-    }
-    if matches!(byte, b'"' | b'\'') {
-        return quoted_lit(bytes, pos, true, false).0;
-    }
-    if byte == b'{' {
-        brace_depth += 1;
-    } else if byte == b'}' {
-        brace_depth = brace_depth.saturating_sub(1);
-    }
-    if let Some(slot) = modes.last_mut() {
-        *slot = LexMode::PyFString { quote, triple, brace_depth };
-    }
-    pos + 1
-}
-
-fn step_py_standard(bytes: &[u8], out: &mut [u8], pos: usize, modes: &mut Vec<LexMode>) -> usize {
-    let byte = bytes[pos];
-    if byte == b'#' {
-        let end = to_eol(bytes, pos + 1);
-        blank_range(out, pos, end);
-        return end;
-    }
-    if let Some((after_open, quote, triple)) = detect_py_fstring(bytes, pos) {
-        modes.push(LexMode::PyFString { quote, triple, brace_depth: 0 });
-        return after_open;
-    }
-    if matches!(byte, b'"' | b'\'') && bytes.get(pos..pos + 3) == Some(&[byte, byte, byte]) {
-        let end = skip_py_triple(bytes, pos + 3, byte);
-        blank_range(out, pos, end);
-        return end;
-    }
-    if matches!(byte, b'"' | b'\'') {
-        return quoted_lit(bytes, pos, true, false).0;
-    }
-    pos + 1
-}
-
-fn lex_python_sentinel(bytes: &[u8], out: &mut [u8], modes: &mut Vec<LexMode>) {
-    let mut pos = 0usize;
-    while pos < bytes.len() {
-        let top = *modes.last().unwrap_or(&LexMode::Standard);
-        pos = match top {
-            LexMode::PyFString { quote, triple, brace_depth: 0 } => {
-                step_py_fstring_text(bytes, pos, quote, triple, modes)
-            }
-            LexMode::PyFString { quote, triple, brace_depth } => {
-                step_py_fstring_expr(bytes, out, pos, quote, triple, brace_depth, modes)
-            }
-            _ => step_py_standard(bytes, out, pos, modes),
-        };
-    }
-}
-
-struct BalanceChecker<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-    line: usize,
-    prev_sig: u8,
-    prev_word: &'a [u8],
-    delims: Vec<(u8, usize)>,
-    modes: Vec<LexMode>,
-    is_rs: bool,
-    is_go: bool,
-    is_js: bool,
-    is_jsx: bool,
-}
-
-impl<'a> BalanceChecker<'a> {
-    fn new(lang: LangKind, bytes: &'a [u8]) -> Self {
-        Self {
-            bytes,
-            pos: 0,
-            line: 1,
-            prev_sig: b';',
-            prev_word: b"",
-            delims: Vec::new(),
-            modes: vec![LexMode::Standard],
-            is_rs: lang == LangKind::Rust,
-            is_go: lang == LangKind::Go,
-            is_js: lang.is_js_like(),
-            is_jsx: lang == LangKind::Jsx,
-        }
-    }
-
-    fn step_regex_literal(&mut self) {
-        if let Some(end) = scan_regex_literal(self.bytes, self.pos) {
-            self.pos = end;
-            self.prev_sig = b'0';
-            self.prev_word = b"";
-        } else {
-            self.pos += 1;
-        }
-        self.modes.pop();
-    }
-
-    fn step_jsx_text(&mut self) {
-        let byte = self.bytes[self.pos];
-        if byte == b'\n' {
-            self.line += 1;
-        } else if byte == b'<' {
-            self.modes.pop();
-            self.prev_sig = b'<';
-            self.prev_word = b"";
-        } else if byte == b'{' {
-            let depth = self.delims.len();
-            self.delims.push((b'{', self.line));
-            self.modes.push(LexMode::JsxExpr { brace_depth: depth });
-            self.prev_sig = b'{';
-            self.prev_word = b"";
-        }
-        self.pos += 1;
-    }
-
-    fn try_step_trivia_or_rust(&mut self, byte: u8) -> Result<bool, String> {
-        if byte == b'\n' || byte.is_ascii_whitespace() {
-            self.line += usize::from(byte == b'\n');
-            self.pos += 1;
-            return Ok(true);
-        }
-        if self.bytes.get(self.pos..self.pos + 2) == Some(b"//") {
-            self.pos = to_eol(self.bytes, self.pos + 2);
-            return Ok(true);
-        }
-        if self.bytes.get(self.pos..self.pos + 2) == Some(b"/*") {
-            let start = self.line;
-            let (end, nl, closed) = block_comment(self.bytes, self.pos, self.is_rs);
-            if !closed {
-                return Err(format!("unterminated block comment at L{start}"));
-            }
-            self.line += nl;
-            self.pos = end;
-            return Ok(true);
-        }
-        if self.is_rs
-            && let Some(res) = raw_str(self.bytes, self.pos)
-        {
-            return match res {
-                RawStr::Closed { end, newlines } => {
-                    self.line += newlines;
-                    self.pos = end;
-                    self.prev_sig = b'"';
-                    self.prev_word = b"";
-                    Ok(true)
-                }
-                RawStr::Unterminated => {
-                    Err(format!("unterminated Rust raw string at L{}", self.line))
-                }
-            };
-        }
-        Ok(false)
-    }
-
-    fn scan_checked_quote(&mut self, byte: u8) -> Result<(), String> {
-        if byte == b'\'' && self.is_rs {
-            self.pos = char_end(self.bytes, self.pos).unwrap_or(self.pos + 1);
-            self.prev_sig = b'\'';
-            self.prev_word = b"";
-            return Ok(());
-        }
-        let start = self.line;
-        let (end, nl, closed) =
-            quoted_lit(self.bytes, self.pos, byte != b'`', byte == b'`' || self.is_rs);
-        if !closed {
-            return Err(format!("unterminated string literal at L{start}"));
-        }
-        self.line += nl;
-        self.pos = end;
-        self.prev_sig = byte;
-        self.prev_word = b"";
-        Ok(())
-    }
-
-    fn try_step_js_or_quote(&mut self, byte: u8) -> Result<bool, String> {
-        if self.is_js
-            && byte == b'/'
-            && allow_regex(self.prev_sig, self.prev_word)
-            && scan_regex_literal(self.bytes, self.pos).is_some()
-        {
-            self.modes.push(LexMode::RegexLiteral);
-            return Ok(true);
-        }
-        if self.is_js && byte == b'`' {
-            self.pos += 1;
-            scan_template_checked(
-                self.bytes,
-                &mut self.pos,
-                &mut self.line,
-                self.delims.len(),
-                &mut self.modes,
-            )?;
-            self.prev_sig = b'`';
-            self.prev_word = b"";
-            return Ok(true);
-        }
-        if self.is_jsx && byte == b'>' && self.prev_sig != b'=' {
-            self.pos += 1;
-            self.prev_sig = b'>';
-            self.prev_word = b"";
-            if lookahead_jsx_text(self.bytes, self.pos) {
-                self.modes.push(LexMode::JsxText);
-            }
-            return Ok(true);
-        }
-        if byte == b'"' || (self.is_go && byte == b'`') || byte == b'\'' {
-            self.scan_checked_quote(byte)?;
-            return Ok(true);
-        }
-        if self.is_js && (byte.is_ascii_alphabetic() || byte == b'_') {
-            let start = self.pos;
-            while self.pos < self.bytes.len() && ident_byte(self.bytes[self.pos]) {
-                self.pos += 1;
-            }
-            self.prev_word = &self.bytes[start..self.pos];
-            self.prev_sig = self.bytes[self.pos - 1];
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    fn step_standard(&mut self, top: LexMode) -> Result<(), String> {
-        let byte = self.bytes[self.pos];
-        if self.try_step_trivia_or_rust(byte)? || self.try_step_js_or_quote(byte)? {
-            return Ok(());
-        }
-        self.prev_word = b"";
-        if matches!(byte, b'{' | b'(' | b'[') {
-            self.delims.push((byte, self.line));
-        } else if matches!(byte, b'}' | b')' | b']') {
-            pop_delim(byte, self.line, &mut self.delims)?;
-            if let LexMode::JsxExpr { brace_depth } = top
-                && byte == b'}'
-                && self.delims.len() == brace_depth
-            {
-                self.modes.pop();
-            }
-        }
-        self.prev_sig = byte;
-        self.pos += 1;
-        Ok(())
-    }
-
-    fn run(mut self) -> Result<(), String> {
-        while self.pos < self.bytes.len() {
-            let top = *self.modes.last().unwrap_or(&LexMode::Standard);
-            match top {
-                LexMode::RegexLiteral => self.step_regex_literal(),
-                LexMode::JsxText => self.step_jsx_text(),
-                LexMode::Template { brace_depth }
-                    if self.bytes[self.pos] == b'}' && self.delims.len() == brace_depth =>
+        if tok.flags.in_test() {
+            if tok.flags.in_attr() {
+                if let Some((s, e)) = active_test.take()
+                    && s < e
                 {
-                    self.modes.pop();
-                    self.pos += 1;
-                    scan_template_checked(
-                        self.bytes,
-                        &mut self.pos,
-                        &mut self.line,
-                        self.delims.len(),
-                        &mut self.modes,
-                    )?;
-                    self.prev_sig = b'`';
-                    self.prev_word = b"";
+                    test_spans.push((s, e));
                 }
-                LexMode::Standard | LexMode::JsxExpr { .. } | LexMode::Template { .. } => {
-                    self.step_standard(top)?;
-                }
-                LexMode::PyFString { .. } | LexMode::RustCfgTest { .. } => {
-                    self.modes.pop();
-                }
+                blank_range(&mut out, tok.start, tok.end);
+            } else if tok.kind != LexKind::Newline {
+                let prev_end = match &mut active_test {
+                    Some((_, end)) => {
+                        let old = *end;
+                        *end = tok.end;
+                        old
+                    }
+                    None => {
+                        active_test = Some((tok.start, tok.end));
+                        tok.start
+                    }
+                };
+                blank_range(&mut out, prev_end, tok.end);
             }
+        } else if tok.kind != LexKind::Newline
+            && let Some((s, e)) = active_test.take()
+            && s < e
+        {
+            test_spans.push((s, e));
         }
-        if self.modes.iter().any(|mode| matches!(mode, LexMode::Template { .. })) {
-            return Err("unterminated JS/TS template literal interpolation".into());
-        }
-        if let Some((open, open_line)) = self.delims.pop() {
-            return Err(format!("unclosed `{}` opened at L{open_line}", open as char));
-        }
-        Ok(())
     }
+    if let Some((s, e)) = active_test
+        && s < e
+    {
+        test_spans.push((s, e));
+    }
+    SentinelLex { bytes: out, test_spans }
 }
 
 /// Unified pushdown stateful brace & literal balance checker across Rust, TS, JS, JSX, and Go.
@@ -1213,39 +1455,29 @@ pub fn check_balanced_syntax(rel_path: &str, source: &str) -> Result<(), String>
     if !matches!(lang, LangKind::Rust | LangKind::Go | LangKind::Js | LangKind::Jsx) {
         return Ok(());
     }
-    BalanceChecker::new(lang, source.as_bytes()).run()
-}
-
-fn scan_template_checked(
-    bytes: &[u8],
-    i: &mut usize,
-    line: &mut usize,
-    brace_depth: usize,
-    modes: &mut Vec<LexMode>,
-) -> Result<(), String> {
-    let start = *line;
-    while *i < bytes.len() {
-        let c = bytes[*i];
-        if c == b'\\' {
-            *i = (*i + 2).min(bytes.len());
-            continue;
+    let mut cursor = LexCursor::new(lang, source.as_bytes());
+    let mut delims: Vec<(u8, u32)> = Vec::new();
+    while let Some(tok) = cursor.next_checked()? {
+        match tok.kind {
+            LexKind::LBrace => delims.push((b'{', tok.line)),
+            LexKind::LParen => delims.push((b'(', tok.line)),
+            LexKind::LBracket => delims.push((b'[', tok.line)),
+            LexKind::RBrace => pop_delim(b'}', tok.line, &mut delims)?,
+            LexKind::RParen => pop_delim(b')', tok.line, &mut delims)?,
+            LexKind::RBracket => pop_delim(b']', tok.line, &mut delims)?,
+            _ => {}
         }
-        *line += usize::from(c == b'\n');
-        if bytes.get(*i..*i + 2) == Some(b"${") {
-            *i += 2;
-            modes.push(LexMode::Template { brace_depth });
-            return Ok(());
-        }
-        if c == b'`' {
-            *i += 1;
-            return Ok(());
-        }
-        *i += 1;
     }
-    Err(format!("unterminated template literal at L{start}"))
+    if cursor.has_unclosed_template() {
+        return Err("unterminated JS/TS template literal interpolation".into());
+    }
+    if let Some((open, open_line)) = delims.pop() {
+        return Err(format!("unclosed `{}` opened at L{open_line}", open as char));
+    }
+    Ok(())
 }
 
-fn pop_delim(b: u8, line: usize, stack: &mut Vec<(u8, usize)>) -> Result<(), String> {
+fn pop_delim(b: u8, line: u32, stack: &mut Vec<(u8, u32)>) -> Result<(), String> {
     let expected = match b {
         b'}' => b'{',
         b')' => b'(',
@@ -1308,5 +1540,43 @@ mod tests {
         assert!(check_balanced_syntax("src/V.tsx", tsx).is_ok());
         let lexed_tsx = blank_noise_sentinel("tsx", tsx);
         assert!(lexed_tsx.to_clean_string(tsx).contains("runAction"));
+    }
+
+    #[test]
+    fn test_lex_cursor_flags_and_shared_helpers() {
+        let rs = concat!(
+            "/// Doc comment\n",
+            "// SAFETY: verified\n",
+            "#[cfg(unix)]\n",
+            "pub fn os_only<'a>(x: &'a str) -> char { 'z' }\n",
+            "#[cfg(test)]\n",
+            "mod tests { fn inner() {} }\n",
+        );
+        let mut cursor = LexCursor::new(LangKind::Rust, rs.as_bytes());
+        let mut saw_doc = false;
+        let mut saw_safety = false;
+        let mut saw_os = false;
+        let mut saw_test = false;
+        let mut saw_char = false;
+        while let Some(tok) = cursor.next_token() {
+            saw_doc |= tok.kind == LexKind::LineComment && tok.flags.is_doc_comment();
+            saw_safety |= tok.kind == LexKind::LineComment && tok.flags.has(TokFlags::SAFETY_COMMENT);
+            saw_os |= tok.kind == LexKind::Ident && tok.as_str() == "os_only" && tok.flags.has(TokFlags::IN_OS_CFG);
+            saw_test |= tok.kind == LexKind::Ident && tok.as_str() == "inner" && tok.flags.in_test();
+            saw_char |= tok.kind == LexKind::CharLit && tok.as_str() == "'z'";
+        }
+        assert!(saw_doc && saw_safety && saw_os && saw_test && saw_char);
+
+        assert_eq!(
+            iter_backtick_spans("see `src/lex.rs` and `foo()`").collect::<Vec<_>>(),
+            vec!["src/lex.rs", "foo()"]
+        );
+        assert_eq!(find_ascii_ci(b"Hello ReFiT:Ignore", b"refit:ignore"), Some(6));
+        assert_eq!(
+            iter_idents(b"let foo_1 = bar2 + 99;").collect::<Vec<_>>(),
+            vec![b"let".as_slice(), b"foo_1", b"bar2"]
+        );
+        assert_eq!(extract_comment_body("rs", "  /// hello world"), Some("hello world"));
+        assert_eq!(extract_comment_body("py", "  # py note"), Some("py note"));
     }
 }

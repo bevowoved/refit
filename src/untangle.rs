@@ -1,17 +1,15 @@
-mod clones;
 mod infra;
-mod simiflow;
+mod similarity;
 #[cfg(any(feature = "ste100", test))]
 pub mod ste100;
 
-use crate::graph::dag_from;
 use crate::hygiene::HygieneScorer;
-use crate::lex::blank_noise_sentinel;
-use crate::platform::{walk_tree, write_atomic};
-use crate::source::{
-    count_lines, entrypoint, ext_of, rel_norm, source_rel, supported_ext, test_path,
+use crate::lex::{
+    LangKind, LexCursor, LexKind, extract_comment_body, find_ascii_ci, iter_backtick_spans,
 };
-use crate::stem::{SymbolGraph, csr, genome, index_repo};
+use crate::platform::write_atomic;
+use crate::source::{RepoSnapshot, count_lines, entrypoint, ext_of, read_bytes, test_path};
+use crate::stem::{SymbolGraph, analysis, index_repo_snap};
 use crate::types::{
     AuditReport, DocDriftFinding, GodFileScore, InfraFinding, RoleCluster, SustainFiles,
     TriageEntry, UnusedDep,
@@ -19,7 +17,13 @@ use crate::types::{
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditScope {
+    Full,
+    Sustain,
+}
 
 #[cfg(test)]
 pub fn scan_infra(repo_root: &Path) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>) {
@@ -28,39 +32,65 @@ pub fn scan_infra(repo_root: &Path) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>
 
 /// Audit clones, dead symbols, large files, duplicate roles, unused deps, and infra configs.
 pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditReport> {
-    let constrained = crate::platform::budget().is_constrained();
-    let (source_rels, mut preloaded) = load_sources(repo_root, constrained);
-    let preload_opt = (!constrained).then_some(&preloaded);
-    let (discovery, snap) = index_repo(repo_root, preload_opt);
-    // Pre-warm hygiene cache via scheduled batch scoring BEFORE `dag_from` so cold audit
-    // never falls back to sequential per-unit scoring inside `build_unit`.
-    let (hygiene_median, hygiene_p10, per_file_h) =
-        hygiene.score_files(repo_root, &source_rels, preload_opt);
-    let plan = dag_from(repo_root, discovery, hygiene, preload_opt)?;
-    if constrained {
-        crate::platform::collect_os_memory();
-        preloaded = load_bounded_bytes(repo_root, &source_rels);
-    }
+    untangle_repo_with_scope(repo_root, hygiene, AuditScope::Full)
+}
 
-    let clone_clusters = clones::find_clones(&source_rels, &preloaded);
-    let (god_files, orphan_files) = rank_files(&source_rels, &preloaded, &per_file_h, &snap);
-    let capability_clusters = simiflow::find_capability_clusters(&source_rels, &preloaded);
-    let doc_drift_findings = if cfg!(any(feature = "doc-drift", test)) {
-        scan_doc_drift(repo_root, &source_rels, &preloaded, &snap)
-    } else {
-        Vec::new()
-    };
-    let (total_infra_files, unused_deps, infra_findings) = if constrained {
-        preloaded.clear();
-        crate::platform::collect_os_memory();
-        infra::scan_parts(repo_root, None)
-    } else {
-        infra::scan_parts(repo_root, Some(&preloaded))
-    };
-    let genome_summary = genome::analyze_git_cochange(repo_root, &source_rels);
-    let genome_twins = genome::format_genome_twins(&genome_summary, 25);
-    let deep_module_findings =
-        csr::deep_module_findings(&source_rels, &snap.runtime_edges, &snap.metrics_by_file);
+/// Scoped repository audit allowing `sustain` to skip genome, simiflow, deep-module, and doc-drift.
+pub fn untangle_repo_with_scope(
+    repo_root: &Path,
+    hygiene: &HygieneScorer,
+    scope: AuditScope,
+) -> Result<AuditReport> {
+    let repo_snap = RepoSnapshot::capture(repo_root, true);
+    let source_rels = &repo_snap.source_rels;
+    let preloaded = &repo_snap.preloaded;
+    tracing::debug!(
+        sources = source_rels.len(),
+        preloaded_bytes = repo_snap.total_preloaded_bytes,
+        "captured single-walk repository snapshot"
+    );
+
+    let (_discovery, sym_graph) = index_repo_snap(repo_root, &repo_snap);
+    let (hygiene_median, hygiene_p10, per_file_h) =
+        hygiene.score_files(repo_root, source_rels, Some(preloaded));
+
+    let (csr, _) = analysis::CsrGraph::from_named_edges(source_rels, &sym_graph.runtime_edges);
+    let sccs = csr.pearce_scc();
+    let scc_count = sccs.iter().filter(|c| c.len() >= 2).count();
+
+    let clone_clusters = similarity::find_clones(source_rels, preloaded);
+    let (god_files, orphan_files) = rank_files(repo_root, source_rels, preloaded, &per_file_h, &sym_graph);
+    let (total_infra_files, unused_deps, infra_findings) = infra::scan_parts_snap(repo_root, &repo_snap);
+
+    let (capability_clusters, doc_drift_findings, genome_twins, deep_module_findings) =
+        if scope == AuditScope::Full {
+            let caps = similarity::find_capability_clusters(source_rels, preloaded);
+            let drift = if cfg!(any(feature = "doc-drift", test)) {
+                scan_doc_drift(repo_root, &repo_snap, &sym_graph)
+            } else {
+                Vec::new()
+            };
+            let genome_summary = analysis::analyze_git_cochange(repo_root, source_rels);
+            let twins = analysis::format_genome_twins(&genome_summary, 25);
+            let arch = analysis::ArchGraphRef {
+                all_edges: &sym_graph.edges,
+                runtime_edges: &sym_graph.runtime_edges,
+                metrics: &sym_graph.metrics_by_file,
+                defs_by_file: Some(&sym_graph.defs_by_file),
+                refs_by_file: Some(&sym_graph.refs_by_file),
+            };
+            let ego_map = analysis::build_ego_contexts(
+                source_rels,
+                &sccs,
+                &arch,
+                &genome_summary.file_commits,
+                &clone_clusters,
+            );
+            let deep = analysis::deep_module_findings_with_csr(source_rels, &sccs, &arch, &ego_map);
+            (caps, drift, twins, deep)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
 
     let triage_plan = build_triage(
         &infra_findings,
@@ -76,8 +106,8 @@ pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditR
         total_infra_files,
         hygiene_median,
         hygiene_p10,
-        scc_count: plan.scc_count,
-        dead_symbols: snap.dead_symbols.into_iter().take(80).collect(),
+        scc_count,
+        dead_symbols: sym_graph.dead_symbols.into_iter().take(80).collect(),
         orphan_files,
         clone_clusters,
         god_files,
@@ -92,43 +122,8 @@ pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditR
     })
 }
 
-fn load_sources(repo_root: &Path, constrained: bool) -> (Vec<String>, BTreeMap<String, Vec<u8>>) {
-    let mut preloaded = BTreeMap::new();
-    let mut source_rels = Vec::new();
-
-    for path in walk_tree(repo_root, None, false) {
-        if !supported_ext(&ext_of(&path)) {
-            continue;
-        }
-        let Some(rel) = rel_norm(repo_root, &path) else { continue };
-        if source_rel(&rel) {
-            source_rels.push(rel.clone());
-        }
-        if !constrained && let Ok(bytes) = fs::read(&path) {
-            preloaded.insert(rel, bytes);
-        }
-    }
-
-    source_rels.sort();
-    (source_rels, preloaded)
-}
-
-fn load_bounded_bytes(repo_root: &Path, source_rels: &[String]) -> BTreeMap<String, Vec<u8>> {
-    const MAX_CONSTRAINED_FILE_BYTES: u64 = 1024 * 1024;
-    let mut map = BTreeMap::new();
-    for rel in source_rels {
-        let path = repo_root.join(rel);
-        let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        if len <= MAX_CONSTRAINED_FILE_BYTES
-            && let Ok(bytes) = fs::read(&path)
-        {
-            map.insert(rel.clone(), bytes);
-        }
-    }
-    map
-}
-
 fn rank_files(
+    repo_root: &Path,
     source_rels: &[String],
     preloaded: &BTreeMap<String, Vec<u8>>,
     per_file_h: &HashMap<String, crate::types::HygieneResult>,
@@ -138,7 +133,11 @@ fn rank_files(
     let mut orphans = Vec::new();
 
     for rel in source_rels {
-        let loc = preloaded.get(rel).map(|b| count_lines(b)).unwrap_or(0);
+        let loc = preloaded
+            .get(rel)
+            .map(|b| count_lines(b))
+            .or_else(|| read_bytes(repo_root, rel, None).map(|b| count_lines(&b)))
+            .unwrap_or(0);
         let h_score = per_file_h.get(rel).map(|h| h.score).unwrap_or(0.90);
         let fi = snap.fan_in.get(rel).copied().unwrap_or(0);
         let fo = snap.fan_out.get(rel).copied().unwrap_or(0);
@@ -454,9 +453,6 @@ pub fn write_sustain_ste100(
 // Folded ReCite / DOCER documentation & comment drift scanner
 // ---------------------------------------------------------------------------
 
-const DOC_FILENAMES: &[&str] = &[
-    "readme.md", "claude.md", "agents.md", ".cursorrules", "contributing.md", "architecture.md",
-];
 const KNOWN_PATH_ROOTS: &[&str] = &[
     "src", "lib", "app", "pkg", "packages", "crates", "cmd", "internal", "tests", "docs",
     "scripts", "infra", ".github", "config", "migrations", "ui", "skills",
@@ -500,12 +496,10 @@ struct DriftCtx<'a> {
     npm_scripts: Option<&'a BTreeSet<String>>,
 }
 
-/// Zero-LLM ReCite / DOCER scanner consuming `SymbolGraph.defs_by_file` + `refs_by_file`
-/// directly and skipping test-only paths and Rust `#[cfg(test)]` blocks.
+/// Zero-LLM ReCite / DOCER scanner reusing `RepoSnapshot` and `LexCursor` (`!in_test`).
 fn scan_doc_drift(
     repo_root: &Path,
-    source_rels: &[String],
-    preloaded: &BTreeMap<String, Vec<u8>>,
+    repo_snap: &RepoSnapshot,
     snap: &SymbolGraph,
 ) -> Vec<DocDriftFinding> {
     let known_symbols: BTreeSet<String> = snap
@@ -514,7 +508,14 @@ fn scan_doc_drift(
         .chain(snap.refs_by_file.values())
         .flat_map(|syms| syms.iter().cloned())
         .collect();
-    let (repo_files, repo_dirs, doc_files) = collect_repo_inventory(repo_root, source_rels, preloaded);
+    let mut repo_files = BTreeSet::new();
+    let mut repo_dirs = BTreeSet::new();
+    for rel in &repo_snap.all_rels {
+        repo_files.insert(rel.clone());
+        if let Some((top, _)) = rel.split_once('/') {
+            repo_dirs.insert(top.to_string());
+        }
+    }
     let npm_scripts = load_package_scripts(repo_root);
     let ctx = DriftCtx {
         repo_root,
@@ -525,60 +526,29 @@ fn scan_doc_drift(
     };
 
     let mut findings = Vec::new();
-    for (rel, abs) in &doc_files {
+    for (rel, abs) in &repo_snap.doc_rels {
         if let Ok(content) = fs::read_to_string(abs) {
             scan_markdown_doc(&ctx, rel, &content, &mut findings);
         }
     }
-    for rel in source_rels {
+    for rel in &repo_snap.source_rels {
         if test_path(rel) {
             continue;
         }
-        let Some(bytes) = preloaded.get(rel) else { continue };
-        let content = String::from_utf8_lossy(bytes);
+        let Some(bytes) = read_bytes(repo_root, rel, Some(&repo_snap.preloaded)) else { continue };
+        let content = String::from_utf8_lossy(&bytes);
         scan_source_comments(&ctx, rel, &content, &mut findings);
     }
 
     findings.sort_by(|a, b| {
-        a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)).then_with(|| a.kind.cmp(&b.kind)).then_with(|| a.reference.cmp(&b.reference))
+        a.file
+            .cmp(&b.file)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.reference.cmp(&b.reference))
     });
     findings.dedup_by(|a, b| a.file == b.file && a.line == b.line && a.reference == b.reference);
     findings
-}
-
-fn collect_repo_inventory(
-    repo_root: &Path,
-    source_rels: &[String],
-    preloaded: &BTreeMap<String, Vec<u8>>,
-) -> (BTreeSet<String>, BTreeSet<String>, Vec<(String, PathBuf)>) {
-    let (mut repo_files, mut repo_dirs, mut doc_files, mut seen_docs) =
-        (BTreeSet::new(), BTreeSet::new(), Vec::new(), BTreeSet::new());
-
-    for rel in source_rels.iter().chain(preloaded.keys()) {
-        repo_files.insert(rel.clone());
-        if let Some((top, _)) = rel.split_once('/') {
-            repo_dirs.insert(top.to_string());
-        }
-    }
-    for abs in walk_tree(repo_root, None, true) {
-        let Some(rel) = rel_norm(repo_root, &abs) else { continue };
-        repo_files.insert(rel.clone());
-        if let Some((top, _)) = rel.split_once('/') {
-            repo_dirs.insert(top.to_string());
-        }
-        let lower = rel.to_ascii_lowercase();
-        let fname = lower.rsplit('/').next().unwrap_or(&lower);
-        let is_doc = DOC_FILENAMES.contains(&fname) || (lower.starts_with("docs/") && lower.ends_with(".md"));
-        if is_doc && seen_docs.insert(rel.clone()) {
-            doc_files.push((rel, abs));
-        }
-    }
-    let cursor_rules = repo_root.join(".cursorrules");
-    if cursor_rules.is_file() && seen_docs.insert(".cursorrules".into()) {
-        doc_files.push((".cursorrules".into(), cursor_rules));
-    }
-    doc_files.sort_by(|a, b| a.0.cmp(&b.0));
-    (repo_files, repo_dirs, doc_files)
 }
 
 fn load_package_scripts(repo_root: &Path) -> Option<BTreeSet<String>> {
@@ -598,30 +568,14 @@ fn scan_markdown_doc(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec
         if in_fence || trimmed.is_empty() || contains_ignore_marker(trimmed) {
             continue;
         }
-        for span in extract_backtick_spans(line) {
+        for span in iter_backtick_spans(line) {
             check_doc_span(ctx, rel, idx + 1, span, out);
         }
     }
 }
 
 fn contains_ignore_marker(text: &str) -> bool {
-    let needle = b"refit: ignore";
-    text.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
-}
-
-fn extract_backtick_spans(line: &str) -> Vec<&str> {
-    let mut spans = Vec::new();
-    let mut rest = line;
-    while let Some(open) = rest.find('`') {
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('`') else { break };
-        let span = after[..close].trim();
-        if !span.is_empty() {
-            spans.push(span);
-        }
-        rest = &after[close + 1..];
-    }
-    spans
+    find_ascii_ci(text.as_bytes(), b"refit: ignore").is_some()
 }
 
 fn check_doc_span(ctx: &DriftCtx<'_>, doc_file: &str, ln: usize, span: &str, out: &mut Vec<DocDriftFinding>) {
@@ -735,55 +689,55 @@ fn is_ignored_symbol(sym: &str) -> bool {
     IGNORED_SYMBOLS.contains(&sym.to_ascii_lowercase().as_str())
 }
 
-fn extract_comment_body<'a>(ext: &str, line: &'a str) -> Option<&'a str> {
-    let t = line.trim();
-    if ext == "py" {
-        return t.strip_prefix('#').map(str::trim);
+fn check_comment_line(
+    ctx: &DriftCtx<'_>,
+    rel: &str,
+    ln: usize,
+    comment: &str,
+    out: &mut Vec<DocDriftFinding>,
+) {
+    if comment.is_empty() || contains_ignore_marker(comment) {
+        return;
     }
-    t.strip_prefix("///")
-        .or_else(|| t.strip_prefix("//!"))
-        .or_else(|| t.strip_prefix("//"))
-        .or_else(|| t.strip_prefix("/**").map(|r| r.trim_end_matches("*/")))
-        .or_else(|| t.strip_prefix("/*").map(|r| r.trim_end_matches("*/")))
-        .or_else(|| t.strip_prefix("* "))
-        .map(str::trim)
+    for span in iter_backtick_spans(comment) {
+        if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs)
+            && !ctx.repo_files.contains(clean_path)
+            && !ctx.repo_root.join(clean_path).exists()
+        {
+            out.push(DocDriftFinding {
+                file: rel.to_string(),
+                line: ln,
+                kind: "doc_stale_path".into(),
+                reference: clean_path.to_string(),
+                message: format!("Comment cites missing file `{clean_path}`"),
+            });
+        }
+    }
+    if !ctx.known_symbols.is_empty() {
+        scan_comment_call_refs(ctx, rel, ln, comment, out);
+    }
 }
 
 fn scan_source_comments(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec<DocDriftFinding>) {
     let ext = ext_of(rel);
-    let test_spans = if ext == "rs" && content.contains("cfg(test)") {
-        blank_noise_sentinel("rs", content).test_spans
-    } else {
-        Vec::new()
-    };
-    let base_ptr = content.as_ptr() as usize;
-
-    for (idx, line) in content.lines().enumerate() {
-        let offset = (line.as_ptr() as usize).saturating_sub(base_ptr);
-        if test_spans.iter().any(|&(s, e)| offset >= s && offset < e) {
-            continue;
-        }
-        let Some(comment) = extract_comment_body(&ext, line) else { continue };
-        if comment.is_empty() || contains_ignore_marker(comment) {
-            continue;
-        }
-        let ln = idx + 1;
-        for span in extract_backtick_spans(comment) {
-            if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs)
-                && !ctx.repo_files.contains(clean_path)
-                && !ctx.repo_root.join(clean_path).exists()
-            {
-                out.push(DocDriftFinding {
-                    file: rel.to_string(),
-                    line: ln,
-                    kind: "doc_stale_path".into(),
-                    reference: clean_path.to_string(),
-                    message: format!("Comment cites missing file `{clean_path}`"),
-                });
+    if ext == "rs" {
+        let mut cursor = LexCursor::new(LangKind::Rust, content.as_bytes());
+        while let Some(tok) = cursor.next_token() {
+            if !matches!(tok.kind, LexKind::LineComment | LexKind::BlockComment) || tok.flags.in_test() {
+                continue;
+            }
+            for (offset, raw_line) in tok.as_str().lines().enumerate() {
+                if let Some(comment) = extract_comment_body("rs", raw_line) {
+                    check_comment_line(ctx, rel, (tok.line as usize) + offset, comment, out);
+                }
             }
         }
-        if !ctx.known_symbols.is_empty() {
-            scan_comment_call_refs(ctx, rel, ln, comment, out);
+        return;
+    }
+
+    for (idx, line) in content.lines().enumerate() {
+        if let Some(comment) = extract_comment_body(&ext, line) {
+            check_comment_line(ctx, rel, idx + 1, comment, out);
         }
     }
 }

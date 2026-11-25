@@ -1,6 +1,6 @@
-use crate::platform::walk_files;
+use crate::platform::{walk_files, walk_tree};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[inline]
@@ -159,6 +159,139 @@ pub fn scan_files(root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8>>>) ->
     out.tests.sort_by(|a, b| a.0.cmp(&b.0));
     out.all.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+const SNAP_DOC_FILENAMES: &[&str] = &[
+    "readme.md", "claude.md", "agents.md", ".cursorrules", "contributing.md", "architecture.md",
+];
+
+fn is_snap_infra_file(rel: &str, fname: &str, ext_lo: &str) -> bool {
+    fname.starts_with("Dockerfile")
+        || fname.ends_with(".dockerfile")
+        || ext_lo == "tf"
+        || ext_lo == "tfvars"
+        || (rel.starts_with(".github/workflows/") && matches!(ext_lo, "yml" | "yaml"))
+        || ext_lo == "sql"
+        || (fname.starts_with("docker-compose") && matches!(ext_lo, "yml" | "yaml"))
+}
+
+/// Single-walk byte-budgeted repository snapshot shared across `stem`, `hygiene`,
+/// `similarity`, `drift`, and `infra` to eliminate redundant tree walks and disk re-reads.
+pub struct RepoSnapshot {
+    pub all_rels: Vec<String>,
+    pub source_rels: Vec<String>,
+    pub doc_rels: Vec<(String, PathBuf)>,
+    pub infra_rels: Vec<(String, PathBuf)>,
+    pub manifest_rels: Vec<(String, String, PathBuf)>,
+    pub ts_configs: Vec<PathBuf>,
+    pub preloaded: BTreeMap<String, Vec<u8>>,
+    pub total_preloaded_bytes: usize,
+}
+
+impl RepoSnapshot {
+    pub fn capture(repo_root: &Path, include_hidden_configs: bool) -> Self {
+        const MIB: usize = 1024 * 1024;
+        const MAX_SINGLE_PRELOAD: u64 = 1024 * 1024;
+        let b = crate::platform::budget();
+        let max_preload = if b.is_constrained() {
+            (b.mem_gate_bytes / 4).min(4 * MIB)
+        } else {
+            32 * MIB
+        };
+
+        let mut all_rels = Vec::new();
+        let mut source_rels = Vec::new();
+        let mut doc_rels = Vec::new();
+        let mut seen_docs = BTreeSet::new();
+        let mut infra_rels = Vec::new();
+        let mut manifest_rels = Vec::new();
+        let mut ts_configs = Vec::new();
+        let mut preloaded = BTreeMap::new();
+        let mut total_preloaded_bytes = 0usize;
+
+        for abs in walk_tree(repo_root, None, include_hidden_configs) {
+            let Some(rel) = rel_norm(repo_root, &abs) else { continue };
+            let fname = abs.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let ext = ext_str(&abs);
+            all_rels.push(rel.clone());
+
+            if matches!(fname, "tsconfig.json" | "jsconfig.json") {
+                ts_configs.push(abs.clone());
+            }
+            if matches!(fname, "package.json" | "Cargo.toml" | "pyproject.toml" | "go.mod") {
+                manifest_rels.push((rel.clone(), fname.to_string(), abs.clone()));
+            }
+
+            if supported_ext(ext) {
+                if source_rel(&rel) {
+                    source_rels.push(rel.clone());
+                }
+                if total_preloaded_bytes < max_preload {
+                    let len = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(u64::MAX);
+                    if len <= MAX_SINGLE_PRELOAD
+                        && total_preloaded_bytes.saturating_add(len as usize) <= max_preload
+                        && let Ok(bytes) = std::fs::read(&abs)
+                    {
+                        total_preloaded_bytes += bytes.len();
+                        preloaded.insert(rel.clone(), bytes);
+                    }
+                }
+            } else {
+                let lower = rel.to_ascii_lowercase();
+                let fname_lo = lower.rsplit('/').next().unwrap_or(&lower);
+                let is_doc = SNAP_DOC_FILENAMES.contains(&fname_lo)
+                    || (lower.starts_with("docs/") && lower.ends_with(".md"));
+                if is_doc && seen_docs.insert(rel.clone()) {
+                    doc_rels.push((rel.clone(), abs.clone()));
+                }
+                let ext_lo = ext.to_ascii_lowercase();
+                if is_snap_infra_file(&rel, fname, &ext_lo) {
+                    infra_rels.push((rel, abs));
+                }
+            }
+        }
+
+        let cursor_rules = repo_root.join(".cursorrules");
+        if cursor_rules.is_file() && seen_docs.insert(".cursorrules".into()) {
+            doc_rels.push((".cursorrules".into(), cursor_rules));
+        }
+
+        source_rels.sort();
+        doc_rels.sort_by(|a, b| a.0.cmp(&b.0));
+        Self {
+            all_rels,
+            source_rels,
+            doc_rels,
+            infra_rels,
+            manifest_rels,
+            ts_configs,
+            preloaded,
+            total_preloaded_bytes,
+        }
+    }
+
+    pub fn to_repo_scan(&self) -> RepoScan {
+        let mut out = RepoScan { sources: Vec::new(), tests: Vec::new(), all: Vec::new() };
+        for rel in &self.all_rels {
+            let ext = ext_of(rel);
+            if !supported_ext(&ext) {
+                continue;
+            }
+            out.all.push((rel.clone(), ext.clone(), None));
+            if rel.ends_with("__init__.py") {
+                continue;
+            }
+            if test_path(rel) {
+                out.tests.push((rel.clone(), ext, None));
+            } else {
+                out.sources.push((rel.clone(), ext, None));
+            }
+        }
+        out.sources.sort_by(|a, b| a.0.cmp(&b.0));
+        out.tests.sort_by(|a, b| a.0.cmp(&b.0));
+        out.all.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
 }
 
 /// Borrow bytes from `preloaded` without cloning, or read from disk once.

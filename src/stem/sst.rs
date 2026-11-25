@@ -1,7 +1,7 @@
 //! Leaf Zstd-compressed front-coded (`k = 8`) SST index (`RFST0004`) with lazy single-block
 //! point-lookup, streaming BLAKE3 authentication, and cycle-free package ABI helpers.
 
-use super::genome::check_wipe_guard;
+use super::analysis::check_wipe_guard;
 use super::parse::FileSymbols;
 use crate::platform::{ensure_cachedir_tag, write_atomic};
 use anyhow::Result;

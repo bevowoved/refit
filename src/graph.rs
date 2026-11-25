@@ -14,7 +14,7 @@ use crate::hygiene::HygieneScorer;
 use crate::mvcc::MvccStore;
 use crate::platform::os_tag;
 use crate::source::{count_lines, ext_str, read_text, scan_files, stem_of};
-use crate::stem::csr::{CsrGraph, match_tests_inverted};
+use crate::stem::analysis::{CsrGraph, match_tests_inverted};
 use crate::stem::{EdgeScan, scan_edges};
 use crate::types::{DagPlan, ModuleUnit};
 use anyhow::{Context, Result};
@@ -95,22 +95,7 @@ pub fn dag_from(
 }
 
 fn compute_waves(source_files: &[String], edges: &[(String, String)]) -> SccWaves {
-    let mut idx_map: FxHashMap<&str, u32> =
-        FxHashMap::with_capacity_and_hasher(source_files.len(), Default::default());
-    for (i, f) in source_files.iter().enumerate() {
-        idx_map.insert(f.as_str(), i as u32);
-    }
-
-    let mut csr_edges: Vec<(u32, u32)> = Vec::with_capacity(edges.len());
-    for (src, dst) in edges {
-        if let (Some(&u), Some(&v)) = (idx_map.get(src.as_str()), idx_map.get(dst.as_str()))
-            && u != v
-        {
-            csr_edges.push((u, v));
-        }
-    }
-
-    let csr = CsrGraph::from_edges(source_files.len(), &csr_edges);
+    let (csr, csr_edges) = CsrGraph::from_named_edges(source_files, edges);
     let sccs = csr.pearce_scc();
 
     let mut file_scc = vec![0usize; source_files.len()];

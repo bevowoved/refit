@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 /// Embedded 8 KB ternary weights from `brianbell-x/codehygiene v0.7.0`.
 static WEIGHTS_NPZ: &[u8] = include_bytes!("../../vendor/codehygiene/weights.npz");
 static WEIGHTS_CACHE: OnceLock<ResolvedWeights> = OnceLock::new();
+static DEFAULT_WEIGHTS_HASH_PREFIX: OnceLock<String> = OnceLock::new();
 
 pub(super) const MAX_NPZ_ARCHIVE_BYTES: usize = 512 * 1024;
 pub(super) const MAX_NPY_ENTRY_BYTES: usize = 2 * 1024 * 1024;
@@ -173,7 +174,9 @@ pub(super) fn v07_weights() -> &'static ResolvedWeights {
 }
 
 pub(super) fn default_weights_hash_prefix() -> &'static str {
-    &v07_weights().hash_prefix
+    DEFAULT_WEIGHTS_HASH_PREFIX
+        .get_or_init(|| blake3::hash(WEIGHTS_NPZ).to_hex()[..16].to_string())
+        .as_str()
 }
 
 pub(super) fn load_verified_override(repo_root: &Path) -> Result<Option<Arc<ResolvedWeights>>> {

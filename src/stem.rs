@@ -1,15 +1,20 @@
-pub(crate) mod csr;
-pub(crate) mod genome;
+pub(crate) mod analysis;
 mod parse;
 pub(crate) mod sst;
-pub(crate) mod witness;
 
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
 use crate::platform::{mkdir_private, read_zstd, walk_files, write_zstd};
-use crate::source::{dir_of, entrypoint, ext_of, read_bytes, rel_norm, same_family, scan_files, stem_of};
+use crate::source::{
+    RepoScan, RepoSnapshot, dir_of, entrypoint, ext_of, read_bytes, rel_norm, same_family,
+    scan_files, stem_of,
+};
 use crate::types::DeadSymbol;
-use csr::{EdgeKind, ModuleMetrics};
+use analysis::{
+    BOUNDARY_ENTRYPOINT_OR_GLOB, BOUNDARY_FFI_NO_MANGLE, BOUNDARY_MACRO_DERIVE, EdgeKind,
+    ModuleMetrics, PathArena, RefWitness, WITNESS_DYNAMIC_REF, WITNESS_EXTERNAL,
+    WITNESS_GLOB_REEXPORT, WITNESS_MACRO_ATTR, check_wipe_guard, classify_symbol, hash_symbol,
+};
 use parse::{FileSymbols, parse_symbols};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -20,11 +25,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
-use witness::{
-    BOUNDARY_ENTRYPOINT_OR_GLOB, BOUNDARY_FFI_NO_MANGLE, BOUNDARY_MACRO_DERIVE, PathArena,
-    RefWitness, WITNESS_DYNAMIC_REF, WITNESS_EXTERNAL, WITNESS_GLOB_REEXPORT, WITNESS_MACRO_ATTR,
-    classify_symbol, hash_symbol,
-};
 
 const CACHE_VERSION: &str = "0.6.0";
 
@@ -66,12 +66,15 @@ pub struct SymbolGraph {
 struct SymbolCache {
     version: String,
     files: BTreeMap<String, FileSymbols>,
+    #[serde(default)]
+    test_hashes: BTreeMap<String, (String, Vec<u64>)>,
 }
 
 #[derive(Serialize)]
 struct SymbolCacheRef<'a> {
     version: &'a str,
     files: &'a BTreeMap<String, FileSymbols>,
+    test_hashes: &'a BTreeMap<String, (String, Vec<u64>)>,
 }
 
 struct TsConfigScope {
@@ -116,7 +119,7 @@ pub fn scan_edges(
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> EdgeScan {
     let started = Instant::now();
-    let (mut disc, _, _, _) = discover_internal(repo_root, preloaded);
+    let (mut disc, _, _, _) = discover_internal(repo_root, preloaded, None);
     let mut edge_set: HashSet<(String, String)> = disc.edges.into_iter().collect();
     let mut rt_set: HashSet<(String, String)> = disc.runtime_edges.into_iter().collect();
 
@@ -205,19 +208,26 @@ fn query_ext(
     used
 }
 
+#[cfg(test)]
 pub fn index_repo(
     repo_root: &Path,
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> (EdgeScan, SymbolGraph) {
-    let (disc, _, _, snap) = discover_internal(repo_root, preloaded);
+    let (disc, _, _, snap) = discover_internal(repo_root, preloaded, None);
     (disc, snap)
+}
+
+/// Snapshot-backed repository indexing sharing the single `RepoSnapshot` tree walk and `ts_configs`.
+pub fn index_repo_snap(repo_root: &Path, snap: &RepoSnapshot) -> (EdgeScan, SymbolGraph) {
+    let (disc, _, _, graph) = discover_internal(repo_root, Some(&snap.preloaded), Some(snap));
+    (disc, graph)
 }
 
 pub fn load_symbols(
     repo_root: &Path,
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> SymbolGraph {
-    discover_internal(repo_root, preloaded).3
+    discover_internal(repo_root, preloaded, None).3
 }
 
 pub fn query_symbols(repo_root: &Path, symbol: Option<&str>, file: Option<&str>) -> Value {
@@ -317,7 +327,7 @@ fn top_fan(map: &HashMap<String, usize>, limit: usize) -> Vec<(String, usize)> {
 
 #[cfg(test)]
 pub fn index_stats(repo_root: &Path) -> (EdgeScan, usize, usize) {
-    let (d, p, c, _) = discover_internal(repo_root, None);
+    let (d, p, c, _) = discover_internal(repo_root, None, None);
     (d, p, c)
 }
 
@@ -404,18 +414,22 @@ fn load_tsconfig_resolved(
     (base, aliases)
 }
 
-fn discover_ts_scopes(repo_root: &Path) -> Vec<TsConfigScope> {
+fn discover_ts_scopes(repo_root: &Path, pre_ts_configs: Option<&[PathBuf]>) -> Vec<TsConfigScope> {
     let mut cfg_paths = Vec::new();
-    let root_cfg = repo_root.join("tsconfig.json");
-    if root_cfg.exists() {
-        cfg_paths.push(root_cfg);
-    }
-    for p in walk_files(repo_root, None) {
-        if let Some(name) = p.file_name().and_then(|s| s.to_str())
-            && matches!(name, "tsconfig.json" | "jsconfig.json")
-            && !cfg_paths.contains(&p)
-        {
-            cfg_paths.push(p);
+    if let Some(found) = pre_ts_configs {
+        cfg_paths.extend(found.iter().cloned());
+    } else {
+        let root_cfg = repo_root.join("tsconfig.json");
+        if root_cfg.exists() {
+            cfg_paths.push(root_cfg);
+        }
+        for p in walk_files(repo_root, None) {
+            if let Some(name) = p.file_name().and_then(|s| s.to_str())
+                && matches!(name, "tsconfig.json" | "jsconfig.json")
+                && !cfg_paths.contains(&p)
+            {
+                cfg_paths.push(p);
+            }
         }
     }
 
@@ -598,6 +612,7 @@ fn build_tables(
     repo_root: &Path,
     sources: &[(String, String, Option<PathBuf>)],
     all_files: &[(String, String, Option<PathBuf>)],
+    pre_ts_configs: Option<&[PathBuf]>,
 ) -> LookupTables {
     let go_mods = discover_go_modules(repo_root);
     let mut tbl = LookupTables {
@@ -606,7 +621,7 @@ fn build_tables(
         stem_to_rels: FxHashMap::default(),
         go_pkg_rels: FxHashMap::default(),
         go_full_pkg_rels: FxHashMap::default(),
-        ts_scopes: discover_ts_scopes(repo_root),
+        ts_scopes: discover_ts_scopes(repo_root, pre_ts_configs),
         rs_crate_roots: Vec::new(),
     };
 
@@ -676,6 +691,7 @@ fn load_cached_symbols(repo_root: &Path) -> SymbolCache {
         return SymbolCache {
             version: CACHE_VERSION.to_string(),
             files,
+            test_hashes: BTreeMap::new(),
         };
     }
     SymbolCache::default()
@@ -684,13 +700,14 @@ fn load_cached_symbols(repo_root: &Path) -> SymbolCache {
 fn persist_symbol_caches(
     repo_root: &Path,
     new_files: &BTreeMap<String, FileSymbols>,
+    new_test_hashes: &BTreeMap<String, (String, Vec<u64>)>,
     edges: &[(String, String)],
     runtime_edges: &[(String, String)],
     prev_len: usize,
 ) {
     let cache_path = repo_root.join(".refit/cache/symbol_index.zst");
     let sst_path = repo_root.join(".refit/cache/sym.sst");
-    if genome::check_wipe_guard(prev_len, new_files.len()) {
+    if check_wipe_guard(prev_len, new_files.len()) {
         tracing::warn!(
             prev_files = prev_len,
             new_files = new_files.len(),
@@ -716,6 +733,7 @@ fn persist_symbol_caches(
         let next_ref = SymbolCacheRef {
             version: CACHE_VERSION,
             files: new_files,
+            test_hashes: new_test_hashes,
         };
         if write_zstd(&cache_path, &next_ref).is_ok() {
             let _ = std::fs::remove_file(&sst_path);
@@ -726,12 +744,21 @@ fn persist_symbol_caches(
 fn discover_internal(
     repo_root: &Path,
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
+    repo_snap: Option<&RepoSnapshot>,
 ) -> (EdgeScan, usize, usize, SymbolGraph) {
     let started = Instant::now();
     let prev = load_cached_symbols(repo_root);
 
-    let scan = scan_files(repo_root, preloaded);
-    let tables = build_tables(repo_root, &scan.sources, &scan.all);
+    let scan: RepoScan = match repo_snap {
+        Some(s) => s.to_repo_scan(),
+        None => scan_files(repo_root, preloaded),
+    };
+    let tables = build_tables(
+        repo_root,
+        &scan.sources,
+        &scan.all,
+        repo_snap.map(|s| s.ts_configs.as_slice()),
+    );
 
     let parse_one = |(rel, ext, _): &(String, String, Option<PathBuf>)| -> Option<(String, FileSymbols, bool)> {
         let bytes = read_bytes(repo_root, rel, preloaded)?;
@@ -761,18 +788,25 @@ fn discover_internal(
     }
 
     let (edges, runtime_edges, glob_reexport_targets) = collect_edges(&new_files, &tables);
+    let (new_test_hashes, test_changed) =
+        collect_test_hashes_cached(repo_root, preloaded, &scan.tests, &prev.test_hashes);
     let want_sst = should_use_sst(new_files.len(), estimate_symbol_json_bytes(&new_files));
     let cache_exists = repo_root.join(".refit/cache/symbol_index.zst").is_file();
     let sst_exists = repo_root.join(".refit/cache/sym.sst").is_file();
     let format_mismatch = if want_sst { !sst_exists || cache_exists } else { !cache_exists || sst_exists };
-    if parsed_n > 0 || prev.files.len() != new_files.len() || format_mismatch {
-        persist_symbol_caches(repo_root, &new_files, &edges, &runtime_edges, prev.files.len());
+    if parsed_n > 0 || test_changed || prev.files.len() != new_files.len() || format_mismatch {
+        persist_symbol_caches(
+            repo_root,
+            &new_files,
+            &new_test_hashes,
+            &edges,
+            &runtime_edges,
+            prev.files.len(),
+        );
     }
     let snap = build_graph(
-        repo_root,
-        preloaded,
         new_files,
-        &scan.tests,
+        &new_test_hashes,
         &edges,
         &runtime_edges,
         &glob_reexport_targets,
@@ -904,15 +938,22 @@ fn record_source_witnesses(
     }
 }
 
-fn fold_test_witnesses(
+type TestHashMap = BTreeMap<String, (String, Vec<u64>)>;
+
+fn collect_test_hashes_cached(
     repo_root: &Path,
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
     tests: &[(String, String, Option<PathBuf>)],
-    arena: &mut PathArena,
-    witnesses: &mut FxHashMap<u64, RefWitness>,
-) {
-    let scan_test = |(rel, ext, _): &(String, String, Option<PathBuf>)| -> Option<(String, Vec<u64>)> {
+    prev_test_hashes: &TestHashMap,
+) -> (TestHashMap, bool) {
+    let scan_test = |(rel, ext, _): &(String, String, Option<PathBuf>)| -> Option<(String, String, Vec<u64>, bool)> {
         let bytes = read_bytes(repo_root, rel, preloaded)?;
+        let hash = MvccStore::hash_bytes(&bytes);
+        if let Some((prev_h, cached_ids)) = prev_test_hashes.get(rel)
+            && prev_h == &hash
+        {
+            return Some((rel.clone(), hash, cached_ids.clone(), false));
+        }
         let parsed = parse_symbols(ext, &String::from_utf8_lossy(&bytes), String::new());
         let mut hashes: Vec<u64> = parsed
             .refs_tokens
@@ -922,21 +963,22 @@ fn fold_test_witnesses(
             .collect();
         hashes.sort_unstable();
         hashes.dedup();
-        Some((rel.clone(), hashes))
+        Some((rel.clone(), hash, hashes, true))
     };
 
-    let test_hashes: Vec<(String, Vec<u64>)> = if crate::platform::budget().is_constrained() {
+    let rows: Vec<(String, String, Vec<u64>, bool)> = if crate::platform::budget().is_constrained() {
         tests.iter().filter_map(scan_test).collect()
     } else {
         tests.par_iter().filter_map(scan_test).collect()
     };
 
-    for (trel, hashes) in test_hashes {
-        let tid = arena.intern(&trel);
-        for hash in hashes {
-            witnesses.entry(hash).or_default().record_test(tid);
-        }
+    let mut changed = rows.len() != prev_test_hashes.len();
+    let mut map = BTreeMap::new();
+    for (rel, hash, ids, was_parsed) in rows {
+        changed |= was_parsed;
+        map.insert(rel, (hash, ids));
     }
+    (map, changed)
 }
 
 fn collect_dead_symbols_for_file(
@@ -970,28 +1012,30 @@ fn collect_dead_symbols_for_file(
 }
 
 fn build_graph(
-    repo_root: &Path,
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
     files: BTreeMap<String, FileSymbols>,
-    tests: &[(String, String, Option<PathBuf>)],
+    test_hashes: &TestHashMap,
     edges: &[(String, String)],
     runtime_edges: &[(String, String)],
     glob_targets: &FxHashSet<String>,
 ) -> SymbolGraph {
     let (fan_in, fan_out) = compute_fan_counts(runtime_edges);
-    let mut arena = PathArena::with_capacity(files.len() + tests.len());
+    let mut arena = PathArena::with_capacity(files.len() + test_hashes.len());
     let mut witnesses: FxHashMap<u64, RefWitness> =
         FxHashMap::with_capacity_and_hasher(files.len() * 16 + 64, Default::default());
 
     record_source_witnesses(&files, glob_targets, &mut arena, &mut witnesses);
-    // Stream test files and fold their tokens directly into 16B RefWitnesses (0 retained test bodies).
-    fold_test_witnesses(repo_root, preloaded, tests, &mut arena, &mut witnesses);
+    for (trel, (_, hashes)) in test_hashes {
+        let tid = arena.intern(trel);
+        for &hash in hashes {
+            witnesses.entry(hash).or_default().record_test(tid);
+        }
+    }
 
     let (mut defs_by, mut refs_by, mut imps_by, mut metrics_by) =
         (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
     let mut dead = Vec::new();
     for (rel, entry) in files {
-        let fid = arena.id_of(&rel).unwrap_or(witness::NO_FILE);
+        let fid = arena.id_of(&rel).unwrap_or(analysis::NO_FILE);
         collect_dead_symbols_for_file(&rel, fid, &entry, glob_targets, &witnesses, &mut dead);
         defs_by.insert(rel.clone(), entry.defs);
         refs_by.insert(rel.clone(), entry.refs_tokens);

@@ -506,7 +506,7 @@ fn cmd_audit_sync(
 
 fn cmd_sustain(repo: &Path, dry_run: bool, ste100: bool, ste_dict: Option<&Path>) -> Result<()> {
     let scorer = hygiene::HygieneScorer::open_persistent(repo);
-    let rep = untangle::untangle_repo(repo, &scorer)?;
+    let rep = untangle::untangle_repo_with_scope(repo, &scorer, untangle::AuditScope::Sustain)?;
     if ste100 || ste_dict.is_some() {
         return emit_sustain_ste100(repo, &rep, dry_run, ste_dict);
     }

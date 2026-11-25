@@ -373,8 +373,8 @@ fn abi_summary_enriched(
         let sigs = file_heads(&src);
         if let Some(fi_map) = fan_in_by_file {
             let fi = fi_map.get(*rel).copied().unwrap_or(0);
-            let is_new = crate::stem::genome::is_recent_48h(repo_root, rel);
-            let summary = crate::stem::genome::synthetic_summary(rel, &src, &sigs, fi, is_new, None);
+            let is_new = is_recent_48h(repo_root, rel);
+            let summary = synthetic_summary(rel, &src, &sigs, fi, is_new, None);
             return Some(format!("- {summary}"));
         }
         (!sigs.is_empty()).then(|| format!("- {rel}: {}", sigs.join(" | ")))
@@ -418,4 +418,84 @@ fn file_heads(src: &str) -> Vec<String> {
         }
     }
     sigs
+}
+
+const RECENT_WINDOW_SECS: u64 = 48 * 3600;
+
+fn is_recent_48h(repo_root: &Path, rel: &str) -> bool {
+    let Ok(meta) = fs::metadata(repo_root.join(rel)) else { return false };
+    let Ok(mtime) = meta.modified() else { return false };
+    let Ok(age) = std::time::SystemTime::now().duration_since(mtime) else { return true };
+    age.as_secs() <= RECENT_WINDOW_SECS
+}
+
+fn first_doc_sentence(src: &str) -> Option<String> {
+    for line in src.lines().take(20) {
+        let t = line.trim();
+        let cleaned = t
+            .strip_prefix("///")
+            .or_else(|| t.strip_prefix("//!"))
+            .or_else(|| t.strip_prefix("/**"))
+            .or_else(|| t.strip_prefix("* "))
+            .or_else(|| t.strip_prefix("\"\"\""))
+            .or_else(|| t.strip_prefix("# "));
+        if let Some(raw) = cleaned {
+            let trimmed = raw.trim().trim_end_matches("*/").trim_end_matches("\"\"\"").trim();
+            if trimmed.len() >= 8 {
+                let sentence = trimmed.split(". ").next().unwrap_or(trimmed).trim();
+                return Some(sentence.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn synthetic_summary(
+    rel: &str,
+    src: &str,
+    exports: &[String],
+    fan_in: usize,
+    is_new: bool,
+    top_twin: Option<(&str, f64)>,
+) -> String {
+    let mut parts = Vec::with_capacity(4);
+    if is_new {
+        parts.push("[NEW]".to_string());
+    }
+    if fan_in > 0 {
+        parts.push(format!("(->{fan_in})"));
+    }
+    if !exports.is_empty() {
+        let joined = exports.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        parts.push(format!("exports:[{joined}]"));
+    }
+    if let Some(d) = first_doc_sentence(src) {
+        parts.push(char_prefix(&d, 72).to_string());
+    }
+    if let Some((twin, npmi)) = top_twin {
+        parts.push(format!("twin:{twin}({npmi:.2})"));
+    }
+    if parts.is_empty() {
+        format!("{rel} (->0)")
+    } else {
+        format!("{rel} {}", parts.join(" | "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_synthetic_summary_badges() {
+        let s = synthetic_summary(
+            "src/auth.rs",
+            "/// Validates JWT bearer tokens.\npub fn verify() {}\n",
+            &["verify".into()],
+            7,
+            true,
+            Some(("src/session.rs", 0.86)),
+        );
+        assert!(s.contains("[NEW]") && s.contains("(->7)") && s.contains("twin:src/session.rs(0.86)"));
+    }
 }

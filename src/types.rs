@@ -433,6 +433,18 @@ pub struct SustainFiles {
     pub layers_detected: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileEgoContext {
+    pub fan_in: usize,
+    pub fan_out: usize,
+    pub neighbor_dirs: usize,
+    pub has_module_cycle: bool,
+    pub tangle: bool,
+    pub external_field_readers: usize,
+    pub clone_cluster_hits: usize,
+    pub churn_commits: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryEvent {
     pub seq: u64,

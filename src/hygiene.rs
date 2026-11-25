@@ -308,9 +308,12 @@ impl HygieneScorer {
         }
     }
 
-    /// Expose the active weights' 16-hex BLAKE3 prefix used for cache keying.
+    /// Expose the active weights' 16-hex BLAKE3 prefix without inflating embedded `WEIGHTS_NPZ`.
     pub fn weights_blake3_prefix(&self) -> &str {
-        &self.active_weights().hash_prefix
+        match &self.override_weights {
+            Some(w) => &w.hash_prefix,
+            None => weights::default_weights_hash_prefix(),
+        }
     }
 
     pub fn open_persistent(repo_root: &Path) -> Self {
@@ -418,9 +421,6 @@ impl HygieneScorer {
         drop(permit);
         drop(guard);
         self.release_in_flight(&key, &lock);
-        if content.len() > 128 * 1024 {
-            collect_os_memory();
-        }
         res
     }
 
