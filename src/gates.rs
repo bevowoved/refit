@@ -1,4 +1,5 @@
 mod audit;
+pub mod cache_orch;
 mod rules;
 mod runners;
 mod stage;
@@ -81,8 +82,9 @@ pub fn run_gates(
     deleted: &[String],
     hygiene: &HygieneScorer,
 ) -> Result<GateVerdict> {
+    cache_orch::ensure_cache_dirs_tagged(&cfg.repo_root);
     let stage = materialize_stage(&cfg.repo_root, candidates, deleted)?;
-    let base_env = sandbox_env(&[]);
+    let base_env = sandbox_env(&cache_orch::polyglot_cache_env(&cfg.repo_root));
     let paths = group_paths(candidates);
     let cargo_slot = (!paths.rs.is_empty() && stage.join("Cargo.toml").exists())
         .then(|| CargoSlot::acquire(&cfg.repo_root));
@@ -180,8 +182,7 @@ fn check_js0(ctx: &StageCtx<'_>, strict: bool) -> Option<(String, String)> {
 }
 
 fn check_rs0(ctx: &StageCtx<'_>, slot: &CargoSlot, strict: bool) -> Option<(String, String)> {
-    let dir = slot.dir.display().to_string();
-    let env = sandbox_env(&[("CARGO_TARGET_DIR".into(), dir)]);
+    let env = sandbox_env(&slot.rust_cache_env(&ctx.cfg.repo_root, true));
     let args = ["check".into(), "--quiet".into()];
     let cmd = CmdSpec::new("cargo", &args, ctx.root, &env, 30_000);
     check_g0("gate0_rust_check", "cargo check", &cmd, strict, false)
@@ -359,7 +360,9 @@ fn run_py(
         } else {
             args.extend(unit.test_files.iter().cloned());
         }
-        let env = sandbox_env(&[("PYTHONPATH".into(), ctx.root.display().to_string())]);
+        let mut py_extra = cache_orch::py_worktree_cache_env(&ctx.cfg.repo_root);
+        py_extra.push(("PYTHONPATH".into(), ctx.root.display().to_string()));
+        let env = sandbox_env(&py_extra);
         let res = run_cmd(&ctx.cfg.pytest_bin, &args, ctx.root, &env, true, 15_000);
         (res, t.elapsed().as_millis() as u64)
     };
@@ -435,7 +438,7 @@ fn run_poly(
 ) {
     let strict = ctx.cfg.strict_polyglot_tools;
     if let Some(slot) = ctx.slot {
-        let env = sandbox_env(&[("CARGO_TARGET_DIR".into(), slot.dir.display().to_string())]);
+        let env = sandbox_env(&slot.rust_cache_env(&ctx.cfg.repo_root, true));
         let t_args = ["test".into(), "--quiet".into()];
         let t_cmd = CmdSpec::new("cargo", &t_args, ctx.root, &env, 45_000);
         poly_test("cargo test", &t_cmd, strict, 8, verdict, acc);

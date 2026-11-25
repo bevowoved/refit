@@ -1,3 +1,6 @@
+use super::cache_orch::{
+    ensure_cache_dirs_tagged, polyglot_cache_env, py_worktree_cache_env,
+};
 use super::runners::{CmdSpec, first_lines, parse_pytest, parse_ty, ruff_map};
 use super::stage::CargoSlot;
 use crate::graph::build_dag;
@@ -363,7 +366,8 @@ fn recount_ty(repo_root: &Path, cfg: &GateConfig, source_rels: &[String]) -> Opt
     }
     let mut args = vec!["check".into(), "--error-on-warning".into()];
     args.extend(all_py);
-    let o = run_cmd(&cfg.ty_bin, &args, repo_root, &sandbox_env(&[]), true, 20_000).ok()?;
+    let py_env = sandbox_env(&py_worktree_cache_env(repo_root));
+    let o = run_cmd(&cfg.ty_bin, &args, repo_root, &py_env, true, 20_000).ok()?;
     Some(if o.exit_code == 0 { 0 } else { parse_ty(&o.stdout, &o.stderr).len() })
 }
 
@@ -437,7 +441,8 @@ pub fn audit_files(
     skip_tests: bool,
 ) -> Result<AuditStats> {
     let py_files = py_rels(rel_files);
-    let base_env = sandbox_env(&[]);
+    ensure_cache_dirs_tagged(&cfg.repo_root);
+    let base_env = sandbox_env(&polyglot_cache_env(&cfg.repo_root));
 
     let ((med, p10, per_h), py_audit, poly_diags) = if budget().is_constrained() {
         let h = hygiene.score_files(&cfg.repo_root, rel_files, preloaded);
@@ -494,7 +499,9 @@ fn audit_python(
     skip_tests: bool,
 ) -> Result<PyAudit> {
     let run_pt = || {
-        let env = sandbox_env(&[("PYTHONPATH".into(), cfg.repo_root.display().to_string())]);
+        let mut py_extra = py_worktree_cache_env(&cfg.repo_root);
+        py_extra.push(("PYTHONPATH".into(), cfg.repo_root.display().to_string()));
+        let env = sandbox_env(&py_extra);
         run_cmd(&cfg.pytest_bin, &["-q".into(), "--tb=line".into()], &cfg.repo_root, &env, true, 30_000)
     };
     let run_rf = || {
@@ -603,7 +610,7 @@ fn audit_polyglot(
 
 fn probe_cargo(root: &Path) -> Option<(String, String)> {
     let slot = CargoSlot::acquire(root);
-    let env = sandbox_env(&[("CARGO_TARGET_DIR".into(), slot.dir.display().to_string())]);
+    let env = sandbox_env(&slot.rust_cache_env(root, false));
     let args = ["check".into(), "--quiet".into()];
     let cmd = CmdSpec::new("cargo", &args, root, &env, 30_000);
     poly_probe(&cmd, "Cargo.toml", "cargo check", false)
