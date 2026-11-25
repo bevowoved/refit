@@ -2,7 +2,7 @@ mod abi;
 mod packet;
 mod patch;
 
-pub use abi::{InterfaceCutoff, check_interface_cutoff_digests, hash_abi};
+pub use abi::hash_abi;
 #[cfg(test)]
 pub use abi::{check_interface_cutoff, python_abi};
 pub use packet::{build_packet, deps_context};
@@ -77,7 +77,6 @@ pub fn dag_from(
     };
 
     let mut units = built?;
-    refresh_package_abis(&units);
     let total_loc: usize = units.iter().map(|u| u.loc).sum();
     let max_wave = units.iter().fold(0usize, |m, u| m.max(u.wave));
     sort_units(&mut units);
@@ -262,28 +261,6 @@ fn build_unit(
         baseline_hygiene: score_sum / (files.len().max(1) as f64),
         allow_abi_change: files.len() > 1 && files.len() <= 4,
     })
-}
-
-fn refresh_package_abis(units: &[ModuleUnit]) {
-    let mut by_pkg: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
-    for unit in units {
-        for (rel, abi) in &unit.abi_hash {
-            let pkg_id = crate::stem::sst::pkg_id_for_rel(rel);
-            by_pkg.entry(pkg_id).or_default().push((rel.as_str(), abi.as_str()));
-        }
-    }
-    let reg = crate::platform::EpochRegistry::global();
-    let mut cache = crate::stem::sst::FrozenPkgCache::global().lock();
-    for (pkg_id, pairs) in by_pkg {
-        let cutoff = cache.refresh_package_abi_digests(&pkg_id, &pairs, reg);
-        tracing::trace!(
-            pkg = %cutoff.pkg_id,
-            iface = %cutoff.interface_blake3,
-            changed = cutoff.changed,
-            epoch = cutoff.epoch,
-            "Salsa interface cutoff evaluated"
-        );
-    }
 }
 
 fn collect_ids(set: &BTreeSet<usize>, scc_ids: &[String]) -> Vec<String> {
@@ -498,6 +475,27 @@ mod tests {
             python_abi("def calc(\n    x: int,\n    y: str,\n) -> float:\n    return 1.0\n"),
             python_abi("def calc(\n    x: int,\n    z: str,\n) -> float:\n    return 1.0\n")
         );
+
+        let reg = crate::platform::EpochRegistry::new();
+        let v1 = "pub fn compute(x: i32) -> i32 { x + 1 }\n";
+        let v2_same = "pub fn compute(x: i32) -> i32 { let y = x * 2; y - x + 1 }\n";
+        let v3_changed = "pub fn compute(x: i32, scale: i32) -> i32 { x * scale }\n";
+        let c1 = check_interface_cutoff("packages/calc", &[("src/calc.rs", v1)], None, &reg);
+        assert!(c1.changed);
+        let c2 = check_interface_cutoff(
+            "packages/calc",
+            &[("src/calc.rs", v2_same)],
+            Some(&c1.interface_blake3),
+            &reg,
+        );
+        assert!(!c2.changed && c2.epoch == c1.epoch && c2.interface_blake3 == c1.interface_blake3);
+        let c3 = check_interface_cutoff(
+            "packages/calc",
+            &[("src/calc.rs", v3_changed)],
+            Some(&c2.interface_blake3),
+            &reg,
+        );
+        assert!(c3.changed && c3.epoch > c2.epoch && c3.interface_blake3 != c2.interface_blake3);
     }
 
     #[test]

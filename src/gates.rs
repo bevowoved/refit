@@ -3,7 +3,6 @@ pub mod cache_orch;
 mod rules;
 mod runners;
 mod stage;
-mod syntax;
 
 #[cfg(test)]
 pub use audit::{detect_langs, detect_tools};
@@ -15,7 +14,6 @@ pub use runners::net_new_diagnostics;
 #[cfg(test)]
 pub use stage::{decode_lsp, encode_lsp, stage_copies};
 pub use stage::{stage_hardlinks, sweep_stages};
-pub use syntax::check_braces;
 
 use crate::graph::hash_abi;
 use crate::hygiene::HygieneScorer;
@@ -213,7 +211,7 @@ fn run_gate0(
     candidates: &BTreeMap<String, String>,
 ) -> Option<(String, String)> {
     for (rel, content) in candidates {
-        if let Err(err) = check_braces(rel, content) {
+        if let Err(err) = crate::lex::check_balanced_syntax(rel, content) {
             let msg = format!("Gate 0 polyglot syntax error in `{rel}`: {err}");
             return Some(("gate0_syntax".into(), msg));
         }
@@ -694,7 +692,7 @@ mod tests {
             ("pkg/raw.go", "package p\nfunc Raw() string { return `unbalanced {\\` }\n", true),
         ];
         for (rel, body, ok) in cases {
-            assert_eq!(check_braces(rel, body).is_ok(), ok, "case {rel}");
+            assert_eq!(crate::lex::check_balanced_syntax(rel, body).is_ok(), ok, "case {rel}");
         }
     }
 

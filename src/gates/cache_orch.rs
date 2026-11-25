@@ -475,7 +475,7 @@ fn cargo_slots_has_active_lock(slots_dir: &Path) -> bool {
         let lossy = name.to_string_lossy();
         if lossy.starts_with("slot-") && lossy.ends_with(".lock") {
             let p = item.path();
-            if matches!(crate::platform::io::SidecarLock::try_acquire(&p), Ok(None)) {
+            if matches!(crate::platform::SidecarLock::try_acquire(&p), Ok(None)) {
                 return true;
             }
         }

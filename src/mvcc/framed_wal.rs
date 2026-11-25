@@ -1,7 +1,7 @@
 //! PM-V7 CRC32C binary-framed WAL (`RFWL`) with dual-format legacy JSONL auto-detection,
 //! all-zero EOF sentinel handling, monotonic sequence verification, and clean-halt errors.
 
-use crate::platform::io::sync_file_barrier;
+use crate::platform::sync_file_barrier;
 use crate::types::WalRecord;
 use anyhow::{Context, Result};
 use memchr::{memchr, memmem};

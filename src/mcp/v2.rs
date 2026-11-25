@@ -3,7 +3,6 @@
 //! and `SEP-2663` durable atomic task lifecycle with cooperative cancellation.
 
 use super::catalog::{catalog_digest, sep2549_meta, tool_catalog};
-use super::{McpCtx, dispatch_tool, ok_json};
 use crate::net::{json_str, rpc_err, rpc_ok};
 use crate::platform::{EpochRegistry, MemGate, ensure_cachedir_tag, now_ms, write_atomic};
 use anyhow::{Context, Result};
@@ -18,8 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::net::TcpListener;
@@ -215,9 +216,10 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let hi = hex_nibble(pair[0])?;
-        let lo = hex_nibble(pair[1])?;
+    let (pairs, _) = bytes.as_chunks::<2>();
+    for &[a, b] in pairs {
+        let hi = hex_nibble(a)?;
+        let lo = hex_nibble(b)?;
         out.push((hi << 4) | lo);
     }
     Some(out)
@@ -363,18 +365,29 @@ impl TaskStore {
     }
 }
 
+pub type SearchFuture<'a> = Pin<Box<dyn Future<Output = Value> + Send + 'a>>;
+
+/// Dependency-inverted backend boundary keeping `mcp/v2.rs` strictly acyclic (zero `super::*` ctx imports).
+pub trait McpBackend: Send + Sync + 'static {
+    fn repo_root(&self) -> &Path;
+    fn dispatch_sync(&self, name: &str, args: &Value) -> Value;
+    fn dispatch_search(&self, language: String, capability: String) -> SearchFuture<'_>;
+    fn blocking_sem(&self) -> &Arc<tokio::sync::Semaphore>;
+}
+
 /// Shared stateless MCP `2026-07-28` server state (zero in-memory sessions!).
 pub struct McpV2State {
-    pub ctx: Arc<McpCtx>,
+    pub backend: Arc<dyn McpBackend>,
     pub tasks: Arc<TaskStore>,
     pub signer: MrtrSigner,
 }
 
 impl McpV2State {
-    pub fn from_ctx(ctx: Arc<McpCtx>) -> Arc<Self> {
-        let tasks = Arc::new(TaskStore::for_repo(&ctx.repo_root));
-        let signer = MrtrSigner::for_repo(&ctx.repo_root);
-        Arc::new(Self { ctx, tasks, signer })
+    pub fn from_backend(backend: Arc<dyn McpBackend>) -> Arc<Self> {
+        let root = backend.repo_root();
+        let tasks = Arc::new(TaskStore::for_repo(root));
+        let signer = MrtrSigner::for_repo(root);
+        Arc::new(Self { backend, tasks, signer })
     }
 }
 
@@ -746,17 +759,17 @@ async fn run_complete_tool_call(
     };
 
     let payload = if name == "refit_search" {
-        let lang = args["language"].as_str().unwrap_or("Rust");
-        let cap = args["capability"].as_str().unwrap_or("rate limiter");
-        let res = ok_json(state.ctx.research.check_library(lang, cap).await);
+        let lang = args["language"].as_str().unwrap_or("Rust").to_string();
+        let cap = args["capability"].as_str().unwrap_or("rate limiter").to_string();
+        let res = state.backend.dispatch_search(lang, cap).await;
         drop(mem_permit);
         res
     } else {
-        let _sem = state.ctx.blocking_sem.acquire().await.ok();
-        let ctx_clone = state.ctx.clone();
+        let _sem = state.backend.blocking_sem().acquire().await.ok();
+        let backend = state.backend.clone();
         tokio::task::spawn_blocking(move || {
             let _held = mem_permit;
-            dispatch_tool(&name, &args, &ctx_clone.repo_root, &ctx_clone.hygiene, &ctx_clone.gate_cfg)
+            backend.dispatch_sync(&name, &args)
         })
         .await
         .unwrap_or_else(|e| json!({"error": format!("mcp worker join error: {e}")}))
@@ -808,23 +821,15 @@ fn spawn_durable_task(
 
     let task_id = record.task_id.clone();
     let tasks_store = state.tasks.clone();
-    let ctx_clone = state.ctx.clone();
-    #[cfg(test)]
-    let delay_ms = args["_test_delay_ms"].as_u64().unwrap_or(0).min(5_000);
-    #[cfg(not(test))]
-    let delay_ms = 0u64;
+    let backend = state.backend.clone();
 
     tokio::spawn(async move {
         let _held_permit = mem_permit;
-        if delay_ms > 0 && !sleep_cancellable(delay_ms, &cancel_flag).await {
-            tasks_store.clear_flag(&task_id);
-            return;
-        }
         if cancel_flag.load(Ordering::Acquire) {
             tasks_store.clear_flag(&task_id);
             return;
         }
-        let outcome = execute_task_tool(&name, args, &ctx_clone, &cancel_flag).await;
+        let outcome = execute_task_tool(&name, args, &backend, &cancel_flag).await;
         if cancel_flag.load(Ordering::Acquire) {
             tasks_store.clear_flag(&task_id);
             return;
@@ -841,41 +846,26 @@ fn spawn_durable_task(
     (StatusCode::OK, Some(rpc_ok(id, res)))
 }
 
-async fn sleep_cancellable(delay_ms: u64, cancel_flag: &AtomicBool) -> bool {
-    let mut waited = 0u64;
-    while waited < delay_ms {
-        if cancel_flag.load(Ordering::Acquire) {
-            return false;
-        }
-        let step = 10u64.min(delay_ms - waited);
-        tokio::time::sleep(std::time::Duration::from_millis(step)).await;
-        waited += step;
-    }
-    true
-}
-
 async fn execute_task_tool(
     name: &str,
     args: Value,
-    ctx: &Arc<McpCtx>,
+    backend: &Arc<dyn McpBackend>,
     cancel_flag: &AtomicBool,
 ) -> std::result::Result<Value, String> {
     if name == "refit_search" {
-        let lang = args["language"].as_str().unwrap_or("Rust");
-        let cap = args["capability"].as_str().unwrap_or("rate limiter");
-        return Ok(ok_json(ctx.research.check_library(lang, cap).await));
+        let lang = args["language"].as_str().unwrap_or("Rust").to_string();
+        let cap = args["capability"].as_str().unwrap_or("rate limiter").to_string();
+        return Ok(backend.dispatch_search(lang, cap).await);
     }
-    let _sem = ctx.blocking_sem.acquire().await.ok();
+    let _sem = backend.blocking_sem().acquire().await.ok();
     if cancel_flag.load(Ordering::Acquire) {
         return Err("cancelled before execution".into());
     }
-    let cc = ctx.clone();
+    let b = backend.clone();
     let tool_name = name.to_string();
-    tokio::task::spawn_blocking(move || {
-        dispatch_tool(&tool_name, &args, &cc.repo_root, &cc.hygiene, &cc.gate_cfg)
-    })
-    .await
-    .map_err(|e| format!("task join error: {e}"))
+    tokio::task::spawn_blocking(move || b.dispatch_sync(&tool_name, &args))
+        .await
+        .map_err(|e| format!("task join error: {e}"))
 }
 
 fn task_id_param(params: &Value) -> &str {
@@ -1008,12 +998,10 @@ pub fn build_http_router(state: Arc<McpV2State>) -> Router {
 
 /// Bind and start the stateless Streamable HTTP MCP `2026-07-28` server (default loopback).
 pub async fn bind_http_server(
-    repo_root: PathBuf,
+    backend: Arc<dyn McpBackend>,
     listen_addr: &str,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<String>(1);
-    let ctx = super::build_mcp_ctx(repo_root, out_tx);
-    let state = McpV2State::from_ctx(ctx);
+    let state = McpV2State::from_backend(backend);
     let app = build_http_router(state);
 
     let listener = TcpListener::bind(listen_addr)
@@ -1028,26 +1016,59 @@ pub async fn bind_http_server(
     Ok((bound, handle))
 }
 
-/// Serve the stateless MCP `2026-07-28` Streamable HTTP endpoint until shutdown.
-#[cfg(feature = "mcp-v2")]
-pub async fn serve_http(repo_root: PathBuf, listen_addr: String) -> Result<()> {
-    let (bound, handle) = bind_http_server(repo_root, &listen_addr).await?;
-    tracing::info!("refit MCP 2026-07-28 stateless HTTP listening on http://{bound}/mcp");
-    handle.await.context("mcp-v2 HTTP server join")?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::TempRepo;
 
-    fn test_state(tag: &str, files: &[(&str, &str)]) -> (TempRepo, Arc<McpV2State>) {
+    struct MockBackend {
+        root: PathBuf,
+        delay_ms: AtomicU64,
+        sem: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl MockBackend {
+        fn new(root: PathBuf) -> Arc<Self> {
+            Arc::new(Self {
+                root,
+                delay_ms: AtomicU64::new(0),
+                sem: Arc::new(tokio::sync::Semaphore::new(4)),
+            })
+        }
+    }
+
+    impl McpBackend for MockBackend {
+        fn repo_root(&self) -> &Path {
+            &self.root
+        }
+
+        fn dispatch_sync(&self, name: &str, args: &Value) -> Value {
+            let delay = self.delay_ms.load(Ordering::Acquire);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            if name == "refit_read" {
+                let rel = args["path"].as_str().unwrap_or("");
+                let content = fs::read_to_string(self.root.join(rel)).unwrap_or_default();
+                return json!({ "path": rel, "content": content });
+            }
+            json!({ "ok": true, "tool": name })
+        }
+
+        fn dispatch_search(&self, language: String, capability: String) -> SearchFuture<'_> {
+            Box::pin(async move { json!({ "language": language, "capability": capability }) })
+        }
+
+        fn blocking_sem(&self) -> &Arc<tokio::sync::Semaphore> {
+            &self.sem
+        }
+    }
+
+    fn test_state(tag: &str, files: &[(&str, &str)]) -> (TempRepo, Arc<MockBackend>, Arc<McpV2State>) {
         let repo = TempRepo::nested_with(tag, "repo", files);
-        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
-        let ctx = super::super::build_mcp_ctx(repo.path().to_path_buf(), tx);
-        let state = McpV2State::from_ctx(ctx);
-        (repo, state)
+        let backend = MockBackend::new(repo.path().to_path_buf());
+        let state = McpV2State::from_backend(backend.clone());
+        (repo, backend, state)
     }
 
     #[tokio::test]
@@ -1057,9 +1078,8 @@ mod tests {
             "repo",
             &[("src/demo.rs", "pub fn demo() -> i32 {\n    42\n}\n")],
         );
-        let (addr, handle) = bind_http_server(repo.path().to_path_buf(), "127.0.0.1:0")
-            .await
-            .unwrap();
+        let backend = MockBackend::new(repo.path().to_path_buf());
+        let (addr, handle) = bind_http_server(backend, "127.0.0.1:0").await.unwrap();
         let url = format!("http://{addr}/mcp");
         let client = reqwest::Client::new();
 
@@ -1126,7 +1146,8 @@ mod tests {
         assert!(call_val["result"]["content"][0]["text"].as_str().unwrap().contains("pub fn demo"));
 
         // 4. SEP-2243 mismatches -> HTTP 400 + JSON-RPC -32020 (`HeaderMismatchError`)
-        let bad_cases: Vec<(&str, Vec<(&str, &str)>, Value)> = vec![
+        type HeaderCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, Value);
+        let bad_cases: Vec<HeaderCase<'_>> = vec![
             ("missing Mcp-Method", vec![], disc_req.clone()),
             ("wrong Mcp-Method", vec![("Mcp-Method", "tools/list")], disc_req.clone()),
             ("missing Mcp-Name", vec![("Mcp-Method", "tools/call")], call_req.clone()),
@@ -1201,7 +1222,7 @@ mod tests {
 
     #[tokio::test]
     async fn sep2322_mrtr_signed_token_tamper_expiry_and_stateless_resume() {
-        let (_repo, state) = test_state(
+        let (_repo, _backend, state) = test_state(
             "mcp_v2_mrtr",
             &[("src/ok.rs", "pub fn ok() -> i32 { 1 }\n")],
         );
@@ -1263,7 +1284,7 @@ mod tests {
 
     #[tokio::test]
     async fn sep2663_tasks_atomic_persistence_five_states_and_cooperative_cancel() {
-        let (repo, state) = test_state(
+        let (repo, backend, state) = test_state(
             "mcp_v2_tasks",
             &[("src/lib.rs", "pub fn hello() -> i32 { 7 }\n")],
         );
@@ -1302,7 +1323,8 @@ mod tests {
         }
         assert!(completed, "durable task should reach `completed`");
 
-        // 2. Cooperative cancellation via `tasks/cancel`
+        // 2. Cooperative cancellation via `tasks/cancel` using `MockBackend` delay
+        backend.delay_ms.store(250, Ordering::Release);
         let slow_req = json!({
             "jsonrpc": "2.0",
             "id": 22,
@@ -1310,7 +1332,7 @@ mod tests {
             "params": {
                 "name": "refit_read",
                 "mode": "task",
-                "arguments": { "path": "src/lib.rs", "_test_delay_ms": 500 }
+                "arguments": { "path": "src/lib.rs" }
             }
         });
         let (_, slow_resp) = handle_v2_request(&state, &slow_req).await;
@@ -1321,7 +1343,8 @@ mod tests {
         )
         .await;
         assert_eq!(cancel_resp.unwrap()["result"]["status"], json!("cancelled"));
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        backend.delay_ms.store(0, Ordering::Release);
         let persisted = state.tasks.load(&slow_id).unwrap();
         assert_eq!(persisted.status, TaskState::Cancelled);
 
@@ -1361,7 +1384,7 @@ mod tests {
 
     #[tokio::test]
     async fn mrtr_rejects_forged_repo_path_key_and_tool_confusion() {
-        let (dir, state) = test_state("mcp_v2_sec", &[("src/lib.rs", "pub fn x() {}\n")]);
+        let (dir, _backend, state) = test_state("mcp_v2_sec", &[("src/lib.rs", "pub fn x() {}\n")]);
         assert!(dir.path().join(".refit/.mrtr.key").is_file());
 
         // Forged key derived from public repo_root must fail verification.

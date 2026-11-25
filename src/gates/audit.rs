@@ -9,11 +9,11 @@ use super::stage::CargoSlot;
 use crate::graph::build_dag;
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::MvccStore;
-use crate::platform::io::{
-    FileBuf, StatEntry, ensure_cachedir_tag, file_mtime_size, load_stat_cache, now_unix_ns,
-    save_stat_cache, stat_cache_fresh,
+use crate::platform::{
+    FileBuf, StatEntry, budget, collect_os_memory, ensure_cachedir_tag, file_mtime_size,
+    load_stat_cache, now_unix_ns, read_zstd, run_cmd, sandbox_env, save_stat_cache,
+    stat_cache_fresh, walk_files, write_zstd,
 };
-use crate::platform::{budget, collect_os_memory, read_zstd, run_cmd, sandbox_env, walk_files, write_zstd};
 use crate::source::{ext_lang, ext_str, rel_norm, source_rel, stem_of, supported_ext};
 use crate::types::DagPlan;
 use anyhow::Result;

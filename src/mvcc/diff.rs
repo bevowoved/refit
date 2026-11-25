@@ -8,7 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-static TIMELINE_CACHE: OnceLock<SieveCache<PathBuf, (u64, u64, Vec<WalEvent>)>> = OnceLock::new();
+type TimelineEntry = (u64, u64, Vec<WalEvent>);
+static TIMELINE_CACHE: OnceLock<SieveCache<PathBuf, TimelineEntry>> = OnceLock::new();
 
 pub fn wal_timeline(repo_root: &Path) -> Result<Vec<WalEvent>> {
     let (wal_path, cas_dir) = storage_paths(repo_root);
@@ -16,7 +17,7 @@ pub fn wal_timeline(repo_root: &Path) -> Result<Vec<WalEvent>> {
         return Ok(Vec::new());
     }
 
-    let (mtime_ns, wal_len) = crate::platform::io::file_mtime_size(&wal_path).unwrap_or((0, 0));
+    let (mtime_ns, wal_len) = crate::platform::file_mtime_size(&wal_path).unwrap_or((0, 0));
     let cache = TIMELINE_CACHE.get_or_init(|| SieveCache::new(8, 4 * 1024 * 1024));
     if let Some((cached_len, cached_mtime, cached_events)) = cache.get(&wal_path)
         && cached_len == wal_len

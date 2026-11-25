@@ -1,6 +1,5 @@
 pub mod budget;
 pub mod epoch;
-pub mod io;
 pub mod memgate;
 pub mod paths;
 mod proc;
@@ -13,7 +12,6 @@ pub use crate::net::backoff_ms;
 use crate::net::{is_quota_exhausted, is_retryable, retry_ms};
 pub use budget::{allocator_name, budget, collect_os_memory, init_allocator, under_memory_pressure};
 pub use epoch::EpochRegistry;
-pub use io::{SidecarLock, ensure_cachedir_tag, has_cachedir_tag};
 pub use memgate::{MemGate, TangoCreditRing};
 pub use paths::{
     check_rel, check_target_in_repo, normalize_rel, pwsh_utf8_preamble, rel_to_root,
@@ -32,12 +30,24 @@ use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::fs::{self, File};
-use std::io::Write;
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const FILE_BUF_SIZE: usize = 64 * 1024;
+#[cfg(target_os = "linux")]
+const FADV_SEQ_MIN: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
+const FADV_DONTNEED_MIN: u64 = 1024 * 1024;
+const ZSTD_STREAM_WLOG: u32 = 18;
+const STAT_MAGIC: &[u8; 8] = b"RFST0002";
+const STAT_MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+const RACY_GIT_NS: u64 = 2_000_000_000;
+const CACHEDIR_TAG_BODY: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CLOCK_ANCHOR: OnceLock<(u64, Instant)> = OnceLock::new();
@@ -173,12 +183,176 @@ pub fn stream_http(
     build_http(user_agent, connect_timeout_secs, pool_idle_secs, pool_max, None)
 }
 
+/// Reusable O(1) 64 KiB scratch buffer for streaming file I/O.
+pub struct FileBuf {
+    buf: Vec<u8>,
+}
+
+impl FileBuf {
+    pub fn new() -> Self {
+        Self { buf: vec![0u8; FILE_BUF_SIZE] }
+    }
+
+    pub fn hash_file_blake3(&mut self, path: &Path) -> Result<(u64, String)> {
+        let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        advise_sequential_if_medium(&f, file_len);
+
+        let mut hasher = blake3::Hasher::new();
+        let mut total = 0u64;
+        loop {
+            let n = f.read(&mut self.buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&self.buf[..n]);
+            total += n as u64;
+        }
+        advise_dontneed_if_large(&f, total);
+        Ok((total, hasher.finalize().to_hex().to_string()))
+    }
+}
+
+impl Default for FileBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Write the standard 43-byte `CACHEDIR.TAG` marker inside `dir`.
+pub fn ensure_cachedir_tag(dir: &Path) {
+    let tag = dir.join("CACHEDIR.TAG");
+    if tag.exists() {
+        return;
+    }
+    let _ = fs::create_dir_all(dir);
+    let _ = fs::write(&tag, CACHEDIR_TAG_BODY);
+}
+
+#[inline]
+pub fn has_cachedir_tag(dir: &Path) -> bool {
+    let tag = dir.join("CACHEDIR.TAG");
+    let Ok(mut f) = File::open(&tag) else { return false };
+    let mut head = [0u8; 43];
+    f.read_exact(&mut head).is_ok() && head.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55")
+}
+
+fn advise_sequential_if_medium(file: &File, len: u64) {
+    #[cfg(target_os = "linux")]
+    if (FADV_SEQ_MIN..FADV_DONTNEED_MIN).contains(&len) {
+        let _ = nix::fcntl::posix_fadvise(
+            file,
+            0,
+            0,
+            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, len);
+}
+
+fn advise_dontneed_if_large(file: &File, len: u64) {
+    #[cfg(target_os = "linux")]
+    if len >= FADV_DONTNEED_MIN {
+        let _ = nix::fcntl::posix_fadvise(
+            file,
+            0,
+            0,
+            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, len);
+}
+
+/// Cross-OS durability barrier (`fdatasync` on Linux, `F_FULLFSYNC` on macOS, `sync_data` on Win).
+pub fn sync_file_barrier(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_FULLFSYNC).is_ok() {
+        return Ok(());
+    }
+    file.sync_data()
+}
+
+fn write_atomic_with<T>(target: &Path, write_fn: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create parent dir {}", parent.display()))?;
+
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nonce = u32::from_le_bytes(os_random_bytes::<4>().unwrap_or([0; 4]));
+    let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
+    let tmp_path = parent.join(format!(".refit.tmp.{}.{seq}.{nonce:08x}.{name}", std::process::id()));
+
+    let outcome = (|| -> Result<T> {
+        let mut f = File::create(&tmp_path)
+            .with_context(|| format!("create temp file {}", tmp_path.display()))?;
+        let res = write_fn(&mut f)?;
+        sync_file_barrier(&f)?;
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        advise_dontneed_if_large(&f, len);
+        Ok(res)
+    })();
+
+    match outcome {
+        Ok(val) => {
+            replace_file(&tmp_path, target, parent)?;
+            Ok(val)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(err)
+        }
+    }
+}
+
 pub fn write_zstd<T: Serialize>(path: &Path, val: &T) -> Result<()> {
-    io::write_zstd_stream(path, val)
+    write_atomic_with(path, |f| {
+        let mut enc = zstd::stream::Encoder::new(f, 1)?;
+        let _ = enc.window_log(ZSTD_STREAM_WLOG);
+        serde_json::to_writer(&mut enc, val)?;
+        enc.finish()?;
+        Ok(())
+    })
 }
 
 pub fn read_zstd<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    io::read_zstd_stream(path)
+    let f = File::open(path).ok()?;
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    advise_sequential_if_medium(&f, len);
+    let dec = zstd::stream::Decoder::new(&f).ok()?;
+    let out = serde_json::from_reader(dec).ok();
+    advise_dontneed_if_large(&f, len);
+    out
+}
+
+/// Stream-compress an existing file on disk into `dst` without loading the whole file in RAM.
+pub fn compress_file_zstd(src: &Path, dst: &Path, level: i32) -> Result<(u64, u64)> {
+    write_atomic_with(dst, |writer| {
+        let mut reader = File::open(src).with_context(|| format!("open {}", src.display()))?;
+        let src_len = reader.metadata().map(|m| m.len()).unwrap_or(0);
+        advise_sequential_if_medium(&reader, src_len);
+
+        let mut enc = zstd::stream::Encoder::new(&mut *writer, level)?;
+        let _ = enc.window_log(ZSTD_STREAM_WLOG);
+        let mut buf = vec![0u8; FILE_BUF_SIZE];
+        let mut raw_total = 0u64;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            enc.write_all(&buf[..n])?;
+            raw_total += n as u64;
+        }
+        advise_dontneed_if_large(&reader, raw_total);
+        enc.finish()?;
+        let out_len = writer.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok((raw_total, out_len))
+    })
 }
 
 pub fn mkdir_private(path: &Path) -> Result<()> {
@@ -200,29 +374,214 @@ pub fn os_random_bytes<const N: usize>() -> Result<[u8; N]> {
 }
 
 pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create parent dir {}", parent.display()))?;
-
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nonce = u32::from_le_bytes(os_random_bytes::<4>().unwrap_or([0; 4]));
-    let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
-    let tmp_path = parent.join(format!(".refit.tmp.{}.{seq}.{nonce:08x}.{name}", std::process::id()));
-
-    let mut f = File::create(&tmp_path)
-        .with_context(|| format!("create temp file {}", tmp_path.display()))?;
-    f.write_all(bytes)?;
-    io::sync_file_barrier(&f)?;
-    drop(f);
-
-    replace_file(&tmp_path, target, parent)
+    write_atomic_with(target, |f| Ok(f.write_all(bytes)?))
 }
 
-pub(crate) fn replace_file_pub(src_path: &Path, dst_path: &Path, parent: &Path) -> Result<()> {
-    replace_file(src_path, dst_path, parent)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatEntry {
+    pub mtime_ns: u64,
+    pub size: u64,
+    pub blake3: String,
+}
+
+pub fn file_mtime_size(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some((mtime_ns, meta.len()))
+}
+
+pub fn now_unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Racy-git 2-second guard: only trust a stat cache hit when `now - mtime_ns >= 2s`.
+#[inline]
+pub fn stat_cache_fresh(entry: &StatEntry, mtime_ns: u64, size: u64, now_ns: u64) -> bool {
+    entry.size == size
+        && entry.mtime_ns == mtime_ns
+        && now_ns.saturating_sub(mtime_ns) >= RACY_GIT_NS
+}
+
+pub fn load_stat_cache(path: &Path) -> BTreeMap<String, StatEntry> {
+    let Ok(raw) = fs::read(path) else { return BTreeMap::new() };
+    let Ok(dec) = zstd::stream::Decoder::new(raw.as_slice()) else { return BTreeMap::new() };
+    let mut out = Vec::new();
+    if dec.take(STAT_MAX_DECODE_BYTES).read_to_end(&mut out).is_err() {
+        return BTreeMap::new();
+    }
+    decode_stat_map(&out).unwrap_or_default()
+}
+
+pub fn save_stat_cache(path: &Path, map: &BTreeMap<String, StatEntry>) -> Result<()> {
+    if let Some(p) = path.parent() {
+        ensure_cachedir_tag(p);
+    }
+    let raw = encode_stat_map(map);
+    let compressed = zstd::bulk::compress(&raw, 1)?;
+    write_atomic(path, &compressed)
+}
+
+fn encode_stat_map(map: &BTreeMap<String, StatEntry>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + map.len() * 112);
+    out.extend_from_slice(STAT_MAGIC);
+    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    for (rel, e) in map {
+        let rb = rel.as_bytes();
+        let rlen = rb.len().min(u16::MAX as usize);
+        let hb = e.blake3.as_bytes();
+        let hlen = hb.len().min(u16::MAX as usize);
+        out.extend_from_slice(&(rlen as u16).to_le_bytes());
+        out.extend_from_slice(&rb[..rlen]);
+        out.extend_from_slice(&e.mtime_ns.to_le_bytes());
+        out.extend_from_slice(&e.size.to_le_bytes());
+        out.extend_from_slice(&(hlen as u16).to_le_bytes());
+        out.extend_from_slice(&hb[..hlen]);
+    }
+    out
+}
+
+fn decode_stat_map(buf: &[u8]) -> Option<BTreeMap<String, StatEntry>> {
+    if buf.len() < 12 || &buf[..8] != STAT_MAGIC {
+        return None;
+    }
+    let count = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+    let mut pos = 12usize;
+    let mut map = BTreeMap::new();
+    for _ in 0..count {
+        let rlen = u16::from_le_bytes(buf.get(pos..pos + 2)?.try_into().ok()?) as usize;
+        pos += 2;
+        let rel = std::str::from_utf8(buf.get(pos..pos + rlen)?).ok()?.to_string();
+        pos += rlen;
+        let mtime_ns = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
+        pos += 8;
+        let size = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
+        pos += 8;
+        let hlen = u16::from_le_bytes(buf.get(pos..pos + 2)?.try_into().ok()?) as usize;
+        pos += 2;
+        let blake3 = std::str::from_utf8(buf.get(pos..pos + hlen)?).ok()?.to_string();
+        pos += hlen;
+        map.insert(rel, StatEntry { mtime_ns, size, blake3 });
+    }
+    Some(map)
+}
+
+/// Cross-OS sidecar lock (`File::lock()` with `O_EXCL` stale-reaper fallback for OverlayFS/WSL2).
+pub enum SidecarLock {
+    OsFile(File),
+    ExclLease(PathBuf),
+}
+
+impl SidecarLock {
+    pub fn acquire(lock_path: &Path) -> Result<Self> {
+        let file = open_lock_file(lock_path)?;
+        match file.lock() {
+            Ok(()) => Ok(Self::OsFile(file)),
+            Err(err) if is_lock_unsupported(&err) => acquire_excl_fallback(lock_path),
+            Err(err) => Err(err).with_context(|| format!("acquire lock {}", lock_path.display())),
+        }
+    }
+
+    pub fn try_acquire(lock_path: &Path) -> Result<Option<Self>> {
+        let file = open_lock_file(lock_path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self::OsFile(file))),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(err)) if is_lock_unsupported(&err) => {
+                try_acquire_excl_once(lock_path)
+            }
+            Err(fs::TryLockError::Error(err)) => Err(err.into()),
+        }
+    }
+}
+
+impl Drop for SidecarLock {
+    fn drop(&mut self) {
+        match self {
+            Self::OsFile(f) => { let _ = f.unlock(); }
+            Self::ExclLease(p) => { let _ = fs::remove_file(p); }
+        }
+    }
+}
+
+fn open_lock_file(lock_path: &Path) -> Result<File> {
+    if let Some(p) = lock_path.parent() {
+        fs::create_dir_all(p).with_context(|| format!("create lock dir {}", p.display()))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .with_context(|| format!("open sidecar lock {}", lock_path.display()))
+}
+
+fn is_lock_unsupported(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    if let Some(code) = err.raw_os_error()
+        && matches!(
+            nix::errno::Errno::from_raw(code),
+            nix::errno::Errno::EOPNOTSUPP
+                | nix::errno::Errno::ENOTSUP
+                | nix::errno::Errno::ENOLCK
+                | nix::errno::Errno::ENOSYS
+        )
+    {
+        return true;
+    }
+    err.kind() == io::ErrorKind::Unsupported
+}
+
+fn try_acquire_excl_once(lock_path: &Path) -> Result<Option<SidecarLock>> {
+    let name = lock_path.file_name().and_then(|s| s.to_str()).unwrap_or("refit.lock");
+    let lease = lock_path.with_file_name(format!("{name}.excl"));
+    match OpenOptions::new().create_new(true).write(true).open(&lease) {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{} {}", std::process::id(), now_ms());
+            Ok(Some(SidecarLock::ExclLease(lease)))
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            reap_stale_excl(&lease);
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn acquire_excl_fallback(lock_path: &Path) -> Result<SidecarLock> {
+    for attempt in 0..200u64 {
+        if let Some(lock) = try_acquire_excl_once(lock_path)? {
+            return Ok(lock);
+        }
+        std::thread::sleep(Duration::from_millis((5 + attempt).min(50)));
+    }
+    anyhow::bail!("timed out waiting for O_EXCL fallback lock {}", lock_path.display())
+}
+
+fn reap_stale_excl(lease: &Path) {
+    #[cfg(unix)]
+    if let Ok(raw) = fs::read_to_string(lease)
+        && let Some(pid) = raw.split_whitespace().next().and_then(|s| s.parse::<i32>().ok())
+        && pid > 0
+        && matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Ok(()) | Err(nix::errno::Errno::EPERM)
+        )
+    {
+        return;
+    }
+    let Ok(meta) = fs::metadata(lease) else { return };
+    if meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|a| a > Duration::from_secs(60)) {
+        let _ = fs::remove_file(lease);
+    }
 }
 
 #[cfg(windows)]
@@ -388,5 +747,55 @@ mod tests {
             assert!(!red.contains(leak.as_str()), "leaked {leak}");
         }
         assert!(red.contains("REDACTED_AWS_") && red.contains("REDACTED_GITHUB_") && red.contains("REDACTED_SLACK_"));
+    }
+
+    #[test]
+    fn stat_bin_v1_lz4_auto_invalidates_to_v2_zstd() {
+        let tmp = TempRepo::new("io_stat_v2");
+        let cache = tmp.join(".refit/cache/stat.bin");
+
+        // 1. Stale RFST0001 LZ4-prepended bytes must safely return empty map (zero panic).
+        let mut fake_v1_lz4 = vec![12, 0, 0, 0];
+        fake_v1_lz4.extend_from_slice(b"RFST0001\x00\x00\x00\x00");
+        write_atomic(&cache, &fake_v1_lz4).unwrap();
+        assert!(load_stat_cache(&cache).is_empty());
+
+        // Even Zstd-compressed RFST0001 bytes must be rejected by STAT_MAGIC = RFST0002.
+        let zst_v1 = zstd::bulk::compress(b"RFST0001\x00\x00\x00\x00", 1).unwrap();
+        write_atomic(&cache, &zst_v1).unwrap();
+        assert!(load_stat_cache(&cache).is_empty());
+
+        // 2. Round-trip v2 Zstd stat.bin + 2-second racy-git guard.
+        let old_ns = 1_000_000_000_000u64;
+        let now_ns = old_ns + 5_000_000_000;
+        let mut map = BTreeMap::new();
+        map.insert("src/a.rs".into(), StatEntry { mtime_ns: old_ns, size: 128, blake3: "abcd".into() });
+        save_stat_cache(&cache, &map).unwrap();
+
+        assert!(has_cachedir_tag(&tmp.join(".refit/cache")));
+        let on_disk = fs::read(&cache).unwrap();
+        assert_eq!(&on_disk[..4], &[0x28, 0xB5, 0x2F, 0xFD], "stat.bin must be Zstd-compressed");
+        let loaded = load_stat_cache(&cache);
+        let e = loaded.get("src/a.rs").unwrap();
+        assert!(stat_cache_fresh(e, old_ns, 128, now_ns));
+        assert!(!stat_cache_fresh(e, old_ns, 128, old_ns + 500_000_000));
+        assert!(!stat_cache_fresh(e, old_ns, 129, now_ns));
+    }
+
+    #[test]
+    fn file_buf_hash_and_sidecar_lock() {
+        let tmp = TempRepo::with_files("io_buf", &[("big.txt", &"hello\n".repeat(4000))]);
+        let p = tmp.join("big.txt");
+        let mut fb = FileBuf::new();
+        let (len, hex) = fb.hash_file_blake3(&p).unwrap();
+        let raw = fs::read(&p).unwrap();
+        assert_eq!(len, raw.len() as u64);
+        assert_eq!(hex, blake3::hash(&raw).to_hex().to_string());
+
+        let lp = tmp.join(".refit/test.lock");
+        let lk = SidecarLock::acquire(&lp).unwrap();
+        assert!(SidecarLock::try_acquire(&lp).unwrap().is_none());
+        drop(lk);
+        assert!(SidecarLock::try_acquire(&lp).unwrap().is_some());
     }
 }

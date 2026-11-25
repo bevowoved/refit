@@ -1,10 +1,13 @@
-use crate::lex::{RUST_PUB, TS_EXPORT, first_ident, go_export, match_prefix, scan_code};
+use crate::lex::{
+    RUST_PUB, TS_EXPORT, blank_noise_sentinel, first_ident, go_export, match_prefix, scan_code,
+};
 use crate::mvcc::MvccStore;
+#[cfg(test)]
 use crate::platform::EpochRegistry;
 use crate::source::{ext_of, is_js};
-use crate::stem::strip_noise;
 use std::ops::ControlFlow;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceCutoff {
     pub pkg_id: String,
@@ -25,6 +28,7 @@ pub fn hash_abi(rel_path: &str, source: &str) -> String {
 }
 
 /// Compute a deterministic Salsa-style package `interface_blake3` from precomputed `(rel, abi_hash)` pairs.
+#[cfg(test)]
 pub fn interface_blake3_from_digests(digests: &[(&str, &str)]) -> String {
     let mut items: Vec<(&str, &str)> = digests.to_vec();
     items.sort_by(|lhs, rhs| lhs.0.cmp(rhs.0));
@@ -41,6 +45,7 @@ pub fn interface_blake3_from_digests(digests: &[(&str, &str)]) -> String {
 
 /// Salsa early-cutoff helper over precomputed `(rel, abi_hash)` pairs wired to `EpochRegistry`.
 /// Preserves the current epoch with zero invalidations when `interface_blake3` is unchanged.
+#[cfg(test)]
 pub fn check_interface_cutoff_digests(
     pkg_id: &str,
     digests: &[(&str, &str)],
@@ -319,7 +324,7 @@ fn push_ended(lines: &[&str], i: &mut usize, sigs: &mut Vec<String>, braces: boo
 }
 
 fn rust_abi(source: &str) -> String {
-    let cleaned = strip_noise("rs", source);
+    let cleaned = blank_noise_sentinel("rs", source).to_clean_string(source);
     let lines: Vec<&str> = cleaned.lines().collect();
     let (mut sigs, mut i) = (Vec::new(), 0usize);
 

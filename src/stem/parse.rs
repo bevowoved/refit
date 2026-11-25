@@ -1,12 +1,11 @@
 use super::csr::{EdgeKind, ModuleMetrics};
-use super::strip::lex_sentinel;
 use super::witness::{
     BOUNDARY_CTOR_INVENTORY, BOUNDARY_DYNAMIC_REF, BOUNDARY_FFI_NO_MANGLE,
     BOUNDARY_FRAMEWORK_ROUTE, BOUNDARY_MACRO_DERIVE, BOUNDARY_PY_ALL, DEF_VIS_INTERNAL,
 };
 use crate::lex::{
-    RUST_PUB, TS_EXPORT, char_end, first_ident, go_export, ident_byte, match_prefix, quoted_lit,
-    quoted_path,
+    RUST_PUB, TS_EXPORT, blank_noise_sentinel, char_end, first_ident, go_export, ident_byte,
+    match_prefix, quoted_lit, quoted_path,
 };
 use crate::source::{count_lines, is_js};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -464,7 +463,7 @@ fn collect_non_test_import_targets(typed_imports: &[TypedImport]) -> Vec<String>
 }
 
 pub fn parse_symbols(ext: &str, content: &str, blake3: String) -> FileSymbols {
-    let lexed = lex_sentinel(ext, content);
+    let lexed = blank_noise_sentinel(ext, content);
     let raw_lines: Vec<&str> = content.lines().collect();
     let mut parser = SymbolParser::new(ext, content, &raw_lines);
 

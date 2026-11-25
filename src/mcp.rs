@@ -46,10 +46,35 @@ fn build_mcp_ctx(repo_root: PathBuf, out_tx: tokio::sync::mpsc::Sender<String>) 
     })
 }
 
+#[cfg(any(feature = "mcp-v2", test))]
+impl v2::McpBackend for McpCtx {
+    fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    fn dispatch_sync(&self, name: &str, args: &Value) -> Value {
+        dispatch_tool(name, args, &self.repo_root, &self.hygiene, &self.gate_cfg)
+    }
+
+    fn dispatch_search(&self, language: String, capability: String) -> v2::SearchFuture<'_> {
+        Box::pin(async move { ok_json(self.research.check_library(&language, &capability).await) })
+    }
+
+    fn blocking_sem(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.blocking_sem
+    }
+}
+
 /// Serve stateless MCP `2026-07-28` Streamable HTTP (`POST /mcp`) when `mcp-v2` is enabled.
 #[cfg(feature = "mcp-v2")]
 pub async fn serve_http(repo_root: PathBuf, listen_addr: String) -> Result<()> {
-    v2::serve_http(repo_root, listen_addr).await
+    use anyhow::Context;
+    let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let backend: Arc<dyn v2::McpBackend> = build_mcp_ctx(repo_root, out_tx);
+    let (bound, handle) = v2::bind_http_server(backend, &listen_addr).await?;
+    tracing::info!("refit MCP 2026-07-28 stateless HTTP listening on http://{bound}/mcp");
+    handle.await.context("mcp-v2 HTTP server join")?;
+    Ok(())
 }
 
 /// Run the concurrent JSON-RPC 2.0 MCP server over stdio with a serialized writer task.
@@ -70,7 +95,7 @@ pub async fn serve_mcp(repo_root: PathBuf) -> Result<()> {
 
     let ctx = build_mcp_ctx(repo_root, out_tx);
     #[cfg(any(feature = "mcp-v2", test))]
-    let v2_state = v2::McpV2State::from_ctx(ctx.clone());
+    let v2_state = v2::McpV2State::from_backend(ctx.clone());
     let mut tasks = tokio::task::JoinSet::new();
 
     while let Some(line) = lines.next_line().await? {
@@ -538,7 +563,7 @@ mod tests {
         );
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
         let ctx = build_mcp_ctx(repo.path().to_path_buf(), out_tx);
-        let v2_state = v2::McpV2State::from_ctx(ctx.clone());
+        let v2_state = v2::McpV2State::from_backend(ctx.clone());
         let mut tasks = tokio::task::JoinSet::new();
 
         // 1. Legacy 2024-11-05 handshake + notifications/initialized + tools/list + tools/call

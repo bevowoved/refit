@@ -198,7 +198,7 @@ impl TelemetryHub {
         self.inner.writer.lock().flush()?;
         let path = self.inner.jsonl_path.with_extension("jsonl.zst");
         let (raw_len, zst_len) =
-            crate::platform::io::compress_file_zstd(&self.inner.jsonl_path, &path, 3)
+            crate::platform::compress_file_zstd(&self.inner.jsonl_path, &path, 3)
                 .with_context(|| format!("write compact zstd {}", path.display()))?;
         Ok((path, raw_len, zst_len))
     }

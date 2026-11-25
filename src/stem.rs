@@ -2,10 +2,7 @@ pub(crate) mod csr;
 pub(crate) mod genome;
 mod parse;
 pub(crate) mod sst;
-mod strip;
 pub(crate) mod witness;
-
-pub(crate) use strip::strip_noise;
 
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
@@ -224,6 +221,35 @@ pub fn load_symbols(
 }
 
 pub fn query_symbols(repo_root: &Path, symbol: Option<&str>, file: Option<&str>) -> Value {
+    if symbol.is_none()
+        && let Some(f) = file
+    {
+        let norm = f.replace('\\', "/");
+        if let Some(hit) = sst::query_file_sst(repo_root, CACHE_VERSION, &norm) {
+            let deps: Vec<String> = hit
+                .edges
+                .iter()
+                .filter(|(s, _)| s == &norm)
+                .map(|(_, d)| d.clone())
+                .collect();
+            let dependents: Vec<String> = hit
+                .edges
+                .iter()
+                .filter(|(_, d)| d == &norm)
+                .map(|(s, _)| s.clone())
+                .collect();
+            let fan_in = hit.runtime_edges.iter().filter(|(_, d)| d == &norm).count();
+            let fan_out = hit.runtime_edges.iter().filter(|(s, _)| s == &norm).count();
+            return json!({
+                "file": norm,
+                "defs": hit.sym.defs,
+                "imports": hit.sym.imports,
+                "deps": deps, "dependents": dependents,
+                "fan_in": fan_in, "fan_out": fan_out
+            });
+        }
+    }
+
     let snap = load_symbols(repo_root, None);
     if let Some(sym) = symbol {
         let definers: Vec<String> = snap
@@ -609,24 +635,49 @@ fn build_tables(
     tbl
 }
 
+pub(crate) fn should_use_sst(file_count: usize, est_json_bytes: u64) -> bool {
+    (cfg!(feature = "sst-storage")
+        && (file_count >= sst::SST_MIN_FILES || est_json_bytes >= sst::SST_MIN_INDEX_BYTES))
+        || std::env::var_os("REFIT_FORCE_SST").is_some()
+}
+
+fn estimate_symbol_json_bytes(files: &BTreeMap<String, FileSymbols>) -> u64 {
+    files
+        .iter()
+        .map(|(rel, f)| {
+            let sym_bytes: usize = f.defs.iter().map(|s| s.len() + 3).sum::<usize>()
+                + f.imports.iter().map(|s| s.len() + 3).sum::<usize>()
+                + f.refs_tokens.iter().map(|s| s.len() + 3).sum::<usize>();
+            (rel.len() + sym_bytes + 128) as u64
+        })
+        .sum()
+}
+
 fn load_cached_symbols(repo_root: &Path) -> SymbolCache {
     let cache_path = repo_root.join(".refit/cache/symbol_index.zst");
     let sst_path = repo_root.join(".refit/cache/sym.sst");
-    let use_sst = cfg!(feature = "sst-storage") || sst_path.exists();
-    if use_sst && let Some(files) = sst::load_symbol_sst(&sst_path, CACHE_VERSION) {
+    if cache_path.is_file()
+        && let Some(idx) =
+            read_zstd::<SymbolCache>(&cache_path).filter(|idx| idx.version == CACHE_VERSION)
+    {
+        return idx;
+    }
+    if sst_path.is_file()
+        && let Some(files) = sst::load_symbol_sst(&sst_path, CACHE_VERSION)
+    {
         return SymbolCache {
             version: CACHE_VERSION.to_string(),
             files,
         };
     }
-    read_zstd(&cache_path)
-        .filter(|idx: &SymbolCache| idx.version == CACHE_VERSION)
-        .unwrap_or_default()
+    SymbolCache::default()
 }
 
 fn persist_symbol_caches(
     repo_root: &Path,
     new_files: &BTreeMap<String, FileSymbols>,
+    edges: &[(String, String)],
+    runtime_edges: &[(String, String)],
     prev_len: usize,
 ) {
     let cache_path = repo_root.join(".refit/cache/symbol_index.zst");
@@ -639,13 +690,28 @@ fn persist_symbol_caches(
         );
         return;
     }
-    let next_ref = SymbolCacheRef {
-        version: CACHE_VERSION,
-        files: new_files,
-    };
-    let _ = write_zstd(&cache_path, &next_ref);
-    if cfg!(feature = "sst-storage") || sst_path.exists() {
-        let _ = sst::save_symbol_sst(&sst_path, CACHE_VERSION, new_files, prev_len);
+    let est_bytes = estimate_symbol_json_bytes(new_files);
+    if should_use_sst(new_files.len(), est_bytes) {
+        if sst::save_symbol_sst(
+            &sst_path,
+            CACHE_VERSION,
+            new_files,
+            edges,
+            runtime_edges,
+            prev_len,
+        )
+        .is_ok_and(|written| written)
+        {
+            let _ = std::fs::remove_file(&cache_path);
+        }
+    } else {
+        let next_ref = SymbolCacheRef {
+            version: CACHE_VERSION,
+            files: new_files,
+        };
+        if write_zstd(&cache_path, &next_ref).is_ok() {
+            let _ = std::fs::remove_file(&sst_path);
+        }
     }
 }
 
@@ -686,12 +752,10 @@ fn discover_internal(
         new_files.insert(rel, entry);
     }
 
-    if parsed_n > 0 || prev.files.len() != new_files.len() {
-        persist_symbol_caches(repo_root, &new_files, prev.files.len());
-    }
-    sst::update_frozen_pkg_cache(&new_files);
-
     let (edges, runtime_edges, glob_reexport_targets) = collect_edges(&new_files, &tables);
+    if parsed_n > 0 || prev.files.len() != new_files.len() {
+        persist_symbol_caches(repo_root, &new_files, &edges, &runtime_edges, prev.files.len());
+    }
     let snap = build_graph(
         repo_root,
         preloaded,
@@ -750,10 +814,9 @@ fn collect_file_edges(
     }
 }
 
-fn collect_edges(
-    files: &BTreeMap<String, FileSymbols>,
-    tbl: &LookupTables,
-) -> (Vec<(String, String)>, Vec<(String, String)>, FxHashSet<String>) {
+type EdgeTuple = (Vec<(String, String)>, Vec<(String, String)>, FxHashSet<String>);
+
+fn collect_edges(files: &BTreeMap<String, FileSymbols>, tbl: &LookupTables) -> EdgeTuple {
     let mut edge_set: FxHashSet<(String, String)> = FxHashSet::default();
     let mut rt_set: FxHashSet<(String, String)> = FxHashSet::default();
     let mut glob_targets: FxHashSet<String> = FxHashSet::default();
