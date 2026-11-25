@@ -48,7 +48,7 @@ fn quick_repo_stat_sig(repo_root: &Path) -> u64 {
 
 struct McpCtx {
     repo_root: PathBuf,
-    hygiene: HygieneScorer,
+    hygiene: Arc<HygieneScorer>,
     gate_cfg: GateConfig,
     research: Arc<WebClient>,
     out_tx: tokio::sync::mpsc::Sender<String>,
@@ -69,7 +69,7 @@ fn build_mcp_ctx_with_epoch(
 ) -> Arc<McpCtx> {
     let permits = crate::platform::budget().mcp_blocking_permits;
     Arc::new(McpCtx {
-        hygiene: HygieneScorer::open_persistent(&repo_root),
+        hygiene: Arc::new(HygieneScorer::open_persistent(&repo_root)),
         gate_cfg: read_gates(&repo_root),
         research: WebClient::for_repo(&repo_root, None),
         repo_root,
@@ -93,6 +93,10 @@ impl v2::McpBackend for McpCtx {
 
     fn dispatch_search(&self, language: String, capability: String) -> v2::SearchFuture<'_> {
         Box::pin(async move { ok_json(self.research.check_library(&language, &capability).await) })
+    }
+
+    fn dispatch_audit_research(&self, args: Value) -> Option<v2::SearchFuture<'_>> {
+        Some(Box::pin(async move { run_audit_research_async(self, &args).await }))
     }
 
     fn blocking_sem(&self) -> &Arc<tokio::sync::Semaphore> {
@@ -252,6 +256,10 @@ fn spawn_call(tasks: &mut tokio::task::JoinSet<()>, id: Option<Value>, req: &Val
             let out = ok_json(ctx_clone.research.check_library(lang, cap).await);
             drop(pre_permit);
             out
+        } else if name == "refit_audit" && args["research"].as_bool().unwrap_or(false) {
+            let out = run_audit_research_async(&ctx_clone, &args).await;
+            drop(pre_permit);
+            out
         } else {
             let _sem_permit = ctx_clone.blocking_sem.acquire().await.ok();
             let cc = ctx_clone.clone();
@@ -381,19 +389,53 @@ fn run_symbols(ctx: &McpCtx, args: &Value) -> Value {
     v
 }
 
-fn run_audit(repo_root: &Path, args: &Value, hygiene: &HygieneScorer) -> Value {
-    match untangle_repo(repo_root, hygiene) {
-        Ok(rep) if args["markdown"].as_bool().unwrap_or(false) => json!({
+fn format_audit_value(rep: crate::types::AuditReport, args: &Value) -> Value {
+    if args["markdown"].as_bool().unwrap_or(false) {
+        json!({
             "markdown": render_audit(&rep),
             "summary": {
                 "clones": rep.clone_clusters.len(),
                 "dead_symbols": rep.dead_symbols.len(),
+                "dep_advisories": rep.dep_advisories.len(),
                 "god_files": rep.god_files.len(),
                 "infra_findings": rep.infra_findings.len(),
                 "unused_deps": rep.unused_deps.len()
             }
-        }),
-        Ok(rep) => ok_json(Ok(rep)),
+        })
+    } else {
+        ok_json(Ok(rep))
+    }
+}
+
+async fn run_audit_research_async(ctx: &McpCtx, args: &Value) -> Value {
+    let repo_root = ctx.repo_root.clone();
+    let hygiene = ctx.hygiene.clone();
+    let _sem_permit = ctx.blocking_sem.acquire().await.ok();
+    let base = tokio::task::spawn_blocking(move || untangle_repo(&repo_root, &hygiene))
+        .await
+        .map_err(|e| anyhow::anyhow!("mcp audit join error: {e}"))
+        .and_then(|r| r);
+    let mut rep = match base {
+        Ok(r) => r,
+        Err(e) => return json!({"error": e.to_string()}),
+    };
+    let (advisories, _) = ctx.research.audit_deps_full(&ctx.repo_root).await;
+    rep.dep_advisories = advisories;
+    format_audit_value(rep, args)
+}
+
+fn run_audit(repo_root: &Path, args: &Value, hygiene: &HygieneScorer) -> Value {
+    match untangle_repo(repo_root, hygiene) {
+        Ok(mut rep) => {
+            if args["research"].as_bool().unwrap_or(false) {
+                let (advisories, _) = crate::research::deps::evaluate_repo_deps(
+                    repo_root,
+                    &rustc_hash::FxHashMap::default(),
+                );
+                rep.dep_advisories = advisories;
+            }
+            format_audit_value(rep, args)
+        }
         Err(e) => json!({"error": e.to_string()}),
     }
 }

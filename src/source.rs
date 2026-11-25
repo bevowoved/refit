@@ -375,33 +375,39 @@ fn cargo_deps(txt: &str, out: &mut Vec<ManifestDep>) {
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+struct PyProjectManifest {
+    project: Option<PyProjectSection>,
+    tool: Option<PyToolSection>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct PyProjectSection {
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct PyToolSection {
+    poetry: Option<PyPoetrySection>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct PyPoetrySection {
+    #[serde(default)]
+    dependencies: BTreeMap<String, toml::Value>,
+}
+
 fn py_deps(txt: &str, out: &mut Vec<ManifestDep>) {
-    let (mut in_arr, mut in_poetry) = (false, false);
-    for line in txt.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_arr = false;
-            in_poetry = line == "[tool.poetry.dependencies]";
-            continue;
+    let Ok(doc) = toml::from_str::<PyProjectManifest>(txt) else { return };
+    if let Some(proj) = doc.project {
+        for item in &proj.dependencies {
+            push_py(item, out);
         }
-        if in_poetry {
-            if let Some((k, _)) = line.split_once('=') {
-                push_py(k, out);
-            }
-            continue;
-        }
-        if line.starts_with("dependencies") && line.contains('[') {
-            let rest = &line[line.find('[').unwrap() + 1..];
-            let (items, closed) = rest.find(']').map_or((rest, false), |c| (&rest[..c], true));
-            for item in items.split(',') {
-                push_py(item, out);
-            }
-            in_arr = !closed;
-        } else if in_arr {
-            if line.starts_with(']') {
-                in_arr = false;
-            } else {
-                push_py(line, out);
-            }
+    }
+    if let Some(poetry) = doc.tool.and_then(|t| t.poetry) {
+        for name in poetry.dependencies.keys() {
+            push_py(name, out);
         }
     }
 }

@@ -28,7 +28,7 @@ const TOOLS: &[ToolRow] = &[
     (
         "refit_audit",
         "Audit clones, dead symbols, large files, unused deps, and infra configs.",
-        &[("markdown", "boolean")],
+        &[("markdown", "boolean"), ("research", "boolean")],
         &[],
     ),
     (

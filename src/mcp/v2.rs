@@ -305,6 +305,9 @@ pub trait McpBackend: Send + Sync + 'static {
     fn repo_root(&self) -> &Path;
     fn dispatch_sync(&self, name: &str, args: &Value) -> Value;
     fn dispatch_search(&self, language: String, capability: String) -> SearchFuture<'_>;
+    fn dispatch_audit_research(&self, _args: Value) -> Option<SearchFuture<'_>> {
+        None
+    }
     fn blocking_sem(&self) -> &Arc<tokio::sync::Semaphore>;
 }
 
@@ -536,6 +539,13 @@ async fn run_complete_tool_call(state: &Arc<McpV2State>, id: Option<Value>, name
         ).await;
         drop(mem_permit);
         res
+    } else if name == "refit_audit"
+        && args["research"].as_bool().unwrap_or(false)
+        && let Some(fut) = state.backend.dispatch_audit_research(args.clone())
+    {
+        let res = fut.await;
+        drop(mem_permit);
+        res
     } else {
         let _sem = state.backend.blocking_sem().acquire().await.ok();
         let backend = state.backend.clone();
@@ -580,6 +590,11 @@ fn spawn_durable_task(state: &Arc<McpV2State>, id: Option<Value>, name: String, 
                 args["language"].as_str().unwrap_or("Rust").to_string(),
                 args["capability"].as_str().unwrap_or("rate limiter").to_string(),
             ).await)
+        } else if name == "refit_audit"
+            && args["research"].as_bool().unwrap_or(false)
+            && let Some(fut) = backend.dispatch_audit_research(args.clone())
+        {
+            Ok(fut.await)
         } else {
             let _sem = backend.blocking_sem().acquire().await.ok();
             if cancel_flag.load(Ordering::Acquire) {

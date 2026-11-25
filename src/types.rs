@@ -383,6 +383,23 @@ pub struct TriageEntry {
     pub priority: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepAdvisory {
+    pub ecosystem: String,
+    pub name: String,
+    pub installed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    /// `"std_replacement" | "rustsec_unmaintained" | "major_upgrade_hops"`
+    pub kind: String,
+    pub recommendation: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hops: Vec<String>,
+    pub breaking_hops: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_guard: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditReport {
     pub repo_root: String,
@@ -405,6 +422,8 @@ pub struct AuditReport {
     pub deep_module_findings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub doc_drift_findings: Vec<DocDriftFinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dep_advisories: Vec<DepAdvisory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,11 +1,10 @@
-use super::cache_orch::{
-    ensure_cache_dirs_tagged, polyglot_cache_env, py_worktree_cache_env,
-};
 use super::runners::{
     CmdSpec, detect_cold_js_linter, detect_cold_rust_checker, detect_cold_ts_checker, first_lines,
     merged_rust_cargo_env, parse_pytest, parse_ty, ruff_map,
 };
-use super::stage::CargoSlot;
+use super::stage::{
+    CargoSlot, ensure_cache_dirs_tagged, polyglot_cache_env, py_worktree_cache_env,
+};
 use crate::graph::build_dag;
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::MvccStore;
@@ -288,7 +287,7 @@ pub fn scan_cached(
         let targets = if partial { &changed } else { &snap.source_rels };
         let mut fresh = audit_files(&gate_cfg, targets, scorer, preloaded, skip_tests)?;
         if let Some(ref p) = prev.filter(|_| partial) {
-            merge_partial(repo_root, &gate_cfg, scorer, &snap, preloaded, &changed, p, &mut fresh);
+            merge_partial(&gate_cfg, scorer, &snap, preloaded, &changed, p, &mut fresh);
         }
         Ok::<AuditStats, anyhow::Error>(fresh)
     };
@@ -325,7 +324,6 @@ pub fn scan_cached(
 }
 
 fn merge_partial(
-    repo_root: &Path,
     gate_cfg: &GateConfig,
     scorer: &HygieneScorer,
     snap: &TreeMeta,
@@ -334,6 +332,7 @@ fn merge_partial(
     prev: &ScanCache,
     fresh: &mut AuditStats,
 ) {
+    let repo_root = &gate_cfg.repo_root;
     let changed_set: BTreeSet<&String> = changed.iter().collect();
     for rel in &snap.source_rels {
         if changed_set.contains(rel) {

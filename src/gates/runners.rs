@@ -3,7 +3,7 @@ use crate::types::{GateVerdict, SandboxResult};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -75,15 +75,25 @@ pub(super) fn run_fmt(
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+struct CargoEditionDoc {
+    package: Option<CargoEditionPkg>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CargoEditionPkg {
+    edition: Option<toml::Value>,
+}
+
 pub(super) fn rust_edition(stage_root: &Path) -> String {
     let Ok(src) = fs::read_to_string(stage_root.join("Cargo.toml")) else {
         return "2021".into();
     };
-    let found = src.lines().find_map(|l| {
-        let rest = l.trim().strip_prefix("edition")?;
-        let (_, v) = rest.split_once('=')?;
-        Some(v.trim().trim_matches(['"', '\'']).to_string())
-    });
+    let found = toml::from_str::<CargoEditionDoc>(&src)
+        .ok()
+        .and_then(|d| d.package)
+        .and_then(|p| p.edition)
+        .and_then(|v| v.as_str().map(str::to_string));
     found
         .filter(|e| matches!(e.as_str(), "2015" | "2018" | "2021" | "2024"))
         .unwrap_or_else(|| "2021".into())
@@ -226,17 +236,14 @@ pub(super) fn first_pair(a: &str, b: &str, max: usize) -> String {
         .join(" | ")
 }
 
-/// Fast zero-spawn `PATH` lookup for cold low-RAM native Rust verifiers.
-pub(super) fn tool_on_path(bin: &str) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
+/// Fast zero-spawn `PATH` directory scan returning the resolved executable path.
+pub(super) fn find_tool_in_dirs(dirs: &[PathBuf], bin: &str) -> Option<PathBuf> {
     let exts: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".cmd", ".bat"]
+        &[".exe", ".cmd", ".bat", ""]
     } else {
         &[""]
     };
-    for dir in std::env::split_paths(&path_var) {
+    for dir in dirs {
         for ext in exts {
             let candidate = if ext.is_empty() {
                 dir.join(bin)
@@ -244,11 +251,22 @@ pub(super) fn tool_on_path(bin: &str) -> bool {
                 dir.join(format!("{bin}{ext}"))
             };
             if candidate.is_file() {
-                return true;
+                return Some(candidate);
             }
         }
     }
-    false
+    None
+}
+
+/// Fast zero-spawn `PATH` lookup returning the first matching binary path.
+pub(super) fn find_tool_on_path(bin: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    find_tool_in_dirs(&dirs, bin)
+}
+
+pub(super) fn tool_on_path(bin: &str) -> bool {
+    find_tool_on_path(bin).is_some()
 }
 
 pub(super) fn oxlint_supports_type_aware() -> bool {

@@ -84,6 +84,7 @@ pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditR
         genome_twins,
         deep_module_findings,
         doc_drift_findings,
+        dep_advisories: Vec::new(),
     })
 }
 
@@ -284,6 +285,28 @@ pub fn render_audit(report: &AuditReport) -> String {
             md.push_str(&format!(
                 "- `{}` L{} [{}]: `{}` — {}\n",
                 df.file, df.line, df.kind, df.reference, df.message
+            ));
+        }
+        md.push('\n');
+    }
+
+    if !report.dep_advisories.is_empty() {
+        md.push_str("## Dependency Advisories & SemVer Hops\n\n");
+        for adv in report.dep_advisories.iter().take(25) {
+            let latest = adv.latest.as_deref().unwrap_or(&adv.installed);
+            let hops = if adv.hops.is_empty() {
+                String::new()
+            } else {
+                format!(" (hops: {}, breaking: {})", adv.hops.join(" -> "), adv.breaking_hops)
+            };
+            let guard = adv
+                .keep_guard
+                .as_deref()
+                .map(|g| format!(" [keep-guard: {g}]"))
+                .unwrap_or_default();
+            md.push_str(&format!(
+                "- [{}] `{}/{}` `{}` -> `{}`{} — {}{}\n",
+                adv.kind, adv.ecosystem, adv.name, adv.installed, latest, hops, adv.recommendation, guard
             ));
         }
         md.push('\n');

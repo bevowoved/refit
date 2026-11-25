@@ -394,9 +394,12 @@ async fn cmd_audit(
     ste_dict: Option<&Path>,
 ) -> Result<()> {
     let scorer = hygiene::HygieneScorer::open_persistent(repo);
-    let report = untangle::untangle_repo(repo, &scorer)?;
+    let mut report = untangle::untangle_repo(repo, &scorer)?;
     let dep_res = if do_research {
-        research::WebClient::for_repo(repo, None).audit_deps(repo).await
+        let wc = research::WebClient::for_repo(repo, None);
+        let (advisories, res) = wc.audit_deps_full(repo).await;
+        report.dep_advisories = advisories;
+        res
     } else {
         Vec::new()
     };
@@ -572,7 +575,7 @@ fn main() -> Result<()> {
             let pruned_cas_blobs = store.gc_cas(keep_revs)?;
             let swept_orphan_stages = gates::sweep_stages(&repo, 0);
             let max_bytes = cache_max_mb.saturating_mul(1024 * 1024);
-            let cache_gc = gates::cache_orch::prune_repo_caches(&repo, max_bytes)?;
+            let cache_gc = gates::prune_repo_caches(&repo, max_bytes)?;
             print_json(&json!({
                 "pruned_cas_blobs": pruned_cas_blobs,
                 "swept_orphan_stages": swept_orphan_stages,

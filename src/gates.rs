@@ -1,5 +1,4 @@
 mod audit;
-pub mod cache_orch;
 mod rules;
 mod runners;
 mod stage;
@@ -13,7 +12,7 @@ pub use rules::check_rules;
 pub use runners::net_new_diagnostics;
 #[cfg(test)]
 pub use stage::{decode_lsp, encode_lsp, stage_copies};
-pub use stage::{stage_hardlinks, sweep_stages};
+pub use stage::{prune_repo_caches, stage_hardlinks, sweep_stages};
 
 use crate::graph::hash_abi;
 use crate::hygiene::HygieneScorer;
@@ -82,9 +81,9 @@ pub fn run_gates(
     deleted: &[String],
     hygiene: &HygieneScorer,
 ) -> Result<GateVerdict> {
-    cache_orch::ensure_cache_dirs_tagged(&cfg.repo_root);
+    stage::ensure_cache_dirs_tagged(&cfg.repo_root);
     let stage = materialize_stage(&cfg.repo_root, candidates, deleted)?;
-    let base_env = sandbox_env(&cache_orch::polyglot_cache_env(&cfg.repo_root));
+    let base_env = sandbox_env(&stage::polyglot_cache_env(&cfg.repo_root));
     let paths = group_paths(candidates);
     let cargo_slot = (!paths.rs.is_empty() && stage.join("Cargo.toml").exists())
         .then(|| CargoSlot::acquire(&cfg.repo_root));
@@ -378,7 +377,7 @@ fn run_py(
         } else {
             args.extend(unit.test_files.iter().cloned());
         }
-        let mut py_extra = cache_orch::py_worktree_cache_env(&ctx.cfg.repo_root);
+        let mut py_extra = stage::py_worktree_cache_env(&ctx.cfg.repo_root);
         py_extra.push(("PYTHONPATH".into(), ctx.root.display().to_string()));
         let env = sandbox_env(&py_extra);
         let res = run_cmd(&ctx.cfg.pytest_bin, &args, ctx.root, &env, true, 15_000);
