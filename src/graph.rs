@@ -2,7 +2,7 @@ mod abi;
 mod packet;
 mod patch;
 
-pub use abi::hash_abi;
+pub use abi::{InterfaceCutoff, check_interface_cutoff, hash_abi};
 #[cfg(test)]
 pub use abi::python_abi;
 pub use packet::{build_packet, deps_context};
@@ -229,6 +229,7 @@ fn build_unit(
     let (mut base, mut abi, mut tests) = (BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
     let (mut loc, mut score_sum) = (0usize, 0.0f64);
 
+    let mut abi_inputs: Vec<(String, String)> = Vec::with_capacity(files.len());
     for rel in files {
         let content = if let Some(txt) = read_text(ctx.repo_root, rel, ctx.preloaded) {
             txt
@@ -241,10 +242,25 @@ fn build_unit(
         loc += count_lines(content.as_bytes());
         base.insert(rel.clone(), MvccStore::hash_bytes(content.as_bytes()));
         abi.insert(rel.clone(), hash_abi(rel, &content));
-        score_sum += ctx.hygiene.score_content(rel, &content).score;
+        abi_inputs.push((rel.clone(), content.into_owned()));
+        score_sum += ctx.hygiene.score_content(rel, &abi_inputs.last().map_or("", |(_, s)| s)).score;
         if let Some(ts) = ctx.mod_tests.get(rel) {
             tests.extend(ts.iter().cloned());
         }
+    }
+    if let Some(first_rel) = files.first() {
+        let pkg_id = crate::stem::sst::pkg_id_for_rel(first_rel);
+        let refs: Vec<(&str, &str)> = abi_inputs.iter().map(|(r, s)| (r.as_str(), s.as_str())).collect();
+        let cutoff = crate::stem::sst::FrozenPkgCache::global()
+            .lock()
+            .refresh_package_interface(&pkg_id, &refs, crate::platform::EpochRegistry::global());
+        tracing::trace!(
+            pkg = %cutoff.pkg_id,
+            iface = %cutoff.interface_blake3,
+            changed = cutoff.changed,
+            epoch = cutoff.epoch,
+            "Salsa interface cutoff evaluated"
+        );
     }
 
     Ok(ModuleUnit {

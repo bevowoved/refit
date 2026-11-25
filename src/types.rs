@@ -234,6 +234,14 @@ pub struct BenchReport {
     pub after_rss_mb_median: f64,
     pub rss_ratio: f64,
     pub passed_anti_regression: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ratio_ci_lo: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ratio_ci_hi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wilcoxon_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abba_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

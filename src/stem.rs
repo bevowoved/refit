@@ -1,6 +1,7 @@
 pub(crate) mod csr;
 pub(crate) mod genome;
 mod parse;
+pub(crate) mod sst;
 mod strip;
 pub(crate) mod witness;
 
@@ -608,15 +609,52 @@ fn build_tables(
     tbl
 }
 
+fn load_cached_symbols(repo_root: &Path) -> SymbolCache {
+    let cache_path = repo_root.join(".refit/cache/symbol_index.zst");
+    let sst_path = repo_root.join(".refit/cache/sym.sst");
+    let use_sst = cfg!(feature = "sst-storage") || sst_path.exists();
+    if use_sst && let Some(files) = sst::load_symbol_sst(&sst_path, CACHE_VERSION) {
+        return SymbolCache {
+            version: CACHE_VERSION.to_string(),
+            files,
+        };
+    }
+    read_zstd(&cache_path)
+        .filter(|idx: &SymbolCache| idx.version == CACHE_VERSION)
+        .unwrap_or_default()
+}
+
+fn persist_symbol_caches(
+    repo_root: &Path,
+    new_files: &BTreeMap<String, FileSymbols>,
+    prev_len: usize,
+) {
+    let cache_path = repo_root.join(".refit/cache/symbol_index.zst");
+    let sst_path = repo_root.join(".refit/cache/sym.sst");
+    if genome::check_wipe_guard(prev_len, new_files.len()) {
+        tracing::warn!(
+            prev_files = prev_len,
+            new_files = new_files.len(),
+            "index-wipe guard triggered (>80% files vanished); keeping previous symbol index cache"
+        );
+        return;
+    }
+    let next_ref = SymbolCacheRef {
+        version: CACHE_VERSION,
+        files: new_files,
+    };
+    let _ = write_zstd(&cache_path, &next_ref);
+    if cfg!(feature = "sst-storage") || sst_path.exists() {
+        let _ = sst::save_symbol_sst(&sst_path, CACHE_VERSION, new_files, prev_len);
+    }
+}
+
 fn discover_internal(
     repo_root: &Path,
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> (EdgeScan, usize, usize, SymbolGraph) {
     let started = Instant::now();
-    let cache_path = repo_root.join(".refit/cache/symbol_index.zst");
-    let prev: SymbolCache = read_zstd(&cache_path)
-        .filter(|idx: &SymbolCache| idx.version == CACHE_VERSION)
-        .unwrap_or_default();
+    let prev = load_cached_symbols(repo_root);
 
     let scan = scan_files(repo_root, preloaded);
     let tables = build_tables(repo_root, &scan.sources, &scan.all);
@@ -649,20 +687,9 @@ fn discover_internal(
     }
 
     if parsed_n > 0 || prev.files.len() != new_files.len() {
-        if genome::check_wipe_guard(prev.files.len(), new_files.len()) {
-            tracing::warn!(
-                prev_files = prev.files.len(),
-                new_files = new_files.len(),
-                "index-wipe guard triggered (>80% files vanished); keeping previous symbol index cache"
-            );
-        } else {
-            let next_ref = SymbolCacheRef {
-                version: CACHE_VERSION,
-                files: &new_files,
-            };
-            let _ = write_zstd(&cache_path, &next_ref);
-        }
+        persist_symbol_caches(repo_root, &new_files, prev.files.len());
     }
+    sst::update_frozen_pkg_cache(&new_files);
 
     let (edges, runtime_edges, glob_reexport_targets) = collect_edges(&new_files, &tables);
     let snap = build_graph(

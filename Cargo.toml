@@ -9,6 +9,8 @@ description = "Pure-Rust cross-platform polyglot refactoring engine for Kimi K3.
 default = ["alloc-mimalloc"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+wal-crc32c = []
+sst-storage = ["dep:roaring"]
 
 [dependencies]
 aho-corasick = "1.1.5"
@@ -32,6 +34,7 @@ mimalloc = { version = "0.1.52", optional = true }
 parking_lot = "0.12"
 rayon = "1.12.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls", "stream", "gzip", "json"] }
+roaring = { version = "0.12", optional = true }
 rustc-hash = "2.1.3"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }

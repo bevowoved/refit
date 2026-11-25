@@ -1,8 +1,17 @@
 use crate::lex::{RUST_PUB, TS_EXPORT, first_ident, go_export, match_prefix, scan_code};
 use crate::mvcc::MvccStore;
+use crate::platform::EpochRegistry;
 use crate::source::{ext_of, is_js};
 use crate::stem::strip_noise;
 use std::ops::ControlFlow;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceCutoff {
+    pub pkg_id: String,
+    pub interface_blake3: String,
+    pub changed: bool,
+    pub epoch: u64,
+}
 
 pub fn hash_abi(rel_path: &str, source: &str) -> String {
     let ext = ext_of(rel_path);
@@ -12,6 +21,54 @@ pub fn hash_abi(rel_path: &str, source: &str) -> String {
         "go" => go_abi(source),
         e if is_js(e) => ts_abi(source),
         _ => MvccStore::hash_bytes(b""),
+    }
+}
+
+/// Compute a deterministic Salsa-style package `interface_blake3` over sorted `(rel, hash_abi)` pairs.
+pub fn interface_blake3(files: &[(&str, &str)]) -> String {
+    let mut items: Vec<(&str, String)> = files
+        .iter()
+        .map(|&(rel, src)| (rel, hash_abi(rel, src)))
+        .collect();
+    items.sort_by(|lhs, rhs| lhs.0.cmp(rhs.0));
+
+    let mut hasher = blake3::Hasher::new();
+    for (rel, abi) in items {
+        hasher.update(rel.as_bytes());
+        hasher.update(&[0u8]);
+        hasher.update(abi.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Salsa early-cutoff helper wired to `hash_abi` and `EpochRegistry`.
+/// Preserves the current epoch with zero invalidations when `interface_blake3` is unchanged.
+pub fn check_interface_cutoff(
+    pkg_id: &str,
+    files: &[(&str, &str)],
+    prev_interface_blake3: Option<&str>,
+    registry: &EpochRegistry,
+) -> InterfaceCutoff {
+    let next_hash = interface_blake3(files);
+    if prev_interface_blake3 == Some(next_hash.as_str()) {
+        let epoch = registry
+            .try_read(pkg_id)
+            .map_or_else(|| registry.global_epoch(), |(ep, _)| ep);
+        return InterfaceCutoff {
+            pkg_id: pkg_id.to_string(),
+            interface_blake3: next_hash,
+            changed: false,
+            epoch,
+        };
+    }
+    let rev = u64::from_str_radix(&next_hash[..16], 16).unwrap_or(1);
+    let epoch = registry.publish(pkg_id, rev);
+    InterfaceCutoff {
+        pkg_id: pkg_id.to_string(),
+        interface_blake3: next_hash,
+        changed: true,
+        epoch,
     }
 }
 

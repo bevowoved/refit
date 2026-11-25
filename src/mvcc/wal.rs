@@ -1,9 +1,9 @@
+use super::framed_wal::{WalScanStats, scan_wal_file};
 use crate::types::WalRecord;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,31 +58,15 @@ pub enum CommitOutcome {
     },
 }
 
-/// Stream every valid `WalRecord` while reusing one line buffer (zero per-line String allocs).
-pub fn visit_wal(path: &Path, mut on_rec: impl FnMut(WalRecord)) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let mut reader = BufReader::new(fs::File::open(path)?);
-    let mut line = String::with_capacity(512);
-    loop {
-        line.clear();
-        let read = match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        let _ = read;
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(rec) = serde_json::from_str::<WalRecord>(trimmed) {
-            on_rec(rec);
-        }
-    }
+/// Stream every valid `WalRecord` from either binary `RFWL` framed WAL or legacy JSONL.
+pub fn visit_wal(path: &Path, on_rec: impl FnMut(WalRecord)) -> Result<()> {
+    let _ = scan_wal_file(path, on_rec)?;
     Ok(())
+}
+
+/// Scan every valid `WalRecord` and return framing / torn-tail statistics.
+pub fn visit_wal_stats(path: &Path, on_rec: impl FnMut(WalRecord)) -> Result<WalScanStats> {
+    scan_wal_file(path, on_rec)
 }
 
 pub fn wal_head(wal_path: &Path) -> u64 {

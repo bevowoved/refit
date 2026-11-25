@@ -135,6 +135,142 @@ pub fn bench_command(
     })
 }
 
+const BOOTSTRAP_RESAMPLES: usize = 2_000;
+const BOOTSTRAP_SEED: u64 = 0xC0DE_5EED_2026_0004;
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+    }
+
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        let mut state = self.0;
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        self.0 = state;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    #[inline]
+    fn next_usize(&mut self, bound: usize) -> usize {
+        (self.next_u64() as usize) % bound
+    }
+}
+
+fn quantile_nearest(vals: &mut [f64], q: f64) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    vals.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((vals.len() as f64 - 1.0) * q).round() as usize;
+    vals[idx.min(vals.len() - 1)]
+}
+
+/// Deterministic bootstrap 95% confidence interval `(median, ci_lo, ci_hi)` over paired CPU ratios.
+pub fn bootstrap_ratio_ci(ratios: &[f64], resamples: usize) -> (f64, f64, f64) {
+    if ratios.is_empty() {
+        return (1.0, 1.0, 1.0);
+    }
+    let mut base = ratios.to_vec();
+    let median = quantile_nearest(&mut base, 0.5);
+    let mut rng = XorShift64::new(BOOTSTRAP_SEED);
+    let mut boot = Vec::with_capacity(resamples);
+    let mut sample = vec![0.0f64; ratios.len()];
+
+    for _ in 0..resamples {
+        for slot in &mut sample {
+            *slot = ratios[rng.next_usize(ratios.len())];
+        }
+        boot.push(quantile_nearest(&mut sample, 0.5));
+    }
+    let lo = quantile_nearest(&mut boot, 0.025);
+    let hi = quantile_nearest(&mut boot, 0.975);
+    (median, lo, hi)
+}
+
+fn assign_wilcoxon_ranks(sorted_nz: &[f64]) -> Vec<f64> {
+    let count = sorted_nz.len();
+    let mut ranks = vec![0.0f64; count];
+    let mut i = 0usize;
+    while i < count {
+        let mut j = i + 1;
+        while j < count && (sorted_nz[j].abs() - sorted_nz[i].abs()).abs() <= 1e-12 {
+            j += 1;
+        }
+        let avg_rank = ((i + 1 + j) as f64) * 0.5;
+        for slot in &mut ranks[i..j] {
+            *slot = avg_rank;
+        }
+        i = j;
+    }
+    ranks
+}
+
+fn exact_wilcoxon_small(ranks: &[f64], w_min: f64) -> f64 {
+    let count = ranks.len();
+    let total = 1usize << count;
+    let mut le_count = 0usize;
+    for mask in 0..total {
+        let mut sum = 0.0f64;
+        for (bit, &rank) in ranks.iter().enumerate() {
+            if ((mask >> bit) & 1) != 0 {
+                sum += rank;
+            }
+        }
+        if sum <= w_min + 1e-9 {
+            le_count += 1;
+        }
+    }
+    ((2.0 * (le_count as f64)) / (total as f64)).min(1.0)
+}
+
+fn normal_approx_wilcoxon(count: usize, w_min: f64) -> f64 {
+    let mu = (count * (count + 1)) as f64 / 4.0;
+    let sigma = ((count * (count + 1) * (2 * count + 1)) as f64 / 24.0).sqrt();
+    let z_score = ((w_min - mu).abs() - 0.5).max(0.0) / sigma.max(1e-9);
+    let t_val = 1.0 / (1.0 + 0.2316419 * z_score);
+    let poly = t_val
+        * (0.319381530
+            + t_val
+                * (-0.356563782
+                    + t_val * (1.781477937 + t_val * (-1.821255978 + t_val * 1.330274429))));
+    let pdf = (-0.5 * z_score * z_score).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    (2.0 * pdf * poly).clamp(0.0, 1.0)
+}
+
+/// Exact two-sided Wilcoxon signed-rank `(W_min, p_value)` for `m <= 16`, normal approx above.
+pub fn exact_wilcoxon_p(diffs: &[f64]) -> (f64, f64) {
+    let mut nz: Vec<f64> = diffs.iter().copied().filter(|d| d.abs() > 1e-12).collect();
+    if nz.is_empty() {
+        return (0.0, 1.0);
+    }
+    nz.sort_by(|lhs, rhs| {
+        lhs.abs()
+            .partial_cmp(&rhs.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let ranks = assign_wilcoxon_ranks(&nz);
+    let (mut w_pos, mut w_neg) = (0.0f64, 0.0f64);
+    for (idx, &diff) in nz.iter().enumerate() {
+        if diff > 0.0 {
+            w_pos += ranks[idx];
+        } else {
+            w_neg += ranks[idx];
+        }
+    }
+    let w_min = w_pos.min(w_neg);
+    let p_val = if nz.len() <= 16 {
+        exact_wilcoxon_small(&ranks, w_min)
+    } else {
+        normal_approx_wilcoxon(nz.len(), w_min)
+    };
+    (w_min, p_val)
+}
+
 #[derive(Default)]
 struct Samples {
     cpu: Vec<f64>,
@@ -150,9 +286,15 @@ fn bench_pairs(
 ) -> Result<BenchReport> {
     let (mut before, mut after) = (Samples::default(), Samples::default());
     let mut checksum: Option<String> = None;
+    let use_abba = pairs >= 4;
 
-    for _ in 0..pairs {
-        for (is_after, repo) in [(false, before_repo), (true, after_repo)] {
+    for pair_idx in 0..pairs {
+        let order = if use_abba && pair_idx % 2 == 1 {
+            [(true, after_repo), (false, before_repo)]
+        } else {
+            [(false, before_repo), (true, after_repo)]
+        };
+        for (is_after, repo) in order {
             let res = exec(repo)?;
             if res.exit_code != 0 {
                 anyhow::bail!("bench failed on {}: {}", repo.display(), res.stderr);
@@ -165,6 +307,26 @@ fn bench_pairs(
             target.rss.push((res.peak_rss_bytes as f64) / (1024.0 * 1024.0));
         }
     }
+
+    let paired_ratios: Vec<f64> = before
+        .cpu
+        .iter()
+        .zip(&after.cpu)
+        .map(|(&b_val, &a_val)| a_val.max(1.0) / b_val.max(1.0))
+        .collect();
+    let paired_diffs: Vec<f64> = before
+        .cpu
+        .iter()
+        .zip(&after.cpu)
+        .map(|(&b_val, &a_val)| a_val - b_val)
+        .collect();
+    let (cpu_ratio_ci_lo, cpu_ratio_ci_hi, wilcoxon_p) = if paired_ratios.is_empty() {
+        (None, None, None)
+    } else {
+        let (_, lo, hi) = bootstrap_ratio_ci(&paired_ratios, BOOTSTRAP_RESAMPLES);
+        let (_, p_val) = exact_wilcoxon_p(&paired_diffs);
+        (Some(lo), Some(hi), Some(p_val))
+    };
 
     let b_cpu = quantile(&mut before.cpu, 0.5).max(1.0);
     let a_cpu = quantile(&mut after.cpu, 0.5).max(1.0);
@@ -183,6 +345,10 @@ fn bench_pairs(
         after_rss_mb_median: a_rss,
         rss_ratio,
         passed_anti_regression: cpu_ratio <= 1.05 && rss_ratio <= 1.05,
+        cpu_ratio_ci_lo,
+        cpu_ratio_ci_hi,
+        wilcoxon_p,
+        abba_mode: Some(use_abba),
     })
 }
 
@@ -267,5 +433,103 @@ mod tests {
         let b = TempRepo::new("bench_after");
         let rep = bench_command("git --version", a.path(), b.path(), 1).unwrap();
         assert_eq!(rep.pairs, 1);
+        assert_eq!(rep.abba_mode, Some(false));
+    }
+
+    #[test]
+    fn bench_abba_bootstrap_ci_and_exact_wilcoxon() {
+        let before = Path::new("before_repo");
+        let after = Path::new("after_repo");
+
+        // 1. Verify ABBA interleaved schedule for pairs >= 4 (6 pairs => 3 exact ABBA quartets).
+        let mut order: Vec<&'static str> = Vec::new();
+        let mut step = 0u64;
+        let drift_rep = bench_pairs(before, after, 6, |repo| {
+            let tag = if repo == before { "A" } else { "B" };
+            order.push(tag);
+            step += 1;
+            // Identical baseline + linear thermal drift (+10 ms/step): ABBA cancels drift!
+            let cpu = 1_000 + step * 10;
+            Ok(SandboxResult {
+                exit_code: 0,
+                timed_out: false,
+                stdout: "{\"checksum\":\"same\"}\n".into(),
+                stderr: String::new(),
+                wall_ms: cpu,
+                cpu_ms: cpu,
+                peak_rss_bytes: 32 * 1024 * 1024,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            order,
+            vec!["A", "B", "B", "A", "A", "B", "B", "A", "A", "B", "B", "A"]
+        );
+        assert_eq!(drift_rep.abba_mode, Some(true));
+        assert!((drift_rep.cpu_ratio - 1.0).abs() <= 0.02, "ratio={}", drift_rep.cpu_ratio);
+        assert_eq!(drift_rep.wilcoxon_p, Some(1.0), "ABBA must cancel symmetric linear drift");
+        assert!(drift_rep.cpu_ratio_ci_lo.unwrap() <= 1.0 && drift_rep.cpu_ratio_ci_hi.unwrap() >= 1.0);
+
+        // 2. Pairs < 4 preserves classic AB order for compatibility.
+        let mut short_order: Vec<&'static str> = Vec::new();
+        let short_rep = bench_pairs(before, after, 2, |repo| {
+            short_order.push(if repo == before { "A" } else { "B" });
+            Ok(SandboxResult {
+                exit_code: 0,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: String::new(),
+                wall_ms: 50,
+                cpu_ms: 50,
+                peak_rss_bytes: 16 * 1024 * 1024,
+            })
+        })
+        .unwrap();
+        assert_eq!(short_order, vec!["A", "B", "A", "B"]);
+        assert_eq!(short_rep.abba_mode, Some(false));
+
+        // 3. Clear 1.5x slowdown over 8 ABBA pairs -> tight deterministic Bootstrap 95% CI & exact p.
+        let slow_rep = bench_pairs(before, after, 8, |repo| {
+            let cpu = if repo == before { 100 } else { 150 };
+            Ok(SandboxResult {
+                exit_code: 0,
+                timed_out: false,
+                stdout: String::new(),
+                stderr: String::new(),
+                wall_ms: cpu,
+                cpu_ms: cpu,
+                peak_rss_bytes: 16 * 1024 * 1024,
+            })
+        })
+        .unwrap();
+        assert!(!slow_rep.passed_anti_regression);
+        assert_eq!(slow_rep.cpu_ratio_ci_lo, Some(1.5));
+        assert_eq!(slow_rep.cpu_ratio_ci_hi, Some(1.5));
+        assert!((slow_rep.wilcoxon_p.unwrap() - (2.0 / 256.0)).abs() < 1e-12);
+
+        // 4. Deterministic Bootstrap CI reproducibility + exact Wilcoxon textbook vectors.
+        let ratios = [0.95, 1.02, 0.98, 1.04, 1.01, 0.97, 1.03, 1.00];
+        let b1 = bootstrap_ratio_ci(&ratios, 2_000);
+        let b2 = bootstrap_ratio_ci(&ratios, 2_000);
+        assert_eq!(b1, b2, "bootstrap CI must be bit-deterministic");
+        assert!(b1.1 <= b1.0 && b1.0 <= b1.2);
+
+        let (w6, p6) = exact_wilcoxon_p(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(w6, 0.0);
+        assert!((p6 - 0.03125).abs() < 1e-12, "exact m=6 p={p6}");
+        let (_, p_sym) = exact_wilcoxon_p(&[1.0, -1.0, 2.0, -2.0]);
+        assert_eq!(p_sym, 1.0);
+        assert_eq!(exact_wilcoxon_p(&[0.0, 0.0]), (0.0, 1.0));
+        let large_pos: Vec<f64> = (1..=20).map(|v| v as f64).collect();
+        assert!(exact_wilcoxon_p(&large_pos).1 < 0.001);
+
+        // 5. Additive serde backward compatibility (legacy BenchReport JSON without optional fields).
+        let legacy_json = r#"{
+            "pairs": 3, "before_cpu_ms_median": 10.0, "after_cpu_ms_median": 10.0,
+            "cpu_ratio": 1.0, "before_rss_mb_median": 20.0, "after_rss_mb_median": 20.0,
+            "rss_ratio": 1.0, "passed_anti_regression": true
+        }"#;
+        let parsed: BenchReport = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!((parsed.cpu_ratio_ci_lo, parsed.wilcoxon_p, parsed.abba_mode), (None, None, None));
     }
 }
