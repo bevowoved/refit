@@ -3,6 +3,10 @@ use super::stage::CargoSlot;
 use crate::graph::build_dag;
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::MvccStore;
+use crate::platform::io::{
+    FileBuf, StatEntry, ensure_cachedir_tag, file_mtime_size, load_stat_cache, now_unix_ns,
+    save_stat_cache, stat_cache_fresh,
+};
 use crate::platform::{budget, collect_os_memory, read_zstd, run_cmd, sandbox_env, walk_files, write_zstd};
 use crate::source::{ext_lang, ext_str, rel_norm, source_rel, stem_of, supported_ext};
 use crate::types::DagPlan;
@@ -89,17 +93,16 @@ pub struct ScanCache {
     pub audit: AuditStats,
 }
 
-struct TreeSnap {
+struct TreeMeta {
     fingerprint: String,
     langs: Vec<String>,
     source_rels: Vec<String>,
-    preloaded: BTreeMap<String, Vec<u8>>,
+    supported: Vec<(String, PathBuf)>,
     hashes: BTreeMap<String, String>,
 }
 
-fn read_tree(repo_root: &Path) -> TreeSnap {
+fn collect_tree_paths(repo_root: &Path) -> (Vec<String>, Vec<(String, PathBuf)>, Vec<String>) {
     let (mut langs, mut supported, mut source_rels) = (BTreeSet::new(), Vec::new(), Vec::new());
-
     for path in walk_files(repo_root, None) {
         let ext = ext_str(&path);
         if !supported_ext(ext) {
@@ -114,55 +117,113 @@ fn read_tree(repo_root: &Path) -> TreeSnap {
         }
         supported.push((rel, path));
     }
-
     if langs.is_empty() {
         langs.insert("polyglot".into());
     }
     supported.sort_by(|a, b| a.0.cmp(&b.0));
     source_rels.sort();
+    (langs.into_iter().collect(), supported, source_rels)
+}
 
-    let loaded: Vec<_> = if budget().is_constrained() {
+fn resolve_file_hash(
+    rel: &str,
+    abs: &Path,
+    prev_stats: &BTreeMap<String, StatEntry>,
+    now_ns: u64,
+    fb: &mut FileBuf,
+) -> (u64, String, Option<StatEntry>) {
+    if let Some((mtime_ns, size)) = file_mtime_size(abs) {
+        if let Some(prev) = prev_stats.get(rel)
+            && stat_cache_fresh(prev, mtime_ns, size, now_ns)
+        {
+            return (size, prev.blake3.clone(), None);
+        }
+        if let Ok((len, hash)) = fb.hash_file_blake3(abs) {
+            let entry = StatEntry { mtime_ns, size: len, blake3: hash.clone() };
+            return (len, hash, Some(entry));
+        }
+    }
+    let bytes = fs::read(abs).unwrap_or_default();
+    let hash = MvccStore::hash_bytes(&bytes);
+    (bytes.len() as u64, hash, None)
+}
+
+fn hash_supported_entries(
+    supported: &[(String, PathBuf)],
+    prev_stats: &BTreeMap<String, StatEntry>,
+    now_ns: u64,
+) -> Vec<(String, u64, String, Option<StatEntry>)> {
+    if budget().is_constrained() {
+        let mut fb = FileBuf::new();
         supported
             .iter()
             .map(|(rel, abs)| {
-                let bytes = fs::read(abs).unwrap_or_default();
-                let h = MvccStore::hash_bytes(&bytes);
-                (rel.clone(), bytes, h)
+                let (len, hash, upd) = resolve_file_hash(rel, abs, prev_stats, now_ns, &mut fb);
+                (rel.clone(), len, hash, upd)
             })
             .collect()
     } else {
         supported
             .par_iter()
-            .map(|(rel, abs)| {
-                let bytes = fs::read(abs).unwrap_or_default();
-                let h = MvccStore::hash_bytes(&bytes);
-                (rel.clone(), bytes, h)
+            .map_init(FileBuf::new, |fb, (rel, abs)| {
+                let (len, hash, upd) = resolve_file_hash(rel, abs, prev_stats, now_ns, fb);
+                (rel.clone(), len, hash, upd)
             })
             .collect()
-    };
+    }
+}
 
-    let (mut preloaded, mut hashes) = (BTreeMap::new(), BTreeMap::new());
+fn read_tree(repo_root: &Path) -> TreeMeta {
+    let (langs, supported, source_rels) = collect_tree_paths(repo_root);
+    let cache_dir = repo_root.join(".refit/cache");
+    let stat_path = cache_dir.join("stat.bin");
+    let prev_stats = load_stat_cache(&stat_path);
+    let now_ns = now_unix_ns();
+
+    let hashed = hash_supported_entries(&supported, &prev_stats, now_ns);
+    let mut next_stats = BTreeMap::new();
+    let mut stat_dirty = false;
+    let mut hashes = BTreeMap::new();
     let mut fp = blake3::Hasher::new();
-    for (idx, (rel, bytes, hash)) in loaded.into_iter().enumerate() {
+
+    for (idx, (rel, len, hash, updated)) in hashed.into_iter().enumerate() {
         if idx > 0 {
             fp.update(b"\n");
         }
         fp.update(rel.as_bytes());
         fp.update(b":");
-        fp.update(bytes.len().to_string().as_bytes());
+        fp.update(len.to_string().as_bytes());
         fp.update(b":");
         fp.update(hash.as_bytes());
-        preloaded.insert(rel.clone(), bytes);
+
+        if let Some(entry) = updated {
+            stat_dirty = true;
+            next_stats.insert(rel.clone(), entry);
+        } else if let Some(prev) = prev_stats.get(&rel) {
+            next_stats.insert(rel.clone(), prev.clone());
+        }
         hashes.insert(rel, hash);
     }
 
-    TreeSnap {
+    if stat_dirty || next_stats.len() != prev_stats.len() {
+        let _ = save_stat_cache(&stat_path, &next_stats);
+    }
+
+    TreeMeta {
         fingerprint: fp.finalize().to_hex().to_string(),
-        langs: langs.into_iter().collect(),
+        langs,
         source_rels,
-        preloaded,
+        supported,
         hashes,
     }
+}
+
+fn load_preloaded_bytes(supported: &[(String, PathBuf)]) -> BTreeMap<String, Vec<u8>> {
+    let pairs: Vec<(String, Vec<u8>)> = supported
+        .par_iter()
+        .map(|(rel, abs)| (rel.clone(), fs::read(abs).unwrap_or_default()))
+        .collect();
+    pairs.into_iter().collect()
 }
 
 pub fn scan_repo(repo_root: &Path, use_cache: bool, scorer: &HygieneScorer) -> Result<(ScanCache, bool)> {
@@ -175,7 +236,8 @@ pub fn scan_cached(
     skip_tests: bool,
     scorer: &HygieneScorer,
 ) -> Result<(ScanCache, bool)> {
-    let cache_path = repo_root.join(".refit/cache/scan_cache.zst");
+    let cache_dir = repo_root.join(".refit/cache");
+    let cache_path = cache_dir.join("scan_cache.zst");
     let snap = read_tree(repo_root);
     let prev = read_zstd::<ScanCache>(&cache_path).filter(|c| c.version == "0.5.0");
 
@@ -186,6 +248,10 @@ pub fn scan_cached(
     {
         return Ok((c.clone(), true));
     }
+
+    ensure_cachedir_tag(&cache_dir);
+    let preloaded_owned = (!budget().is_constrained()).then(|| load_preloaded_bytes(&snap.supported));
+    let preloaded = preloaded_owned.as_ref();
 
     let polyglot_toolchains = detect_tools(&snap.langs);
     let gate_cfg = read_gates(repo_root);
@@ -202,10 +268,9 @@ pub fn scan_cached(
     let run_audit = || {
         let partial = use_cache && skip_tests && prev.is_some() && !changed.is_empty();
         let targets = if partial { &changed } else { &snap.source_rels };
-        let mut fresh =
-            audit_files(&gate_cfg, targets, scorer, Some(&snap.preloaded), skip_tests)?;
+        let mut fresh = audit_files(&gate_cfg, targets, scorer, preloaded, skip_tests)?;
         if let Some(ref p) = prev.filter(|_| partial) {
-            merge_partial(repo_root, &gate_cfg, scorer, &snap, &changed, p, &mut fresh);
+            merge_partial(repo_root, &gate_cfg, scorer, &snap, preloaded, &changed, p, &mut fresh);
         }
         Ok::<AuditStats, anyhow::Error>(fresh)
     };
@@ -214,16 +279,17 @@ pub fn scan_cached(
     // cross-thread contention on constrained hosts.
     let (plan_res, audit_res) = if budget().is_constrained() {
         let audit_res = run_audit();
-        let plan_res = build_dag(repo_root, None, scorer, Some(&snap.preloaded));
+        let plan_res = build_dag(repo_root, None, scorer, preloaded);
         (plan_res, audit_res)
     } else {
         std::thread::scope(|s| {
-            let h_plan = s.spawn(|| build_dag(repo_root, None, scorer, Some(&snap.preloaded)));
+            let h_plan = s.spawn(|| build_dag(repo_root, None, scorer, preloaded));
             let h_audit = s.spawn(run_audit);
             (h_plan.join().expect("dag"), h_audit.join().expect("audit"))
         })
     };
 
+    drop(preloaded_owned);
     scorer.flush_cache();
     collect_os_memory();
     let bundle = ScanCache {
@@ -244,7 +310,8 @@ fn merge_partial(
     repo_root: &Path,
     gate_cfg: &GateConfig,
     scorer: &HygieneScorer,
-    snap: &TreeSnap,
+    snap: &TreeMeta,
+    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
     changed: &[String],
     prev: &ScanCache,
     fresh: &mut AuditStats,
@@ -260,7 +327,7 @@ fn merge_partial(
         }
     }
 
-    let (med, p10, _) = scorer.score_files(repo_root, &snap.source_rels, Some(&snap.preloaded));
+    let (med, p10, _) = scorer.score_files(repo_root, &snap.source_rels, preloaded);
     fresh.hygiene_median = med;
     fresh.hygiene_p10 = p10;
     fresh.ruff_errors = fresh

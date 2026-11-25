@@ -1,8 +1,7 @@
-use crate::platform::{now_ms, write_atomic};
+use crate::platform::{SieveCache, now_ms};
 use crate::state::RunState;
 use crate::types::{ModuleUnit, RunSummary, TelemetryEvent};
 use anyhow::{Context, Result};
-use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -48,7 +47,7 @@ struct TelemetryInner {
     seq: AtomicU64,
     writer: Mutex<BufWriter<File>>,
     history: Mutex<VecDeque<TelemetryEvent>>,
-    last_unit_sig: DashMap<String, u64>,
+    last_unit_sig: SieveCache<String, u64>,
     dedup_skipped: AtomicU64,
     bytes_written: AtomicU64,
     shared_state: Mutex<Option<Arc<RunState>>>,
@@ -85,7 +84,7 @@ impl TelemetryHub {
                 seq: AtomicU64::new(1),
                 writer: Mutex::new(BufWriter::with_capacity(32 * 1024, file)),
                 history: Mutex::new(VecDeque::with_capacity(512)),
-                last_unit_sig: DashMap::new(),
+                last_unit_sig: SieveCache::new(4_096, 512 * 1024),
                 dedup_skipped: AtomicU64::new(0),
                 bytes_written: AtomicU64::new(0),
                 shared_state: Mutex::new(None),
@@ -128,7 +127,8 @@ impl TelemetryHub {
             .unwrap_or(0);
         let tpm = spec.uncached_tpm.unwrap_or(0);
         let sig = fast_sig(kind, tpm ^ extra.rotate_left(19));
-        if self.inner.last_unit_sig.insert(id.to_string(), sig) != Some(sig) {
+        let weight = id.len().saturating_add(32);
+        if self.inner.last_unit_sig.insert(id.to_string(), sig, weight) != Some(sig) {
             return false;
         }
 
@@ -196,16 +196,10 @@ impl TelemetryHub {
 
     pub fn flush_zstd(&self) -> Result<(PathBuf, u64, u64)> {
         self.inner.writer.lock().flush()?;
-        let raw = fs::read(&self.inner.jsonl_path)?;
-        let raw_len = raw.len() as u64;
-
-        let zst = zstd::stream::encode_all(raw.as_slice(), 6)
-            .context("zstd compress telemetry")?;
-        let zst_len = zst.len() as u64;
         let path = self.inner.jsonl_path.with_extension("jsonl.zst");
-
-        write_atomic(&path, &zst)
-            .with_context(|| format!("write compact zstd {}", path.display()))?;
+        let (raw_len, zst_len) =
+            crate::platform::io::compress_file_zstd(&self.inner.jsonl_path, &path, 3)
+                .with_context(|| format!("write compact zstd {}", path.display()))?;
         Ok((path, raw_len, zst_len))
     }
 

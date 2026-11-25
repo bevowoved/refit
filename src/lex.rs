@@ -182,11 +182,12 @@ pub fn match_prefix<'a>(s: &'a str, table: &[&str]) -> Option<&'a str> {
 }
 
 #[inline]
-pub fn to_eol(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && bytes[i] != b'\n' {
-        i += 1;
+pub fn to_eol(bytes: &[u8], i: usize) -> usize {
+    let Some(tail) = bytes.get(i..) else { return i };
+    match memchr::memchr(b'\n', tail) {
+        Some(rel) => i + rel,
+        None => bytes.len(),
     }
-    i
 }
 
 /// Scan `/* ... */` starting at `i`. Returns `(end, newlines, closed)`.

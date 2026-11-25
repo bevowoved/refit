@@ -82,7 +82,7 @@ pub fn build_http(
 /// Drain complete SSE `data: {...}` frames using one cursor pass.
 pub fn drain_sse(buf: &mut Vec<u8>, flush: bool, mut on_val: impl FnMut(Value)) {
     let mut cursor = 0usize;
-    while let Some(rel_nl) = buf[cursor..].iter().position(|&b| b == b'\n') {
+    while let Some(rel_nl) = memchr::memchr(b'\n', &buf[cursor..]) {
         let end = cursor + rel_nl;
         parse_sse(&buf[cursor..end], &mut on_val);
         cursor = end + 1;
@@ -98,13 +98,12 @@ pub fn drain_sse(buf: &mut Vec<u8>, flush: bool, mut on_val: impl FnMut(Value)) 
 }
 
 fn parse_sse(raw: &[u8], on_val: &mut impl FnMut(Value)) {
-    let line = String::from_utf8_lossy(raw);
-    let Some(data) = line.trim().strip_prefix("data: ") else { return };
-    if data == "[DONE]" {
+    let Some(data) = raw.trim_ascii().strip_prefix(b"data: ") else { return };
+    if data == b"[DONE]" {
         return;
     }
-    if let Ok(v) = serde_json::from_str::<Value>(data) {
-        on_val(v);
+    if let Ok(val) = serde_json::from_slice::<Value>(data) {
+        on_val(val);
     }
 }
 

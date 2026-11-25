@@ -1,14 +1,14 @@
 use super::wal::{FileDiff, TxDiffReport, WalEvent, read_blob, storage_paths, visit_wal};
+use crate::platform::SieveCache;
 use crate::source::count_lines;
 use crate::types::{WalFileEntry, WalRecord};
 use anyhow::Result;
-use dashmap::DashMap;
 use similar::{ChangeTag, TextDiff};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-static TIMELINE_CACHE: OnceLock<DashMap<PathBuf, (u64, Vec<WalEvent>)>> = OnceLock::new();
+static TIMELINE_CACHE: OnceLock<SieveCache<PathBuf, (u64, u64, Vec<WalEvent>)>> = OnceLock::new();
 
 pub fn wal_timeline(repo_root: &Path) -> Result<Vec<WalEvent>> {
     let (wal_path, cas_dir) = storage_paths(repo_root);
@@ -16,10 +16,13 @@ pub fn wal_timeline(repo_root: &Path) -> Result<Vec<WalEvent>> {
         return Ok(Vec::new());
     }
 
-    let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-    let cache = TIMELINE_CACHE.get_or_init(DashMap::new);
-    if let Some(hit) = cache.get(&wal_path).filter(|e| e.0 == wal_len) {
-        return Ok(hit.1.clone());
+    let (mtime_ns, wal_len) = crate::platform::io::file_mtime_size(&wal_path).unwrap_or((0, 0));
+    let cache = TIMELINE_CACHE.get_or_init(|| SieveCache::new(8, 4 * 1024 * 1024));
+    if let Some((cached_len, cached_mtime, cached_events)) = cache.get(&wal_path)
+        && cached_len == wal_len
+        && cached_mtime == mtime_ns
+    {
+        return Ok(cached_events);
     }
 
     let mut events = Vec::new();
@@ -66,7 +69,8 @@ pub fn wal_timeline(repo_root: &Path) -> Result<Vec<WalEvent>> {
         WalRecord::RunStart { .. } | WalRecord::Prepared { .. } => {}
     })?;
 
-    cache.insert(wal_path, (wal_len, events.clone()));
+    let weight = events.len().saturating_mul(256).saturating_add(128);
+    cache.insert(wal_path, (wal_len, mtime_ns, events.clone()), weight);
     Ok(events)
 }
 

@@ -45,7 +45,7 @@ pub fn count_lines(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
     }
-    let nl = bytes.iter().filter(|&&b| b == b'\n').count();
+    let nl = memchr::memchr_iter(b'\n', bytes).count();
     nl + usize::from(bytes.last() != Some(&b'\n'))
 }
 

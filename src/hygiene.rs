@@ -7,11 +7,11 @@ mod weights;
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
 use crate::platform::{
-    MemGate, TangoCreditRing, budget, collect_os_memory, under_memory_pressure, write_atomic,
+    MemGate, SieveCache, TangoCreditRing, budget, collect_os_memory, ensure_cachedir_tag,
+    under_memory_pressure, write_atomic,
 };
 use crate::source::{quantile, read_text};
 use crate::types::{HygieneResult, Squiggle};
-use dashmap::DashMap;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
@@ -317,9 +317,18 @@ fn read_hygiene_cache(path: &Path, active_prefix: &str) -> Option<HashMap<String
     Some(migrated)
 }
 
+fn hygiene_entry_weight(key: &str, res: &HygieneResult) -> usize {
+    let sq_bytes = res.squiggles.len().saturating_mul(96);
+    let veto_bytes: usize = res.triggered_vetoes.iter().map(String::len).sum();
+    key.len()
+        .saturating_add(160)
+        .saturating_add(sq_bytes)
+        .saturating_add(veto_bytes)
+}
+
 pub struct HygieneScorer {
-    cache: DashMap<String, HygieneResult>,
-    in_flight: DashMap<String, Arc<Mutex<()>>>,
+    cache: SieveCache<String, HygieneResult>,
+    in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     disk_path: Option<PathBuf>,
     override_weights: Option<Arc<weights::ResolvedWeights>>,
     dirty: AtomicBool,
@@ -337,8 +346,8 @@ impl HygieneScorer {
         override_weights: Option<Arc<weights::ResolvedWeights>>,
     ) -> Self {
         Self {
-            cache: DashMap::new(),
-            in_flight: DashMap::new(),
+            cache: SieveCache::new(16_384, 32 * 1024 * 1024),
+            in_flight: Mutex::new(HashMap::new()),
             disk_path,
             override_weights,
             dirty: AtomicBool::new(false),
@@ -385,8 +394,9 @@ impl HygieneScorer {
         let scorer = Self::with_path(Some(disk_path.clone()), override_weights);
         let prefix = scorer.weights_blake3_prefix().to_string();
         if let Some(saved) = read_hygiene_cache(&disk_path, &prefix) {
-            for (k, v) in saved {
-                scorer.cache.insert(k, v);
+            for (key, val) in saved {
+                let weight = hygiene_entry_weight(&key, &val);
+                scorer.cache.insert(key, val, weight);
             }
         }
         scorer
@@ -401,20 +411,27 @@ impl HygieneScorer {
             return;
         }
         let Some(ref path) = self.disk_path else { return };
-        let mut map = HashMap::with_capacity(self.cache.len());
-        for entry in self.cache.iter() {
-            map.insert(entry.key().clone(), entry.value().clone());
+        if let Some(parent) = path.parent() {
+            ensure_cachedir_tag(parent);
         }
+        let map: HashMap<String, HygieneResult> = self.cache.snapshot().into_iter().collect();
         let _ = write_compact_cache_zstd(path, &map);
     }
 
-    fn cache_hit(&self, key: &str, t0: Instant) -> Option<HygieneResult> {
-        let mut res = self.cache.get(key)?.clone();
+    fn cache_hit(&self, key: &String, t0: Instant) -> Option<HygieneResult> {
+        let mut res = self.cache.get(key)?;
         let us = t0.elapsed().as_micros().max(1) as u64;
         res.cached = true;
         res.latency_us = us;
         self.last_warm_us.store(us, Ordering::Relaxed);
         Some(res)
+    }
+
+    fn release_in_flight(&self, key: &str, lock: &Arc<Mutex<()>>) {
+        let mut guard = self.in_flight.lock();
+        if matches!(guard.get(key), Some(existing) if Arc::ptr_eq(existing, lock)) {
+            guard.remove(key);
+        }
     }
 
     pub fn score_content(&self, _path: &str, content: &str) -> HygieneResult {
@@ -428,15 +445,17 @@ impl HygieneScorer {
             return res;
         }
 
-        let lock = self
-            .in_flight
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
+        let lock = {
+            let mut inflight = self.in_flight.lock();
+            inflight
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
         let guard = lock.lock();
         if let Some(res) = self.cache_hit(&key, t0) {
             drop(guard);
-            self.in_flight.remove_if(&key, |_, v| Arc::ptr_eq(v, &lock));
+            self.release_in_flight(&key, &lock);
             return res;
         }
 
@@ -447,12 +466,13 @@ impl HygieneScorer {
         let started = Instant::now();
         let mut res = model::score_v07_with_weights(content, self.active_weights());
         res.latency_us = started.elapsed().as_micros().max(1) as u64;
-        self.cache.insert(key.clone(), res.clone());
+        let weight = hygiene_entry_weight(&key, &res);
+        self.cache.insert(key.clone(), res.clone(), weight);
         self.dirty.store(true, Ordering::Release);
 
         drop(permit);
         drop(guard);
-        self.in_flight.remove_if(&key, |_, v| Arc::ptr_eq(v, &lock));
+        self.release_in_flight(&key, &lock);
         if content.len() > 128 * 1024 {
             collect_os_memory();
         }

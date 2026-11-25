@@ -199,36 +199,45 @@ fn run_sustain(repo_root: &Path, args: &Value, hygiene: &HygieneScorer) -> Value
 }
 
 fn run_read(repo_root: &Path, args: &Value) -> Value {
+    use std::io::BufRead;
+
     let rel = args["path"].as_str().unwrap_or("");
     if !check_target(repo_root, rel) {
         return json!({"error": format!("unsafe path `{rel}`")});
     }
-    let Ok(content) = fs::read_to_string(repo_root.join(rel)) else {
+    let Ok(file) = fs::File::open(repo_root.join(rel)) else {
         return json!({"error": format!("file not found `{rel}`")});
     };
+    let _epoch = crate::platform::EpochRegistry::global().global_epoch();
+    let _file_epoch = crate::platform::EpochRegistry::global().try_read(rel);
 
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    let raw_start = args["start_line"].as_u64().unwrap_or(1);
-    let start = raw_start.max(1) as usize;
-    let end = args["end_line"]
+    let start = args["start_line"].as_u64().unwrap_or(1).max(1) as usize;
+    let req_end = args["end_line"]
         .as_u64()
         .map(|e| e as usize)
-        .unwrap_or_else(|| start.saturating_add(199).min(total))
-        .min(total)
+        .unwrap_or_else(|| start.saturating_add(199))
         .min(start.saturating_add(400));
 
-    let slice = if start <= end && start >= 1 {
-        lines[start - 1..end]
-            .iter()
-            .enumerate()
-            .map(|(idx, l)| format!("{}: {l}", start + idx))
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        String::new()
-    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = String::new();
+    let mut total = 0usize;
+    let mut kept = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                total += 1;
+                if total >= start && total <= req_end {
+                    let trimmed = buf.trim_end_matches(['\n', '\r']);
+                    kept.push(format!("{total}: {trimmed}"));
+                }
+            }
+        }
+    }
 
+    let end = req_end.min(total);
+    let slice = if start <= end { kept.join("\n") } else { String::new() };
     json!({
         "path": rel, "start_line": start, "end_line": end,
         "total_lines": total, "content": slice

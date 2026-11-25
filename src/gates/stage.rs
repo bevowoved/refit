@@ -1,4 +1,4 @@
-use crate::platform::{now_ms, walk_files};
+use crate::platform::{SidecarLock, ensure_cachedir_tag, now_ms, walk_files};
 use crate::source::{rel_norm, work_dir};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -33,18 +33,48 @@ pub(super) struct CargoSlot {
     slot: usize,
     pooled: bool,
     pub(super) dir: PathBuf,
+    _lock: Option<SidecarLock>,
+}
+
+fn max_cargo_slots() -> usize {
+    std::env::var("REFIT_CARGO_SLOTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(2, |n| n.clamp(1, 2))
 }
 
 impl CargoSlot {
     pub(super) fn acquire(repo_root: &Path) -> Self {
-        let pool = CARGO_SLOT_POOL.get_or_init(|| Mutex::new((0..8).rev().collect()));
-        let (slot, pooled) = match pool.lock().pop() {
-            Some(s) => (s, true),
-            None => (CARGO_EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed) as usize, false),
+        let cap = max_cargo_slots();
+        let pool = CARGO_SLOT_POOL.get_or_init(|| Mutex::new((0..cap).rev().collect()));
+        let slots_root = stages_dir(repo_root).join("cargo-slots");
+        ensure_cachedir_tag(&stages_dir(repo_root));
+        ensure_cachedir_tag(&slots_root);
+
+        let mut skipped = Vec::new();
+        let mut chosen: Option<(usize, SidecarLock)> = None;
+        while let Some(s) = pool.lock().pop() {
+            let lock_path = slots_root.join(format!("slot-{s}.lock"));
+            if let Ok(Some(lk)) = SidecarLock::try_acquire(&lock_path) {
+                chosen = Some((s, lk));
+                break;
+            }
+            skipped.push(s);
+        }
+        if !skipped.is_empty() {
+            let mut g = pool.lock();
+            for s in skipped {
+                g.push(s);
+            }
+        }
+
+        let (slot, pooled, lock) = match chosen {
+            Some((s, lk)) => (s, true, Some(lk)),
+            None => (CARGO_EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed) as usize, false, None),
         };
-        let dir = stages_dir(repo_root).join("cargo-slots").join(format!("slot-{slot}"));
+        let dir = slots_root.join(format!("slot-{slot}"));
         let _ = fs::create_dir_all(&dir);
-        Self { slot, pooled, dir }
+        Self { slot, pooled, dir, _lock: lock }
     }
 }
 

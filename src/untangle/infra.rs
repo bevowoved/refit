@@ -1,17 +1,167 @@
-use crate::lex::has_word;
+use crate::lex::{ident_byte, left_bound};
 use crate::platform::{find_secret, walk_tree};
-use crate::source::{ext_of, parse_deps, rel_norm, supported_ext};
+use crate::source::{ext_of, ext_str, parse_deps, rel_norm, supported_ext};
 use crate::types::{InfraFinding, UnusedDep};
-use std::collections::BTreeMap;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use fixedbitset::FixedBitSet;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Eco {
+    Npm = 0,
+    Cargo = 1,
+    Python = 2,
+    Go = 3,
+}
+
+impl Eco {
+    const ALL: [Self; 4] = [Self::Npm, Self::Cargo, Self::Python, Self::Go];
+
+    fn from_ext(ext: &str) -> Self {
+        if ext.eq_ignore_ascii_case("rs") {
+            Self::Cargo
+        } else if ext.eq_ignore_ascii_case("py") {
+            Self::Python
+        } else if ext.eq_ignore_ascii_case("go") {
+            Self::Go
+        } else {
+            Self::Npm
+        }
+    }
+
+    fn from_name(name: &str) -> Self {
+        match name {
+            "npm" => Self::Npm,
+            "cargo" => Self::Cargo,
+            "python" => Self::Python,
+            _ => Self::Go,
+        }
+    }
+
+    #[inline]
+    fn idx(self) -> usize {
+        self as usize
+    }
+
+    #[inline]
+    fn word_bound(self) -> bool {
+        self != Self::Go
+    }
+
+    #[inline]
+    fn case_insensitive(self) -> bool {
+        self == Self::Python
+    }
+}
+
+struct ParsedDep {
+    manifest: String,
+    ecosystem: &'static str,
+    package: String,
+    eco: Eco,
+    slot: usize,
+}
 
 #[derive(Default)]
-struct LangCorpus {
-    js: String,
-    rs: String,
-    py: String,
-    go: String,
+struct EcoBuilder {
+    pkg_slots: HashMap<String, usize>,
+    pat_ids: HashMap<String, usize>,
+    patterns: Vec<String>,
+    pat_slots: Vec<Vec<usize>>,
+}
+
+impl EcoBuilder {
+    fn add_dep(&mut self, eco: Eco, package: &str) -> usize {
+        let key = if eco.case_insensitive() {
+            package.to_ascii_lowercase()
+        } else {
+            package.to_string()
+        };
+        let next_slot = self.pkg_slots.len();
+        let slot = *self.pkg_slots.entry(key.clone()).or_insert(next_slot);
+        if key.is_empty() {
+            return slot;
+        }
+        self.add_pattern(&key, slot);
+        if matches!(eco, Eco::Cargo | Eco::Python) && key.contains('-') {
+            self.add_pattern(&key.replace('-', "_"), slot);
+        }
+        slot
+    }
+
+    fn add_pattern(&mut self, pat: &str, slot: usize) {
+        let pat_id = if let Some(&existing) = self.pat_ids.get(pat) {
+            existing
+        } else {
+            let new_id = self.patterns.len();
+            self.patterns.push(pat.to_string());
+            self.pat_ids.insert(pat.to_string(), new_id);
+            self.pat_slots.push(Vec::new());
+            new_id
+        };
+        let slots = &mut self.pat_slots[pat_id];
+        if !slots.contains(&slot) {
+            slots.push(slot);
+        }
+    }
+
+    fn build(self, eco: Eco) -> Option<EcoMatcher> {
+        let dep_count = self.pkg_slots.len();
+        if dep_count == 0 || self.patterns.is_empty() {
+            return None;
+        }
+        let ac = AhoCorasickBuilder::new()
+            .ascii_case_insensitive(eco.case_insensitive())
+            .build(&self.patterns)
+            .ok()?;
+        Some(EcoMatcher {
+            ac,
+            pat_slots: self.pat_slots,
+            dep_count,
+            word_bound: eco.word_bound(),
+            hits: FixedBitSet::with_capacity(dep_count),
+        })
+    }
+}
+
+struct EcoMatcher {
+    ac: AhoCorasick,
+    pat_slots: Vec<Vec<usize>>,
+    dep_count: usize,
+    word_bound: bool,
+    hits: FixedBitSet,
+}
+
+impl EcoMatcher {
+    #[inline]
+    fn is_complete(&self) -> bool {
+        self.hits.count_ones(..) == self.dep_count
+    }
+
+    fn scan_bytes(&mut self, bytes: &[u8]) {
+        if self.is_complete() || bytes.is_empty() {
+            return;
+        }
+        for mat in self.ac.find_overlapping_iter(bytes) {
+            if self.word_bound && !is_word_span(bytes, mat.start(), mat.end()) {
+                continue;
+            }
+            let mut added = false;
+            for &slot in &self.pat_slots[mat.pattern().as_usize()] {
+                added |= !self.hits.put(slot);
+            }
+            if added && self.is_complete() {
+                return;
+            }
+        }
+    }
+}
+
+#[inline]
+fn is_word_span(bytes: &[u8], start: usize, end: usize) -> bool {
+    left_bound(bytes, start) && (end == bytes.len() || !ident_byte(bytes[end]))
 }
 
 #[derive(Clone, Copy)]
@@ -135,25 +285,17 @@ pub fn scan_parts(
 ) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>) {
     let mut infra_count = 0usize;
     let mut findings = Vec::new();
-    let mut corpora = LangCorpus::default();
     let mut manifests = Vec::new();
-
-    if let Some(map) = preloaded {
-        for (rel, bytes) in map {
-            push_corpus(&mut corpora, &ext_of(rel), &String::from_utf8_lossy(bytes));
-        }
-    }
+    let mut source_paths: Vec<(Eco, PathBuf)> = Vec::new();
 
     for abs in walk_tree(repo_root, None, true) {
         let Some(rel) = rel_norm(repo_root, &abs) else { continue };
         let fname = abs.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let ext = ext_of(&abs);
+        let ext = ext_str(&abs);
 
-        if supported_ext(&ext) {
-            if preloaded.is_none()
-                && let Ok(txt) = fs::read_to_string(&abs)
-            {
-                push_corpus(&mut corpora, &ext, &txt);
+        if supported_ext(ext) {
+            if preloaded.is_none() {
+                source_paths.push((Eco::from_ext(ext), abs));
             }
             continue;
         }
@@ -165,25 +307,15 @@ pub fn scan_parts(
             continue;
         }
 
-        let Some(kind) = infra_kind(&rel, fname, &ext) else { continue };
+        let ext_lo = ext_of(&abs);
+        let Some(kind) = infra_kind(&rel, fname, &ext_lo) else { continue };
         infra_count += 1;
         let Ok(txt) = fs::read_to_string(&abs) else { continue };
         scan_file(&rel, kind, &txt, &mut findings);
     }
 
-    let unused = dead_deps(&manifests, &corpora);
+    let unused = find_unused_deps(&manifests, preloaded, &source_paths);
     (infra_count, unused, findings)
-}
-
-fn push_corpus(corpora: &mut LangCorpus, ext: &str, txt: &str) {
-    let dst = match ext {
-        "rs" => &mut corpora.rs,
-        "py" => &mut corpora.py,
-        "go" => &mut corpora.go,
-        _ => &mut corpora.js,
-    };
-    dst.push_str(txt);
-    dst.push('\n');
 }
 
 fn infra_kind(rel: &str, fname: &str, ext: &str) -> Option<Option<Kind>> {
@@ -325,31 +457,92 @@ fn has_baked(t: &str, up: &str) -> bool {
     !val.is_empty() && !val.starts_with('$')
 }
 
-fn dead_deps(manifests: &[(String, String, String)], corpora: &LangCorpus) -> Vec<UnusedDep> {
-    let py_lower = corpora.py.to_ascii_lowercase();
-    let mut unused = Vec::new();
-
+fn collect_manifest_deps(
+    manifests: &[(String, String, String)],
+) -> (Vec<ParsedDep>, [Option<EcoMatcher>; 4]) {
+    let mut builders: [EcoBuilder; 4] = Default::default();
+    let mut parsed = Vec::new();
     for (manifest, fname, txt) in manifests {
         for dep in parse_deps(fname, txt) {
-            let used = match dep.ecosystem {
-                "npm" => has_word(&corpora.js, &dep.package),
-                "cargo" => {
-                    let ident = dep.package.replace('-', "_");
-                    has_word(&corpora.rs, &ident) || has_word(&corpora.rs, &dep.package)
-                }
-                "python" => {
-                    let lo = dep.package.to_ascii_lowercase();
-                    has_word(&py_lower, &lo.replace('-', "_")) || has_word(&py_lower, &lo)
-                }
-                _ => corpora.go.contains(&dep.package),
-            };
-            if !used {
-                unused.push(UnusedDep {
-                    manifest: manifest.clone(),
-                    ecosystem: dep.ecosystem.into(),
-                    package: dep.package,
-                });
+            let eco = Eco::from_name(dep.ecosystem);
+            let slot = builders[eco.idx()].add_dep(eco, &dep.package);
+            parsed.push(ParsedDep {
+                manifest: manifest.clone(),
+                ecosystem: dep.ecosystem,
+                package: dep.package,
+                eco,
+                slot,
+            });
+        }
+    }
+    let [b0, b1, b2, b3] = builders;
+    let matchers = [
+        b0.build(Eco::ALL[0]),
+        b1.build(Eco::ALL[1]),
+        b2.build(Eco::ALL[2]),
+        b3.build(Eco::ALL[3]),
+    ];
+    (parsed, matchers)
+}
+
+fn all_matchers_complete(matchers: &[Option<EcoMatcher>; 4]) -> bool {
+    matchers.iter().all(|m| m.as_ref().is_none_or(EcoMatcher::is_complete))
+}
+
+fn scan_sources_for_deps(
+    matchers: &mut [Option<EcoMatcher>; 4],
+    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
+    source_paths: &[(Eco, PathBuf)],
+) {
+    if let Some(map) = preloaded {
+        for (rel, bytes) in map {
+            let eco = Eco::from_ext(&ext_of(rel));
+            if let Some(m) = matchers[eco.idx()].as_mut() {
+                m.scan_bytes(bytes);
             }
+            if all_matchers_complete(matchers) {
+                return;
+            }
+        }
+        return;
+    }
+
+    for (eco, abs) in source_paths {
+        let Some(m) = matchers[eco.idx()].as_mut() else { continue };
+        if m.is_complete() {
+            continue;
+        }
+        if let Ok(bytes) = fs::read(abs) {
+            m.scan_bytes(&bytes);
+        }
+        if all_matchers_complete(matchers) {
+            return;
+        }
+    }
+}
+
+fn find_unused_deps(
+    manifests: &[(String, String, String)],
+    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
+    source_paths: &[(Eco, PathBuf)],
+) -> Vec<UnusedDep> {
+    if manifests.is_empty() {
+        return Vec::new();
+    }
+    let (parsed, mut matchers) = collect_manifest_deps(manifests);
+    scan_sources_for_deps(&mut matchers, preloaded, source_paths);
+
+    let mut unused = Vec::new();
+    for dep in parsed {
+        let used = matchers[dep.eco.idx()]
+            .as_ref()
+            .is_some_and(|m| m.hits.contains(dep.slot));
+        if !used {
+            unused.push(UnusedDep {
+                manifest: dep.manifest,
+                ecosystem: dep.ecosystem.into(),
+                package: dep.package,
+            });
         }
     }
     unused

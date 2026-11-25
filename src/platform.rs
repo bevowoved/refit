@@ -1,13 +1,18 @@
 pub mod budget;
+pub mod epoch;
+pub mod io;
 pub mod memgate;
 pub mod paths;
 mod proc;
 mod redact;
+pub mod sieve;
 
 pub use crate::net::backoff_ms;
 #[cfg(test)]
 use crate::net::{is_quota_exhausted, is_retryable, retry_ms};
 pub use budget::{allocator_name, budget, collect_os_memory, init_allocator, under_memory_pressure};
+pub use epoch::EpochRegistry;
+pub use io::{SidecarLock, ensure_cachedir_tag, has_cachedir_tag};
 pub use memgate::{MemGate, TangoCreditRing};
 pub use paths::{
     check_rel, check_target_in_repo, normalize_rel, pwsh_utf8_preamble, rel_to_root,
@@ -15,6 +20,7 @@ pub use paths::{
 };
 pub use proc::{run_cmd, self_metrics};
 pub use redact::{find_secret, redact_secrets};
+pub use sieve::SieveCache;
 
 use crate::net::build_http;
 use anyhow::{Context, Result};
@@ -112,7 +118,7 @@ fn keep_entry(e: &ignore::DirEntry, include_hidden: bool) -> bool {
     }
 
     let name = e.file_name().to_string_lossy();
-    if skip_dir(&name) {
+    if skip_dir(&name) || has_cachedir_tag(e.path()) {
         return false;
     }
     if name.starts_with('.') {
@@ -163,15 +169,11 @@ pub fn stream_http(
 }
 
 pub fn write_zstd<T: Serialize>(path: &Path, val: &T) -> Result<()> {
-    let raw = serde_json::to_vec(val)?;
-    let compressed = zstd::stream::encode_all(raw.as_slice(), 3)?;
-    write_atomic(path, &compressed)
+    io::write_zstd_stream(path, val)
 }
 
 pub fn read_zstd<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let raw = fs::read(path).ok()?;
-    let decoded = zstd::stream::decode_all(raw.as_slice()).ok()?;
-    serde_json::from_slice(&decoded).ok()
+    io::read_zstd_stream(path)
 }
 
 pub fn mkdir_private(path: &Path) -> Result<()> {
@@ -201,10 +203,14 @@ pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = File::create(&tmp_path)
         .with_context(|| format!("create temp file {}", tmp_path.display()))?;
     f.write_all(bytes)?;
-    f.sync_data()?;
+    io::sync_file_barrier(&f)?;
     drop(f);
 
     replace_file(&tmp_path, target, parent)
+}
+
+pub(crate) fn replace_file_pub(src_path: &Path, dst_path: &Path, parent: &Path) -> Result<()> {
+    replace_file(src_path, dst_path, parent)
 }
 
 #[cfg(windows)]

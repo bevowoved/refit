@@ -1,4 +1,6 @@
 use crate::lex::left_bound;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use std::sync::LazyLock;
 
 const DB_SCHEMES: &[&str] = &[
     "postgres://", "postgresql://", "mysql://", "mongodb://",
@@ -24,6 +26,23 @@ const SECRET_SPECS: &[(&str, &str, &str, usize, usize, bool)] = &[
     ("sk-", "generic_sk_secret", "REDACTED_SK_", 24, 24, false),
 ];
 
+const PEM_MARKER: &str = "PRIVATE KEY-----";
+const DB_BASE: usize = SECRET_SPECS.len();
+const PEM_IDX: usize = DB_BASE + DB_SCHEMES.len();
+
+static SECRET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    let mut patterns: Vec<&str> = Vec::with_capacity(PEM_IDX + 1);
+    for &(prefix, _, _, _, _, _) in SECRET_SPECS {
+        patterns.push(prefix);
+    }
+    patterns.extend_from_slice(DB_SCHEMES);
+    patterns.push("-----BEGIN ");
+    AhoCorasickBuilder::new()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(patterns)
+        .expect("secret aho-corasick")
+});
+
 fn token_len(tail: &str, upper_only: bool) -> usize {
     if upper_only {
         tail.bytes()
@@ -36,151 +55,96 @@ fn token_len(tail: &str, upper_only: bool) -> usize {
     }
 }
 
-fn has_prefix(line: &str, prefix: &str, min_len: usize, upper_only: bool) -> bool {
-    let mut rest = line;
-    while let Some(pos) = rest.find(prefix) {
-        let tail = &rest[pos + prefix.len()..];
-        if left_bound(rest.as_bytes(), pos) && token_len(tail, upper_only) >= min_len {
-            return true;
-        }
-        rest = tail;
+fn db_creds_span(after: &str) -> Option<(usize, &str, &str)> {
+    let end = after
+        .find(['/', ' ', '"', '\'', ')', ']', '\n', '\r'])
+        .unwrap_or(after.len());
+    let (creds, host) = after[..end].split_once('@')?;
+    if host.is_empty() || !creds.contains(':') {
+        return None;
     }
-    false
+    Some((end, creds, host))
 }
 
-fn has_dburi(line: &str, scheme: &str) -> bool {
-    let mut rest = line;
-    while let Some(pos) = rest.find(scheme) {
-        let after = &rest[pos + scheme.len()..];
-        let auth = after.split(['/', ' ', '"', '\'', ')', ']']).next().unwrap_or("");
-        if let Some((creds, host)) = auth.split_once('@')
-            && !host.is_empty()
-            && creds.contains(':')
+/// Single-pass SIMD secret detection across all 22 prefix/URI/PEM patterns.
+pub fn find_secret(line: &str) -> Option<&'static str> {
+    let bytes = line.as_bytes();
+    for mat in SECRET_AC.find_iter(line) {
+        let pid = mat.pattern().as_usize();
+        if pid == PEM_IDX {
+            if line[mat.end()..].contains(PEM_MARKER) {
+                return Some("pem_private_key");
+            }
+        } else if pid < DB_BASE {
+            let (_, kind, _, dmin, _, upper) = SECRET_SPECS[pid];
+            if left_bound(bytes, mat.start()) && token_len(&line[mat.end()..], upper) >= dmin {
+                return Some(kind);
+            }
+        } else if let Some((_, creds, _)) = db_creds_span(&line[mat.end()..])
             && !creds.ends_with(':')
             && !creds.contains("${")
             && !creds.contains("REDACTED")
         {
-            return true;
-        }
-        rest = after;
-    }
-    false
-}
-
-pub fn find_secret(line: &str) -> Option<&'static str> {
-    if line.contains("-----BEGIN ") && line.contains("PRIVATE KEY-----") {
-        return Some("pem_private_key");
-    }
-
-    for &(prefix, kind, _, dmin, _, upper) in SECRET_SPECS {
-        if line.contains(prefix) && has_prefix(line, prefix, dmin, upper) {
-            return Some(kind);
-        }
-    }
-
-    for &scheme in DB_SCHEMES {
-        if line.contains(scheme) && has_dburi(line, scheme) {
             return Some("database_credential_url");
         }
     }
     None
 }
 
-pub fn redact_secrets(mut s: String) -> String {
-    for &(prefix, _, tag, _, rmin, _) in SECRET_SPECS {
-        if s.contains(prefix) {
-            s = redact_prefix(&s, prefix, tag, rmin);
-        }
-    }
-
-    for &scheme in DB_SCHEMES {
-        if s.contains(scheme) {
-            s = redact_uris(&s, scheme);
-        }
-    }
-
-    if s.contains("PRIVATE KEY-----") {
-        s = redact_pem(&s);
-    }
-    s
+fn consume_pem_block(s: &str, start: usize, end: usize) -> Option<usize> {
+    let hdr_rel = s[end..].find(PEM_MARKER)?;
+    let tail_start = end + hdr_rel + PEM_MARKER.len();
+    let tail = &s[tail_start..];
+    let Some(end_rel) = tail.find("-----END ") else {
+        return Some(s.len());
+    };
+    let Some(close_rel) = tail[end_rel..].find(PEM_MARKER) else {
+        return Some(s.len());
+    };
+    let _ = start;
+    Some(tail_start + end_rel + close_rel + PEM_MARKER.len())
 }
 
-fn redact_pem(input: &str) -> String {
-    const MARKER: &str = "PRIVATE KEY-----";
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
+/// Single-pass SIMD secret redaction across all secret prefixes, DB URIs, and PEM blocks.
+pub fn redact_secrets(s: String) -> String {
+    if SECRET_AC.find(&s).is_none() && !s.contains(PEM_MARKER) {
+        return s;
+    }
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
 
-    while let Some(begin) = rest.find("-----BEGIN ") {
-        let Some(hdr_end) = rest[begin..].find(MARKER) else {
-            out.push_str(&rest[..begin + 11]);
-            rest = &rest[begin + 11..];
+    for mat in SECRET_AC.find_iter(&s) {
+        if mat.start() < cursor {
             continue;
-        };
-
-        out.push_str(&rest[..begin]);
-        out.push_str("[REDACTED_PEM_PRIVATE_KEY]");
-        let tail = &rest[begin + hdr_end + MARKER.len()..];
-
-        let Some(end_rel) = tail.find("-----END ") else {
-            rest = "";
-            break;
-        };
-        let Some(close_rel) = tail[end_rel..].find(MARKER) else {
-            rest = "";
-            break;
-        };
-        rest = &tail[end_rel + close_rel + MARKER.len()..];
-    }
-
-    out.push_str(rest);
-    out.replace(MARKER, "REDACTED_PRIVATE_KEY-----")
-}
-
-fn redact_prefix(input: &str, prefix: &str, replacement: &str, min_tail: usize) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-
-    while let Some(pos) = rest.find(prefix) {
-        let after = &rest[pos + prefix.len()..];
-        let skip = token_len(after, false);
-        if left_bound(rest.as_bytes(), pos) && skip >= min_tail {
-            out.push_str(&rest[..pos]);
-            out.push_str(replacement);
-            rest = &after[skip..];
-        } else {
-            out.push_str(&rest[..pos + prefix.len()]);
-            rest = after;
         }
-    }
-
-    out.push_str(rest);
-    out
-}
-
-fn redact_uris(input: &str, scheme: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-
-    while let Some(pos) = rest.find(scheme) {
-        out.push_str(&rest[..pos + scheme.len()]);
-        let after = &rest[pos + scheme.len()..];
-        let end = after
-            .find(['/', ' ', '"', '\'', ')', ']', '\n', '\r'])
-            .unwrap_or(after.len());
-
-        let Some((creds, host)) = after[..end].split_once('@') else {
-            rest = after;
-            continue;
-        };
-        if creds.contains(':') && !host.is_empty() {
+        let pid = mat.pattern().as_usize();
+        if pid == PEM_IDX {
+            if let Some(next_pos) = consume_pem_block(&s, mat.start(), mat.end()) {
+                out.push_str(&s[cursor..mat.start()]);
+                out.push_str("[REDACTED_PEM_PRIVATE_KEY]");
+                cursor = next_pos;
+            }
+        } else if pid < DB_BASE {
+            let (_, _, tag, _, rmin, _) = SECRET_SPECS[pid];
+            let skip = token_len(&s[mat.end()..], false);
+            if left_bound(bytes, mat.start()) && skip >= rmin {
+                out.push_str(&s[cursor..mat.start()]);
+                out.push_str(tag);
+                cursor = mat.end() + skip;
+            }
+        } else if let Some((span_end, _, host)) = db_creds_span(&s[mat.end()..]) {
+            out.push_str(&s[cursor..mat.end()]);
             out.push_str("REDACTED:REDACTED@");
             out.push_str(host);
-            rest = &after[end..];
-        } else {
-            rest = after;
+            cursor = mat.end() + span_end;
         }
     }
 
-    out.push_str(rest);
-    out
+    out.push_str(&s[cursor..]);
+    if out.contains(PEM_MARKER) {
+        out.replace(PEM_MARKER, "REDACTED_PRIVATE_KEY-----")
+    } else {
+        out
+    }
 }

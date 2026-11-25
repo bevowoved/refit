@@ -63,6 +63,15 @@ fn copy_untracked(repo_root: &Path, wt_path: &Path) -> bool {
     copied
 }
 
+fn git_lock_path(repo_root: &Path) -> PathBuf {
+    if let Some(common) = git_stdout(repo_root, &["rev-parse", "--git-common-dir"]) {
+        let p = PathBuf::from(common);
+        let dir = if p.is_absolute() { p } else { repo_root.join(p) };
+        return dir.join("refit-git.lock");
+    }
+    repo_root.join(".git").join("refit-git.lock")
+}
+
 pub fn open_worktree(
     repo_root: &Path,
     run_id: &str,
@@ -77,6 +86,7 @@ pub fn open_worktree(
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect();
     let canonical_repo = crate::platform::paths::canonical_root(repo_root);
+    let _git_lock = crate::platform::SidecarLock::acquire(&git_lock_path(&canonical_repo))?;
     let parent = canonical_repo
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -98,6 +108,7 @@ pub fn open_worktree(
     if !add.status.success() {
         anyhow::bail!("git worktree add failed: {}", String::from_utf8_lossy(&add.stderr).trim());
     }
+    drop(_git_lock);
 
     let wt = Worktree {
         core_repo: canonical_repo.clone(),
@@ -148,6 +159,7 @@ pub fn list_worktrees(repo_root: &Path) -> Vec<String> {
 }
 
 pub fn remove_worktree(wt: &Worktree) -> Result<()> {
+    let _git_lock = crate::platform::SidecarLock::acquire(&git_lock_path(&wt.core_repo)).ok();
     let wt_str = wt.worktree_path.display().to_string();
     let _ = git_run(&wt.core_repo, &["worktree", "remove", "--force", &wt_str]);
     if wt.branch.starts_with("refit/") {

@@ -1,7 +1,6 @@
-use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -41,7 +40,7 @@ pub struct SteerState {
 
 #[derive(Default)]
 pub struct RunState {
-    units: DashMap<String, UnitState>,
+    units: Mutex<HashMap<String, UnitState>>,
     committed_units: AtomicU64,
     in_flight_units: AtomicU64,
     loc_before: AtomicU64,
@@ -55,8 +54,8 @@ pub struct RunState {
     abort_requested: AtomicBool,
     k_override: AtomicUsize,
     priority_units: Mutex<VecDeque<String>>,
-    skipped_units: DashMap<String, ()>,
-    blocked_units: DashMap<String, String>,
+    skipped_units: Mutex<HashSet<String>>,
+    blocked_units: Mutex<HashMap<String, String>>,
     steer_notify: Notify,
 }
 
@@ -109,7 +108,7 @@ impl RunState {
 
     pub fn steer_skip(&self, unit_id: String) {
         if !unit_id.is_empty() {
-            self.skipped_units.insert(unit_id, ());
+            self.skipped_units.lock().insert(unit_id);
             self.steer_notify.notify_waiters();
         }
     }
@@ -147,23 +146,19 @@ impl RunState {
     }
 
     pub fn mark_blocked(&self, unit_id: &str, reason: &str) {
-        self.blocked_units.insert(unit_id.to_string(), reason.to_string());
+        self.blocked_units.lock().insert(unit_id.to_string(), reason.to_string());
     }
 
     pub fn blocked_count(&self) -> usize {
-        self.blocked_units.len()
+        self.blocked_units.lock().len()
     }
 
     pub fn is_skipped(&self, unit_id: &str) -> bool {
-        self.skipped_units.contains_key(unit_id)
+        self.skipped_units.lock().contains(unit_id)
     }
 
     pub fn steering_snapshot(&self) -> SteerState {
-        let mut skipped: Vec<String> = self
-            .skipped_units
-            .iter()
-            .map(|e| e.key().clone())
-            .collect();
+        let mut skipped: Vec<String> = self.skipped_units.lock().iter().cloned().collect();
         skipped.sort();
 
         let queue = self.priority_units.lock();
@@ -179,6 +174,7 @@ impl RunState {
 
     pub fn set_phase(&self, unit_id: &str, phase: &str, attempt: u32, loc_before: usize) {
         self.units
+            .lock()
             .entry(unit_id.to_string())
             .and_modify(|u| {
                 u.phase = phase.to_string();
@@ -219,7 +215,7 @@ impl RunState {
             self.loc_after.fetch_add(extra, Ordering::Relaxed);
         }
 
-        self.units.insert(
+        self.units.lock().insert(
             unit_id.to_string(),
             UnitState {
                 phase: "committed".into(),
@@ -254,10 +250,10 @@ impl RunState {
     pub fn digest(&self) -> StateDigest {
         let r = Ordering::Relaxed;
         StateDigest {
-            tracked_units: self.units.len(),
+            tracked_units: self.units.lock().len(),
             committed_units: self.committed_units.load(r),
             in_flight_units: self.in_flight_units.load(r),
-            blocked_units: self.blocked_units.len(),
+            blocked_units: self.blocked_units.lock().len(),
             loc_before: self.loc_before.load(r),
             loc_after: self.loc_after.load(r),
             stage_hardlinked_files: self.stage_hardlinked_files.load(r),

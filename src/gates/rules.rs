@@ -1,6 +1,7 @@
 use crate::lex::has_word;
 use crate::platform::find_secret;
 use crate::source::ext_of;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -10,6 +11,7 @@ struct GuardRule {
     id: String,
     languages: Vec<String>,
     paths: Vec<String>,
+    path_matcher: Option<GlobSet>,
     forbid: Option<String>,
     require: Option<String>,
     forbid_import: Option<String>,
@@ -20,8 +22,8 @@ fn parse_list(rest: &str) -> Vec<String> {
     rest.trim()
         .trim_matches(['[', ']'])
         .split(',')
-        .map(|s| s.trim().trim_matches(['"', '\'']).to_string())
-        .filter(|s| !s.is_empty())
+        .map(|item| item.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|item| !item.is_empty())
         .collect()
 }
 
@@ -49,108 +51,87 @@ fn parse_rules(text: &str) -> Vec<GuardRule> {
             });
             continue;
         }
-        if let Some(ref mut r) = cur {
-            apply_field(r, line);
+        if let Some(ref mut rule) = cur {
+            apply_field(rule, line);
         }
     }
 
     if let Some(last) = cur {
         rules.push(last);
     }
+    for rule in &mut rules {
+        rule.path_matcher = compile_paths(&rule.paths);
+    }
     rules
 }
 
-fn apply_field(r: &mut GuardRule, line: &str) {
+fn apply_field(rule: &mut GuardRule, line: &str) {
     if let Some(rest) = line.strip_prefix("languages:") {
         let items = parse_list(rest);
-        r.languages = items.into_iter().map(|s| s.to_ascii_lowercase()).collect();
+        rule.languages = items.into_iter().map(|lang| lang.to_ascii_lowercase()).collect();
     } else if let Some(rest) = line.strip_prefix("paths:") {
-        r.paths = parse_list(rest);
+        rule.paths = parse_list(rest);
     } else if let Some(rest) = line.strip_prefix("forbid_import:") {
-        r.forbid_import = Some(strip_val(rest));
+        rule.forbid_import = Some(strip_val(rest));
     } else if let Some(rest) = line.strip_prefix("forbid:") {
-        r.forbid = Some(strip_val(rest));
+        rule.forbid = Some(strip_val(rest));
     } else if let Some(rest) = line.strip_prefix("require:") {
-        r.require = Some(strip_val(rest));
+        rule.require = Some(strip_val(rest));
     } else if let Some(rest) = line.strip_prefix("message:") {
-        r.message = strip_val(rest);
+        rule.message = strip_val(rest);
     }
 }
 
-fn is_comment(t: &str) -> bool {
-    t.is_empty()
-        || t.starts_with("//")
-        || t.starts_with('#')
-        || t.starts_with("/*")
-        || t == "*"
-        || t.starts_with("* ")
-        || t.starts_with("--")
+fn is_comment(trimmed: &str) -> bool {
+    trimmed.is_empty()
+        || trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed == "*"
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("--")
 }
 
-fn is_import(t: &str, in_go: bool) -> bool {
+fn is_import(trimmed: &str, in_go: bool) -> bool {
     in_go
-        || t.starts_with("import ")
-        || t.starts_with("from ")
-        || t.starts_with("use ")
-        || t.starts_with("pub use ")
-        || t.starts_with("pub(crate) use ")
-        || t.contains("require(")
-        || (t.starts_with("export ") && t.contains(" from "))
+        || trimmed.starts_with("import ")
+        || trimmed.starts_with("from ")
+        || trimmed.starts_with("use ")
+        || trimmed.starts_with("pub use ")
+        || trimmed.starts_with("pub(crate) use ")
+        || trimmed.contains("require(")
+        || (trimmed.starts_with("export ") && trimmed.contains(" from "))
 }
 
-fn glob_match(pattern: &str, text: &str) -> bool {
-    if pattern.ends_with('/') {
-        return text.starts_with(pattern);
+fn add_glob(builder: &mut GlobSetBuilder, pat: &str) {
+    if let Ok(glob) = GlobBuilder::new(pat).literal_separator(true).build() {
+        builder.add(glob);
     }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return text == prefix || text.starts_with(&format!("{prefix}/"));
-    }
-
-    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
-    let (mut pi, mut ti, mut star_p, mut star_t) = (0, 0, None, 0);
-
-    while ti < t.len() {
-        if pi < p.len() && p[pi] == '*' {
-            let dbl = pi + 1 < p.len() && p[pi + 1] == '*';
-            pi += if dbl { 2 } else { 1 };
-            star_p = Some((pi, dbl));
-            star_t = ti;
-        } else if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if let Some((sp, dbl)) = star_p {
-            if !dbl && t[star_t] == '/' {
-                return false;
-            }
-            star_t += 1;
-            ti = star_t;
-            pi = sp;
-        } else {
-            return false;
-        }
-    }
-
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
 }
 
-fn match_globs(rel: &str, patterns: &[String]) -> bool {
+fn compile_paths(patterns: &[String]) -> Option<GlobSet> {
     if patterns.is_empty() {
-        return true;
+        return None;
     }
-    let norm = rel.replace('\\', "/");
-    patterns.iter().any(|p| {
-        let pn = p.replace('\\', "/");
-        if pn.contains('*') || pn.contains('?') {
-            glob_match(&pn, &norm)
-        } else if pn.ends_with('/') {
-            norm.starts_with(&pn)
+    let mut builder = GlobSetBuilder::new();
+    for raw in patterns {
+        let norm = raw.replace('\\', "/");
+        if norm.ends_with('/') {
+            add_glob(&mut builder, &format!("{norm}**"));
+        } else if norm.contains('*') || norm.contains('?') {
+            add_glob(&mut builder, &norm);
         } else {
-            norm == pn || norm.starts_with(&format!("{pn}/"))
+            add_glob(&mut builder, &norm);
+            add_glob(&mut builder, &format!("{norm}/**"));
         }
-    })
+    }
+    builder.build().ok()
+}
+
+fn match_globs(rel: &str, matcher: Option<&GlobSet>) -> bool {
+    let Some(set) = matcher else { return true };
+    let norm = rel.replace('\\', "/");
+    set.is_match(norm)
 }
 
 pub fn check_rules(repo_root: &Path, candidates: &BTreeMap<String, String>) -> Vec<String> {
@@ -182,10 +163,10 @@ pub fn check_rules(repo_root: &Path, candidates: &BTreeMap<String, String>) -> V
 }
 
 fn check_rule(rel: &str, ext: &str, content: &str, rule: &GuardRule, out: &mut Vec<String>) {
-    if !rule.languages.is_empty() && !rule.languages.iter().any(|l| l == ext) {
+    if !rule.languages.is_empty() && !rule.languages.iter().any(|lang| lang == ext) {
         return;
     }
-    if !match_globs(rel, &rule.paths) {
+    if !match_globs(rel, rule.path_matcher.as_ref()) {
         return;
     }
 

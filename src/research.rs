@@ -2,11 +2,12 @@ pub mod deps;
 pub mod router;
 
 use crate::net::{backoff_ms, is_quota_exhausted, is_retryable, retry_hdr};
-use crate::platform::{new_http, now_ms, read_zstd, write_atomic};
+use crate::platform::{
+    SieveCache, ensure_cachedir_tag, new_http, now_ms, read_zstd, write_atomic,
+};
 use crate::state::RunState;
 use aho_corasick::AhoCorasick;
 use anyhow::Result;
-use dashmap::DashMap;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
@@ -90,14 +91,25 @@ struct WebCacheFile {
 
 type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
+fn cache_entry_weight(key: &str, entry: &WebCacheEntry) -> usize {
+    let snip_bytes: usize = entry.result.snippets.iter().map(String::len).sum();
+    let url_bytes: usize = entry.result.urls.iter().map(String::len).sum();
+    key.len()
+        .saturating_add(entry.result.query.len())
+        .saturating_add(entry.result.raw_summary.len())
+        .saturating_add(snip_bytes)
+        .saturating_add(url_bytes)
+        .saturating_add(128)
+}
+
 pub struct WebClient {
     endpoint: String,
     api_key: Option<String>,
     client: reqwest::Client,
     limiter: Arc<DirectLimiter>,
     router: Mutex<SlidingRouter>,
-    cache: DashMap<String, WebCacheEntry>,
-    in_flight: DashMap<String, Arc<OnceCell<SearchResult>>>,
+    cache: SieveCache<String, WebCacheEntry>,
+    in_flight: Mutex<HashMap<String, Arc<OnceCell<SearchResult>>>>,
     disk_cache_path: Option<PathBuf>,
     cache_ttl_ms: u64,
     last_save_ms: AtomicU64,
@@ -155,7 +167,7 @@ impl WebClient {
             limiter,
             router,
             cache,
-            in_flight: DashMap::new(),
+            in_flight: Mutex::new(HashMap::new()),
             disk_cache_path,
             cache_ttl_ms,
             last_save_ms: AtomicU64::new(0),
@@ -189,22 +201,26 @@ impl WebClient {
     }
 
     fn save_cache_debounced(&self, force: bool) {
-        let Some(ref p) = self.disk_cache_path else { return };
+        let Some(ref path) = self.disk_cache_path else { return };
         let now = now_ms();
         let prev = self.last_save_ms.load(Ordering::Relaxed);
         if !force && prev > 0 && now.saturating_sub(prev) < CACHE_SAVE_DEBOUNCE_MS {
             return;
         }
         self.last_save_ms.store(now, Ordering::Relaxed);
-
-        let mut entries = HashMap::with_capacity(self.cache.len());
-        for item in self.cache.iter() {
-            let e = item.value();
-            if e.result.online && now.saturating_sub(e.saved_at_ms) <= self.cache_ttl_ms {
-                entries.insert(item.key().clone(), e.clone());
-            }
+        if let Some(parent) = path.parent() {
+            ensure_cachedir_tag(parent);
         }
-        let _ = write_zstd_bounded(p, &WebCacheFile { entries });
+
+        let entries: HashMap<String, WebCacheEntry> = self
+            .cache
+            .snapshot()
+            .into_iter()
+            .filter(|(_, entry)| {
+                entry.result.online && now.saturating_sub(entry.saved_at_ms) <= self.cache_ttl_ms
+            })
+            .collect();
+        let _ = write_zstd_bounded(path, &WebCacheFile { entries });
     }
 
     pub async fn search_web(&self, query: &str, max_results: usize) -> Result<SearchResult> {
@@ -238,11 +254,13 @@ impl WebClient {
             ));
         }
 
-        let cell = self
-            .in_flight
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone();
+        let cell = {
+            let mut inflight = self.in_flight.lock();
+            inflight
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
         let (mut res, was_leader) =
             run_coalesced(self, &key, &cell, api_key, query, max_results).await?;
 
@@ -262,16 +280,15 @@ impl WebClient {
         Ok(res)
     }
 
-    fn get_cached(&self, key: &str) -> Option<SearchResult> {
+    fn get_cached(&self, key: &String) -> Option<SearchResult> {
         let now = now_ms();
         let hit = self.cache.get(key)?;
         if now.saturating_sub(hit.saved_at_ms) <= self.cache_ttl_ms {
-            let mut res = hit.result.clone();
+            let mut res = hit.result;
             res.cache_hit = true;
             res.latency_ms = 0;
             return Some(res);
         }
-        drop(hit);
         self.cache.remove(key);
         None
     }
@@ -340,14 +357,15 @@ impl WebClient {
                 "research_batch sliding-10 completed"
             );
 
-            for ((k, _), res) in pending.into_iter().zip(batch_res) {
+            for ((key, _), res) in pending.into_iter().zip(batch_res) {
                 if res.online && self.cache_ttl_ms > 0 {
                     let entry = WebCacheEntry { saved_at_ms: now_ms(), result: res.clone() };
-                    self.cache.insert(k.clone(), entry);
+                    let weight = cache_entry_weight(&key, &entry);
+                    self.cache.insert(key.clone(), entry, weight);
                     any_fresh_online = true;
                 }
                 self.count(false);
-                by_key.insert(k, res);
+                by_key.insert(key, res);
             }
         }
 
@@ -442,12 +460,16 @@ async fn run_coalesced(
             // DropGuard removes `in_flight` key ONLY AFTER cache insertion completes below,
             // closing the coalescing race window completely.
             let _guard = DropGuard::new((), |()| {
-                wc.in_flight.remove_if(key, |_, v| Arc::ptr_eq(v, cell));
+                let mut inflight = wc.in_flight.lock();
+                if matches!(inflight.get(key), Some(existing) if Arc::ptr_eq(existing, cell)) {
+                    inflight.remove(key);
+                }
             });
             let out = run_single_routed(wc, api_key, query, max_results).await?;
             if out.online && wc.cache_ttl_ms > 0 {
                 let entry = WebCacheEntry { saved_at_ms: now_ms(), result: out.clone() };
-                wc.cache.insert(key.to_string(), entry);
+                let weight = cache_entry_weight(key, &entry);
+                wc.cache.insert(key.to_string(), entry, weight);
             }
             Ok::<SearchResult, anyhow::Error>(out)
         })
@@ -605,16 +627,17 @@ fn write_zstd_bounded<T: Serialize>(path: &Path, val: &T) -> Result<()> {
     write_atomic(path, &compressed)
 }
 
-fn load_cache(path: Option<&Path>, ttl_ms: u64) -> DashMap<String, WebCacheEntry> {
-    let cache = DashMap::new();
+fn load_cache(path: Option<&Path>, ttl_ms: u64) -> SieveCache<String, WebCacheEntry> {
+    let cache = SieveCache::new(512, 8 * 1024 * 1024);
     let Some(disk) = path.and_then(read_zstd::<WebCacheFile>) else {
         return cache;
     };
 
     let now = now_ms();
-    for (k, e) in disk.entries {
-        if e.result.online && now.saturating_sub(e.saved_at_ms) <= ttl_ms {
-            cache.insert(k, e);
+    for (key, entry) in disk.entries {
+        if entry.result.online && now.saturating_sub(entry.saved_at_ms) <= ttl_ms {
+            let weight = cache_entry_weight(&key, &entry);
+            cache.insert(key, entry, weight);
         }
     }
     cache

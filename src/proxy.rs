@@ -8,7 +8,7 @@ pub use guard::{
 
 use crate::mvcc::MvccStore;
 use crate::net::retry_http;
-use crate::platform::stream_http;
+use crate::platform::{SieveCache, stream_http};
 use crate::state::RunState;
 use crate::telemetry::{EventSpec, TelemetryHub};
 use crate::types::{LlmCallMetrics, ProxySnapshot};
@@ -21,7 +21,6 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
-use dashmap::DashMap;
 use futures_util::StreamExt;
 use guard::{find_module, header_u64, localip, parse_metrics, sys_text};
 use pacer::PacerState;
@@ -51,7 +50,7 @@ pub struct ProxyState {
     client: reqwest::Client,
     telemetry: TelemetryHub,
     pacer: Mutex<PacerState>,
-    module_metrics: DashMap<String, LlmCallMetrics>,
+    module_metrics: SieveCache<String, LlmCallMetrics>,
     in_flight: AtomicU64,
     req_seq: AtomicU64,
     repo_root: Mutex<Option<PathBuf>>,
@@ -75,7 +74,7 @@ impl ProxyState {
             client,
             telemetry,
             pacer: Mutex::new(PacerState::new()),
-            module_metrics: DashMap::new(),
+            module_metrics: SieveCache::new(1_024, 2 * 1024 * 1024),
             in_flight: AtomicU64::new(0),
             req_seq: AtomicU64::new(1),
             repo_root: Mutex::new(repo_root),
@@ -97,7 +96,7 @@ impl ProxyState {
     }
 
     pub fn take_metrics(&self, module_id: &str) -> Option<LlmCallMetrics> {
-        self.module_metrics.remove(module_id).map(|(_, v)| v)
+        self.module_metrics.remove(&module_id.to_string())
     }
 
     pub fn timing_samples(&self) -> (Vec<f64>, Vec<f64>) {
@@ -143,7 +142,7 @@ impl ProxyState {
     fn record_usage(&self, req_id: u64, m: LlmCallMetrics) {
         let rolling = self.pacer.lock().record_usage(req_id, &m);
         if !m.module_id.is_empty() {
-            self.module_metrics.insert(m.module_id.clone(), m.clone());
+            self.module_metrics.insert(m.module_id.clone(), m.clone(), 256);
         }
         let mid = (!m.module_id.is_empty()).then(|| m.module_id.clone());
         let data = serde_json::to_value(&m).unwrap_or(Value::Null);

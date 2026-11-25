@@ -3,10 +3,9 @@ use crate::graph::{apply_patches, hash_abi, impacted_tests, parse_patches};
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::{CommitOutcome, MvccStore};
 use crate::net::{json_path, json_str};
-use crate::platform::{check_target_in_repo, now_ms, write_atomic};
+use crate::platform::{SieveCache, check_target_in_repo, ensure_cachedir_tag, now_ms, write_atomic};
 use crate::source::{count_lines, work_dir};
 use crate::types::{ModuleUnit, PatchOp};
-use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -18,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 static MCP_TX_SEQ: AtomicU64 = AtomicU64::new(1);
-static TX_LOCKS: OnceLock<DashMap<String, Arc<Mutex<()>>>> = OnceLock::new();
+static TX_LOCKS: OnceLock<SieveCache<String, Arc<Mutex<()>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StagedFile {
@@ -76,10 +75,15 @@ pub fn txs_dir(repo_root: &Path) -> PathBuf {
 }
 
 fn lock_tx(handle: &str) -> Arc<Mutex<()>> {
-    let map = TX_LOCKS.get_or_init(DashMap::new);
-    map.entry(handle.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+    let cache = TX_LOCKS.get_or_init(|| SieveCache::new(4_096, 1024 * 1024));
+    let weight = handle.len().saturating_add(64);
+    cache.get_or_insert_with(handle.to_string(), weight, || Arc::new(Mutex::new(())))
+}
+
+fn evict_tx_lock(handle: &str) {
+    if let Some(cache) = TX_LOCKS.get() {
+        cache.remove(&handle.to_string());
+    }
 }
 
 pub fn check_txid(handle: &str) -> bool {
@@ -117,6 +121,9 @@ fn sweep_txs(tx_root: &Path, now: u64) -> usize {
                     .unwrap_or(true)
             });
         if expired && fs::remove_dir_all(&dir).is_ok() {
+            if let Some(name) = entry.file_name().to_str() {
+                evict_tx_lock(name);
+            }
             swept += 1;
         }
     }
@@ -185,6 +192,7 @@ pub fn tx_begin(repo_root: &Path, args: &Value) -> Value {
     if let Err(e) = fs::create_dir_all(&tx_dir) {
         return json!({"error": format!("create tx dir: {e}")});
     }
+    ensure_cachedir_tag(&root);
 
     let meta = TxMeta {
         tx_handle: handle.clone(),
@@ -301,12 +309,14 @@ pub fn tx_commit(ctx: &ToolCtx<'_>, args: &Value) -> Value {
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
     let allow_abi = args["allow_abi_change"].as_bool().unwrap_or(false);
 
-    with_tx(ctx.repo_root, handle, "passed", false, |tx_dir, meta| {
+    let mut committed = false;
+    let res = with_tx(ctx.repo_root, handle, "passed", false, |tx_dir, meta| {
         if meta.staged.is_empty() {
             return Err(json!({"passed": false, "error": "no staged files in transaction"}));
         }
 
-        let (unit, cands, deleted, base) = build_unit(ctx.repo_root, handle, allow_abi, meta, ctx.hygiene);
+        let (unit, cands, deleted, base) =
+            build_unit(ctx.repo_root, handle, allow_abi, meta, ctx.hygiene);
         let mut extra_dry = Map::new();
         extra_dry.insert("tx_handle".into(), json!(handle));
         extra_dry.insert("staged_files_count".into(), json!(meta.staged.len()));
@@ -317,14 +327,27 @@ pub fn tx_commit(ctx: &ToolCtx<'_>, args: &Value) -> Value {
         extra_ok.insert("files_deleted".into(), json!(deleted.len()));
 
         let req = CommitReq {
-            ctx, unit: &unit, cands: &cands, deleted: &deleted, base: &base,
-            dry_run, tag: "mcp-tx", extra_dry, extra_ok,
+            ctx,
+            unit: &unit,
+            cands: &cands,
+            deleted: &deleted,
+            base: &base,
+            dry_run,
+            tag: "mcp-tx",
+            extra_dry,
+            extra_ok,
         };
         let dir_c = tx_dir.to_path_buf();
+        let committed_ref = &mut committed;
         Ok(verify_commit(req, move || {
             let _ = fs::remove_dir_all(&dir_c);
+            *committed_ref = true;
         }))
-    })
+    });
+    if committed {
+        evict_tx_lock(handle);
+    }
+    res
 }
 
 pub fn tx_abort(repo_root: &Path, args: &Value) -> Value {
@@ -333,9 +356,13 @@ pub fn tx_abort(repo_root: &Path, args: &Value) -> Value {
         return json!({"rolled_back": false, "error": "invalid tx_handle"});
     }
 
+    let tx_lock = lock_tx(handle);
+    let guard = tx_lock.lock();
     let tx_dir = txs_dir(repo_root).join(handle);
     let existed = tx_dir.exists();
     let _ = fs::remove_dir_all(&tx_dir);
+    drop(guard);
+    evict_tx_lock(handle);
     json!({"rolled_back": existed, "tx_handle": handle})
 }
 

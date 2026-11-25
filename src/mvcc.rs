@@ -9,9 +9,8 @@ use crate::types::{WalFileEntry, WalRecord};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use wal::{visit_wal, wal_head};
@@ -66,19 +65,9 @@ impl MvccStore {
         Ok(store)
     }
 
-    fn lock_wal(&self) -> Result<DropGuard<File, impl FnOnce(File)>> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&self.lock_path)
-            .with_context(|| format!("open WAL lock {}", self.lock_path.display()))?;
-        file.lock()
-            .with_context(|| format!("acquire OS lock {}", self.lock_path.display()))?;
-        Ok(DropGuard::new(file, |f| {
-            let _ = f.unlock();
-        }))
+    fn lock_wal(&self) -> Result<crate::platform::SidecarLock> {
+        crate::platform::SidecarLock::acquire(&self.lock_path)
+            .with_context(|| format!("acquire OS lock {}", self.lock_path.display()))
     }
 
     pub fn hash_bytes(bytes: &[u8]) -> String {
@@ -199,6 +188,7 @@ impl MvccStore {
             loc_delta: Some(loc_delta),
             files: entries,
         })?;
+        let _ = crate::platform::EpochRegistry::global().publish(module_id, head_rev);
         Ok(CommitOutcome::Committed { head_rev, tx_id, new_hashes })
     }
 
