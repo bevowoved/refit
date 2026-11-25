@@ -5,6 +5,7 @@ pub mod memgate;
 pub mod paths;
 mod proc;
 mod redact;
+pub mod rewind;
 pub mod sieve;
 
 pub use crate::net::backoff_ms;
@@ -20,6 +21,10 @@ pub use paths::{
 };
 pub use proc::{run_cmd, self_metrics};
 pub use redact::{find_secret, redact_secrets};
+pub use rewind::{
+    Durability, InvertedRewindIndex, MIN_KERNEL_COST_US, RewindEvent, RewindTrigger,
+    should_use_index,
+};
 pub use sieve::SieveCache;
 
 use crate::net::build_http;

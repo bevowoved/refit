@@ -10,6 +10,7 @@ pub use audit::{
     AuditStats, GateConfig, ScanCache, audit_repo, read_gates, scan_cached, scan_repo,
 };
 pub use rules::check_rules;
+pub use runners::net_new_diagnostics;
 #[cfg(test)]
 pub use stage::{decode_lsp, encode_lsp, stage_copies};
 pub use stage::{stage_hardlinks, sweep_stages};
@@ -22,8 +23,9 @@ use crate::types::{GateVerdict, ModuleUnit};
 use anyhow::Result;
 use rayon::prelude::*;
 use runners::{
-    CmdSpec, RunAccum, check_g0, first_lines, first_pair, parse_pytest, parse_ruff, parse_ty,
-    poly_test, run_fmt, rust_edition,
+    CmdSpec, RunAccum, check_g0, detect_cold_js_linter, detect_cold_rust_checker,
+    detect_cold_ts_checker, first_lines, first_pair, parse_pytest, parse_ruff, parse_ty,
+    poly_test, run_fmt, rust_cargo_env, rust_edition,
 };
 use stage::{CargoSlot, materialize_stage};
 use std::collections::BTreeMap;
@@ -180,10 +182,27 @@ fn check_js0(ctx: &StageCtx<'_>, strict: bool) -> Option<(String, String)> {
 }
 
 fn check_rs0(ctx: &StageCtx<'_>, slot: &CargoSlot, strict: bool) -> Option<(String, String)> {
-    let dir = slot.dir.display().to_string();
-    let env = sandbox_env(&[("CARGO_TARGET_DIR".into(), dir)]);
-    let args = ["check".into(), "--quiet".into()];
-    let cmd = CmdSpec::new("cargo", &args, ctx.root, &env, 30_000);
+    let env = rust_cargo_env(&slot.dir);
+    let (prog, args, label) = detect_cold_rust_checker();
+    if prog == "rust-glancer" {
+        let probe = CmdSpec::new(prog, &args, ctx.root, &env, 20_000);
+        if let Ok(out) = probe.run()
+            && !out.timed_out
+        {
+            if out.exit_code == 0 {
+                return None;
+            }
+            let combined = first_pair(&out.stdout, &out.stderr, 6);
+            if !combined.to_ascii_lowercase().contains("unrecognized") {
+                return Some((
+                    "gate0_rust_check".into(),
+                    format!("Gate 0 {label} failed: {combined}"),
+                ));
+            }
+        }
+    }
+    let cargo_args = ["check".into(), "--quiet".into()];
+    let cmd = CmdSpec::new("cargo", &cargo_args, ctx.root, &env, 30_000);
     check_g0("gate0_rust_check", "cargo check", &cmd, strict, false)
 }
 
@@ -200,9 +219,9 @@ fn run_gate0(
 
     let strict = ctx.cfg.strict_polyglot_tools;
     let check_ts = || {
-        let args = ["--noEmit".into()];
-        let cmd = ctx.cmd("tsc", &args, 20_000);
-        check_g0("gate0_ts_check", "tsc --noEmit", &cmd, strict, true)
+        let (prog, args, label) = detect_cold_ts_checker();
+        let cmd = ctx.cmd(prog, &args, 20_000);
+        check_g0("gate0_ts_check", label, &cmd, strict, true)
     };
     let check_go = || {
         let args = ["vet".into(), "./...".into()];
@@ -435,7 +454,7 @@ fn run_poly(
 ) {
     let strict = ctx.cfg.strict_polyglot_tools;
     if let Some(slot) = ctx.slot {
-        let env = sandbox_env(&[("CARGO_TARGET_DIR".into(), slot.dir.display().to_string())]);
+        let env = rust_cargo_env(&slot.dir);
         let t_args = ["test".into(), "--quiet".into()];
         let t_cmd = CmdSpec::new("cargo", &t_args, ctx.root, &env, 45_000);
         poly_test("cargo test", &t_cmd, strict, 8, verdict, acc);
@@ -466,15 +485,17 @@ fn run_poly(
     }
 
     if has_js_ts {
-        let mut a = vec!["lint".into()];
-        a.extend(ctx.paths.ts.iter().cloned());
-        a.extend(ctx.paths.js.iter().cloned());
-        match run_cmd("biome", &a, ctx.root, ctx.env, true, 10_000) {
+        let has_tsconfig = ctx.root.join("tsconfig.json").exists();
+        let (prog, mut args, label) = detect_cold_js_linter(has_tsconfig);
+        args.extend(ctx.paths.ts.iter().cloned());
+        args.extend(ctx.paths.js.iter().cloned());
+        match run_cmd(prog, &args, ctx.root, ctx.env, true, 10_000) {
             Ok(o) if o.exit_code != 0 && !o.timed_out => {
-                acc.poly_lint.push(format!("biome lint: {}", first_pair(&o.stdout, &o.stderr, 4)));
+                acc.poly_lint
+                    .push(format!("{label}: {}", first_pair(&o.stdout, &o.stderr, 4)));
             }
             Err(e) if strict => {
-                acc.poly_lint.push(format!("biome unavailable (strict mode): {e}"));
+                acc.poly_lint.push(format!("{prog} unavailable (strict mode): {e}"));
             }
             _ => {}
         }

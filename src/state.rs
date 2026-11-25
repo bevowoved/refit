@@ -1,3 +1,4 @@
+use crate::platform::RewindEvent;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -56,6 +57,8 @@ pub struct RunState {
     priority_units: Mutex<VecDeque<String>>,
     skipped_units: Mutex<HashSet<String>>,
     blocked_units: Mutex<HashMap<String, String>>,
+    rewind_events: Mutex<VecDeque<(RewindEvent, Vec<String>)>>,
+    rewind_trigger_count: AtomicU64,
     steer_notify: Notify,
 }
 
@@ -104,6 +107,28 @@ impl RunState {
         }
         drop(q);
         self.steer_notify.notify_waiters();
+    }
+
+    pub fn record_rewind(&self, event: RewindEvent, flagged_units: &[String]) {
+        self.rewind_trigger_count.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut log = self.rewind_events.lock();
+            if log.len() >= 64 {
+                log.pop_front();
+            }
+            log.push_back((event, flagged_units.to_vec()));
+        }
+        for uid in flagged_units {
+            self.steer_prioritize(uid.clone());
+        }
+    }
+
+    pub fn drain_rewind_events(&self) -> Vec<(RewindEvent, Vec<String>)> {
+        self.rewind_events.lock().drain(..).collect()
+    }
+
+    pub fn rewind_count(&self) -> u64 {
+        self.rewind_trigger_count.load(Ordering::Relaxed)
     }
 
     pub fn steer_skip(&self, unit_id: String) {
@@ -322,5 +347,16 @@ mod tests {
         assert_eq!(pop("blocked_child").as_deref(), Some("blocked_child"));
         st.mark_blocked("orphan_u", "dependency skipped");
         assert_eq!(st.blocked_count(), 1);
+
+        let ev = RewindEvent::new(
+            crate::platform::RewindTrigger::AbiChanged,
+            "verify_sig".into(),
+            "abi_pin".into(),
+        );
+        st.record_rewind(ev.clone(), &["caller_a".into(), "caller_b".into()]);
+        assert_eq!(st.rewind_count(), 1);
+        assert_eq!(st.pop_prio().as_deref(), Some("caller_a"));
+        assert_eq!(st.pop_prio().as_deref(), Some("caller_b"));
+        assert_eq!(st.drain_rewind_events().len(), 1);
     }
 }

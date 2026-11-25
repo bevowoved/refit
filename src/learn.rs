@@ -1,4 +1,4 @@
-use crate::platform::write_atomic;
+use crate::platform::{RewindEvent, RewindTrigger, write_atomic};
 use crate::types::LearnRule;
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_RULES: usize = 16;
+const REWIND_HIT_THRESHOLD: u32 = 2;
 
 struct DiagRule {
     gate: &'static str,
@@ -116,21 +117,25 @@ impl LearnStore {
         })
     }
 
-    pub fn record_failure(&self, gate: &str, dir_prefix: &str, raw_diagnostic: &str) {
-        let Some((key, advice)) = classify_diag(gate, raw_diagnostic) else {
-            return;
-        };
+    pub fn record_failure(
+        &self,
+        gate: &str,
+        dir_prefix: &str,
+        raw_diagnostic: &str,
+    ) -> Option<RewindEvent> {
+        let (key, advice) = classify_diag(gate, raw_diagnostic)?;
 
-        let snapshot = {
+        let (snapshot, crossed_hits) = {
             let mut guard = self.rules.lock();
-            if let Some(rule) = guard
+            let hits = if let Some(rule) = guard
                 .iter_mut()
                 .find(|r| r.key == key && r.dir_prefix == dir_prefix)
             {
                 rule.hits += 1;
+                rule.hits
             } else {
                 guard.push(LearnRule {
-                    key,
+                    key: key.clone(),
                     gate: gate.to_string(),
                     dir_prefix: dir_prefix.to_string(),
                     advice,
@@ -138,11 +143,18 @@ impl LearnStore {
                     helpful: 0,
                 });
                 prune_rules(&mut guard);
-            }
-            guard.clone()
+                1
+            };
+            (guard.clone(), hits == REWIND_HIT_THRESHOLD)
         };
 
         let _ = self.flush_snapshot(&snapshot);
+        if !crossed_hits {
+            return None;
+        }
+        let trigger = trigger_for_rule(&key, raw_diagnostic)?;
+        let token = extract_trigger_token(&key, raw_diagnostic);
+        Some(RewindEvent::new(trigger, token, key))
     }
 
     pub fn credit_keys(&self, dir_prefix: &str, applied_keys: &[String]) {
@@ -241,15 +253,59 @@ fn credit_one(rules: &mut [LearnRule], dir_prefix: &str, key: &str) -> bool {
     false
 }
 
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    let hbytes = haystack.as_bytes();
+    let nbytes = needle.as_bytes();
+    if nbytes.is_empty() {
+        return true;
+    }
+    if nbytes.len() > hbytes.len() {
+        return false;
+    }
+    hbytes.windows(nbytes.len()).any(|win| win.eq_ignore_ascii_case(nbytes))
+}
+
+fn trigger_for_rule(key: &str, raw_diagnostic: &str) -> Option<RewindTrigger> {
+    if contains_ascii_ci(raw_diagnostic, "cve-")
+        || contains_ascii_ci(raw_diagnostic, "advisory")
+        || contains_ascii_ci(raw_diagnostic, "vulnerable")
+    {
+        return Some(RewindTrigger::NewDepAdvisory);
+    }
+    match key {
+        "abi_pin" => Some(RewindTrigger::AbiChanged),
+        "invariants_security" => Some(RewindTrigger::NewInvariantRule),
+        "ruff_b006" | "ruff_f401" | "ruff_f841" | "line_len" | "deep_nesting" | "dedup"
+        | "cramped_layout" | "ty_types" => Some(RewindTrigger::NewSmellPattern),
+        _ => None,
+    }
+}
+
+fn extract_trigger_token(key: &str, raw_diagnostic: &str) -> String {
+    let mut parts = raw_diagnostic.split('`');
+    let _ = parts.next();
+    while let Some(span) = parts.next() {
+        let _ = parts.next();
+        let trimmed = span.trim().trim_end_matches("()");
+        let is_ident = trimmed.len() >= 3
+            && trimmed
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if is_ident {
+            return trimmed.to_string();
+        }
+    }
+    key.to_string()
+}
+
 fn classify_diag(gate: &str, raw: &str) -> Option<(String, String)> {
-    let lower = raw.to_lowercase();
     DIAG_RULES
         .iter()
-        .find(|r| {
-            (!r.gate.is_empty() && gate == r.gate)
-                || r.needles.iter().any(|n| lower.contains(n))
+        .find(|rule| {
+            (!rule.gate.is_empty() && gate == rule.gate)
+                || rule.needles.iter().any(|needle| contains_ascii_ci(raw, needle))
         })
-        .map(|r| (r.key.to_string(), r.advice.to_string()))
+        .map(|rule| (rule.key.to_string(), rule.advice.to_string()))
 }
 
 #[cfg(test)]
@@ -293,6 +349,14 @@ mod tests {
 
         s2.credit_keys("pkg/api", &["asrf_exact_context".to_string()]);
         assert_eq!(s2.stats().1, 1);
+
+        // Second hit on same rule crosses threshold and emits a RewindEvent.
+        let first_ev = store.record_failure("gate3_ruff", "pkg/new", "B006 mutable default `bad_fn`");
+        assert!(first_ev.is_none());
+        let second_ev = store.record_failure("gate3_ruff", "pkg/new", "B006 mutable default `bad_fn`");
+        let ev = second_ev.expect("expected rewind event on threshold crossing");
+        assert_eq!(ev.trigger, RewindTrigger::NewSmellPattern);
+        assert_eq!(ev.token, "bad_fn");
     }
 
     #[test]

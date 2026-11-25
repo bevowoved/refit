@@ -347,6 +347,15 @@ pub struct InfraFinding {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocDriftFinding {
+    pub file: String,
+    pub line: usize,
+    pub kind: String,
+    pub reference: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleCluster {
     pub capability: String,
@@ -382,6 +391,8 @@ pub struct AuditReport {
     pub genome_twins: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deep_module_findings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doc_drift_findings: Vec<DocDriftFinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
