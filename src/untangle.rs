@@ -353,6 +353,57 @@ pub fn write_sustain(
     })
 }
 
+/// Compile and lint an audit report using ASD-STE100 Issue 9 rules + optional user `--ste-dict`.
+#[cfg(any(feature = "ste100", test))]
+pub fn render_audit_ste100(
+    report: &AuditReport,
+    dict_path: Option<&Path>,
+) -> Result<(String, crate::research::ste100::DocumentLintReport)> {
+    use crate::research::ste100::{SteDictionary, compile_audit_markdown, lint_markdown};
+
+    let dict = match dict_path {
+        Some(path) => Some(SteDictionary::load_from_file(path)?),
+        None => None,
+    };
+    let compiled = compile_audit_markdown(report);
+    let lint = lint_markdown(&compiled, dict.as_ref());
+    Ok((compiled, lint))
+}
+
+/// Generate sustainability guardrails normalized and linted with ASD-STE100 Issue 9 rules.
+#[cfg(any(feature = "ste100", test))]
+pub fn write_sustain_ste100(
+    repo_root: &Path,
+    report: &AuditReport,
+    dry_run: bool,
+    dict_path: Option<&Path>,
+) -> Result<(SustainFiles, crate::research::ste100::DocumentLintReport)> {
+    use crate::research::ste100::{SteDictionary, lint_markdown, normalize_clarity_verbs};
+
+    let dict = match dict_path {
+        Some(path) => Some(SteDictionary::load_from_file(path)?),
+        None => None,
+    };
+    let sustain = write_sustain(repo_root, report, dry_run)?;
+    let agents_doc = format!(
+        concat!(
+            "# AGENTS.md\n\n",
+            "1. Keep `codehygiene v0.7.0` score above `0.85` on changed files.\n",
+            "2. Keep circular imports at or below `{}`.\n",
+            "3. Consolidate shared helpers instead of duplicate code.\n",
+            "4. Remove hardcoded credentials, `*:*` wildcards, and root containers.\n",
+            "5. Run `refit scan . --fast` and `refit audit .` before a PR.\n"
+        ),
+        report.scc_count
+    );
+    let normalized = normalize_clarity_verbs(&agents_doc);
+    if !dry_run {
+        write_atomic(&repo_root.join("AGENTS.md"), normalized.as_bytes())?;
+    }
+    let lint = lint_markdown(&normalized, dict.as_ref());
+    Ok((sustain, lint))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +465,13 @@ mod tests {
         dir.write("Dockerfile", "FROM alpine:3.20\nUSER rootless\n");
         let (_, _, f2) = scan_infra(dir.path());
         assert!(!f2.iter().any(|f| f.rule_id == "docker_runs_as_root"));
+
+        let (ste_md, ste_lint) = render_audit_ste100(&rep, None).unwrap();
+        assert!(ste_md.contains("STE100 Issue 9 Audit Report"));
+        assert!(ste_lint.compliant, "compiled STE100 audit had violations: {:?}", ste_lint.issues);
+
+        let (sus_ste, sus_lint) = write_sustain_ste100(dir.path(), &rep, true, None).unwrap();
+        assert_eq!(sus_ste.files_written.len(), 4);
+        assert!(sus_lint.compliant, "compiled STE100 sustain had violations: {:?}", sus_lint.issues);
     }
 }

@@ -3,7 +3,7 @@ use super::cache_orch::{
 };
 use super::runners::{
     CmdSpec, detect_cold_js_linter, detect_cold_rust_checker, detect_cold_ts_checker, first_lines,
-    parse_pytest, parse_ty, ruff_map, rust_cargo_env,
+    merged_rust_cargo_env, parse_pytest, parse_ty, ruff_map,
 };
 use super::stage::CargoSlot;
 use crate::graph::build_dag;
@@ -625,14 +625,7 @@ fn audit_polyglot(
 
 fn probe_cargo(root: &Path) -> Option<(String, String)> {
     let slot = CargoSlot::acquire(root);
-    let mut env = rust_cargo_env(&slot.dir);
-    for (k, v) in slot.rust_cache_env(root, false) {
-        if let Some(entry) = env.iter_mut().find(|(ek, _)| ek == &k) {
-            entry.1 = v;
-        } else {
-            env.push((k, v));
-        }
-    }
+    let env = merged_rust_cargo_env(&slot.dir, slot.rust_cache_env(root, false));
     let (prog, args, label) = detect_cold_rust_checker();
     if prog == "rust-glancer" {
         let probe = CmdSpec::new(prog, &args, root, &env, 20_000);

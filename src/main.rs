@@ -140,12 +140,20 @@ enum Commands {
         markdown: bool,
         #[arg(long)]
         research: bool,
+        #[arg(long)]
+        ste100: bool,
+        #[arg(long)]
+        ste_dict: Option<PathBuf>,
     },
     /// Generate AGENTS.md, .refit/invariants.yml, ADR-001, and the CI guard workflow.
     Sustain {
         repo: PathBuf,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        ste100: bool,
+        #[arg(long)]
+        ste_dict: Option<PathBuf>,
     },
     /// Prune unreferenced CAS blobs, expired stage directories, and bounded disk caches.
     Gc {
@@ -203,8 +211,12 @@ enum Commands {
         #[arg(long)]
         keep_warm: bool,
     },
-    /// Start the concurrent JSON-RPC 2.0 MCP stdio server.
-    Mcp { repo: PathBuf },
+    /// Start the concurrent JSON-RPC 2.0 MCP server (stdio, or stateless HTTP via --http).
+    Mcp {
+        repo: PathBuf,
+        #[arg(long)]
+        http: Option<String>,
+    },
     /// Run batch KeenAble web searches.
     Research {
         #[arg(long)]
@@ -315,7 +327,72 @@ fn cmd_scan(repo: &Path, no_cache: bool, fast: bool) -> Result<()> {
     }))
 }
 
-async fn cmd_audit(repo: &Path, markdown: bool, do_research: bool) -> Result<()> {
+fn emit_audit_output(
+    report: &types::AuditReport,
+    dep_res: &[research::SearchResult],
+    markdown: bool,
+    ste100: bool,
+    ste_dict: Option<&Path>,
+) -> Result<()> {
+    let use_ste = ste100 || ste_dict.is_some();
+    if use_ste {
+        return emit_audit_ste100(report, dep_res, markdown, ste_dict);
+    }
+    if markdown {
+        let mut md = untangle::render_audit(report);
+        if !dep_res.is_empty() {
+            md.push_str("## Dependency Research (KeenAble)\n\n");
+            md.push_str(&research::WebClient::format_snippets(dep_res));
+        }
+        println!("{md}");
+        return Ok(());
+    }
+    print_json(&json!({ "audit": report, "dependency_research": dep_res }))
+}
+
+#[cfg(feature = "ste100")]
+fn emit_audit_ste100(
+    report: &types::AuditReport,
+    dep_res: &[research::SearchResult],
+    markdown: bool,
+    ste_dict: Option<&Path>,
+) -> Result<()> {
+    let (mut compiled, lint) = untangle::render_audit_ste100(report, ste_dict)?;
+    if markdown {
+        if !dep_res.is_empty() {
+            compiled.push_str("## Dependency Research (KeenAble)\n\n");
+            compiled.push_str(&research::WebClient::format_snippets_ste100(dep_res));
+        }
+        println!("{compiled}");
+        return Ok(());
+    }
+    print_json(&json!({
+        "audit": report,
+        "dependency_research": dep_res,
+        "ste100": lint
+    }))
+}
+
+#[cfg(not(feature = "ste100"))]
+fn emit_audit_ste100(
+    _report: &types::AuditReport,
+    _dep_res: &[research::SearchResult],
+    _markdown: bool,
+    _ste_dict: Option<&Path>,
+) -> Result<()> {
+    anyhow::bail!(
+        "ASD-STE100 linting (`--ste100` / `--ste-dict`) requires the `ste100` feature; \
+         rebuild with `cargo build --features ste100`"
+    )
+}
+
+async fn cmd_audit(
+    repo: &Path,
+    markdown: bool,
+    do_research: bool,
+    ste100: bool,
+    ste_dict: Option<&Path>,
+) -> Result<()> {
     let scorer = hygiene::HygieneScorer::open_persistent(repo);
     let report = untangle::untangle_repo(repo, &scorer)?;
     let dep_res = if do_research {
@@ -323,18 +400,7 @@ async fn cmd_audit(repo: &Path, markdown: bool, do_research: bool) -> Result<()>
     } else {
         Vec::new()
     };
-
-    if markdown {
-        let mut md = untangle::render_audit(&report);
-        if !dep_res.is_empty() {
-            md.push_str("## Dependency Research (KeenAble)\n\n");
-            md.push_str(&research::WebClient::format_snippets(&dep_res));
-        }
-        println!("{md}");
-        return Ok(());
-    }
-
-    print_json(&json!({ "audit": report, "dependency_research": dep_res }))
+    emit_audit_output(&report, &dep_res, markdown, ste100, ste_dict)
 }
 
 async fn cmd_probe(
@@ -411,18 +477,77 @@ fn build_rt(multi: bool) -> Result<tokio::runtime::Runtime> {
     builder.enable_all().build().context("build tokio runtime")
 }
 
-fn cmd_audit_sync(repo: &Path, markdown: bool, do_research: bool) -> Result<()> {
+fn cmd_audit_sync(
+    repo: &Path,
+    markdown: bool,
+    do_research: bool,
+    ste100: bool,
+    ste_dict: Option<&Path>,
+) -> Result<()> {
     if !do_research {
         let scorer = hygiene::HygieneScorer::open_persistent(repo);
         let report = untangle::untangle_repo(repo, &scorer)?;
         platform::collect_os_memory();
-        if markdown {
-            println!("{}", untangle::render_audit(&report));
-            return Ok(());
-        }
-        return print_json(&json!({ "audit": report, "dependency_research": Vec::<serde_json::Value>::new() }));
+        return emit_audit_output(&report, &[], markdown, ste100, ste_dict);
     }
-    build_rt(false)?.block_on(cmd_audit(repo, markdown, true))
+    build_rt(false)?.block_on(cmd_audit(repo, markdown, true, ste100, ste_dict))
+}
+
+fn cmd_sustain(repo: &Path, dry_run: bool, ste100: bool, ste_dict: Option<&Path>) -> Result<()> {
+    let scorer = hygiene::HygieneScorer::open_persistent(repo);
+    let rep = untangle::untangle_repo(repo, &scorer)?;
+    if ste100 || ste_dict.is_some() {
+        return emit_sustain_ste100(repo, &rep, dry_run, ste_dict);
+    }
+    let out = untangle::write_sustain(repo, &rep, dry_run)?;
+    platform::collect_os_memory();
+    print_json(&out)
+}
+
+#[cfg(feature = "ste100")]
+fn emit_sustain_ste100(
+    repo: &Path,
+    rep: &types::AuditReport,
+    dry_run: bool,
+    ste_dict: Option<&Path>,
+) -> Result<()> {
+    let (out, lint) = untangle::write_sustain_ste100(repo, rep, dry_run, ste_dict)?;
+    platform::collect_os_memory();
+    print_json(&json!({ "sustain": out, "ste100": lint }))
+}
+
+#[cfg(not(feature = "ste100"))]
+fn emit_sustain_ste100(
+    _repo: &Path,
+    _rep: &types::AuditReport,
+    _dry_run: bool,
+    _ste_dict: Option<&Path>,
+) -> Result<()> {
+    anyhow::bail!(
+        "ASD-STE100 linting (`--ste100` / `--ste-dict`) requires the `ste100` feature; \
+         rebuild with `cargo build --features ste100`"
+    )
+}
+
+fn cmd_mcp(repo: PathBuf, http: Option<String>) -> Result<()> {
+    init_tracing();
+    match http {
+        Some(addr) => run_mcp_http(repo, addr),
+        None => build_rt(false)?.block_on(mcp::serve_mcp(repo)),
+    }
+}
+
+#[cfg(feature = "mcp-v2")]
+fn run_mcp_http(repo: PathBuf, addr: String) -> Result<()> {
+    build_rt(false)?.block_on(mcp::serve_http(repo, addr))
+}
+
+#[cfg(not(feature = "mcp-v2"))]
+fn run_mcp_http(_repo: PathBuf, _addr: String) -> Result<()> {
+    anyhow::bail!(
+        "Streamable HTTP (`--http`) requires the `mcp-v2` feature; \
+         rebuild with `cargo build --features mcp-v2`"
+    )
 }
 
 fn main() -> Result<()> {
@@ -436,13 +561,11 @@ fn main() -> Result<()> {
             platform::collect_os_memory();
             res
         }
-        Commands::Audit { repo, markdown, research } => cmd_audit_sync(&repo, markdown, research),
-        Commands::Sustain { repo, dry_run } => {
-            let scorer = hygiene::HygieneScorer::open_persistent(&repo);
-            let rep = untangle::untangle_repo(&repo, &scorer)?;
-            let out = untangle::write_sustain(&repo, &rep, dry_run)?;
-            platform::collect_os_memory();
-            print_json(&out)
+        Commands::Audit { repo, markdown, research, ste100, ste_dict } => {
+            cmd_audit_sync(&repo, markdown, research, ste100, ste_dict.as_deref())
+        }
+        Commands::Sustain { repo, dry_run, ste100, ste_dict } => {
+            cmd_sustain(&repo, dry_run, ste100, ste_dict.as_deref())
         }
         Commands::Gc { repo, keep_revs, cache_max_mb } => {
             let store = mvcc::MvccStore::open(&repo, "gc")?;
@@ -514,10 +637,7 @@ fn main() -> Result<()> {
                 Ok(())
             })
         }
-        Commands::Mcp { repo } => {
-            init_tracing();
-            build_rt(false)?.block_on(mcp::serve_mcp(repo))
-        }
+        Commands::Mcp { repo, http } => cmd_mcp(repo, http),
         Commands::Research { lang, repo, max_results, queries } => {
             init_tracing();
             build_rt(false)?.block_on(async move {

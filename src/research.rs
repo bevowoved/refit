@@ -1,5 +1,7 @@
 pub mod deps;
 pub mod router;
+#[cfg(any(feature = "ste100", test))]
+pub mod ste100;
 
 use crate::net::{backoff_ms, is_quota_exhausted, is_retryable, retry_hdr};
 use crate::platform::{
@@ -421,6 +423,11 @@ impl WebClient {
         out.push_str("</untrusted_web_evidence>\n");
         out
     }
+
+    #[cfg(any(feature = "ste100", test))]
+    pub fn format_snippets_ste100(results: &[SearchResult]) -> String {
+        ste100::normalize_clarity_verbs(&Self::format_snippets(results))
+    }
 }
 
 fn assemble_batch_results(
@@ -763,6 +770,10 @@ mod tests {
         let block = WebClient::format_snippets(&[cache_entry("q", 0, evil, Some("https://example.com")).result]);
         assert!(block.contains("<untrusted_web_evidence") && !block.contains("<<<REFIT_PATCH"));
         assert!(block.contains("[/evidence]"));
+        let ste_block = WebClient::format_snippets_ste100(&[
+            cache_entry("q", 0, "Utilize `std::fs::File::lock`.", Some("https://example.com")).result,
+        ]);
+        assert!(ste_block.contains("Use `std::fs::File::lock`."));
     }
 
     #[tokio::test]

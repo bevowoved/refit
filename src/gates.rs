@@ -25,8 +25,8 @@ use anyhow::Result;
 use rayon::prelude::*;
 use runners::{
     CmdSpec, RunAccum, check_g0, detect_cold_js_linter, detect_cold_rust_checker,
-    detect_cold_ts_checker, first_lines, first_pair, parse_pytest, parse_ruff, parse_ty,
-    poly_test, run_fmt, rust_cargo_env, rust_edition,
+    detect_cold_ts_checker, first_lines, first_pair, merged_rust_cargo_env, parse_pytest,
+    parse_ruff, parse_ty, poly_test, run_fmt, rust_edition,
 };
 use stage::{CargoSlot, materialize_stage};
 use std::collections::BTreeMap;
@@ -184,14 +184,7 @@ fn check_js0(ctx: &StageCtx<'_>, strict: bool) -> Option<(String, String)> {
 }
 
 fn check_rs0(ctx: &StageCtx<'_>, slot: &CargoSlot, strict: bool) -> Option<(String, String)> {
-    let mut env = rust_cargo_env(&slot.dir);
-    for (k, v) in slot.rust_cache_env(&ctx.cfg.repo_root, true) {
-        if let Some(entry) = env.iter_mut().find(|(ek, _)| ek == &k) {
-            entry.1 = v;
-        } else {
-            env.push((k, v));
-        }
-    }
+    let env = merged_rust_cargo_env(&slot.dir, slot.rust_cache_env(&ctx.cfg.repo_root, true));
     let (prog, args, label) = detect_cold_rust_checker();
     if prog == "rust-glancer" {
         let probe = CmdSpec::new(prog, &args, ctx.root, &env, 20_000);
@@ -465,14 +458,7 @@ fn run_poly(
 ) {
     let strict = ctx.cfg.strict_polyglot_tools;
     if let Some(slot) = ctx.slot {
-        let mut env = rust_cargo_env(&slot.dir);
-        for (k, v) in slot.rust_cache_env(&ctx.cfg.repo_root, true) {
-            if let Some(entry) = env.iter_mut().find(|(ek, _)| ek == &k) {
-                entry.1 = v;
-            } else {
-                env.push((k, v));
-            }
-        }
+        let env = merged_rust_cargo_env(&slot.dir, slot.rust_cache_env(&ctx.cfg.repo_root, true));
         let t_args = ["test".into(), "--quiet".into()];
         let t_cmd = CmdSpec::new("cargo", &t_args, ctx.root, &env, 45_000);
         poly_test("cargo test", &t_cmd, strict, 8, verdict, acc);

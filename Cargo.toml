@@ -14,7 +14,19 @@ sst-storage = ["dep:roaring"]
 neural-v6 = []
 live-rewind = []
 doc-drift = []
+ste100 = []
+mcp-v2 = []
 build-cache = ["dep:reflink-copy"]
+full-v7 = [
+  "wal-crc32c",
+  "sst-storage",
+  "neural-v6",
+  "live-rewind",
+  "doc-drift",
+  "ste100",
+  "mcp-v2",
+  "build-cache",
+]
 
 [dependencies]
 aho-corasick = "1.1.5"

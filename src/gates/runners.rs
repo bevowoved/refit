@@ -332,6 +332,21 @@ pub(super) fn rust_cargo_env(target_dir: &Path) -> Vec<(String, String)> {
     rust_cargo_env_for(target_dir, budget().is_constrained())
 }
 
+pub(super) fn merged_rust_cargo_env(
+    target_dir: &Path,
+    extra: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut env = rust_cargo_env(target_dir);
+    for (k, v) in extra {
+        if let Some(entry) = env.iter_mut().find(|(ek, _)| ek == &k) {
+            entry.1 = v;
+        } else {
+            env.push((k, v));
+        }
+    }
+    env
+}
+
 fn normalize_diag_token(tok: &str) -> String {
     let no_colon = tok.trim_end_matches(':');
     if let Some(rest) = no_colon.strip_prefix('L')

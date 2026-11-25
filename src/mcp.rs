@@ -1,16 +1,19 @@
 mod catalog;
 mod tx;
+#[cfg(any(feature = "mcp-v2", test))]
+mod v2;
 
 use crate::gates::{GateConfig, read_gates, scan_cached};
 use crate::graph::{apply_patches, parse_patches};
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::MvccStore;
 use crate::net::{json_str, rpc_err, rpc_ok, rpc_text};
+use crate::platform::MemGate;
 use crate::research::WebClient;
 use crate::stem::query_symbols;
 use crate::untangle::{render_audit, untangle_repo, write_sustain};
 use anyhow::Result;
-use catalog::tool_catalog;
+use catalog::{encode_legacy_tools_list_rpc, sep2549_meta, tool_catalog};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -31,7 +34,26 @@ struct McpCtx {
     blocking_sem: Arc<tokio::sync::Semaphore>,
 }
 
+fn build_mcp_ctx(repo_root: PathBuf, out_tx: tokio::sync::mpsc::Sender<String>) -> Arc<McpCtx> {
+    let permits = crate::platform::budget().mcp_blocking_permits;
+    Arc::new(McpCtx {
+        hygiene: HygieneScorer::open_persistent(&repo_root),
+        gate_cfg: read_gates(&repo_root),
+        research: WebClient::for_repo(&repo_root, None),
+        repo_root,
+        out_tx,
+        blocking_sem: Arc::new(tokio::sync::Semaphore::new(permits)),
+    })
+}
+
+/// Serve stateless MCP `2026-07-28` Streamable HTTP (`POST /mcp`) when `mcp-v2` is enabled.
+#[cfg(feature = "mcp-v2")]
+pub async fn serve_http(repo_root: PathBuf, listen_addr: String) -> Result<()> {
+    v2::serve_http(repo_root, listen_addr).await
+}
+
 /// Run the concurrent JSON-RPC 2.0 MCP server over stdio with a serialized writer task.
+/// Preserves legacy `2024-11-05` verbatim while supporting stateless `2026-07-28` framing.
 pub async fn serve_mcp(repo_root: PathBuf) -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -46,72 +68,137 @@ pub async fn serve_mcp(repo_root: PathBuf) -> Result<()> {
         }
     });
 
-    let permits = crate::platform::budget().mcp_blocking_permits;
-    let ctx = Arc::new(McpCtx {
-        hygiene: HygieneScorer::open_persistent(&repo_root),
-        gate_cfg: read_gates(&repo_root),
-        research: WebClient::for_repo(&repo_root, None),
-        repo_root,
-        out_tx,
-        blocking_sem: Arc::new(tokio::sync::Semaphore::new(permits)),
-    });
+    let ctx = build_mcp_ctx(repo_root, out_tx);
+    #[cfg(any(feature = "mcp-v2", test))]
+    let v2_state = v2::McpV2State::from_ctx(ctx.clone());
     let mut tasks = tokio::task::JoinSet::new();
 
     while let Some(line) = lines.next_line().await? {
         let Ok(req) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        let id = req.get("id").cloned();
-        let method = req["method"].as_str().unwrap_or("");
-
-        match method {
-            "initialize" => {
-                let res = json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "refit", "version": "0.5.0" }
-                });
-                let _ = ctx.out_tx.send(serde_json::to_string(&rpc_ok(id, res))?).await;
-            }
-            "notifications/initialized" => {}
-            "ping" => {
-                let _ = ctx.out_tx.send(serde_json::to_string(&rpc_ok(id, json!({})))?).await;
-            }
-            "tools/list" => {
-                let res = json!({ "tools": tool_catalog() });
-                let _ = ctx.out_tx.send(serde_json::to_string(&rpc_ok(id, res))?).await;
-            }
-            "tools/call" => spawn_call(&mut tasks, id, &req, &ctx),
-            other => {
-                if let Some(req_id) = id {
-                    let err = rpc_err(req_id, -32601, format!("Method not found: {other}"));
-                    let _ = ctx.out_tx.send(serde_json::to_string(&err)?).await;
-                }
-            }
-        }
+        #[cfg(any(feature = "mcp-v2", test))]
+        dispatch_stdio_value(&req, &ctx, &v2_state, &mut tasks).await?;
+        #[cfg(not(any(feature = "mcp-v2", test)))]
+        dispatch_stdio_legacy(&req, &ctx, &mut tasks).await?;
     }
 
     while tasks.join_next().await.is_some() {}
+    #[cfg(any(feature = "mcp-v2", test))]
+    drop(v2_state);
     drop(ctx);
     let _ = writer.await;
+    Ok(())
+}
+
+#[cfg(any(feature = "mcp-v2", test))]
+async fn dispatch_stdio_value(
+    req: &Value,
+    ctx: &Arc<McpCtx>,
+    v2_state: &Arc<v2::McpV2State>,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> Result<()> {
+    if req.is_array() {
+        let encoded = serde_json::to_string(&v2::batch_rejection_error())?;
+        let _ = ctx.out_tx.send(encoded).await;
+        return Ok(());
+    }
+    if v2::is_v2_request(req) {
+        let (_status, resp_opt) = v2::handle_v2_request(v2_state, req).await;
+        if let Some(resp) = resp_opt {
+            let _ = ctx.out_tx.send(serde_json::to_string(&resp)?).await;
+        }
+        return Ok(());
+    }
+    dispatch_stdio_legacy(req, ctx, tasks).await
+}
+
+async fn dispatch_stdio_legacy(
+    req: &Value,
+    ctx: &Arc<McpCtx>,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> Result<()> {
+    if req.is_array() {
+        let err = rpc_err(
+            Value::Null,
+            -32600,
+            "Invalid Request: JSON-RPC batch arrays are not supported",
+        );
+        let _ = ctx.out_tx.send(serde_json::to_string(&err)?).await;
+        return Ok(());
+    }
+    let id = req.get("id").cloned();
+    let method = req["method"].as_str().unwrap_or("");
+    let wants_v2_meta = req
+        .get("_meta")
+        .and_then(|m| m.get("protocolVersion"))
+        .and_then(Value::as_str)
+        == Some("2026-07-28");
+
+    match method {
+        "initialize" => {
+            let res = json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "refit", "version": "0.5.0" }
+            });
+            let _ = ctx.out_tx.send(serde_json::to_string(&rpc_ok(id, res))?).await;
+        }
+        "notifications/initialized" => {}
+        "ping" => {
+            let _ = ctx.out_tx.send(serde_json::to_string(&rpc_ok(id, json!({})))?).await;
+        }
+        "server/discover" => {
+            let res = json!({
+                "protocolVersion": "2026-07-28",
+                "serverInfo": { "name": "refit", "version": "0.5.0" },
+                "capabilities": { "tools": { "listChanged": false } },
+                "tools": tool_catalog(),
+                "_meta": sep2549_meta(),
+            });
+            let _ = ctx.out_tx.send(serde_json::to_string(&rpc_ok(id, res))?).await;
+        }
+        "tools/list" => {
+            let encoded = if wants_v2_meta {
+                let res = json!({ "tools": tool_catalog(), "_meta": sep2549_meta() });
+                serde_json::to_string(&rpc_ok(id, res))?
+            } else {
+                encode_legacy_tools_list_rpc(id)
+            };
+            let _ = ctx.out_tx.send(encoded).await;
+        }
+        "tools/call" => spawn_call(tasks, id, req, ctx),
+        other => {
+            if let Some(req_id) = id {
+                let err = rpc_err(req_id, -32601, format!("Method not found: {other}"));
+                let _ = ctx.out_tx.send(serde_json::to_string(&err)?).await;
+            }
+        }
+    }
     Ok(())
 }
 
 fn spawn_call(tasks: &mut tokio::task::JoinSet<()>, id: Option<Value>, req: &Value, ctx: &Arc<McpCtx>) {
     let name = json_str(&req["params"], "name");
     let args = req["params"]["arguments"].clone();
-    let c = ctx.clone();
+    let ctx_clone = ctx.clone();
+
+    let gate = MemGate::global();
+    let reserve = (2 * 1024 * 1024).min(gate.capacity());
+    let pre_permit = gate.try_admit(reserve).ok();
 
     tasks.spawn(async move {
         let payload = if name == "refit_search" {
             let lang = args["language"].as_str().unwrap_or("Rust");
             let cap = args["capability"].as_str().unwrap_or("rate limiter");
-            ok_json(c.research.check_library(lang, cap).await)
+            let out = ok_json(ctx_clone.research.check_library(lang, cap).await);
+            drop(pre_permit);
+            out
         } else {
-            let _sem_permit = c.blocking_sem.acquire().await.ok();
-            let cc = c.clone();
+            let _sem_permit = ctx_clone.blocking_sem.acquire().await.ok();
+            let cc = ctx_clone.clone();
             tokio::task::spawn_blocking(move || {
-                let gate = crate::platform::MemGate::global();
-                let reserve = (2 * 1024 * 1024).min(gate.capacity());
-                let _mem = gate.reserve_or_wait(reserve, std::time::Duration::from_secs(5)).ok();
+                let _held = pre_permit.or_else(|| {
+                    gate.reserve_or_wait(reserve, std::time::Duration::from_secs(5)).ok()
+                });
                 dispatch_tool(&name, &args, &cc.repo_root, &cc.hygiene, &cc.gate_cfg)
             })
             .await
@@ -119,7 +206,7 @@ fn spawn_call(tasks: &mut tokio::task::JoinSet<()>, id: Option<Value>, req: &Val
         };
 
         if let Ok(encoded) = serde_json::to_string(&rpc_text(id, &payload)) {
-            let _ = c.out_tx.send(encoded).await;
+            let _ = ctx_clone.out_tx.send(encoded).await;
         }
     });
 }
@@ -440,5 +527,68 @@ mod tests {
         h.call("refit_tx_create", json!({"tx_handle": cr_id, "path": "src/core/helper.ts", "content": body}));
         let cc = h.commit(&cr_id, false, false);
         assert_eq!((&cc["committed"], &cc["head_rev"]), (&json!(true), &json!(3)));
+    }
+
+    #[tokio::test]
+    async fn test_legacy_2024_11_05_stdio_compat_and_v2_framing() {
+        let repo = TempRepo::nested_with(
+            "mcp_stdio_compat",
+            "repo",
+            &[("src/ok.ts", "export function ok(): number { return 1; }\n")],
+        );
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
+        let ctx = build_mcp_ctx(repo.path().to_path_buf(), out_tx);
+        let v2_state = v2::McpV2State::from_ctx(ctx.clone());
+        let mut tasks = tokio::task::JoinSet::new();
+
+        // 1. Legacy 2024-11-05 handshake + notifications/initialized + tools/list + tools/call
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2024-11-05" }
+        });
+        dispatch_stdio_value(&init_req, &ctx, &v2_state, &mut tasks).await.unwrap();
+        let init_res: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(init_res["result"]["protocolVersion"], json!("2024-11-05"));
+
+        let notif = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        dispatch_stdio_value(&notif, &ctx, &v2_state, &mut tasks).await.unwrap();
+        assert!(out_rx.try_recv().is_err());
+
+        let list_req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        dispatch_stdio_value(&list_req, &ctx, &v2_state, &mut tasks).await.unwrap();
+        let list_res: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert!(list_res["result"].get("_meta").is_none());
+        assert_eq!(list_res["result"]["tools"][0]["name"], json!("refit_apply"));
+
+        let call_req = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "refit_read", "arguments": { "path": "src/ok.ts" } }
+        });
+        dispatch_stdio_value(&call_req, &ctx, &v2_state, &mut tasks).await.unwrap();
+        while tasks.join_next().await.is_some() {}
+        let call_res: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert!(call_res["result"].get("resultType").is_none());
+        assert!(call_res["result"]["content"][0]["text"].as_str().unwrap().contains("export function ok"));
+
+        // 2. Stateless 2026-07-28 `server/discover` and batch `-32600` rejection on stdio
+        let disc_req = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "server/discover",
+            "_meta": { "protocolVersion": "2026-07-28" }
+        });
+        dispatch_stdio_value(&disc_req, &ctx, &v2_state, &mut tasks).await.unwrap();
+        let disc_res: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(disc_res["result"]["protocolVersion"], json!("2026-07-28"));
+        assert_eq!(disc_res["result"]["_meta"]["ttlMs"], json!(3_600_000));
+
+        let batch_req = json!([{"jsonrpc": "2.0", "id": 5, "method": "ping"}]);
+        dispatch_stdio_value(&batch_req, &ctx, &v2_state, &mut tasks).await.unwrap();
+        let batch_res: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(batch_res["error"]["code"], json!(-32600));
     }
 }
