@@ -9,6 +9,7 @@ description = "Pure-Rust cross-platform polyglot refactoring engine for Kimi K3.
 default = ["alloc-mimalloc"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+neural-v6 = []
 
 [dependencies]
 aho-corasick = "1.1.5"

@@ -46,6 +46,10 @@ pub struct HygieneResult {
     pub event_load: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggered_vetoes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiscale_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_log: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,4 +1,6 @@
 mod model;
+#[cfg(any(feature = "neural-v6", test))]
+pub mod multiscale;
 mod ops;
 mod simd;
 pub mod strict;
@@ -102,6 +104,47 @@ fn json_style(repo_root: &Path, cfg: &mut StyleConfig) -> bool {
     false
 }
 
+fn encode_optional_fields(out: &mut Vec<u8>, res: &HygieneResult) {
+    let mut flags = 0u8;
+    if res.strict_score.is_some() {
+        flags |= 1 << 0;
+    }
+    if res.veto_cap.is_some() {
+        flags |= 1 << 1;
+    }
+    if res.total_squiggles.is_some() {
+        flags |= 1 << 2;
+    }
+    if res.event_load.is_some() {
+        flags |= 1 << 3;
+    }
+    if res.multiscale_score.is_some() {
+        flags |= 1 << 4;
+    }
+    if res.calibration_log.is_some() {
+        flags |= 1 << 5;
+    }
+    out.push(flags);
+    if let Some(strict_val) = res.strict_score {
+        out.extend_from_slice(&strict_val.to_le_bytes());
+    }
+    if let Some(cap_val) = res.veto_cap {
+        out.extend_from_slice(&cap_val.to_le_bytes());
+    }
+    if let Some(total_sq) = res.total_squiggles {
+        out.extend_from_slice(&(total_sq.min(u32::MAX as usize) as u32).to_le_bytes());
+    }
+    if let Some(load_val) = res.event_load {
+        out.extend_from_slice(&load_val.to_le_bytes());
+    }
+    if let Some(ms_val) = res.multiscale_score {
+        out.extend_from_slice(&ms_val.to_le_bytes());
+    }
+    if let Some(ref cal_log) = res.calibration_log {
+        write_str_u16(out, cal_log);
+    }
+}
+
 /// Safe explicit little-endian binary codec for `HygieneResult` caches (zero `#[repr(C)]` UB).
 fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + map.len() * 96);
@@ -112,33 +155,7 @@ fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
         write_str_u16(&mut out, key);
         out.extend_from_slice(&res.score.to_le_bytes());
         out.extend_from_slice(&res.latency_us.to_le_bytes());
-
-        let mut flags = 0u8;
-        if res.strict_score.is_some() {
-            flags |= 1 << 0;
-        }
-        if res.veto_cap.is_some() {
-            flags |= 1 << 1;
-        }
-        if res.total_squiggles.is_some() {
-            flags |= 1 << 2;
-        }
-        if res.event_load.is_some() {
-            flags |= 1 << 3;
-        }
-        out.push(flags);
-        if let Some(ss) = res.strict_score {
-            out.extend_from_slice(&ss.to_le_bytes());
-        }
-        if let Some(vc) = res.veto_cap {
-            out.extend_from_slice(&vc.to_le_bytes());
-        }
-        if let Some(ts) = res.total_squiggles {
-            out.extend_from_slice(&(ts.min(u32::MAX as usize) as u32).to_le_bytes());
-        }
-        if let Some(el) = res.event_load {
-            out.extend_from_slice(&el.to_le_bytes());
-        }
+        encode_optional_fields(&mut out, res);
 
         let sq_cnt = res.squiggles.len().min(u16::MAX as usize);
         out.extend_from_slice(&(sq_cnt as u16).to_le_bytes());
@@ -224,6 +241,33 @@ impl<'a> LeReader<'a> {
     }
 }
 
+struct DecodedOptFields {
+    strict_score: Option<f64>,
+    veto_cap: Option<f64>,
+    total_squiggles: Option<usize>,
+    event_load: Option<f64>,
+    multiscale_score: Option<f64>,
+    calibration_log: Option<String>,
+}
+
+fn decode_optional_fields(rd: &mut LeReader<'_>) -> Option<DecodedOptFields> {
+    let flags = rd.read_u8()?;
+    let strict_score = if (flags & (1 << 0)) != 0 { Some(rd.read_f64()?) } else { None };
+    let veto_cap = if (flags & (1 << 1)) != 0 { Some(rd.read_f64()?) } else { None };
+    let total_squiggles = if (flags & (1 << 2)) != 0 { Some(rd.read_u32()? as usize) } else { None };
+    let event_load = if (flags & (1 << 3)) != 0 { Some(rd.read_f64()?) } else { None };
+    let multiscale_score = if (flags & (1 << 4)) != 0 { Some(rd.read_f64()?) } else { None };
+    let calibration_log = if (flags & (1 << 5)) != 0 { Some(rd.read_str_u16()?) } else { None };
+    Some(DecodedOptFields {
+        strict_score,
+        veto_cap,
+        total_squiggles,
+        event_load,
+        multiscale_score,
+        calibration_log,
+    })
+}
+
 fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> {
     let mut rd = LeReader::new(bytes);
     if rd.take(8)? != CACHE_MAGIC {
@@ -238,11 +282,7 @@ fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> 
         let key = rd.read_str_u16()?;
         let score = rd.read_f64()?;
         let latency_us = rd.read_u64()?;
-        let flags = rd.read_u8()?;
-        let strict_score = if (flags & 1) != 0 { Some(rd.read_f64()?) } else { None };
-        let veto_cap = if (flags & 2) != 0 { Some(rd.read_f64()?) } else { None };
-        let total_squiggles = if (flags & 4) != 0 { Some(rd.read_u32()? as usize) } else { None };
-        let event_load = if (flags & 8) != 0 { Some(rd.read_f64()?) } else { None };
+        let opt = decode_optional_fields(&mut rd)?;
 
         let sq_cnt = rd.read_u16()? as usize;
         let mut squiggles = Vec::with_capacity(sq_cnt.min(64));
@@ -250,8 +290,8 @@ fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> 
             let line = rd.read_u32()? as usize;
             let kind_id = rd.read_u8()?;
             let (kind, message) = if (kind_id as usize) < model::SQUIGGLE_SPEC.len() {
-                let (k, m, _) = model::SQUIGGLE_SPEC[kind_id as usize];
-                (k.to_string(), m.to_string())
+                let (spec_k, spec_m, _) = model::SQUIGGLE_SPEC[kind_id as usize];
+                (spec_k.to_string(), spec_m.to_string())
             } else if kind_id == 255 {
                 (rd.read_str_u16()?, rd.read_str_u16()?)
             } else {
@@ -274,11 +314,13 @@ fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> 
                 squiggles,
                 cached: false,
                 latency_us,
-                strict_score,
-                veto_cap,
-                total_squiggles,
-                event_load,
+                strict_score: opt.strict_score,
+                veto_cap: opt.veto_cap,
+                total_squiggles: opt.total_squiggles,
+                event_load: opt.event_load,
                 triggered_vetoes,
+                multiscale_score: opt.multiscale_score,
+                calibration_log: opt.calibration_log,
             },
         );
     }
@@ -320,10 +362,12 @@ fn read_hygiene_cache(path: &Path, active_prefix: &str) -> Option<HashMap<String
 fn hygiene_entry_weight(key: &str, res: &HygieneResult) -> usize {
     let sq_bytes = res.squiggles.len().saturating_mul(96);
     let veto_bytes: usize = res.triggered_vetoes.iter().map(String::len).sum();
+    let cal_bytes = res.calibration_log.as_ref().map_or(0, String::len);
     key.len()
         .saturating_add(160)
         .saturating_add(sq_bytes)
         .saturating_add(veto_bytes)
+        .saturating_add(cal_bytes)
 }
 
 pub struct HygieneScorer {
@@ -480,9 +524,32 @@ impl HygieneScorer {
     }
 
     /// Score content with exact `v0.7.0` `score` plus additive `CH-V4` `strict_score` & anti-gaming vetoes.
+    /// When built with `--features neural-v6`, also populates `CH-V5..V7` `multiscale_score` & `calibration_log`.
     pub fn score_content_strict(&self, path: &str, content: &str) -> HygieneResult {
+        #[cfg(feature = "neural-v6")]
+        {
+            self.score_content_multiscale(path, content, None)
+        }
+        #[cfg(not(feature = "neural-v6"))]
+        {
+            let base = self.score_content(path, content);
+            strict::score_strict(path, content, &base)
+        }
+    }
+
+    /// Score content on the `CH-V5..V7` multiscale track while preserving canonical `v0.7.0` `score`.
+    #[cfg(any(feature = "neural-v6", test))]
+    pub fn score_content_multiscale(
+        &self,
+        path: &str,
+        content: &str,
+        ego: Option<&multiscale::EgoContext>,
+    ) -> HygieneResult {
         let base = self.score_content(path, content);
-        strict::score_strict(path, content, &base)
+        let mut out = strict::score_strict(path, content, &base);
+        let zero_ratio = model::weight_zero_ratio(self.active_weights());
+        let _audit = multiscale::score_multiscale(path, content, &mut out, ego, zero_ratio);
+        out
     }
 
     pub fn score_files(
