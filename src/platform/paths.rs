@@ -403,6 +403,14 @@ mod tests {
         #[cfg(windows)]
         if is_dir {
             std::os::windows::fs::symlink_dir(target, link).is_ok()
+                || std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
         } else {
             std::os::windows::fs::symlink_file(target, link).is_ok()
         }
@@ -435,12 +443,17 @@ mod tests {
             (outside.join("gone.rs"), "dangle.rs", false),
             (repo.join(".git/HEAD"), "git_link", false),
         ];
+        let mut tested_links = 0usize;
         for (target, name, is_dir) in links {
-            if try_symlink(&target, &repo.join(name), is_dir) {
+            let link_path = repo.join(name);
+            if try_symlink(&target, &link_path, is_dir) {
+                tested_links += 1;
                 let probe = if is_dir { format!("{name}/child.rs") } else { name.into() };
                 assert!(!check_target_in_repo(&canon, &probe));
+                let _ = if is_dir { fs::remove_dir(&link_path) } else { fs::remove_file(&link_path) };
             }
         }
+        assert!(tested_links >= 1, "expected at least one symlink or junction escape check");
         assert!(!check_target_in_repo(&base.join("missing_root"), "src/main.rs"));
 
         for (raw, want) in [(r"src\core/sub\a.rs", "src/core/sub/a.rs"), ("./src/a.rs", "src/a.rs")] {

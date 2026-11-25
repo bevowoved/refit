@@ -1372,6 +1372,11 @@ mod tests {
             (&json!(snap.fan_in["src/m_250.rs"]), &json!(snap.fan_out["src/m_250.rs"]))
         );
 
+        let mut bad_footer = sst_bytes.clone();
+        bad_footer[26] ^= 0x01;
+        fs::write(&sst_path, &bad_footer).unwrap();
+        assert!(SstIndex::open(&sst_path).is_none());
+
         let mut tampered = sst_bytes;
         let mid = SST_HEADER_LEN + (tampered.len() - SST_HEADER_LEN) / 3;
         tampered[mid] ^= 0x01;
