@@ -17,7 +17,7 @@ pub use stage::{prune_repo_caches, stage_hardlinks, sweep_stages};
 use crate::graph::hash_abi;
 use crate::hygiene::HygieneScorer;
 use crate::platform::{run_cmd, sandbox_env};
-use crate::types::{GateVerdict, ModuleUnit};
+use crate::types::{FileEgoContext, GateVerdict, ModuleUnit};
 use anyhow::Result;
 use rayon::prelude::*;
 use runners::{
@@ -33,20 +33,13 @@ use std::time::Instant;
 
 #[derive(Default)]
 struct LangPaths {
-    all: Vec<String>,
-    py: Vec<String>,
-    js: Vec<String>,
-    rs: Vec<String>,
-    ts: Vec<String>,
-    go: Vec<String>,
+    all: Vec<String>, py: Vec<String>, js: Vec<String>,
+    rs: Vec<String>, ts: Vec<String>, go: Vec<String>,
 }
 
 struct StageCtx<'a> {
-    cfg: &'a GateConfig,
-    root: &'a Path,
-    env: &'a [(String, String)],
-    paths: &'a LangPaths,
-    slot: Option<&'a CargoSlot>,
+    cfg: &'a GateConfig, root: &'a Path, env: &'a [(String, String)],
+    paths: &'a LangPaths, slot: Option<&'a CargoSlot>,
 }
 
 impl StageCtx<'_> {
@@ -59,27 +52,18 @@ fn group_paths(files: &BTreeMap<String, String>) -> LangPaths {
     let mut lp = LangPaths::default();
     for rel in files.keys() {
         lp.all.push(rel.clone());
-        if rel.ends_with(".py") {
-            lp.py.push(rel.clone());
-        } else if rel.ends_with(".js") || rel.ends_with(".mjs") || rel.ends_with(".cjs") {
-            lp.js.push(rel.clone());
-        } else if rel.ends_with(".rs") {
-            lp.rs.push(rel.clone());
-        } else if rel.ends_with(".ts") || rel.ends_with(".tsx") {
-            lp.ts.push(rel.clone());
-        } else if rel.ends_with(".go") {
-            lp.go.push(rel.clone());
-        }
+        if rel.ends_with(".py") { lp.py.push(rel.clone()); }
+        else if rel.ends_with(".js") || rel.ends_with(".mjs") || rel.ends_with(".cjs") { lp.js.push(rel.clone()); }
+        else if rel.ends_with(".rs") { lp.rs.push(rel.clone()); }
+        else if rel.ends_with(".ts") || rel.ends_with(".tsx") { lp.ts.push(rel.clone()); }
+        else if rel.ends_with(".go") { lp.go.push(rel.clone()); }
     }
     lp
 }
 
 pub fn run_gates(
-    cfg: &GateConfig,
-    unit: &ModuleUnit,
-    candidates: &BTreeMap<String, String>,
-    deleted: &[String],
-    hygiene: &HygieneScorer,
+    cfg: &GateConfig, unit: &ModuleUnit, candidates: &BTreeMap<String, String>,
+    deleted: &[String], hygiene: &HygieneScorer,
 ) -> Result<GateVerdict> {
     stage::ensure_cache_dirs_tagged(&cfg.repo_root);
     let stage = materialize_stage(&cfg.repo_root, candidates, deleted)?;
@@ -87,23 +71,12 @@ pub fn run_gates(
     let paths = group_paths(candidates);
     let cargo_slot = (!paths.rs.is_empty() && stage.join("Cargo.toml").exists())
         .then(|| CargoSlot::acquire(&cfg.repo_root));
-
-    let ctx = StageCtx {
-        cfg,
-        root: &stage,
-        env: &base_env,
-        paths: &paths,
-        slot: cargo_slot.as_ref(),
-    };
+    let ctx = StageCtx { cfg, root: &stage, env: &base_env, paths: &paths, slot: cargo_slot.as_ref() };
 
     let mut verdict = GateVerdict {
-        gate0_abi_ok: true,
-        gate2_score_before: unit.baseline_hygiene,
-        gate2_score_after: unit.baseline_hygiene,
-        deleted_files: deleted.to_vec(),
-        ..GateVerdict::default()
+        gate0_abi_ok: true, gate2_score_before: unit.baseline_hygiene,
+        gate2_score_after: unit.baseline_hygiene, deleted_files: deleted.to_vec(), ..GateVerdict::default()
     };
-
     let g0_t = Instant::now();
     if let Some((gate, msg)) = run_gate0(&ctx, candidates) {
         verdict.gate0_ms = g0_t.elapsed().as_millis() as u64;
@@ -112,15 +85,12 @@ pub fn run_gates(
         return Ok(verdict);
     }
     verdict.gate0_syntax_ok = true;
-
     if !check_abi(unit, candidates, "", &mut verdict) {
         verdict.gate0_ms = g0_t.elapsed().as_millis() as u64;
         return Ok(verdict);
     }
     verdict.gate0_ms = g0_t.elapsed().as_millis() as u64;
-    if !check_invariants(&cfg.repo_root, candidates, &mut verdict) {
-        return Ok(verdict);
-    }
+    if !check_invariants(&cfg.repo_root, candidates, &mut verdict) { return Ok(verdict); }
 
     let g3_start = Instant::now();
     verdict.formatted_files = run_formatters(&ctx);
@@ -128,25 +98,16 @@ pub fn run_gates(
     run_ruff(&ctx, &mut verdict, &mut acc);
 
     let mut working = BTreeMap::new();
-    for rel in &paths.all {
-        working.insert(rel.clone(), fs::read_to_string(ctx.root.join(rel))?);
-    }
+    for rel in &paths.all { working.insert(rel.clone(), fs::read_to_string(ctx.root.join(rel))?); }
     if !check_abi(unit, &working, " after formatter/autofix", &mut verdict)
         || !check_invariants(&cfg.repo_root, &working, &mut verdict)
     {
         return Ok(verdict);
     }
-
-    if !paths.py.is_empty() {
-        run_py(&ctx, unit, &mut verdict, &mut acc);
-    }
+    if !paths.py.is_empty() { run_py(&ctx, unit, &mut verdict, &mut acc); }
     run_poly(&ctx, unit, &mut verdict, &mut acc);
-
     verdict.gate3_ms = g3_start.elapsed().as_millis() as u64;
-    if !acc.ran_tests {
-        verdict.gate1_skipped_reason = Some("no_matching_tests_or_manifest_found".into());
-    }
-
+    if !acc.ran_tests { verdict.gate1_skipped_reason = Some("no_matching_tests_or_manifest_found".into()); }
     let (hints, strict_veto) = score_gate2(cfg, unit, &working, hygiene, &mut verdict);
     finalize_verdict(cfg, working, acc, hints, strict_veto, &mut verdict);
     Ok(verdict)
@@ -159,19 +120,15 @@ fn check_py0(ctx: &StageCtx<'_>) -> Option<(String, String)> {
     args.extend(ctx.paths.py.iter().cloned());
     match run_cmd(&ctx.cfg.python_bin, &args, ctx.root, ctx.env, true, 5_000) {
         Ok(o) if o.exit_code == 0 && !o.timed_out => None,
-        Ok(o) => {
-            let msg = format!("Gate 0 syntax error: {}", first_lines(&o.stderr, 4));
-            Some(("gate0_syntax".into(), msg))
-        }
+        Ok(o) => Some(("gate0_syntax".into(), format!("Gate 0 syntax error: {}", first_lines(&o.stderr, 4)))),
         Err(e) => Some(("gate0_syntax".into(), format!("Gate 0 python spawn error: {e}"))),
     }
 }
 
 fn check_js0(ctx: &StageCtx<'_>, strict: bool) -> Option<(String, String)> {
     let check_one = |js: &String| {
-        let lbl = format!("node --check for `{js}`");
         let args = ["--check".into(), js.clone()];
-        check_g0("gate0_syntax", &lbl, &ctx.cmd("node", &args, 5_000), strict, false)
+        check_g0("gate0_syntax", &format!("node --check for `{js}`"), &ctx.cmd("node", &args, 5_000), strict, false)
     };
     if crate::platform::budget().is_constrained() {
         ctx.paths.js.iter().find_map(check_one)
@@ -183,154 +140,90 @@ fn check_js0(ctx: &StageCtx<'_>, strict: bool) -> Option<(String, String)> {
 fn check_rs0(ctx: &StageCtx<'_>, slot: &CargoSlot, strict: bool) -> Option<(String, String)> {
     let env = merged_rust_cargo_env(&slot.dir, slot.rust_cache_env(&ctx.cfg.repo_root, true));
     let (prog, args, label) = detect_cold_rust_checker();
-    if prog == "rust-glancer" {
-        let probe = CmdSpec::new(prog, &args, ctx.root, &env, 20_000);
-        if let Ok(out) = probe.run()
-            && !out.timed_out
-        {
-            if out.exit_code == 0 {
-                return None;
-            }
-            let combined = first_pair(&out.stdout, &out.stderr, 6);
-            if !combined.to_ascii_lowercase().contains("unrecognized") {
-                return Some((
-                    "gate0_rust_check".into(),
-                    format!("Gate 0 {label} failed: {combined}"),
-                ));
-            }
+    if prog == "rust-glancer"
+        && let Ok(out) = CmdSpec::new(prog, &args, ctx.root, &env, 20_000).run()
+        && !out.timed_out
+    {
+        if out.exit_code == 0 { return None; }
+        let combined = first_pair(&out.stdout, &out.stderr, 6);
+        if !combined.to_ascii_lowercase().contains("unrecognized") {
+            return Some(("gate0_rust_check".into(), format!("Gate 0 {label} failed: {combined}")));
         }
     }
     let cargo_args = ["check".into(), "--quiet".into()];
-    let cmd = CmdSpec::new("cargo", &cargo_args, ctx.root, &env, 30_000);
-    check_g0("gate0_rust_check", "cargo check", &cmd, strict, false)
+    check_g0("gate0_rust_check", "cargo check", &CmdSpec::new("cargo", &cargo_args, ctx.root, &env, 30_000), strict, false)
 }
 
-fn run_gate0(
-    ctx: &StageCtx<'_>,
-    candidates: &BTreeMap<String, String>,
-) -> Option<(String, String)> {
+fn run_gate0(ctx: &StageCtx<'_>, candidates: &BTreeMap<String, String>) -> Option<(String, String)> {
     for (rel, content) in candidates {
         if let Err(err) = crate::lex::check_balanced_syntax(rel, content) {
-            let msg = format!("Gate 0 polyglot syntax error in `{rel}`: {err}");
-            return Some(("gate0_syntax".into(), msg));
+            return Some(("gate0_syntax".into(), format!("Gate 0 polyglot syntax error in `{rel}`: {err}")));
         }
     }
-
     let strict = ctx.cfg.strict_polyglot_tools;
     let check_ts = || {
         let (prog, args, label) = detect_cold_ts_checker();
-        let cmd = ctx.cmd(prog, &args, 20_000);
-        check_g0("gate0_ts_check", label, &cmd, strict, true)
+        check_g0("gate0_ts_check", label, &ctx.cmd(prog, &args, 20_000), strict, true)
     };
     let check_go = || {
         let args = ["vet".into(), "./...".into()];
-        let cmd = ctx.cmd("go", &args, 20_000);
-        check_g0("gate0_go_vet", "go vet", &cmd, strict, false)
+        check_g0("gate0_go_vet", "go vet", &ctx.cmd("go", &args, 20_000), strict, false)
     };
     let want_ts = !ctx.paths.ts.is_empty() && ctx.root.join("tsconfig.json").exists();
     let want_go = !ctx.paths.go.is_empty() && ctx.root.join("go.mod").exists();
 
     if crate::platform::budget().is_constrained() {
-        if !ctx.paths.py.is_empty()
-            && let Some(err) = check_py0(ctx)
-        {
-            return Some(err);
-        }
-        if !ctx.paths.js.is_empty()
-            && let Some(err) = check_js0(ctx, strict)
-        {
-            return Some(err);
-        }
-        if let Some(slot) = ctx.slot
-            && let Some(err) = check_rs0(ctx, slot, strict)
-        {
-            return Some(err);
-        }
-        if want_ts
-            && let Some(err) = check_ts()
-        {
-            return Some(err);
-        }
-        if want_go
-            && let Some(err) = check_go()
-        {
-            return Some(err);
-        }
-        return None;
+        return (!ctx.paths.py.is_empty()).then(|| check_py0(ctx)).flatten()
+            .or_else(|| (!ctx.paths.js.is_empty()).then(|| check_js0(ctx, strict)).flatten())
+            .or_else(|| ctx.slot.and_then(|s| check_rs0(ctx, s, strict)))
+            .or_else(|| want_ts.then(check_ts).flatten())
+            .or_else(|| want_go.then(check_go).flatten());
     }
-
     std::thread::scope(|s| {
         let h_py = (!ctx.paths.py.is_empty()).then(|| s.spawn(|| check_py0(ctx)));
         let h_js = (!ctx.paths.js.is_empty()).then(|| s.spawn(|| check_js0(ctx, strict)));
         let h_rs = ctx.slot.map(|slot| s.spawn(move || check_rs0(ctx, slot, strict)));
         let h_ts = want_ts.then(|| s.spawn(check_ts));
         let h_go = want_go.then(|| s.spawn(check_go));
-
-        for h in [h_py, h_js, h_rs, h_ts, h_go].into_iter().flatten() {
-            if let Some(err) = h.join().ok().flatten() {
-                return Some(err);
-            }
-        }
-        None
+        [h_py, h_js, h_rs, h_ts, h_go].into_iter().flatten().find_map(|h| h.join().ok().flatten())
     })
 }
 
-fn check_abi(
-    unit: &ModuleUnit,
-    files: &BTreeMap<String, String>,
-    suffix: &str,
-    v: &mut GateVerdict,
-) -> bool {
-    if unit.allow_abi_change {
-        return true;
-    }
+fn check_abi(unit: &ModuleUnit, files: &BTreeMap<String, String>, suffix: &str, v: &mut GateVerdict) -> bool {
+    if unit.allow_abi_change { return true; }
     for (rel, content) in files {
-        let changed = unit.abi_hash.get(rel).is_some_and(|exp| &hash_abi(rel, content) != exp);
-        if changed {
+        if unit.abi_hash.get(rel).is_some_and(|exp| &hash_abi(rel, content) != exp) {
             v.gate0_abi_ok = false;
             v.failed_gate = Some("gate0_abi".into());
-            let msg = format!(
-                "Gate 0 AbiPinViolation{suffix} in `{rel}`: exported signature names changed"
-            );
-            v.diagnostics.push(msg);
+            v.diagnostics.push(format!("Gate 0 AbiPinViolation{suffix} in `{rel}`: exported signature names changed"));
             return false;
         }
     }
     true
 }
 
-fn check_invariants(
-    repo_root: &Path,
-    files: &BTreeMap<String, String>,
-    v: &mut GateVerdict,
-) -> bool {
+fn check_invariants(repo_root: &Path, files: &BTreeMap<String, String>, v: &mut GateVerdict) -> bool {
     let violations = check_rules(repo_root, files);
-    if violations.is_empty() {
-        return true;
-    }
+    if violations.is_empty() { return true; }
     v.failed_gate = Some("gate3_5_invariants".into());
     v.diagnostics.extend(violations.into_iter().take(8));
     false
 }
 
 fn fmt_group(ctx: &StageCtx<'_>, bin: &str, head: &[&str], files: &[String]) -> usize {
-    if files.is_empty() {
-        return 0;
-    }
+    if files.is_empty() { return 0; }
     let mut args: Vec<String> = head.iter().map(|&s| s.into()).collect();
     args.extend(files.iter().cloned());
     run_fmt(bin, &args, ctx.root, ctx.env, files.len())
 }
 
 fn run_formatters(ctx: &StageCtx<'_>) -> usize {
-    let mut n = 0usize;
-    n += fmt_group(ctx, &ctx.cfg.ruff_bin, &["format", "--quiet"], &ctx.paths.py);
+    let mut n = fmt_group(ctx, &ctx.cfg.ruff_bin, &["format", "--quiet"], &ctx.paths.py);
     if !ctx.paths.rs.is_empty() {
         let ed = rust_edition(ctx.root);
         n += fmt_group(ctx, "rustfmt", &["--edition", &ed], &ctx.paths.rs);
     }
     n += fmt_group(ctx, "gofmt", &["-w"], &ctx.paths.go);
-
     if !ctx.paths.ts.is_empty() || !ctx.paths.js.is_empty() {
         let mut both = ctx.paths.ts.clone();
         both.extend(ctx.paths.js.iter().cloned());
@@ -340,19 +233,12 @@ fn run_formatters(ctx: &StageCtx<'_>) -> usize {
 }
 
 fn run_ruff(ctx: &StageCtx<'_>, verdict: &mut GateVerdict, acc: &mut RunAccum) {
-    if ctx.paths.py.is_empty() {
-        return;
-    }
+    if ctx.paths.py.is_empty() { return; }
     let mut args = vec!["check".into(), "--fix".into(), "--output-format=json".into()];
     args.extend(ctx.paths.py.iter().cloned());
     match run_cmd(&ctx.cfg.ruff_bin, &args, ctx.root, ctx.env, true, 8_000) {
-        Ok(out) => {
-            acc.ruff_diags = parse_ruff(&out.stdout);
-            verdict.gate3_ruff_errors = acc.ruff_diags.len();
-        }
-        Err(e) if ctx.cfg.strict_polyglot_tools => {
-            acc.poly_lint.push(format!("ruff unavailable (strict mode): {e}"));
-        }
+        Ok(out) => { acc.ruff_diags = parse_ruff(&out.stdout); verdict.gate3_ruff_errors = acc.ruff_diags.len(); }
+        Err(e) if ctx.cfg.strict_polyglot_tools => acc.poly_lint.push(format!("ruff unavailable (strict mode): {e}")),
         Err(_) => {}
     }
 }
@@ -538,42 +424,35 @@ fn strict_hygiene_enabled() -> bool {
 }
 
 fn score_gate2(
-    cfg: &GateConfig,
-    unit: &ModuleUnit,
-    working: &BTreeMap<String, String>,
-    hygiene: &HygieneScorer,
-    verdict: &mut GateVerdict,
+    cfg: &GateConfig, unit: &ModuleUnit, working: &BTreeMap<String, String>,
+    hygiene: &HygieneScorer, verdict: &mut GateVerdict,
 ) -> (Vec<String>, bool) {
-    let t = Instant::now();
-    let strict = strict_hygiene_enabled();
+    let (t, strict) = (Instant::now(), strict_hygiene_enabled());
     let (mut sum, mut hints, mut has_veto) = (0.0f64, Vec::new(), false);
-
+    let deg = unit.dependents.len() + unit.deps.len();
+    let is_tangle = unit.dependents.len() >= 6 && unit.deps.len() >= 6 && deg > 0
+        && (0.35..=0.65).contains(&((unit.deps.len() as f64) / (deg as f64)));
+    let unit_ego = FileEgoContext {
+        fan_in: unit.dependents.len(), fan_out: unit.deps.len(), neighbor_dirs: 2,
+        has_module_cycle: unit.files.len() > 1, tangle: is_tangle, ..FileEgoContext::default()
+    };
     for (rel, txt) in working {
         let h = if strict {
-            hygiene.score_content_strict(rel, txt)
+            hygiene.score_content_strict_with_ego(rel, txt, Some(&unit_ego))
         } else {
             hygiene.score_content(rel, txt)
         };
-        let eff_score = if strict {
-            h.multiscale_score.or(h.strict_score).unwrap_or(h.score)
-        } else {
-            h.score
-        };
-        sum += eff_score;
+        let eff = if strict { h.multiscale_score.or(h.strict_score).unwrap_or(h.score) } else { h.score };
+        sum += eff;
         if strict && !h.triggered_vetoes.is_empty() {
             has_veto = true;
             let before = fs::read_to_string(cfg.repo_root.join(rel)).unwrap_or_default();
-            let audit = crate::hygiene::strict::audit_anti_gaming(rel, &before, txt);
-            if !audit.passed {
+            let a = crate::hygiene::strict::audit_anti_gaming(rel, &before, txt);
+            if !a.passed {
                 hints.push(format!(
                     "codehygiene-strict `{}` veto (cap {:.2}, indent {}:{}, before={} after={} new={})",
-                    audit.path,
-                    audit.veto_cap,
-                    audit.indent_mode,
-                    audit.indent_quantum,
-                    audit.before_vetoes.len(),
-                    audit.after_vetoes.len(),
-                    audit.introduced_vetoes.len(),
+                    a.path, a.veto_cap, a.indent_mode, a.indent_quantum,
+                    a.before_vetoes.len(), a.after_vetoes.len(), a.introduced_vetoes.len(),
                 ));
             }
             for veto in h.triggered_vetoes.iter().take(4) {
@@ -581,14 +460,9 @@ fn score_gate2(
             }
         }
         for sq in h.squiggles.iter().take(6) {
-            let msg = format!(
-                "codehygiene `{rel}` L{}: {} ({:.2}) {}",
-                sq.line, sq.kind, sq.probability, sq.message
-            );
-            hints.push(msg);
+            hints.push(format!("codehygiene `{rel}` L{}: {} ({:.2}) {}", sq.line, sq.kind, sq.probability, sq.message));
         }
     }
-
     verdict.gate2_score_after = if working.is_empty() {
         cfg.min_hygiene_target.max(unit.baseline_hygiene)
     } else {
@@ -599,20 +473,12 @@ fn score_gate2(
 }
 
 fn finalize_verdict(
-    cfg: &GateConfig,
-    working: BTreeMap<String, String>,
-    acc: RunAccum,
-    hints: Vec<String>,
-    strict_veto: bool,
-    v: &mut GateVerdict,
+    cfg: &GateConfig, working: BTreeMap<String, String>, acc: RunAccum,
+    hints: Vec<String>, strict_veto: bool, v: &mut GateVerdict,
 ) {
     if acc.pt_exit != 0 || v.gate1_tests_failed > 0 {
         v.failed_gate = Some("gate1_tests".into());
-        v.diagnostics.push(format!(
-            "Gate 1 tests failed ({} failed): {}",
-            v.gate1_tests_failed,
-            first_lines(&acc.pt_stdout, 8)
-        ));
+        v.diagnostics.push(format!("Gate 1 tests failed ({} failed): {}", v.gate1_tests_failed, first_lines(&acc.pt_stdout, 8)));
     }
     if v.gate3_ruff_errors > 0 || !acc.poly_lint.is_empty() {
         v.failed_gate.get_or_insert_with(|| "gate3_ruff".into());
@@ -623,10 +489,7 @@ fn finalize_verdict(
         v.failed_gate.get_or_insert_with(|| "gate3_ty".into());
         v.diagnostics.extend(acc.ty_diags.into_iter().take(6));
     }
-
-    let improved = !strict_veto
-        && v.gate2_score_after >= v.gate2_score_before + 0.12
-        && v.gate2_score_after >= 0.72;
+    let improved = !strict_veto && v.gate2_score_after >= v.gate2_score_before + 0.12 && v.gate2_score_after >= 0.72;
     if strict_veto || (v.gate2_score_after < cfg.min_hygiene_target && !improved) {
         v.failed_gate.get_or_insert_with(|| "gate2_hygiene".into());
         v.diagnostics.push(format!(
@@ -635,12 +498,9 @@ fn finalize_verdict(
         ));
         v.diagnostics.extend(hints.into_iter().take(6));
     }
-
     if v.failed_gate.is_none() {
         v.passed = true;
-        for (rel, txt) in working {
-            v.final_contents.insert(rel, txt.into_bytes());
-        }
+        for (rel, txt) in working { v.final_contents.insert(rel, txt.into_bytes()); }
     }
 }
 

@@ -764,8 +764,7 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_2024_11_05_stdio_compat_and_v2_framing() {
         let repo = TempRepo::nested_with(
-            "mcp_stdio_compat",
-            "repo",
+            "mcp_stdio_compat", "repo",
             &[("src/ok.ts", "export function ok(): number { return 1; }\n")],
         );
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
@@ -773,13 +772,7 @@ mod tests {
         let v2_state = v2::McpV2State::from_backend(ctx.clone());
         let mut tasks = tokio::task::JoinSet::new();
 
-        // 1. Legacy 2024-11-05 handshake + notifications/initialized + tools/list + tools/call
-        let init_req = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": { "protocolVersion": "2024-11-05" }
-        });
+        let init_req = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}});
         dispatch_stdio_value(&init_req, &ctx, &v2_state, &mut tasks).await.unwrap();
         let init_res: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
         assert_eq!(init_res["result"]["protocolVersion"], json!("2024-11-05"));
@@ -794,29 +787,17 @@ mod tests {
         assert!(list_res["result"].get("_meta").is_none());
         assert_eq!(list_res["result"]["tools"][0]["name"], json!("refit_apply"));
 
-        let call_req = json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": { "name": "refit_read", "arguments": { "path": "src/ok.ts" } }
-        });
+        let call_req = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "refit_read", "arguments": {"path": "src/ok.ts"}}});
         dispatch_stdio_value(&call_req, &ctx, &v2_state, &mut tasks).await.unwrap();
         while tasks.join_next().await.is_some() {}
         let call_res: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
         assert!(call_res["result"].get("resultType").is_none());
         assert!(call_res["result"]["content"][0]["text"].as_str().unwrap().contains("export function ok"));
 
-        // 2. Stateless 2026-07-28 `server/discover` and batch `-32600` rejection on stdio
-        let disc_req = json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "server/discover",
-            "_meta": { "protocolVersion": "2026-07-28" }
-        });
+        let disc_req = json!({"jsonrpc": "2.0", "id": 4, "method": "server/discover", "_meta": {"protocolVersion": "2026-07-28"}});
         dispatch_stdio_value(&disc_req, &ctx, &v2_state, &mut tasks).await.unwrap();
         let disc_res: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
-        assert_eq!(disc_res["result"]["protocolVersion"], json!("2026-07-28"));
-        assert_eq!(disc_res["result"]["_meta"]["ttlMs"], json!(3_600_000));
+        assert_eq!((&disc_res["result"]["protocolVersion"], &disc_res["result"]["_meta"]["ttlMs"]), (&json!("2026-07-28"), &json!(3_600_000)));
 
         let batch_req = json!([{"jsonrpc": "2.0", "id": 5, "method": "ping"}]);
         dispatch_stdio_value(&batch_req, &ctx, &v2_state, &mut tasks).await.unwrap();
@@ -826,52 +807,31 @@ mod tests {
 
     #[test]
     fn warm_epoch_short_circuit_and_commit_invalidation() {
-        let repo = TempRepo::nested_with(
-            "mcp_epoch_memo",
-            "repo",
-            &[("src/mod_a.rs", "pub fn initial_sym() -> i32 { 1 }\n")],
-        );
+        let repo = TempRepo::nested_with("mcp_epoch_memo", "repo", &[("src/mod_a.rs", "pub fn initial_sym() -> i32 { 1 }\n")]);
         let reg = Arc::new(EpochRegistry::new());
         let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
-        let ctx = build_mcp_ctx_with_epoch(repo.path().to_path_buf(), tx, reg.clone());
-        let h = Harness { repo, ctx };
+        let h = Harness { ctx: build_mcp_ctx_with_epoch(repo.path().to_path_buf(), tx, reg.clone()), repo };
 
-        // 1. Cold calls populate scan_memo and symbols_memo.
-        let s1 = h.call("refit_scan", json!({}));
-        assert_eq!(s1["epoch_cache_hit"], json!(false));
+        assert_eq!(h.call("refit_scan", json!({}))["epoch_cache_hit"], json!(false));
         let y1 = h.call("refit_symbols", json!({"symbol": "initial_sym"}));
-        assert_eq!(y1["epoch_cache_hit"], json!(false));
-        assert_eq!(y1["definers"], json!(["src/mod_a.rs"]));
+        assert_eq!((&y1["epoch_cache_hit"], &y1["definers"]), (&json!(false), &json!(["src/mod_a.rs"])));
 
-        // 2. Warm calls hit O(1) EpochMemo directly.
         let s2 = h.call("refit_scan", json!({}));
         assert_eq!((&s2["epoch_cache_hit"], &s2["scan_cache_hit"]), (&json!(true), &json!(true)));
         let y2 = h.call("refit_symbols", json!({"symbol": "initial_sym"}));
-        assert_eq!(y2["epoch_cache_hit"], json!(true));
-        assert_eq!(y2["definers"], json!(["src/mod_a.rs"]));
+        assert_eq!((&y2["epoch_cache_hit"], &y2["definers"]), (&json!(true), &json!(["src/mod_a.rs"])));
 
-        // Verify `refit_read` surfaces live epoch & file_epoch.
         let rd = h.call("refit_read", json!({"path": "src/mod_a.rs"}));
-        assert!(rd["epoch"].as_u64().is_some_and(|e| e >= 1));
-        assert!(rd["file_epoch"].as_u64().is_some_and(|e| e >= 1));
+        assert!(rd["epoch"].as_u64().is_some_and(|e| e >= 1) && rd["file_epoch"].as_u64().is_some_and(|e| e >= 1));
 
-        // 3. Commit a new symbol via MvccStore::commit_tx -> invalidates both memos!
         let store = MvccStore::open_with_epoch(h.repo.path(), "memo-commit", reg).unwrap();
-        let mut exp = BTreeMap::new();
-        exp.insert("src/mod_a.rs".into(), h.repo.hash("src/mod_a.rs"));
-        let mut new_files = BTreeMap::new();
-        new_files.insert(
-            "src/mod_a.rs".into(),
-            b"pub fn initial_sym() -> i32 { 1 }\npub fn freshly_committed_sym() -> i32 { 42 }\n"
-                .to_vec(),
-        );
-        let outcome = store.commit_tx("mod_a", &exp, &new_files, &[]).unwrap();
+        let exp = BTreeMap::from([("src/mod_a.rs".into(), h.repo.hash("src/mod_a.rs"))]);
+        let next = b"pub fn initial_sym() -> i32 { 1 }\npub fn freshly_committed_sym() -> i32 { 42 }\n".to_vec();
+        let outcome = store.commit_tx("mod_a", &exp, &BTreeMap::from([("src/mod_a.rs".into(), next)]), &[]).unwrap();
         assert!(matches!(outcome, crate::mvcc::CommitOutcome::Committed { .. }));
 
-        let s3 = h.call("refit_scan", json!({}));
-        assert_eq!(s3["epoch_cache_hit"], json!(false));
+        assert_eq!(h.call("refit_scan", json!({}))["epoch_cache_hit"], json!(false));
         let y3 = h.call("refit_symbols", json!({"symbol": "freshly_committed_sym"}));
-        assert_eq!(y3["epoch_cache_hit"], json!(false));
-        assert_eq!(y3["definers"], json!(["src/mod_a.rs"]));
+        assert_eq!((&y3["epoch_cache_hit"], &y3["definers"]), (&json!(false), &json!(["src/mod_a.rs"])));
     }
 }

@@ -303,3 +303,65 @@ pub async fn mock_sse(chunks: Vec<Vec<u8>>, delay_ms: u64, hold_secs: u64) -> St
     });
     addr
 }
+
+pub fn nest_src(head: &str, step: &str, open: &[String], body: &str, close: Option<&str>) -> String {
+    let mut out = format!("{head}\n");
+    for (i, line) in open.iter().enumerate() {
+        out.push_str(&format!("{}{line}\n", step.repeat(i + 1)));
+    }
+    out.push_str(&format!("{}{body}\n", step.repeat(open.len() + 1)));
+    if let Some(ch) = close {
+        for i in (0..open.len()).rev() {
+            out.push_str(&format!("{}{ch}\n", step.repeat(i + 1)));
+        }
+        out.push_str("  return 0;\n}\n");
+    }
+    out
+}
+
+pub fn repeat_fn(
+    head: &str,
+    range: std::ops::RangeInclusive<usize>,
+    mut line: impl FnMut(usize) -> String,
+    tail: &str,
+) -> String {
+    let mut out = format!("{head}\n");
+    for i in range {
+        out.push_str(&line(i));
+    }
+    out.push_str(tail);
+    out
+}
+
+pub fn map_conds(vars: &[&str], fmt: impl Fn(&str) -> String) -> Vec<String> {
+    vars.iter().map(|v| fmt(v)).collect()
+}
+
+pub fn walk_rs_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_dir() {
+            walk_rs_files(base, &p, out);
+        } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+            let rel = p.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
+            out.push((rel, p));
+        }
+    }
+}
+
+pub fn build_single_entry_zip(name: &str, method: u16, comp: &[u8], uncomp_len: u32) -> Vec<u8> {
+    let (mut out, nb, clen) = (Vec::new(), name.as_bytes(), comp.len() as u32);
+    let nlen = nb.len() as u16;
+    for b in [&0x0403_4b50u32.to_le_bytes()[..], &20u16.to_le_bytes(), &0u16.to_le_bytes(), &method.to_le_bytes(),
+        &0u32.to_le_bytes(), &0u32.to_le_bytes(), &clen.to_le_bytes(), &uncomp_len.to_le_bytes(), &nlen.to_le_bytes(),
+        &0u16.to_le_bytes(), nb, comp] { out.extend_from_slice(b); }
+    let cd_off = out.len() as u32;
+    for b in [&0x0201_4b50u32.to_le_bytes()[..], &20u16.to_le_bytes(), &20u16.to_le_bytes(), &0u16.to_le_bytes(),
+        &method.to_le_bytes(), &0u32.to_le_bytes(), &0u32.to_le_bytes(), &clen.to_le_bytes(), &uncomp_len.to_le_bytes(),
+        &nlen.to_le_bytes(), &0u16.to_le_bytes(), &0u16.to_le_bytes(), &0u16.to_le_bytes(), &0u16.to_le_bytes(),
+        &0u32.to_le_bytes(), &0u32.to_le_bytes(), nb] { out.extend_from_slice(b); }
+    let cd_sz = (out.len() as u32) - cd_off;
+    for b in [&0x0605_4b50u32.to_le_bytes()[..], &0u16.to_le_bytes(), &0u16.to_le_bytes(), &1u16.to_le_bytes(),
+        &1u16.to_le_bytes(), &cd_sz.to_le_bytes(), &cd_off.to_le_bytes(), &0u16.to_le_bytes()] { out.extend_from_slice(b); }
+    out
+}

@@ -808,26 +808,13 @@ mod tests {
     async fn test_sse_stall_watchdog() {
         let up_addr = mock_sse(vec![sse_delta("hi")], 0, 10).await;
         let prx = TestProxy::spawn(&format!("http://{up_addr}/v1"), CacheMode::Short, None).await;
-
-        let started = Instant::now();
-        let body = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true});
-        let resp = prx
-            .client
-            .post(prx.url("/v1/chat/completions"))
-            .header("x-refit-sse-stall-ms", "120")
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
+        let (started, body) = (Instant::now(), json!({"messages": [{"role": "user", "content": "hi"}], "stream": true}));
+        let resp = prx.client.post(prx.url("/v1/chat/completions"))
+            .header("x-refit-sse-stall-ms", "120").json(&body).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 200);
-
-        let mut s = resp.bytes_stream();
-        let mut saw_err = false;
+        let (mut s, mut saw_err) = (resp.bytes_stream(), false);
         while let Some(item) = s.next().await {
-            if item.is_err() {
-                saw_err = true;
-                break;
-            }
+            if item.is_err() { saw_err = true; break; }
         }
         assert!(saw_err && started.elapsed() < Duration::from_secs(2));
     }
@@ -837,46 +824,30 @@ mod tests {
         let tmp = TempRepo::with_files("prx_api", &[("app.py", "def f():\n    return 1\n")]);
         let store = MvccStore::open(tmp.path(), "prx_api").unwrap();
         let (_, tx_id, _) = commit_file(&store, tmp.path(), "app", "app.py", "def f():\n    return 42\n");
-
         let up = MockHttp::spawn(vec![
             http_res("503 Service Unavailable", "Retry-After: 0.01\r\n", "busy"),
             http_res("200 OK", "", r#"{"data":[{"id":"kimi"}]}"#),
-        ])
-        .await;
+        ]).await;
         let tok = "secret-run-token";
         let prx = TestProxy::spawn(&up.url("/v1"), CacheMode::Short, Some(tok)).await;
         let shared = RunState::new(100);
         prx.state.bind_repo(tmp.path().to_path_buf());
         prx.state.attach_state(shared.clone());
 
-        let unauth = prx
-            .client
-            .get(prx.url("/api/timeline"))
-            .header("origin", "https://evil.example")
-            .send()
-            .await
-            .unwrap();
+        let unauth = prx.client.get(prx.url("/api/timeline"))
+            .header("origin", "https://evil.example").send().await.unwrap();
         assert_eq!(unauth.status().as_u16(), 401);
         assert!(unauth.headers().get("access-control-allow-origin").is_none());
 
-        let authed = prx
-            .client
-            .get(prx.url("/api/timeline"))
-            .bearer_auth(tok)
-            .header("origin", "http://127.0.0.1:18790")
-            .send()
-            .await
-            .unwrap();
+        let authed = prx.client.get(prx.url("/api/timeline")).bearer_auth(tok)
+            .header("origin", "http://127.0.0.1:18790").send().await.unwrap();
         assert_eq!(authed.status().as_u16(), 200);
-        let cors = authed.headers().get("access-control-allow-origin");
-        assert_eq!(cors.and_then(|v| v.to_str().ok()), Some("http://127.0.0.1:18790"));
+        assert_eq!(authed.headers().get("access-control-allow-origin").and_then(|v| v.to_str().ok()), Some("http://127.0.0.1:18790"));
 
         let (_, tl) = prx.get_json("/api/timeline").await;
         assert_eq!(tl["entries"][0]["tx_id"], json!(tx_id));
         let (code, dj) = prx.get_json(&format!("/api/diff/{tx_id}")).await;
-        let udiff = dj["files"][0]["unified_diff"].as_str().unwrap();
-        assert_eq!(code, 200);
-        assert!(udiff.contains("+    return 42"));
+        assert!(code == 200 && dj["files"][0]["unified_diff"].as_str().unwrap().contains("+    return 42"));
         assert_eq!(prx.get_json("/api/diff/tx-none").await.0, 404);
 
         assert_eq!((prx.get_json("/v1/models").await.0, up.calls()), (200, 2));

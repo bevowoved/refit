@@ -58,13 +58,7 @@ const _: () = assert!(std::mem::size_of::<RefWitness>() == 16);
 
 impl Default for RefWitness {
     fn default() -> Self {
-        Self {
-            prod_file_a: NO_FILE,
-            prod_file_b: NO_FILE,
-            test_file: NO_FILE,
-            prod_files_sat: 0,
-            flags_and_test: 0,
-        }
+        Self { prod_file_a: NO_FILE, prod_file_b: NO_FILE, test_file: NO_FILE, prod_files_sat: 0, flags_and_test: 0 }
     }
 }
 
@@ -95,20 +89,11 @@ impl RefWitness {
         }
     }
 
-    #[inline]
-    pub fn add_flag(&mut self, flag: u16) {
-        self.flags_and_test |= flag & !WITNESS_TEST_COUNT_MASK;
-    }
-
-    #[inline]
-    pub fn test_count(self) -> u16 {
-        self.flags_and_test & WITNESS_TEST_COUNT_MASK
-    }
-
+    #[inline] pub fn add_flag(&mut self, flag: u16) { self.flags_and_test |= flag & !WITNESS_TEST_COUNT_MASK; }
+    #[inline] pub fn test_count(self) -> u16 { self.flags_and_test & WITNESS_TEST_COUNT_MASK }
     #[inline]
     fn set_test_count(&mut self, count: u16) {
-        let clamped = count.min(WITNESS_TEST_COUNT_MASK);
-        self.flags_and_test = (self.flags_and_test & !WITNESS_TEST_COUNT_MASK) | clamped;
+        self.flags_and_test = (self.flags_and_test & !WITNESS_TEST_COUNT_MASK) | count.min(WITNESS_TEST_COUNT_MASK);
     }
 
     #[inline]
@@ -121,19 +106,12 @@ impl RefWitness {
     pub fn has_external_flag(self) -> bool {
         (self.flags_and_test & (WITNESS_GLOB_REEXPORT | WITNESS_MACRO_ATTR | WITNESS_EXTERNAL)) != 0
     }
-
-    #[inline]
-    pub fn has_dynamic_flag(self) -> bool {
-        (self.flags_and_test & WITNESS_DYNAMIC_REF) != 0
-    }
+    #[inline] pub fn has_dynamic_flag(self) -> bool { (self.flags_and_test & WITNESS_DYNAMIC_REF) != 0 }
 }
 
 /// Compact `u32` path interner eliminating repeated `String` clones across symbol/graph tables.
 #[derive(Debug, Default)]
-pub struct PathArena {
-    paths: Vec<String>,
-    by_path: FxHashMap<String, u32>,
-}
+pub struct PathArena { paths: Vec<String>, by_path: FxHashMap<String, u32> }
 
 impl PathArena {
     pub fn with_capacity(cap: usize) -> Self {
@@ -144,9 +122,7 @@ impl PathArena {
     }
 
     pub fn intern(&mut self, path: &str) -> u32 {
-        if let Some(&id) = self.by_path.get(path) {
-            return id;
-        }
+        if let Some(&id) = self.by_path.get(path) { return id; }
         let id = self.paths.len() as u32;
         let owned = path.to_string();
         self.paths.push(owned.clone());
@@ -154,19 +130,12 @@ impl PathArena {
         id
     }
 
-    pub fn id_of(&self, path: &str) -> Option<u32> {
-        self.by_path.get(path).copied()
-    }
+    pub fn id_of(&self, path: &str) -> Option<u32> { self.by_path.get(path).copied() }
 }
 
 /// 4-Tier Deletion-Safety Proof Lattice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProofTier {
-    T1ProvenDead,
-    T2LikelyDead,
-    T3DynamicOrTestOnly,
-    T4ExternalOrMacro,
-}
+pub enum ProofTier { T1ProvenDead, T2LikelyDead, T3DynamicOrTestOnly, T4ExternalOrMacro }
 
 impl ProofTier {
     pub fn as_str(self) -> &'static str {
@@ -177,37 +146,20 @@ impl ProofTier {
             Self::T4ExternalOrMacro => "T4ExternalOrMacro",
         }
     }
-
-    #[inline]
-    pub fn is_dead_candidate(self) -> bool {
-        matches!(self, Self::T1ProvenDead | Self::T2LikelyDead)
-    }
+    #[inline] pub fn is_dead_candidate(self) -> bool { matches!(self, Self::T1ProvenDead | Self::T2LikelyDead) }
 }
 
 pub fn classify_symbol(
-    def_file: u32,
-    witness: RefWitness,
-    intra_non_def_hits: u16,
-    boundary_flags: u16,
+    def_file: u32, witness: RefWitness, intra_non_def_hits: u16, boundary_flags: u16,
 ) -> Option<ProofTier> {
-    if witness.has_cross_file_prod_caller(def_file) {
-        return None;
-    }
+    if witness.has_cross_file_prod_caller(def_file) { return None; }
     if (boundary_flags & BOUNDARY_T4_MASK) != 0 || witness.has_external_flag() {
         return Some(ProofTier::T4ExternalOrMacro);
     }
-    if witness.test_count() > 0
-        || intra_non_def_hits > 0
-        || (boundary_flags & BOUNDARY_DYNAMIC_REF) != 0
-        || witness.has_dynamic_flag()
-    {
-        return Some(ProofTier::T3DynamicOrTestOnly);
-    }
-    if (boundary_flags & DEF_VIS_INTERNAL) != 0 {
-        Some(ProofTier::T1ProvenDead)
-    } else {
-        Some(ProofTier::T2LikelyDead)
-    }
+    let dyn_or_test = witness.test_count() > 0 || intra_non_def_hits > 0
+        || (boundary_flags & BOUNDARY_DYNAMIC_REF) != 0 || witness.has_dynamic_flag();
+    if dyn_or_test { return Some(ProofTier::T3DynamicOrTestOnly); }
+    Some(if (boundary_flags & DEF_VIS_INTERNAL) != 0 { ProofTier::T1ProvenDead } else { ProofTier::T2LikelyDead })
 }
 
 /// Portable 128-bit multiply-XOR mixer (`rapidhash`-style) shared across STEM, clones & SimiFlow.
@@ -455,16 +407,11 @@ const COMMON_GENERIC_FIELDS: &[&str] = &[
 ];
 
 fn build_importers_of(source_rels: &[String], edges: &[(String, String)]) -> Vec<FxHashSet<usize>> {
-    let mut id_of: FxHashMap<&str, usize> =
-        FxHashMap::with_capacity_and_hasher(source_rels.len(), Default::default());
-    for (idx, rel) in source_rels.iter().enumerate() {
-        id_of.insert(rel.as_str(), idx);
-    }
+    let id_of: FxHashMap<&str, usize> =
+        source_rels.iter().enumerate().map(|(i, r)| (r.as_str(), i)).collect();
     let mut importers = vec![FxHashSet::default(); source_rels.len()];
     for (src, dst) in edges {
-        if let (Some(&s), Some(&d)) = (id_of.get(src.as_str()), id_of.get(dst.as_str()))
-            && s != d
-        {
+        if let (Some(&s), Some(&d)) = (id_of.get(src.as_str()), id_of.get(dst.as_str())) && s != d {
             importers[d].insert(s);
         }
     }
@@ -472,80 +419,42 @@ fn build_importers_of(source_rels: &[String], edges: &[(String, String)]) -> Vec
 }
 
 fn build_field_readers<'a>(
-    source_rels: &[String],
-    metrics: &'a BTreeMap<String, ModuleMetrics>,
+    source_rels: &[String], metrics: &'a BTreeMap<String, ModuleMetrics>,
 ) -> FxHashMap<&'a str, FxHashSet<usize>> {
     let mut field_readers: FxHashMap<&'a str, FxHashSet<usize>> = FxHashMap::default();
     for (idx, rel) in source_rels.iter().enumerate() {
         let Some(metric) = metrics.get(rel) else { continue };
-        for field in &metric.field_reads {
-            field_readers.entry(field.as_str()).or_default().insert(idx);
-        }
+        for field in &metric.field_reads { field_readers.entry(field.as_str()).or_default().insert(idx); }
     }
     field_readers
 }
 
 fn reader_refs_definer_type(
-    definer_rel: &str,
-    reader_rel: &str,
+    definer_rel: &str, reader_rel: &str,
     defs_by_file: Option<&BTreeMap<String, Vec<String>>>,
     refs_by_file: Option<&BTreeMap<String, Vec<String>>>,
 ) -> bool {
-    let (Some(defs_map), Some(refs_map)) = (defs_by_file, refs_by_file) else {
-        return false;
-    };
-    let (Some(defs), Some(refs)) = (defs_map.get(definer_rel), refs_map.get(reader_rel)) else {
-        return false;
-    };
+    let (Some(defs_map), Some(refs_map)) = (defs_by_file, refs_by_file) else { return false };
+    let (Some(defs), Some(refs)) = (defs_map.get(definer_rel), refs_map.get(reader_rel)) else { return false };
     defs.iter()
         .filter(|sym| sym.as_bytes().first().is_some_and(u8::is_ascii_uppercase))
         .any(|ty| refs.iter().any(|r| r == ty))
 }
 
-fn scoped_field_reader_count(
-    idx: usize,
-    rel: &str,
-    pub_field: &str,
-    source_rels: &[String],
-    importers: &FxHashSet<usize>,
-    readers: &FxHashSet<usize>,
-    arch: &ArchGraphRef<'_>,
-) -> usize {
-    let is_generic = COMMON_GENERIC_FIELDS.contains(&pub_field);
-    readers
-        .iter()
-        .filter(|&&reader| {
-            reader != idx
-                && importers.contains(&reader)
-                && (!is_generic
-                    || reader_refs_definer_type(
-                        rel,
-                        &source_rels[reader],
-                        arch.defs_by_file,
-                        arch.refs_by_file,
-                    ))
-        })
-        .count()
-}
-
 fn max_scoped_field_leak_for_file(
-    idx: usize,
-    rel: &str,
-    source_rels: &[String],
-    importers: &FxHashSet<usize>,
-    field_readers: &FxHashMap<&str, FxHashSet<usize>>,
-    arch: &ArchGraphRef<'_>,
+    idx: usize, rel: &str, source_rels: &[String], importers: &FxHashSet<usize>,
+    field_readers: &FxHashMap<&str, FxHashSet<usize>>, arch: &ArchGraphRef<'_>,
 ) -> Option<(String, usize)> {
     let metric = arch.metrics.get(rel)?;
     let mut best: Option<(String, usize)> = None;
     for pub_field in &metric.pub_fields {
         let Some(readers) = field_readers.get(pub_field.as_str()) else { continue };
-        let count = scoped_field_reader_count(
-            idx, rel, pub_field, source_rels, importers, readers, arch,
-        );
-        if count > best.as_ref().map_or(0, |(_, c)| *c) {
-            best = Some((pub_field.clone(), count));
-        }
+        let is_generic = COMMON_GENERIC_FIELDS.contains(&pub_field.as_str());
+        let count = readers.iter().filter(|&&r| {
+            r != idx && importers.contains(&r) && (!is_generic
+                || reader_refs_definer_type(rel, &source_rels[r], arch.defs_by_file, arch.refs_by_file))
+        }).count();
+        if count > best.as_ref().map_or(0, |(_, c)| *c) { best = Some((pub_field.clone(), count)); }
     }
     best
 }
@@ -561,25 +470,16 @@ pub struct ArchGraphRef<'a> {
 
 /// Single-pass `O(V + E)` ego-graph context builder feeding `hygiene::strict` and audit triage.
 pub fn build_ego_contexts(
-    source_rels: &[String],
-    sccs: &[Vec<u32>],
-    arch: &ArchGraphRef<'_>,
-    file_churn: &BTreeMap<String, u32>,
-    clone_clusters: &[CloneCluster],
+    source_rels: &[String], sccs: &[Vec<u32>], arch: &ArchGraphRef<'_>,
+    file_churn: &BTreeMap<String, u32>, clone_clusters: &[CloneCluster],
 ) -> FxHashMap<String, FileEgoContext> {
     let n = source_rels.len();
-    let mut id_of: FxHashMap<&str, usize> = FxHashMap::with_capacity_and_hasher(n, Default::default());
-    for (idx, rel) in source_rels.iter().enumerate() {
-        id_of.insert(rel.as_str(), idx);
-    }
-
-    let mut fan_in = vec![0usize; n];
-    let mut fan_out = vec![0usize; n];
+    let id_of: FxHashMap<&str, usize> =
+        source_rels.iter().enumerate().map(|(i, r)| (r.as_str(), i)).collect();
+    let (mut fan_in, mut fan_out) = (vec![0usize; n], vec![0usize; n]);
     let mut neighbor_dirs: Vec<FxHashSet<String>> = vec![FxHashSet::default(); n];
     for (src, dst) in arch.runtime_edges {
-        if let (Some(&s), Some(&d)) = (id_of.get(src.as_str()), id_of.get(dst.as_str()))
-            && s != d
-        {
+        if let (Some(&s), Some(&d)) = (id_of.get(src.as_str()), id_of.get(dst.as_str())) && s != d {
             fan_out[s] += 1;
             fan_in[d] += 1;
             neighbor_dirs[s].insert(dir_of(dst));
@@ -588,190 +488,96 @@ pub fn build_ego_contexts(
     }
 
     let mut in_cycle = vec![false; n];
-    for comp in sccs {
-        if comp.len() >= 2 {
-            for &id in comp {
-                if let Some(slot) = in_cycle.get_mut(id as usize) {
-                    *slot = true;
-                }
-            }
-        }
+    for comp in sccs.iter().filter(|c| c.len() >= 2) {
+        for &id in comp { if let Some(slot) = in_cycle.get_mut(id as usize) { *slot = true; } }
     }
-
     let mut clone_hits = vec![0usize; n];
     for cluster in clone_clusters {
         for (file, _) in &cluster.occurrences {
-            if let Some(&idx) = id_of.get(file.as_str()) {
-                clone_hits[idx] += 1;
-            }
+            if let Some(&idx) = id_of.get(file.as_str()) { clone_hits[idx] += 1; }
         }
     }
 
     let importers_of = build_importers_of(source_rels, arch.all_edges);
     let field_readers = build_field_readers(source_rels, arch.metrics);
-
     let mut out = FxHashMap::with_capacity_and_hasher(n, Default::default());
     for (idx, rel) in source_rels.iter().enumerate() {
-        let fi = fan_in[idx];
-        let fo = fan_out[idx];
-        let ndirs = neighbor_dirs[idx].len();
-        let tangle = fi >= 6
-            && fo >= 6
-            && ndirs >= 2
+        let (fi, fo, ndirs) = (fan_in[idx], fan_out[idx], neighbor_dirs[idx].len());
+        let tangle = fi >= 6 && fo >= 6 && ndirs >= 2
             && (0.35..=0.65).contains(&((fo as f64) / ((fi + fo) as f64)));
         let external_field_readers = max_scoped_field_leak_for_file(
-            idx,
-            rel,
-            source_rels,
-            &importers_of[idx],
-            &field_readers,
-            arch,
-        )
-        .map_or(0, |(_, count)| count);
-
-        out.insert(
-            rel.clone(),
-            FileEgoContext {
-                fan_in: fi,
-                fan_out: fo,
-                neighbor_dirs: ndirs,
-                has_module_cycle: in_cycle[idx],
-                tangle,
-                external_field_readers,
-                clone_cluster_hits: clone_hits[idx],
-                churn_commits: file_churn.get(rel).copied().unwrap_or(0),
-            },
-        );
+            idx, rel, source_rels, &importers_of[idx], &field_readers, arch,
+        ).map_or(0, |(_, count)| count);
+        out.insert(rel.clone(), FileEgoContext {
+            fan_in: fi, fan_out: fo, neighbor_dirs: ndirs, has_module_cycle: in_cycle[idx],
+            tangle, external_field_readers, clone_cluster_hits: clone_hits[idx],
+            churn_commits: file_churn.get(rel).copied().unwrap_or(0),
+        });
     }
     out
 }
 
-fn append_cycle_findings(source_rels: &[String], sccs: &[Vec<u32>], findings: &mut Vec<String>) {
-    let mut cycles: Vec<Vec<&str>> = sccs
-        .iter()
-        .filter(|comp| comp.len() >= 2)
-        .map(|comp| {
-            let mut files: Vec<&str> =
-                comp.iter().map(|&id| source_rels[id as usize].as_str()).collect();
-            files.sort_unstable();
-            files
-        })
-        .collect();
+fn is_barrel_file(rel: &str) -> bool {
+    let fname = rel.rsplit('/').next().unwrap_or(rel);
+    matches!(fname, "mod.rs" | "lib.rs" | "index.ts" | "index.js" | "__init__.py")
+}
+
+/// Evaluate all 4 deep-module architectural rules reusing a prebuilt CSR SCC list & ego map.
+pub fn deep_module_findings_with_csr(
+    source_rels: &[String], sccs: &[Vec<u32>], arch: &ArchGraphRef<'_>,
+    ego: &FxHashMap<String, FileEgoContext>,
+) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut cycles: Vec<Vec<&str>> = sccs.iter().filter(|c| c.len() >= 2).map(|comp| {
+        let mut files: Vec<&str> = comp.iter().map(|&id| source_rels[id as usize].as_str()).collect();
+        files.sort_unstable();
+        files
+    }).collect();
     cycles.sort();
     for cyc in cycles.into_iter().take(12) {
         let preview = cyc.iter().take(4).copied().collect::<Vec<_>>().join(" <-> ");
         findings.push(format!("[module-cycle] {preview} ({} files)", cyc.len()));
     }
-}
-
-fn append_tangle_findings(
-    source_rels: &[String],
-    ego: &FxHashMap<String, FileEgoContext>,
-    findings: &mut Vec<String>,
-) {
     for rel in source_rels {
-        let Some(ctx) = ego.get(rel) else { continue };
-        if !ctx.tangle {
-            continue;
+        if let Some(ctx) = ego.get(rel) && ctx.tangle {
+            let instab = (ctx.fan_out as f64) / ((ctx.fan_in + ctx.fan_out) as f64);
+            findings.push(format!(
+                "[tangle] {rel}: fan_in={}, fan_out={}, instability={instab:.2} across {} dirs",
+                ctx.fan_in, ctx.fan_out, ctx.neighbor_dirs
+            ));
         }
-        let instability = (ctx.fan_out as f64) / ((ctx.fan_in + ctx.fan_out) as f64);
-        findings.push(format!(
-            "[tangle] {rel}: fan_in={}, fan_out={}, instability={instability:.2} across {} dirs",
-            ctx.fan_in, ctx.fan_out, ctx.neighbor_dirs
-        ));
     }
-}
-
-fn append_field_leak_findings(
-    source_rels: &[String],
-    arch: &ArchGraphRef<'_>,
-    findings: &mut Vec<String>,
-) {
     let importers_of = build_importers_of(source_rels, arch.all_edges);
     let field_readers = build_field_readers(source_rels, arch.metrics);
     let mut leak_count = 0usize;
     for (idx, rel) in source_rels.iter().enumerate() {
-        if leak_count >= 12 {
-            break;
-        }
-        if let Some((pub_field, ext_readers)) = max_scoped_field_leak_for_file(
-            idx,
-            rel,
-            source_rels,
-            &importers_of[idx],
-            &field_readers,
-            arch,
-        ) && ext_readers >= 2
-        {
+        if leak_count >= 12 { break; }
+        if let Some((f, n)) = max_scoped_field_leak_for_file(
+            idx, rel, source_rels, &importers_of[idx], &field_readers, arch,
+        ) && n >= 2 {
             findings.push(format!(
-                "[field-leak] {rel}: public field `.{pub_field}` accessed directly by {ext_readers} external modules"
+                "[field-leak] {rel}: public field `.{f}` accessed directly by {n} external modules"
             ));
             leak_count += 1;
         }
     }
-}
-
-fn is_barrel_file(rel: &str) -> bool {
-    rel.ends_with("/mod.rs")
-        || rel.ends_with("/lib.rs")
-        || rel.ends_with("/index.ts")
-        || rel.ends_with("/index.js")
-        || rel.ends_with("/__init__.py")
-        || matches!(rel, "mod.rs" | "lib.rs" | "index.ts" | "index.js" | "__init__.py")
-}
-
-fn append_shallow_module_findings(
-    source_rels: &[String],
-    metrics: &BTreeMap<String, ModuleMetrics>,
-    findings: &mut Vec<String>,
-) {
     let mut shallow_count = 0usize;
     for rel in source_rels {
-        if shallow_count >= 12 {
-            break;
-        }
-        let Some(metric) = metrics.get(rel) else { continue };
-        if metric.loc == 0 {
-            continue;
-        }
-        let passthrough_ratio = if metric.total_fns > 0 {
-            (metric.passthrough_fns as f64) / (metric.total_fns as f64)
-        } else {
-            0.0
-        };
-        let is_trivial_wrapper = !is_barrel_file(rel)
-            && metric.loc <= 30
-            && metric.total_fns >= 1
-            && metric.exported_symbols >= 1
-            && metric.passthrough_fns == metric.total_fns;
-        let is_dense_shallow = metric.exported_symbols >= 4
-            && metric.total_fns >= 3
-            && (metric.exported_symbols as f64) / (metric.loc as f64) > 0.20
-            && passthrough_ratio >= 0.60;
-        if is_trivial_wrapper || is_dense_shallow {
+        if shallow_count >= 12 { break; }
+        let Some(m) = arch.metrics.get(rel).filter(|m| m.loc > 0) else { continue };
+        let pr = if m.total_fns > 0 { (m.passthrough_fns as f64) / (m.total_fns as f64) } else { 0.0 };
+        let trivial = !is_barrel_file(rel) && m.loc <= 30 && m.total_fns >= 1
+            && m.exported_symbols >= 1 && m.passthrough_fns == m.total_fns;
+        let dense = m.exported_symbols >= 4 && m.total_fns >= 3
+            && (m.exported_symbols as f64) / (m.loc as f64) > 0.20 && pr >= 0.60;
+        if trivial || dense {
             findings.push(format!(
                 "[shallow-module] {rel}: {} exports in {} LOC ({:.0}% passthrough wrappers)",
-                metric.exported_symbols,
-                metric.loc,
-                passthrough_ratio * 100.0
+                m.exported_symbols, m.loc, pr * 100.0
             ));
             shallow_count += 1;
         }
     }
-}
-
-/// Evaluate all 4 deep-module architectural rules reusing a prebuilt CSR SCC list & ego map.
-pub fn deep_module_findings_with_csr(
-    source_rels: &[String],
-    sccs: &[Vec<u32>],
-    arch: &ArchGraphRef<'_>,
-    ego: &FxHashMap<String, FileEgoContext>,
-) -> Vec<String> {
-    let mut findings = Vec::new();
-    append_cycle_findings(source_rels, sccs, &mut findings);
-    append_tangle_findings(source_rels, ego, &mut findings);
-    append_field_leak_findings(source_rels, arch, &mut findings);
-    append_shallow_module_findings(source_rels, arch.metrics, &mut findings);
     findings.truncate(40);
     findings
 }
@@ -1029,91 +835,56 @@ pub fn check_wipe_guard(prev_count: usize, new_count: usize) -> bool {
 
 /// Lockfiles and churn-heavy artifacts excluded from NPMI co-change pairs.
 pub fn is_ignored_cochange_path(path: &str) -> bool {
-    let fname = path.rsplit('/').next().unwrap_or(path);
+    let f = path.rsplit('/').next().unwrap_or(path);
     matches!(
-        fname,
-        "Cargo.lock"
-            | "pnpm-lock.yaml"
-            | "package-lock.json"
-            | "yarn.lock"
-            | "bun.lock"
-            | "bun.lockb"
-            | "uv.lock"
-            | "poetry.lock"
-            | "Pipfile.lock"
-            | "go.sum"
-            | "flake.lock"
-            | "CHANGELOG.md"
-    ) || fname.ends_with(".snap")
-        || fname.ends_with(".min.js")
-        || fname.ends_with(".min.css")
+        f,
+        "Cargo.lock" | "pnpm-lock.yaml" | "package-lock.json" | "yarn.lock"
+            | "bun.lock" | "bun.lockb" | "uv.lock" | "poetry.lock" | "Pipfile.lock"
+            | "go.sum" | "flake.lock" | "CHANGELOG.md"
+    ) || f.ends_with(".snap") || f.ends_with(".min.js") || f.ends_with(".min.css")
 }
 
 /// Exponential 14-day recency decay weight in `(0.0, 1.0]`.
-pub fn recency_decay(age_secs: u64) -> f64 {
-    const FOURTEEN_DAYS: f64 = 14.0 * 86_400.0;
-    (-(age_secs as f64) / FOURTEEN_DAYS).exp()
-}
+pub fn recency_decay(age_secs: u64) -> f64 { (-(age_secs as f64) / (14.0 * 86_400.0)).exp() }
+
+fn is_valid_oid(s: &str) -> bool { s.len() >= 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) }
 
 fn read_hex_oid(path: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let trimmed = raw.trim();
-    let valid = trimmed.len() >= 40 && trimmed.bytes().all(|b| b.is_ascii_hexdigit());
-    valid.then(|| trimmed.to_string())
+    is_valid_oid(trimmed).then(|| trimmed.to_string())
 }
 
 fn find_packed_ref_oid(common_dir: &Path, ref_name: &str) -> Option<String> {
     let raw = std::fs::read_to_string(common_dir.join("packed-refs")).ok()?;
-    for line in raw.lines() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') || t.starts_with('^') {
-            continue;
-        }
+    raw.lines().map(str::trim).filter(|t| !t.is_empty() && !t.starts_with(['#', '^'])).find_map(|t| {
         let mut parts = t.split_whitespace();
-        if let (Some(oid), Some(name)) = (parts.next(), parts.next())
-            && name == ref_name
-            && oid.len() >= 40
-            && oid.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Some(oid.to_string());
-        }
-    }
-    None
+        let (oid, name) = (parts.next()?, parts.next()?);
+        (name == ref_name && is_valid_oid(oid)).then(|| oid.to_string())
+    })
 }
 
-/// Pure-Rust zero-subprocess git `HEAD` OID resolver supporting standard `.git/` dirs,
-/// worktree `.git` pointer files (`gitdir:` + `commondir`), detached HEAD, and `packed-refs`.
+/// Pure-Rust zero-subprocess git `HEAD` OID resolver (dirs, worktrees, detached HEAD, `packed-refs`).
 pub fn resolve_git_head_oid(repo_root: &Path) -> Option<String> {
     let dot_git = repo_root.join(".git");
     let git_dir = if dot_git.is_dir() {
         dot_git
     } else if dot_git.is_file() {
         let ptr = std::fs::read_to_string(&dot_git).ok()?;
-        let raw_dir = ptr.trim().strip_prefix("gitdir:")?.trim();
-        let p = PathBuf::from(raw_dir);
+        let p = PathBuf::from(ptr.trim().strip_prefix("gitdir:")?.trim());
         if p.is_absolute() { p } else { repo_root.join(p) }
-    } else {
-        return None;
-    };
+    } else { return None };
 
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head_trim = head.trim();
     let Some(ref_name) = head_trim.strip_prefix("ref:").map(str::trim) else {
-        let valid = head_trim.len() >= 40 && head_trim.bytes().all(|b| b.is_ascii_hexdigit());
-        return valid.then(|| head_trim.to_string());
+        return is_valid_oid(head_trim).then(|| head_trim.to_string());
     };
-
-    if let Some(oid) = read_hex_oid(&git_dir.join(ref_name)) {
-        return Some(oid);
-    }
-    let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
-        .ok()
-        .map(|raw| {
-            let p = PathBuf::from(raw.trim());
-            if p.is_absolute() { p } else { git_dir.join(p) }
-        })
-        .unwrap_or_else(|| git_dir.clone());
-
+    if let Some(oid) = read_hex_oid(&git_dir.join(ref_name)) { return Some(oid); }
+    let common_dir = std::fs::read_to_string(git_dir.join("commondir")).ok().map(|raw| {
+        let p = PathBuf::from(raw.trim());
+        if p.is_absolute() { p } else { git_dir.join(p) }
+    }).unwrap_or_else(|| git_dir.clone());
     read_hex_oid(&common_dir.join(ref_name)).or_else(|| find_packed_ref_oid(&common_dir, ref_name))
 }
 
@@ -1130,9 +901,7 @@ struct NpmiCounts {
 
 impl NpmiCounts {
     fn intern_path(&mut self, path: &str) -> usize {
-        if let Some(&existing) = self.path_to_id.get(path) {
-            return existing;
-        }
+        if let Some(&existing) = self.path_to_id.get(path) { return existing; }
         let next_id = self.id_to_path.len();
         self.id_to_path.push(path.to_string());
         self.file_commits.push(0);
@@ -1142,37 +911,23 @@ impl NpmiCounts {
     }
 
     fn record_commit(
-        &mut self,
-        raw: &[String],
-        live_files: Option<&FxHashSet<&str>>,
-        commit_ids: &mut Vec<usize>,
-        decay_w: f64,
+        &mut self, raw: &[String], live_files: Option<&FxHashSet<&str>>,
+        commit_ids: &mut Vec<usize>, decay_w: f64,
     ) {
-        if raw.len() >= BULK_COMMIT_LIMIT {
-            return;
-        }
+        if raw.len() >= BULK_COMMIT_LIMIT { return; }
         commit_ids.clear();
         for path in raw {
-            if is_ignored_cochange_path(path) {
-                continue;
-            }
-            if live_files.is_some_and(|live| !live.contains(path.as_str())) {
+            if is_ignored_cochange_path(path) || live_files.is_some_and(|l| !l.contains(path.as_str())) {
                 continue;
             }
             commit_ids.push(self.intern_path(path));
         }
         commit_ids.sort_unstable();
         commit_ids.dedup();
-        for &id in commit_ids.iter() {
-            self.churn_commits[id] = self.churn_commits[id].saturating_add(1);
-        }
-        if commit_ids.len() < 2 {
-            return;
-        }
+        for &id in commit_ids.iter() { self.churn_commits[id] = self.churn_commits[id].saturating_add(1); }
+        if commit_ids.len() < 2 { return; }
         self.valid_commits += 1;
-        for &id in commit_ids.iter() {
-            self.file_commits[id] += 1;
-        }
+        for &id in commit_ids.iter() { self.file_commits[id] += 1; }
         for i in 0..commit_ids.len() {
             for j in (i + 1)..commit_ids.len() {
                 let key = ((commit_ids[i] as u64) << 32) | (commit_ids[j] as u64);
@@ -1184,125 +939,81 @@ impl NpmiCounts {
 
     fn finalize(self, min_support: u32) -> GenomeSummary {
         let n_f = self.valid_commits.max(1) as f64;
-        let mut ranked: Vec<(f64, CochangePair)> = self
-            .co_counts
-            .iter()
+        let mut ranked: Vec<(f64, CochangePair)> = self.co_counts.iter()
             .filter_map(|(&key, &c_xy)| {
                 let pair = score_npmi_pair(&self, key, c_xy, min_support, n_f)?;
-                let avg_decay = self.co_decay.get(&key).copied().unwrap_or(c_xy as f64) / (c_xy as f64);
-                let sort_score = pair.npmi * (0.85 + 0.15 * avg_decay.clamp(0.0, 1.0));
-                Some((sort_score, pair))
+                let avg = self.co_decay.get(&key).copied().unwrap_or(c_xy as f64) / (c_xy as f64);
+                Some((pair.npmi * (0.85 + 0.15 * avg.clamp(0.0, 1.0)), pair))
             })
             .collect();
-
-        ranked.sort_by(|(sa, lhs), (sb, rhs)| {
-            sb.partial_cmp(sa)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| rhs.commits.cmp(&lhs.commits))
-                .then_with(|| lhs.file_a.cmp(&rhs.file_a))
-                .then_with(|| lhs.file_b.cmp(&rhs.file_b))
+        ranked.sort_by(|(sa, a), (sb, b)| {
+            sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.commits.cmp(&a.commits))
+                .then_with(|| a.file_a.cmp(&b.file_a))
+                .then_with(|| a.file_b.cmp(&b.file_b))
         });
-
         let pairs = ranked.into_iter().map(|(_, p)| p).collect();
-        let file_commits = self
-            .id_to_path
-            .into_iter()
-            .zip(self.churn_commits)
-            .filter(|(_, c)| *c > 0)
-            .collect();
+        let file_commits = self.id_to_path.into_iter().zip(self.churn_commits).filter(|(_, c)| *c > 0).collect();
         GenomeSummary { pairs, file_commits }
     }
 }
 
 fn score_npmi_pair(
-    counts: &NpmiCounts,
-    key: u64,
-    c_xy: u32,
-    min_support: u32,
-    n_f: f64,
+    counts: &NpmiCounts, key: u64, c_xy: u32, min_support: u32, n_f: f64,
 ) -> Option<CochangePair> {
-    if c_xy < min_support {
-        return None;
-    }
-    let idx_a = (key >> 32) as usize;
-    let idx_b = (key & 0xffff_ffff) as usize;
-    let p_xy = (c_xy as f64) / n_f;
-    let p_x = (counts.file_commits[idx_a] as f64) / n_f;
-    let p_y = (counts.file_commits[idx_b] as f64) / n_f;
-    if p_x <= 0.0 || p_y <= 0.0 || p_xy <= 0.0 {
-        return None;
-    }
-    let pmi = (p_xy / (p_x * p_y)).ln();
-    let denom = (-p_xy.ln()).max(1e-9);
-    let npmi = (pmi / denom).clamp(-1.0, 1.0);
-    if npmi <= 0.05 {
-        return None;
-    }
-    let path_a = &counts.id_to_path[idx_a];
-    let path_b = &counts.id_to_path[idx_b];
-    let (file_a, file_b) = if path_a <= path_b {
-        (path_a.clone(), path_b.clone())
-    } else {
-        (path_b.clone(), path_a.clone())
-    };
+    if c_xy < min_support { return None; }
+    let (idx_a, idx_b) = ((key >> 32) as usize, (key & 0xffff_ffff) as usize);
+    let (p_xy, p_x, p_y) = (
+        (c_xy as f64) / n_f, (counts.file_commits[idx_a] as f64) / n_f, (counts.file_commits[idx_b] as f64) / n_f,
+    );
+    if p_x <= 0.0 || p_y <= 0.0 || p_xy <= 0.0 { return None; }
+    let npmi = ((p_xy / (p_x * p_y)).ln() / (-p_xy.ln()).max(1e-9)).clamp(-1.0, 1.0);
+    if npmi <= 0.05 { return None; }
+    let (pa, pb) = (&counts.id_to_path[idx_a], &counts.id_to_path[idx_b]);
+    let (file_a, file_b) = if pa <= pb { (pa.clone(), pb.clone()) } else { (pb.clone(), pa.clone()) };
     Some(CochangePair { file_a, file_b, npmi, commits: c_xy })
 }
 
 #[cfg(test)]
 pub fn compute_npmi_commits(
-    commits: &[Vec<String>],
-    live_files: Option<&FxHashSet<&str>>,
-    min_support: u32,
+    commits: &[Vec<String>], live_files: Option<&FxHashSet<&str>>, min_support: u32,
 ) -> GenomeSummary {
-    let mut counts = NpmiCounts::default();
-    let mut commit_ids = Vec::with_capacity(BULK_COMMIT_LIMIT);
-    for raw in commits {
-        counts.record_commit(raw, live_files, &mut commit_ids, 1.0);
-    }
+    let (mut counts, mut commit_ids) = (NpmiCounts::default(), Vec::with_capacity(BULK_COMMIT_LIMIT));
+    for raw in commits { counts.record_commit(raw, live_files, &mut commit_ids, 1.0); }
     counts.finalize(min_support)
 }
 
 fn parse_git_status_line(
-    trimmed: &str,
-    rename_map: &mut FxHashMap<String, String>,
-    current: &mut Vec<String>,
+    trimmed: &str, rename_map: &mut FxHashMap<String, String>, current: &mut Vec<String>,
 ) {
     let mut cols = trimmed.split('\t');
     let status = cols.next().unwrap_or("");
     if status.starts_with('R') {
         if let (Some(old_p), Some(new_p)) = (cols.next(), cols.next()) {
-            let old_norm = old_p.replace('\\', "/");
-            let new_norm = new_p.replace('\\', "/");
-            let canon = rename_map.get(&new_norm).cloned().unwrap_or(new_norm);
-            rename_map.insert(old_norm, canon.clone());
+            let (old_n, new_n) = (old_p.replace('\\', "/"), new_p.replace('\\', "/"));
+            let canon = rename_map.get(&new_n).cloned().unwrap_or(new_n);
+            rename_map.insert(old_n, canon.clone());
             current.push(canon);
         }
     } else if let Some(path) = cols.next() {
         let norm = path.replace('\\', "/");
-        let canon = rename_map.get(&norm).cloned().unwrap_or(norm);
-        current.push(canon);
+        current.push(rename_map.get(&norm).cloned().unwrap_or(norm));
     }
 }
 
-/// Stream up to 2,500 non-merge commits from `git log` directly into `NpmiCounts` (zero
-/// full-log `Vec<Vec<String>>` buffering), cached by pure-Rust `.git/HEAD` OID in `.refit/cache/genome.zst`.
+/// Stream up to 2,500 non-merge commits from `git log` into `NpmiCounts`, cached by `.git/HEAD` OID.
 pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeSummary {
-    let Some(head_oid) = resolve_git_head_oid(repo_root) else {
-        return GenomeSummary::default();
-    };
+    let Some(head_oid) = resolve_git_head_oid(repo_root) else { return GenomeSummary::default() };
     let live: FxHashSet<&str> = source_rels.iter().map(String::as_str).collect();
     let cache_path = repo_root.join(".refit/cache/genome.zst");
 
     if let Some(cached) = read_zstd::<GenomeCache>(&cache_path)
-        && cached.version == GENOME_CACHE_VERSION
-        && cached.head_oid == head_oid
+        && cached.version == GENOME_CACHE_VERSION && cached.head_oid == head_oid
     {
         let pairs = if live.is_empty() {
             cached.pairs
         } else {
-            cached
-                .pairs
-                .into_iter()
+            cached.pairs.into_iter()
                 .filter(|p| live.contains(p.file_a.as_str()) && live.contains(p.file_b.as_str()))
                 .collect()
         };
@@ -1311,39 +1022,19 @@ pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeS
 
     let Ok(mut child) = Command::new("git")
         .args(["log", "--no-merges", "--name-status", "-M", "-n", "2500", "--format=COMMIT %ct"])
-        .current_dir(repo_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return GenomeSummary::default();
-    };
+        .current_dir(repo_root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+    else { return GenomeSummary::default() };
+    let Some(stdout) = child.stdout.take() else { let _ = child.wait(); return GenomeSummary::default() };
 
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.wait();
-        return GenomeSummary::default();
-    };
-
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|dur| dur.as_secs())
-        .unwrap_or(0);
-    let started = Instant::now();
-    let mut reader = BufReader::with_capacity(64 * 1024, stdout);
-    let mut line = String::new();
-    let mut current: Vec<String> = Vec::with_capacity(BULK_COMMIT_LIMIT);
-    let mut commit_ids: Vec<usize> = Vec::with_capacity(BULK_COMMIT_LIMIT);
-    let mut rename_map: FxHashMap<String, String> = FxHashMap::default();
-    let mut counts = NpmiCounts::default();
-    let mut current_decay = 1.0f64;
-    let mut commit_count = 0usize;
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (started, mut reader) = (Instant::now(), BufReader::with_capacity(64 * 1024, stdout));
+    let (mut line, mut current) = (String::new(), Vec::with_capacity(BULK_COMMIT_LIMIT));
+    let (mut commit_ids, mut rename_map) = (Vec::with_capacity(BULK_COMMIT_LIMIT), FxHashMap::default());
+    let (mut counts, mut current_decay, mut commit_count) = (NpmiCounts::default(), 1.0f64, 0usize);
     let live_opt = (!live.is_empty()).then_some(&live);
 
     while let Ok(n) = reader.read_line(&mut line) {
-        if n == 0 || started.elapsed() >= GIT_LOG_TIMEOUT {
-            break;
-        }
+        if n == 0 || started.elapsed() >= GIT_LOG_TIMEOUT { break; }
         let trimmed = line.trim();
         if let Some(ts_str) = trimmed.strip_prefix("COMMIT ") {
             if !current.is_empty() {
@@ -1351,21 +1042,15 @@ pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeS
                 current.clear();
             }
             commit_count += 1;
-            if commit_count > MAX_GIT_COMMITS {
-                break;
-            }
-            current_decay = ts_str
-                .trim()
-                .parse::<u64>()
+            if commit_count > MAX_GIT_COMMITS { break; }
+            current_decay = ts_str.trim().parse::<u64>()
                 .map_or(1.0, |ts| recency_decay(now_secs.saturating_sub(ts)));
         } else if !trimmed.is_empty() {
             parse_git_status_line(trimmed, &mut rename_map, &mut current);
         }
         line.clear();
     }
-    if !current.is_empty() {
-        counts.record_commit(&current, live_opt, &mut commit_ids, current_decay);
-    }
+    if !current.is_empty() { counts.record_commit(&current, live_opt, &mut commit_ids, current_decay); }
     drop(reader);
     if matches!(child.wait_timeout(Duration::from_secs(1)), Ok(None)) {
         let _ = child.kill();
@@ -1373,21 +1058,17 @@ pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeS
     }
 
     let summary = counts.finalize(MIN_COCHANGE_SUPPORT);
-    let cache_entry = GenomeCache {
-        version: GENOME_CACHE_VERSION,
-        head_oid,
+    let entry = GenomeCache {
+        version: GENOME_CACHE_VERSION, head_oid,
         pairs: summary.pairs.iter().take(200).cloned().collect(),
         file_commits: summary.file_commits.clone(),
     };
-    let _ = write_zstd(&cache_path, &cache_entry);
+    let _ = write_zstd(&cache_path, &entry);
     summary
 }
 
 pub fn format_genome_twins(summary: &GenomeSummary, limit: usize) -> Vec<String> {
-    summary
-        .pairs
-        .iter()
-        .take(limit)
+    summary.pairs.iter().take(limit)
         .map(|p| format!("{} <-> {} (npmi={:.2}, commits={})", p.file_a, p.file_b, p.npmi, p.commits))
         .collect()
 }
@@ -1400,34 +1081,18 @@ mod tests {
     use crate::untangle::{AuditScope, untangle_repo_with_scope};
 
     struct TarjanRef<'a> {
-        graph: &'a CsrGraph,
-        index: Vec<u32>,
-        lowlink: Vec<u32>,
-        on_stack: Vec<bool>,
-        scc_stack: Vec<u32>,
-        call_stack: Vec<(u32, u32)>,
-        next_idx: u32,
-        comps: Vec<Vec<u32>>,
+        graph: &'a CsrGraph, index: Vec<u32>, lowlink: Vec<u32>, on_stack: Vec<bool>,
+        scc_stack: Vec<u32>, call_stack: Vec<(u32, u32)>, next_idx: u32, comps: Vec<Vec<u32>>,
     }
 
     impl<'a> TarjanRef<'a> {
         fn run(graph: &'a CsrGraph) -> Vec<Vec<u32>> {
             let n = graph.n;
             let mut st = Self {
-                graph,
-                index: vec![0; n],
-                lowlink: vec![0; n],
-                on_stack: vec![false; n],
-                scc_stack: Vec::new(),
-                call_stack: Vec::new(),
-                next_idx: 1,
-                comps: Vec::new(),
+                graph, index: vec![0; n], lowlink: vec![0; n], on_stack: vec![false; n],
+                scc_stack: Vec::new(), call_stack: Vec::new(), next_idx: 1, comps: Vec::new(),
             };
-            for start in 0..n {
-                if st.index[start] == 0 {
-                    st.visit(start);
-                }
-            }
+            for start in 0..n { if st.index[start] == 0 { st.visit(start); } }
             st.comps
         }
 
@@ -1445,9 +1110,7 @@ mod tests {
             while let Some(w) = self.scc_stack.pop() {
                 self.on_stack[w as usize] = false;
                 comp.push(w);
-                if w == root {
-                    break;
-                }
+                if w == root { break; }
             }
             self.comps.push(comp);
         }
@@ -1455,9 +1118,7 @@ mod tests {
         fn visit(&mut self, start: usize) {
             self.push_node(start);
             while let Some((v, mut ei)) = self.call_stack.pop() {
-                let vu = v as usize;
-                let end = self.graph.offsets[vu + 1];
-                let mut descended = false;
+                let (vu, end, mut descended) = (v as usize, self.graph.offsets[v as usize + 1], false);
                 while ei < end {
                     let w = self.graph.targets[ei as usize] as usize;
                     ei += 1;
@@ -1471,68 +1132,60 @@ mod tests {
                         self.lowlink[vu] = self.index[w];
                     }
                 }
-                if descended {
-                    continue;
-                }
-                if self.lowlink[vu] == self.index[vu] {
-                    self.pop_scc(v);
-                }
+                if descended { continue; }
+                if self.lowlink[vu] == self.index[vu] { self.pop_scc(v); }
                 if let Some(&(parent, _)) = self.call_stack.last() {
-                    let pu = parent as usize;
-                    self.lowlink[pu] = self.lowlink[pu].min(self.lowlink[vu]);
+                    self.lowlink[parent as usize] = self.lowlink[parent as usize].min(self.lowlink[vu]);
                 }
             }
         }
     }
 
     fn canonicalize_sccs(mut comps: Vec<Vec<u32>>) -> Vec<Vec<u32>> {
-        for c in &mut comps {
-            c.sort_unstable();
-        }
+        for c in &mut comps { c.sort_unstable(); }
         comps.sort();
         comps
+    }
+
+    fn mk_metric(
+        loc: usize, exp: usize, fns: usize, pass: usize, pubs: &[&str], reads: &[&str],
+    ) -> ModuleMetrics {
+        ModuleMetrics {
+            loc, exported_symbols: exp, total_fns: fns, passthrough_fns: pass,
+            pub_fields: pubs.iter().map(|s| (*s).into()).collect(),
+            field_reads: reads.iter().map(|s| (*s).into()).collect(),
+        }
     }
 
     #[test]
     fn test_pearce_scc_exact_parity_dense_cyclic_and_deep_chain() {
         let mut rng = TestRng::new(0x9e37_79b9_7f4a_7c15);
-        for &(n, edge_mult) in &[(40usize, 1usize), (120, 3), (250, 6)] {
-            let mut edges = Vec::with_capacity(n * edge_mult);
-            for _ in 0..(n * edge_mult) {
-                edges.push((rng.next_usize(n) as u32, rng.next_usize(n) as u32));
-            }
+        for &(n, mult) in &[(40usize, 1usize), (120, 3), (250, 6)] {
+            let mut edges: Vec<(u32, u32)> = (0..n * mult)
+                .map(|_| (rng.next_usize(n) as u32, rng.next_usize(n) as u32)).collect();
             for base in (0..n.saturating_sub(4)).step_by(17) {
                 let b = base as u32;
                 edges.extend([(b, b + 1), (b + 1, b + 2), (b + 2, b), (b + 1, b + 3), (b + 3, b + 1)]);
             }
             let csr = CsrGraph::from_edges(n, &edges);
-            assert_eq!(
-                canonicalize_sccs(csr.pearce_scc()),
-                canonicalize_sccs(TarjanRef::run(&csr)),
-                "mismatch for n={n}, mult={edge_mult}"
-            );
+            assert_eq!(canonicalize_sccs(csr.pearce_scc()), canonicalize_sccs(TarjanRef::run(&csr)));
         }
-
         let n = 1500usize;
         let mut chain: Vec<(u32, u32)> = (0..n as u32 - 1).map(|i| (i, i + 1)).collect();
         chain.push(((n - 1) as u32, 0));
         let comps = CsrGraph::from_edges(n, &chain).pearce_scc();
-        assert_eq!(comps.len(), 1);
-        assert_eq!(comps[0].len(), n);
+        assert_eq!((comps.len(), comps[0].len()), (1, n));
     }
 
     #[test]
     fn test_csr_shallow_stub_and_scoped_field_leak() {
-        let dir = TempRepo::with_files(
-            "inv_tests",
-            &[
-                ("pkg/alpha.py", "def run_alpha():\n    return 1\n"),
-                ("pkg/beta_core.py", "def run_beta():\n    return 2\n"),
-                ("pkg/orphan.py", "def iso():\n    return 0\n"),
-                ("tests/test_alpha.py", "def test_a(): pass\n"),
-                ("tests/test_smoke.py", "from pkg.beta_core import run_beta\ndef test_b(): assert run_beta() == 2\n"),
-            ],
-        );
+        let dir = TempRepo::with_files("inv_tests", &[
+            ("pkg/alpha.py", "def run_alpha():\n    return 1\n"),
+            ("pkg/beta_core.py", "def run_beta():\n    return 2\n"),
+            ("pkg/orphan.py", "def iso():\n    return 0\n"),
+            ("tests/test_alpha.py", "def test_a(): pass\n"),
+            ("tests/test_smoke.py", "from pkg.beta_core import run_beta\ndef test_b(): assert run_beta() == 2\n"),
+        ]);
         let srcs = vec!["pkg/alpha.py".into(), "pkg/beta_core.py".into(), "pkg/orphan.py".into()];
         let tests = vec!["tests/test_alpha.py".into(), "tests/test_smoke.py".into()];
         let matched = match_tests_inverted(dir.path(), &srcs, &tests, None);
@@ -1540,79 +1193,24 @@ mod tests {
         assert_eq!(matched["pkg/beta_core.py"], vec!["tests/test_smoke.py"]);
         assert!(matched["pkg/orphan.py"].is_empty());
 
-        let mut metrics = BTreeMap::new();
-        metrics.insert(
-            "src/model.rs".into(),
-            ModuleMetrics {
-                loc: 12,
-                exported_symbols: 5,
-                total_fns: 4,
-                passthrough_fns: 3,
-                pub_fields: vec!["raw_token".into(), "line".into()],
-                field_reads: vec![],
-            },
-        );
-        metrics.insert(
-            "src/syntax_stub.rs".into(),
-            ModuleMetrics {
-                loc: 6,
-                exported_symbols: 1,
-                total_fns: 1,
-                passthrough_fns: 1,
-                pub_fields: vec![],
-                field_reads: vec![],
-            },
-        );
-        metrics.insert(
-            "src/sub/mod.rs".into(),
-            ModuleMetrics {
-                loc: 6,
-                exported_symbols: 1,
-                total_fns: 1,
-                passthrough_fns: 1,
-                pub_fields: vec![],
-                field_reads: vec![],
-            },
-        );
-        for reader in ["src/a.rs", "src/b.rs"] {
-            metrics.insert(
-                reader.into(),
-                ModuleMetrics {
-                    loc: 50,
-                    exported_symbols: 1,
-                    total_fns: 2,
-                    passthrough_fns: 0,
-                    pub_fields: vec![],
-                    field_reads: vec!["raw_token".into(), "line".into()],
-                },
-            );
-        }
-        metrics.insert(
-            "src/unrelated.rs".into(),
-            ModuleMetrics {
-                loc: 50,
-                exported_symbols: 1,
-                total_fns: 2,
-                passthrough_fns: 0,
-                pub_fields: vec![],
-                field_reads: vec!["line".into()],
-            },
-        );
+        let metrics = BTreeMap::from([
+            ("src/model.rs".into(), mk_metric(12, 5, 4, 3, &["raw_token", "line"], &[])),
+            ("src/syntax_stub.rs".into(), mk_metric(6, 1, 1, 1, &[], &[])),
+            ("src/sub/mod.rs".into(), mk_metric(6, 1, 1, 1, &[], &[])),
+            ("src/a.rs".into(), mk_metric(50, 1, 2, 0, &[], &["raw_token", "line"])),
+            ("src/b.rs".into(), mk_metric(50, 1, 2, 0, &[], &["raw_token", "line"])),
+            ("src/unrelated.rs".into(), mk_metric(50, 1, 2, 0, &[], &["line"])),
+        ]);
         let rels: Vec<String> = metrics.keys().cloned().collect();
         let edges = vec![
-            ("src/a.rs".into(), "src/b.rs".into()),
-            ("src/b.rs".into(), "src/a.rs".into()),
-            ("src/a.rs".into(), "src/model.rs".into()),
-            ("src/b.rs".into(), "src/model.rs".into()),
+            ("src/a.rs".into(), "src/b.rs".into()), ("src/b.rs".into(), "src/a.rs".into()),
+            ("src/a.rs".into(), "src/model.rs".into()), ("src/b.rs".into(), "src/model.rs".into()),
         ];
         let (csr, _) = CsrGraph::from_named_edges(&rels, &edges);
         let sccs = csr.pearce_scc();
         let arch = ArchGraphRef {
-            all_edges: &edges,
-            runtime_edges: &edges,
-            metrics: &metrics,
-            defs_by_file: None,
-            refs_by_file: None,
+            all_edges: &edges, runtime_edges: &edges, metrics: &metrics,
+            defs_by_file: None, refs_by_file: None,
         };
         let ego = build_ego_contexts(&rels, &sccs, &arch, &BTreeMap::new(), &[]);
         let findings = deep_module_findings_with_csr(&rels, &sccs, &arch, &ego);
@@ -1628,46 +1226,29 @@ mod tests {
 
     #[test]
     fn test_genome_npmi_hub_demotion_lockfile_filter_and_wipe_guard() {
-        let mut commits: Vec<Vec<String>> = Vec::new();
-        let mut bulk = vec!["src/hub.rs".to_string(), "Cargo.lock".to_string()];
-        for i in 0..45 {
-            bulk.push(format!("src/bulk_{i}.rs"));
-        }
-        commits.push(bulk);
-
+        let mut bulk = vec!["src/hub.rs".into(), "Cargo.lock".into()];
+        bulk.extend((0..45).map(|i| format!("src/bulk_{i}.rs")));
+        let mut commits = vec![bulk];
         for c in 0..60 {
             let mut files = vec![
-                "src/hub.rs".to_string(),
-                format!("src/noise_{}.rs", c % 15),
-                "Cargo.lock".to_string(),
-                "pnpm-lock.yaml".to_string(),
+                "src/hub.rs".into(), format!("src/noise_{}.rs", c % 15),
+                "Cargo.lock".into(), "pnpm-lock.yaml".into(),
             ];
-            if c % 5 == 0 {
-                files.extend(["src/route.rs".into(), "src/schema.rs".into()]);
-            }
-            if c % 6 == 1 {
-                files.extend(["src/auth.rs".into(), "src/session.rs".into()]);
-            }
+            if c % 5 == 0 { files.extend(["src/route.rs".into(), "src/schema.rs".into()]); }
+            if c % 6 == 1 { files.extend(["src/auth.rs".into(), "src/session.rs".into()]); }
             commits.push(files);
         }
-
         let summary = compute_npmi_commits(&commits, None, MIN_COCHANGE_SUPPORT);
         assert!(!summary.pairs.iter().any(|p| p.file_a.ends_with(".lock") || p.file_b.ends_with(".lock")));
-        let top2: Vec<(&str, &str)> = summary
-            .pairs
-            .iter()
-            .take(2)
-            .map(|p| (p.file_a.as_str(), p.file_b.as_str()))
-            .collect();
-        assert!(top2.contains(&("src/route.rs", "src/schema.rs")), "top2={top2:?}");
-        assert!(top2.contains(&("src/auth.rs", "src/session.rs")), "top2={top2:?}");
+        let top2: Vec<(&str, &str)> = summary.pairs.iter().take(2)
+            .map(|p| (p.file_a.as_str(), p.file_b.as_str())).collect();
+        assert!(top2.contains(&("src/route.rs", "src/schema.rs")) && top2.contains(&("src/auth.rs", "src/session.rs")));
         assert!(check_wipe_guard(100, 19) && !check_wipe_guard(100, 20) && !check_wipe_guard(40, 2));
         assert!(recency_decay(0) > 0.99 && recency_decay(14 * 86_400) < 0.40);
     }
 
     #[test]
     fn test_genome_head_cache_worktree_and_sustain_skip() {
-        // 1. Verify worktree `.git` pointer file + `commondir` + `packed-refs` resolution.
         let fake_wt = TempRepo::new("wt_head");
         let oid = "0123456789abcdef0123456789abcdef01234567";
         fake_wt.write("common/packed-refs", format!("# pack-refs\n{oid} refs/heads/feat/wt\n"));
@@ -1676,30 +1257,22 @@ mod tests {
         fake_wt.write("work/.git", format!("gitdir: {}\n", fake_wt.join("wt_meta").display()));
         assert_eq!(resolve_git_head_oid(&fake_wt.join("work")).as_deref(), Some(oid));
 
-        // 2. Real git repo: verify genome.zst cache written and Sustain skips genome/drift/deep.
-        let repo = TempRepo::git(
-            "genome_cache",
-            "app",
-            &[
-                ("src/a.rs", "pub fn alpha_one() -> usize { 1 }\n"),
-                ("src/b.rs", "pub fn beta_two() -> usize { 2 }\n"),
-            ],
-        );
+        let repo = TempRepo::git("genome_cache", "app", &[
+            ("src/a.rs", "pub fn alpha_one() -> usize { 1 }\n"),
+            ("src/b.rs", "pub fn beta_two() -> usize { 2 }\n"),
+        ]);
         let head = resolve_git_head_oid(repo.path()).expect("real git HEAD OID");
         assert_eq!(head.len(), 40);
 
         let full = untangle_repo_with_scope(repo.path(), &HygieneScorer::new(), AuditScope::Full).unwrap();
-        assert!(repo.has(".refit/cache/genome.zst"));
         let cached = read_zstd::<GenomeCache>(&repo.join(".refit/cache/genome.zst")).unwrap();
         assert_eq!(cached.head_oid, head);
         assert!(cached.file_commits.get("src/a.rs").copied().unwrap_or(0) >= 1);
 
         let sustain = untangle_repo_with_scope(repo.path(), &HygieneScorer::new(), AuditScope::Sustain).unwrap();
         assert_eq!(sustain.total_source_files, full.total_source_files);
-        assert!(sustain.genome_twins.is_empty());
-        assert!(sustain.capability_clusters.is_empty());
-        assert!(sustain.deep_module_findings.is_empty());
-        assert!(sustain.doc_drift_findings.is_empty());
+        assert!(sustain.genome_twins.is_empty() && sustain.capability_clusters.is_empty());
+        assert!(sustain.deep_module_findings.is_empty() && sustain.doc_drift_findings.is_empty());
     }
 
     #[test]
@@ -1707,16 +1280,13 @@ mod tests {
         assert_eq!(std::mem::size_of::<RefWitness>(), 16);
         let mut w = RefWitness::default();
         assert!(!w.has_cross_file_prod_caller(0));
-        w.record_prod(3);
-        w.record_prod(3);
+        w.record_prod(3); w.record_prod(3);
         assert_eq!(w.prod_files_sat, 1);
         assert!(!w.has_cross_file_prod_caller(3) && w.has_cross_file_prod_caller(4));
         w.record_prod(7);
         assert_eq!(w.prod_files_sat, 2);
         assert!(w.has_cross_file_prod_caller(3) && w.has_cross_file_prod_caller(7));
-        w.record_test(10);
-        w.record_test(10);
-        w.record_test(11);
+        w.record_test(10); w.record_test(10); w.record_test(11);
         assert_eq!(w.test_count(), 2);
 
         let empty = RefWitness::default();
@@ -1725,12 +1295,8 @@ mod tests {
         assert_eq!(classify_symbol(0, empty, 1, 0), Some(ProofTier::T3DynamicOrTestOnly));
         assert_eq!(classify_symbol(0, empty, 0, BOUNDARY_DYNAMIC_REF), Some(ProofTier::T3DynamicOrTestOnly));
         for flag in [
-            BOUNDARY_FFI_NO_MANGLE,
-            BOUNDARY_CTOR_INVENTORY,
-            BOUNDARY_MACRO_DERIVE,
-            BOUNDARY_PY_ALL,
-            BOUNDARY_FRAMEWORK_ROUTE,
-            BOUNDARY_ENTRYPOINT_OR_GLOB,
+            BOUNDARY_FFI_NO_MANGLE, BOUNDARY_CTOR_INVENTORY, BOUNDARY_MACRO_DERIVE,
+            BOUNDARY_PY_ALL, BOUNDARY_FRAMEWORK_ROUTE, BOUNDARY_ENTRYPOINT_OR_GLOB,
         ] {
             assert_eq!(classify_symbol(0, empty, 0, flag), Some(ProofTier::T4ExternalOrMacro));
         }

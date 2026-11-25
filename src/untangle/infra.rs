@@ -1,10 +1,6 @@
 use crate::lex::{find_ascii_ci, ident_byte, left_bound, quoted_lit, scan_code};
 use crate::platform::find_secret;
-#[cfg(test)]
-use crate::platform::walk_tree;
 use crate::source::{RepoSnapshot, ext_of, parse_deps, supported_ext};
-#[cfg(test)]
-use crate::source::{ext_str, rel_norm};
 use crate::types::{InfraFinding, UnusedDep};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use fixedbitset::FixedBitSet;
@@ -14,64 +10,32 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Eco {
-    Npm = 0,
-    Cargo = 1,
-    Python = 2,
-    Go = 3,
-}
+enum Eco { Npm = 0, Cargo = 1, Python = 2, Go = 3 }
 
 impl Eco {
     const ALL: [Self; 4] = [Self::Npm, Self::Cargo, Self::Python, Self::Go];
 
     fn from_ext(ext: &str) -> Self {
-        if ext.eq_ignore_ascii_case("rs") {
-            Self::Cargo
-        } else if ext.eq_ignore_ascii_case("py") {
-            Self::Python
-        } else if ext.eq_ignore_ascii_case("go") {
-            Self::Go
-        } else {
-            Self::Npm
+        match ext.to_ascii_lowercase().as_str() {
+            "rs" => Self::Cargo,
+            "py" => Self::Python,
+            "go" => Self::Go,
+            _ => Self::Npm,
         }
     }
 
     fn from_name(name: &str) -> Self {
-        match name {
-            "npm" => Self::Npm,
-            "cargo" => Self::Cargo,
-            "python" => Self::Python,
-            _ => Self::Go,
-        }
+        match name { "npm" => Self::Npm, "cargo" => Self::Cargo, "python" => Self::Python, _ => Self::Go }
     }
 
-    #[inline]
-    fn idx(self) -> usize {
-        self as usize
-    }
-
-    #[inline]
-    fn word_bound(self) -> bool {
-        self != Self::Go
-    }
-
-    #[inline]
-    fn case_insensitive(self) -> bool {
-        self == Self::Python
-    }
+    #[inline] fn idx(self) -> usize { self as usize }
+    #[inline] fn word_bound(self) -> bool { self != Self::Go }
+    #[inline] fn case_insensitive(self) -> bool { self == Self::Python }
 }
 
-struct ParsedDep {
-    manifest: String,
-    ecosystem: &'static str,
-    package: String,
-    eco: Eco,
-    slot: usize,
-}
+struct ParsedDep { manifest: String, ecosystem: &'static str, package: String, eco: Eco, slot: usize }
 
 #[derive(Default)]
 struct EcoBuilder {
@@ -83,16 +47,10 @@ struct EcoBuilder {
 
 impl EcoBuilder {
     fn add_dep(&mut self, eco: Eco, package: &str) -> usize {
-        let key = if eco.case_insensitive() {
-            package.to_ascii_lowercase()
-        } else {
-            package.to_string()
-        };
+        let key = if eco.case_insensitive() { package.to_ascii_lowercase() } else { package.to_string() };
         let next_slot = self.pkg_slots.len();
         let slot = *self.pkg_slots.entry(key.clone()).or_insert(next_slot);
-        if key.is_empty() {
-            return slot;
-        }
+        if key.is_empty() { return slot; }
         self.add_pattern(&key, slot);
         if matches!(eco, Eco::Cargo | Eco::Python) && key.contains('-') {
             self.add_pattern(&key.replace('-', "_"), slot);
@@ -104,33 +62,25 @@ impl EcoBuilder {
         let pat_id = if let Some(&existing) = self.pat_ids.get(pat) {
             existing
         } else {
-            let new_id = self.patterns.len();
+            let id = self.patterns.len();
             self.patterns.push(pat.to_string());
-            self.pat_ids.insert(pat.to_string(), new_id);
+            self.pat_ids.insert(pat.to_string(), id);
             self.pat_slots.push(Vec::new());
-            new_id
+            id
         };
-        let slots = &mut self.pat_slots[pat_id];
-        if !slots.contains(&slot) {
-            slots.push(slot);
-        }
+        if !self.pat_slots[pat_id].contains(&slot) { self.pat_slots[pat_id].push(slot); }
     }
 
     fn build(self, eco: Eco) -> Option<EcoMatcher> {
         let dep_count = self.pkg_slots.len();
-        if dep_count == 0 || self.patterns.is_empty() {
-            return None;
-        }
+        if dep_count == 0 || self.patterns.is_empty() { return None; }
         let ac = AhoCorasickBuilder::new()
             .ascii_case_insensitive(eco.case_insensitive())
             .build(&self.patterns)
             .ok()?;
         Some(EcoMatcher {
-            ac,
-            pat_slots: self.pat_slots,
-            dep_count,
-            word_bound: eco.word_bound(),
-            hits: FixedBitSet::with_capacity(dep_count),
+            ac, pat_slots: self.pat_slots, dep_count,
+            word_bound: eco.word_bound(), hits: FixedBitSet::with_capacity(dep_count),
         })
     }
 }
@@ -144,26 +94,15 @@ struct EcoMatcher {
 }
 
 impl EcoMatcher {
-    #[inline]
-    fn is_complete(&self) -> bool {
-        self.hits.count_ones(..) == self.dep_count
-    }
+    #[inline] fn is_complete(&self) -> bool { self.hits.count_ones(..) == self.dep_count }
 
     fn scan_bytes(&mut self, bytes: &[u8]) {
-        if self.is_complete() || bytes.is_empty() {
-            return;
-        }
+        if self.is_complete() || bytes.is_empty() { return; }
         for mat in self.ac.find_overlapping_iter(bytes) {
-            if self.word_bound && !is_word_span(bytes, mat.start(), mat.end()) {
-                continue;
-            }
+            if self.word_bound && !is_word_span(bytes, mat.start(), mat.end()) { continue; }
             let mut added = false;
-            for &slot in &self.pat_slots[mat.pattern().as_usize()] {
-                added |= !self.hits.put(slot);
-            }
-            if added && self.is_complete() {
-                return;
-            }
+            for &slot in &self.pat_slots[mat.pattern().as_usize()] { added |= !self.hits.put(slot); }
+            if added && self.is_complete() { return; }
         }
     }
 }
@@ -174,12 +113,7 @@ fn is_word_span(bytes: &[u8], start: usize, end: usize) -> bool {
 }
 
 #[derive(Clone, Copy)]
-enum Kind {
-    Tf,
-    Docker,
-    Gha,
-    Sql,
-}
+enum Kind { Tf, Docker, Gha, Sql }
 
 const UNTRUSTED_GHA_SOURCES: &[&str] = &[
     "github.event.issue.title",
@@ -297,41 +231,9 @@ pub fn scan_parts_snap(
 #[cfg(test)]
 pub fn scan_parts(
     repo_root: &Path,
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
+    _preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>) {
-    let mut infra_count = 0usize;
-    let mut findings = Vec::new();
-    let mut manifests = Vec::new();
-    let mut source_paths: Vec<(Eco, PathBuf)> = Vec::new();
-
-    for abs in walk_tree(repo_root, None, true) {
-        let Some(rel) = rel_norm(repo_root, &abs) else { continue };
-        let fname = abs.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let ext = ext_str(&abs);
-
-        if supported_ext(ext) {
-            if preloaded.is_none() {
-                source_paths.push((Eco::from_ext(ext), abs));
-            }
-            continue;
-        }
-
-        if matches!(fname, "package.json" | "Cargo.toml" | "pyproject.toml" | "go.mod") {
-            if let Ok(txt) = fs::read_to_string(&abs) {
-                manifests.push((rel, fname.to_string(), txt));
-            }
-            continue;
-        }
-
-        let ext_lo = ext_of(&abs);
-        let Some(kind) = infra_kind(&rel, fname, &ext_lo) else { continue };
-        infra_count += 1;
-        let Ok(txt) = fs::read_to_string(&abs) else { continue };
-        scan_file(&rel, kind, &txt, &mut findings);
-    }
-
-    let unused = find_unused_deps(&manifests, preloaded, &source_paths);
-    (infra_count, unused, findings)
+    scan_parts_snap(repo_root, &RepoSnapshot::capture(repo_root, true))
 }
 
 fn infra_kind(rel: &str, fname: &str, ext: &str) -> Option<Option<Kind>> {
@@ -357,16 +259,11 @@ fn scan_file(rel: &str, kind: Option<Kind>, txt: &str, out: &mut Vec<InfraFindin
     for (idx, line) in txt.lines().enumerate() {
         if let Some(sk) = find_secret(line) {
             push_finding(
-                out,
-                rel,
-                idx + 1,
-                "critical",
-                &format!("infra_secret_{sk}"),
+                out, rel, idx + 1, "critical", &format!("infra_secret_{sk}"),
                 "Hardcoded credential/secret committed in infrastructure config",
             );
         }
     }
-
     match kind {
         Some(Kind::Gha) => scan_gha(rel, txt, out),
         Some(Kind::Docker) => scan_docker(rel, txt, out),
@@ -377,8 +274,7 @@ fn scan_file(rel: &str, kind: Option<Kind>, txt: &str, out: &mut Vec<InfraFindin
 }
 
 fn strip_yaml_inline_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut cut = bytes.len();
+    let (bytes, mut cut) = (line.as_bytes(), line.len());
     scan_code(bytes, b"'\"", |idx, cur| {
         if cur == b'#' && (idx == 0 || bytes[idx - 1].is_ascii_whitespace()) {
             cut = idx;
@@ -390,89 +286,58 @@ fn strip_yaml_inline_comment(line: &str) -> &str {
 }
 
 fn extract_gha_uses(code: &str) -> Option<&str> {
-    let rest = code
-        .strip_prefix("uses:")
-        .or_else(|| code.strip_prefix("- uses:"))?;
+    let rest = code.strip_prefix("uses:").or_else(|| code.strip_prefix("- uses:"))?;
     let val = rest.trim().trim_matches(['"', '\'']);
     (!val.is_empty()).then_some(val)
 }
 
 fn is_pinned_gha_action(uses_ref: &str) -> bool {
-    if uses_ref.starts_with("./") || uses_ref.starts_with("../") {
-        return true;
-    }
-    if uses_ref.starts_with("docker://") {
-        return uses_ref.contains("@sha256:");
-    }
-    let Some((_, rev)) = uses_ref.rsplit_once('@') else {
-        return false;
-    };
-    rev.len() == 40 && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if uses_ref.starts_with("./") || uses_ref.starts_with("../") { return true; }
+    if uses_ref.starts_with("docker://") { return uses_ref.contains("@sha256:"); }
+    uses_ref.rsplit_once('@')
+        .is_some_and(|(_, rev)| rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn extract_gha_sink_rhs(trimmed: &str) -> Option<&str> {
     let body = trimmed.strip_prefix("- ").map(str::trim_start).unwrap_or(trimmed);
-    body.strip_prefix("run:")
-        .or_else(|| body.strip_prefix("script:"))
-        .map(str::trim)
+    body.strip_prefix("run:").or_else(|| body.strip_prefix("script:")).map(str::trim)
 }
 
 fn is_yaml_block_scalar(rhs: &str) -> bool {
-    let clean = strip_yaml_inline_comment(rhs).trim();
-    matches!(clean, "|" | "|-" | "|+" | ">" | ">-" | ">+")
+    matches!(strip_yaml_inline_comment(rhs).trim(), "|" | "|-" | "|+" | ">" | ">-" | ">+")
 }
 
 fn is_untrusted_gha_source(expr_lo: &str) -> bool {
-    if UNTRUSTED_GHA_SOURCES.iter().any(|src| expr_lo.contains(src)) {
-        return true;
-    }
-    let bad_commits = expr_lo.contains("github.event.commits")
-        && (expr_lo.contains(".message") || expr_lo.contains(".author"));
-    let bad_pages = expr_lo.contains("github.event.pages") && expr_lo.contains(".page_name");
-    bad_commits || bad_pages
+    UNTRUSTED_GHA_SOURCES.iter().any(|src| expr_lo.contains(src))
+        || (expr_lo.contains("github.event.commits")
+            && (expr_lo.contains(".message") || expr_lo.contains(".author")))
+        || (expr_lo.contains("github.event.pages") && expr_lo.contains(".page_name"))
 }
 
 fn check_gha_sink_line(
-    rel: &str,
-    ln: usize,
-    line: &str,
-    inline_ign: Option<&[String]>,
-    prev_ign: Option<&[String]>,
-    out: &mut Vec<InfraFinding>,
+    rel: &str, ln: usize, line: &str,
+    inline_ign: Option<&[String]>, prev_ign: Option<&[String]>, out: &mut Vec<InfraFinding>,
 ) {
-    let mut rest = line;
-    let mut flagged_inj = false;
-    let mut flagged_sec = false;
-
+    let (mut rest, mut flagged_inj, mut flagged_sec) = (line, false, false);
     while let Some(open) = rest.find("${{") {
         let after_open = &rest[open + 3..];
         let Some(close) = after_open.find("}}") else { break };
         let expr_lo = after_open[..close].to_ascii_lowercase();
-        if !flagged_inj
-            && is_untrusted_gha_source(&expr_lo)
+        if !flagged_inj && is_untrusted_gha_source(&expr_lo)
             && !is_suppressed("gha_script_injection", inline_ign, prev_ign)
         {
             flagged_inj = true;
             push_finding(
-                out,
-                rel,
-                ln,
-                "high",
-                "gha_script_injection",
+                out, rel, ln, "high", "gha_script_injection",
                 "Untrusted `${{ github.event.* }}` interpolation in run/script risks injection",
             );
         }
-        if !flagged_sec
-            && expr_lo.contains("secrets.")
+        if !flagged_sec && expr_lo.contains("secrets.")
             && !is_suppressed("gha_secrets_outside_env", inline_ign, prev_ign)
         {
             flagged_sec = true;
             push_finding(
-                out,
-                rel,
-                ln,
-                "high",
-                "gha_secrets_outside_env",
+                out, rel, ln, "high", "gha_secrets_outside_env",
                 "Secret `${{ secrets.* }}` interpolated directly in shell sink instead of `env:`",
             );
         }
@@ -481,62 +346,37 @@ fn check_gha_sink_line(
 }
 
 fn gha_key_column(indent: usize, trimmed: &str) -> usize {
-    if let Some(after_dash) = trimmed.strip_prefix('-') {
-        let ws = after_dash.bytes().take_while(|&b| b == b' ').count();
-        if ws > 0 {
-            return indent + 1 + ws;
-        }
+    if let Some(after) = trimmed.strip_prefix('-') {
+        let ws = after.bytes().take_while(|&b| b == b' ').count();
+        if ws > 0 { return indent + 1 + ws; }
     }
     indent
 }
 
 fn scan_gha(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
-    let mut in_run_block = false;
-    let mut run_indent = 0usize;
-    let mut prev_ignore: Option<Vec<String>> = None;
-
+    let (mut in_run_block, mut run_indent, mut prev_ignore) = (false, 0usize, None::<Vec<String>>);
     for (idx, raw) in txt.lines().enumerate() {
-        let ln = idx + 1;
-        let indent = raw.bytes().take_while(|&byte| byte == b' ').count();
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            prev_ignore = None;
-            continue;
-        }
-        if trimmed.starts_with('#') {
-            prev_ignore = parse_ignore_directive(trimmed);
-            continue;
-        }
-        if in_run_block && indent <= run_indent {
-            in_run_block = false;
-        }
+        let (ln, indent, trimmed) = (idx + 1, raw.bytes().take_while(|&b| b == b' ').count(), raw.trim());
+        if trimmed.is_empty() { prev_ignore = None; continue; }
+        if trimmed.starts_with('#') { prev_ignore = parse_ignore_directive(trimmed); continue; }
+        if in_run_block && indent <= run_indent { in_run_block = false; }
 
         let inline_ign = parse_ignore_directive(raw);
         let code = strip_yaml_inline_comment(trimmed).trim();
-
         if !in_run_block {
             if code.contains("write-all")
                 && !is_suppressed("gha_write_all_perms", inline_ign.as_deref(), prev_ignore.as_deref())
             {
                 push_finding(
-                    out,
-                    rel,
-                    ln,
-                    "high",
-                    "gha_write_all_perms",
+                    out, rel, ln, "high", "gha_write_all_perms",
                     "Workflow grants overly broad `write-all` permissions",
                 );
             }
-            if let Some(uses_ref) = extract_gha_uses(code)
-                && !is_pinned_gha_action(uses_ref)
+            if let Some(uses_ref) = extract_gha_uses(code) && !is_pinned_gha_action(uses_ref)
                 && !is_suppressed("gha_unpinned_action", inline_ign.as_deref(), prev_ignore.as_deref())
             {
                 push_finding(
-                    out,
-                    rel,
-                    ln,
-                    "medium",
-                    "gha_unpinned_action",
+                    out, rel, ln, "medium", "gha_unpinned_action",
                     "Action not pinned to immutable 40-hex commit SHA",
                 );
             }
@@ -557,13 +397,8 @@ fn scan_gha(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
 
 fn extract_docker_from_image(trimmed: &str) -> &str {
     for tok in trimmed.split_whitespace().skip(1) {
-        if tok.starts_with("--") {
-            continue;
-        }
-        if tok.starts_with('#') {
-            return "";
-        }
-        return tok;
+        if tok.starts_with("--") { continue; }
+        return if tok.starts_with('#') { "" } else { tok };
     }
     ""
 }
@@ -571,33 +406,21 @@ fn extract_docker_from_image(trimmed: &str) -> &str {
 fn is_whitelisted_nonroot_image(image: &str) -> bool {
     let lower = image.trim().to_ascii_lowercase();
     let base = lower.split('@').next().unwrap_or(&lower);
-    base == "scratch"
-        || base.ends_with(":nonroot")
-        || base.contains(":nonroot-")
+    base == "scratch" || base.ends_with(":nonroot") || base.contains(":nonroot-")
         || (base.contains("distroless") && base.contains("nonroot"))
 }
 
 fn scan_docker(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
-    let mut has_stage = false;
-    let mut stage_non_root = false;
-    let mut stage_from_line = 1usize;
-    let mut stage_root_ignored = false;
+    let (mut has_stage, mut stage_non_root, mut stage_from_line, mut stage_root_ignored) =
+        (false, false, 1usize, false);
     let mut prev_ignore: Option<Vec<String>> = None;
 
     for (idx, raw) in txt.lines().enumerate() {
-        let ln = idx + 1;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            prev_ignore = None;
-            continue;
-        }
-        if trimmed.starts_with('#') {
-            prev_ignore = parse_ignore_directive(trimmed);
-            continue;
-        }
+        let (ln, trimmed) = (idx + 1, raw.trim());
+        if trimmed.is_empty() { prev_ignore = None; continue; }
+        if trimmed.starts_with('#') { prev_ignore = parse_ignore_directive(trimmed); continue; }
 
-        let inline_ign = parse_ignore_directive(raw);
-        let up = trimmed.to_ascii_uppercase();
+        let (inline_ign, up) = (parse_ignore_directive(raw), trimmed.to_ascii_uppercase());
         if up.starts_with("FROM ") {
             has_stage = true;
             stage_from_line = ln;
@@ -609,59 +432,34 @@ fn scan_docker(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
                 && !is_suppressed("docker_latest_tag", inline_ign.as_deref(), prev_ignore.as_deref())
             {
                 push_finding(
-                    out,
-                    rel,
-                    ln,
-                    "medium",
-                    "docker_latest_tag",
+                    out, rel, ln, "medium", "docker_latest_tag",
                     "Unpinned `:latest` base image causes non-reproducible builds",
                 );
             }
         } else if up.starts_with("USER ") {
-            let user = trimmed
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("")
-                .split(':')
-                .next()
-                .unwrap_or("");
+            let user = trimmed.split_whitespace().nth(1).unwrap_or("").split(':').next().unwrap_or("");
             stage_non_root = !user.is_empty() && !user.eq_ignore_ascii_case("root") && user != "0";
-        } else if up.starts_with("ADD ")
-            && (trimmed.contains("http://") || trimmed.contains("https://"))
+        } else if up.starts_with("ADD ") && (trimmed.contains("http://") || trimmed.contains("https://"))
             && !is_suppressed("docker_add_remote_url", inline_ign.as_deref(), prev_ignore.as_deref())
         {
             push_finding(
-                out,
-                rel,
-                ln,
-                "high",
-                "docker_add_remote_url",
+                out, rel, ln, "high", "docker_add_remote_url",
                 "Dockerfile `ADD` fetches remote URL without integrity checksum",
             );
         }
-
         if has_baked(trimmed, &up)
             && !is_suppressed("docker_baked_secret", inline_ign.as_deref(), prev_ignore.as_deref())
         {
             push_finding(
-                out,
-                rel,
-                ln,
-                "high",
-                "docker_baked_secret",
+                out, rel, ln, "high", "docker_baked_secret",
                 "Sensitive ENV/ARG value baked into Docker image layer",
             );
         }
         prev_ignore = None;
     }
-
     if has_stage && !stage_non_root && !stage_root_ignored {
         push_finding(
-            out,
-            rel,
-            stage_from_line,
-            "high",
-            "docker_runs_as_root",
+            out, rel, stage_from_line, "high", "docker_runs_as_root",
             "Final Dockerfile stage missing non-root `USER` instruction",
         );
     }
@@ -718,20 +516,11 @@ fn strip_hcl_line(raw: &str, in_block_comment: &mut bool) -> String {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TfBlockKind {
-    Other,
-    Ingress,
-    Egress,
-    Route,
-    SgRule,
-}
+enum TfBlockKind { Other, Ingress, Egress, Route, SgRule }
 
 struct TfBlock {
-    kind: TfBlockKind,
-    from_port: Option<u16>,
-    to_port: Option<u16>,
-    rule_is_egress: bool,
-    open_cidr_line: Option<usize>,
+    kind: TfBlockKind, from_port: Option<u16>, to_port: Option<u16>,
+    rule_is_egress: bool, open_cidr_line: Option<usize>,
 }
 
 impl TfBlock {
@@ -741,26 +530,15 @@ impl TfBlock {
 }
 
 fn classify_tf_block(header: &str) -> TfBlockKind {
-    let lower = header.trim().to_ascii_lowercase();
-    if lower == "ingress" || lower.starts_with("ingress ") || lower.starts_with("ingress\"") {
-        return TfBlockKind::Ingress;
-    }
-    if lower == "egress" || lower.starts_with("egress ") || lower.starts_with("egress\"") {
-        return TfBlockKind::Egress;
-    }
-    if lower.contains("\"aws_vpc_security_group_egress_rule\"") {
-        return TfBlockKind::Egress;
-    }
-    if lower.contains("\"aws_vpc_security_group_ingress_rule\"") {
-        return TfBlockKind::Ingress;
-    }
-    if lower.contains("\"aws_security_group_rule\"") {
-        return TfBlockKind::SgRule;
-    }
-    if lower.contains("\"aws_route\"")
-        || lower.contains("\"google_compute_route\"")
-        || lower.contains("\"azurerm_route\"")
-    {
+    let lo = header.trim().to_ascii_lowercase();
+    if lo == "ingress" || lo.starts_with("ingress ") || lo.starts_with("ingress\"")
+        || lo.contains("\"aws_vpc_security_group_ingress_rule\"")
+    { return TfBlockKind::Ingress; }
+    if lo == "egress" || lo.starts_with("egress ") || lo.starts_with("egress\"")
+        || lo.contains("\"aws_vpc_security_group_egress_rule\"")
+    { return TfBlockKind::Egress; }
+    if lo.contains("\"aws_security_group_rule\"") { return TfBlockKind::SgRule; }
+    if lo.contains("\"aws_route\"") || lo.contains("\"google_compute_route\"") || lo.contains("\"azurerm_route\"") {
         return TfBlockKind::Route;
     }
     TfBlockKind::Other
@@ -769,36 +547,22 @@ fn classify_tf_block(header: &str) -> TfBlockKind {
 fn count_hcl_braces(code: &str) -> (usize, usize) {
     let (mut opens, mut closes) = (0usize, 0usize);
     scan_code(code.as_bytes(), b"\"", |_, cur| {
-        if cur == b'{' {
-            opens += 1;
-        } else if cur == b'}' {
-            closes += 1;
-        }
+        if cur == b'{' { opens += 1; } else if cur == b'}' { closes += 1; }
         ControlFlow::Continue(())
     });
     (opens, closes)
 }
 
 fn parse_hcl_u16_attr(lower: &str, attr: &str) -> Option<u16> {
-    let rest = lower.strip_prefix(attr)?.trim_start();
-    let val = rest.strip_prefix('=')?.trim();
-    val.split(|ch: char| !ch.is_ascii_digit())
-        .next()
-        .filter(|tok| !tok.is_empty())
-        .and_then(|tok| tok.parse::<u16>().ok())
+    let val = lower.strip_prefix(attr)?.trim_start().strip_prefix('=')?.trim();
+    val.split(|ch: char| !ch.is_ascii_digit()).next()
+        .filter(|t| !t.is_empty()).and_then(|t| t.parse::<u16>().ok())
 }
 
 fn update_tf_block(blk: &mut TfBlock, code: &str, lower: &str, ln: usize, cidr_suppressed: bool) {
-    if let Some(port) = parse_hcl_u16_attr(lower, "from_port") {
-        blk.from_port = Some(port);
-    }
-    if let Some(port) = parse_hcl_u16_attr(lower, "to_port") {
-        blk.to_port = Some(port);
-    }
-    if blk.kind == TfBlockKind::SgRule
-        && lower.starts_with("type")
-        && lower.contains("\"egress\"")
-    {
+    if let Some(port) = parse_hcl_u16_attr(lower, "from_port") { blk.from_port = Some(port); }
+    if let Some(port) = parse_hcl_u16_attr(lower, "to_port") { blk.to_port = Some(port); }
+    if blk.kind == TfBlockKind::SgRule && lower.starts_with("type") && lower.contains("\"egress\"") {
         blk.rule_is_egress = true;
     }
     if !cidr_suppressed && (code.contains("0.0.0.0/0") || code.contains("::/0")) {
@@ -809,106 +573,60 @@ fn update_tf_block(blk: &mut TfBlock, code: &str, lower: &str, ln: usize, cidr_s
 fn flush_tf_block(rel: &str, blk: TfBlock, out: &mut Vec<InfraFinding>) {
     let is_ingress = blk.kind == TfBlockKind::Ingress
         || (blk.kind == TfBlockKind::SgRule && !blk.rule_is_egress);
-    let Some(cidr_ln) = blk.open_cidr_line else {
-        return;
-    };
-    if !is_ingress {
-        return;
-    }
-    let web_port_only = matches!(
-        (blk.from_port, blk.to_port),
-        (Some(80), Some(80)) | (Some(443), Some(443))
-    );
-    if !web_port_only {
+    let Some(cidr_ln) = blk.open_cidr_line.filter(|_| is_ingress) else { return };
+    if !matches!((blk.from_port, blk.to_port), (Some(80), Some(80)) | (Some(443), Some(443))) {
         push_finding(
-            out,
-            rel,
-            cidr_ln,
-            "high",
-            "tf_open_cidr",
+            out, rel, cidr_ln, "high", "tf_open_cidr",
             "Ingress security rule open to 0.0.0.0/0 or ::/0 on non-80/443 port",
         );
     }
 }
 
 fn is_tf_wildcard_iam(code: &str, lower: &str) -> bool {
-    code.contains("*:*")
-        || ((lower.contains("action") || lower.contains("resources"))
-            && (code.contains("\"*\"") || code.contains("\\\"*\\\"")))
+    code.contains("*:*") || ((lower.contains("action") || lower.contains("resources"))
+        && (code.contains("\"*\"") || code.contains("\\\"*\\\"")))
 }
 
 fn scan_tf(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
-    let mut in_block_comment = false;
-    let mut has_req_providers = false;
-    let mut prov_block: Option<(usize, bool)> = None;
-    let mut unversioned_provs = Vec::new();
-    let mut blocks: Vec<TfBlock> = Vec::new();
-    let mut prev_ignore: Option<Vec<String>> = None;
+    let (mut in_block_comment, mut has_req_providers) = (false, false);
+    let (mut prov_block, mut unversioned_provs, mut blocks, mut prev_ignore) =
+        (None::<(usize, bool)>, Vec::new(), Vec::<TfBlock>::new(), None::<Vec<String>>);
 
     for (idx, raw) in txt.lines().enumerate() {
-        let ln = idx + 1;
-        let raw_trim = raw.trim();
-        if raw_trim.is_empty() {
-            prev_ignore = None;
-            continue;
-        }
+        let (ln, raw_trim) = (idx + 1, raw.trim());
+        if raw_trim.is_empty() { prev_ignore = None; continue; }
         let code_owned = strip_hcl_line(raw, &mut in_block_comment);
         let code = code_owned.trim();
-        if code.is_empty() {
-            prev_ignore = parse_ignore_directive(raw_trim);
-            continue;
-        }
+        if code.is_empty() { prev_ignore = parse_ignore_directive(raw_trim); continue; }
 
-        let inline_ign = parse_ignore_directive(raw);
-        let lower = code.to_ascii_lowercase();
-        if lower.contains("required_providers") {
-            has_req_providers = true;
-        }
-
+        let (inline_ign, lower) = (parse_ignore_directive(raw), code.to_ascii_lowercase());
+        if lower.contains("required_providers") { has_req_providers = true; }
         if is_tf_wildcard_iam(code, &lower)
             && !is_suppressed("tf_wildcard_iam", inline_ign.as_deref(), prev_ignore.as_deref())
         {
             push_finding(
-                out,
-                rel,
-                ln,
-                "critical",
-                "tf_wildcard_iam",
+                out, rel, ln, "critical", "tf_wildcard_iam",
                 "Overly permissive wildcard IAM policy (`*` / `*:*`)",
             );
         }
-
         let (opens, closes) = count_hcl_braces(code);
         track_tf_provider(code, &lower, ln, opens, closes, &mut prov_block, &mut unversioned_provs);
-
         if opens > 0 {
             let header = code.split('{').next().unwrap_or("");
             blocks.push(TfBlock::new(classify_tf_block(header)));
-            for _ in 1..opens {
-                blocks.push(TfBlock::new(TfBlockKind::Other));
-            }
+            for _ in 1..opens { blocks.push(TfBlock::new(TfBlockKind::Other)); }
         }
         if let Some(top) = blocks.last_mut() {
-            let cidr_sup =
-                is_suppressed("tf_open_cidr", inline_ign.as_deref(), prev_ignore.as_deref());
-            update_tf_block(top, code, &lower, ln, cidr_sup);
+            let sup = is_suppressed("tf_open_cidr", inline_ign.as_deref(), prev_ignore.as_deref());
+            update_tf_block(top, code, &lower, ln, sup);
         }
-        for _ in 0..closes {
-            if let Some(popped) = blocks.pop() {
-                flush_tf_block(rel, popped, out);
-            }
-        }
+        for _ in 0..closes { if let Some(popped) = blocks.pop() { flush_tf_block(rel, popped, out); } }
         prev_ignore = None;
     }
-
     if !has_req_providers {
         for prov_ln in unversioned_provs {
             push_finding(
-                out,
-                rel,
-                prov_ln,
-                "medium",
-                "tf_unversioned_provider",
+                out, rel, prov_ln, "medium", "tf_unversioned_provider",
                 "Terraform provider lacks pinned version constraint",
             );
         }
@@ -916,20 +634,13 @@ fn scan_tf(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
 }
 
 fn track_tf_provider(
-    code: &str,
-    lower: &str,
-    ln: usize,
-    opens: usize,
-    closes: usize,
-    prov_block: &mut Option<(usize, bool)>,
-    unversioned: &mut Vec<usize>,
+    code: &str, lower: &str, ln: usize, opens: usize, closes: usize,
+    prov_block: &mut Option<(usize, bool)>, unversioned: &mut Vec<usize>,
 ) {
     if lower.starts_with("provider ") && opens > 0 {
         let has_ver = lower.contains("version");
         if closes >= opens {
-            if !has_ver {
-                unversioned.push(ln);
-            }
+            if !has_ver { unversioned.push(ln); }
         } else {
             *prov_block = Some((ln, has_ver));
         }
@@ -938,19 +649,15 @@ fn track_tf_provider(
     if let Some((prov_ln, has_ver)) = prov_block.as_mut() {
         *has_ver |= lower.contains("version");
         if code.starts_with('}') || closes > opens {
-            let missing_ver = !*has_ver;
-            let start_ln = *prov_ln;
+            let (missing, start_ln) = (!*has_ver, *prov_ln);
             *prov_block = None;
-            if missing_ver {
-                unversioned.push(start_ln);
-            }
+            if missing { unversioned.push(start_ln); }
         }
     }
 }
 
 fn strip_sql_comment(raw: &str) -> &str {
-    let bytes = raw.as_bytes();
-    let mut cut = bytes.len();
+    let (bytes, mut cut) = (raw.as_bytes(), raw.len());
     scan_code(bytes, b"'", |idx, cur| {
         if cur == b'-' && bytes.get(idx + 1) == Some(&b'-') {
             cut = idx;
@@ -962,10 +669,7 @@ fn strip_sql_comment(raw: &str) -> &str {
 }
 
 fn normalize_sql_upper(code: &str) -> String {
-    code.split_whitespace()
-        .map(str::to_ascii_uppercase)
-        .collect::<Vec<_>>()
-        .join(" ")
+    code.split_whitespace().map(str::to_ascii_uppercase).collect::<Vec<_>>().join(" ")
 }
 
 fn is_down_migration(rel: &str) -> bool {
@@ -974,55 +678,30 @@ fn is_down_migration(rel: &str) -> bool {
 }
 
 fn scan_sql(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
-    let down_file = is_down_migration(rel);
-    let mut prev_ignore: Option<Vec<String>> = None;
-
+    let (down_file, mut prev_ignore) = (is_down_migration(rel), None::<Vec<String>>);
     for (idx, raw) in txt.lines().enumerate() {
-        let ln = idx + 1;
-        let raw_trim = raw.trim();
-        if raw_trim.is_empty() {
-            prev_ignore = None;
-            continue;
-        }
+        let (ln, raw_trim) = (idx + 1, raw.trim());
+        if raw_trim.is_empty() { prev_ignore = None; continue; }
         let code = strip_sql_comment(raw).trim();
-        if code.is_empty() {
-            prev_ignore = parse_ignore_directive(raw_trim);
-            continue;
-        }
-
-        let inline_ign = parse_ignore_directive(raw);
-        let stmt_up = normalize_sql_upper(code);
-
+        if code.is_empty() { prev_ignore = parse_ignore_directive(raw_trim); continue; }
+        let (inline_ign, stmt_up) = (parse_ignore_directive(raw), normalize_sql_upper(code));
         let is_temp_drop = stmt_up.starts_with("DROP TEMP TABLE ")
             || stmt_up.starts_with("DROP TEMPORARY TABLE ");
-        let is_destructive = !is_temp_drop
-            && ((stmt_up.starts_with("DROP TABLE ") && !stmt_up.contains("IF EXISTS"))
-                || stmt_up.starts_with("TRUNCATE TABLE ")
-                || stmt_up.starts_with("TRUNCATE "));
-
-        if !down_file
-            && is_destructive
+        let is_destructive = !is_temp_drop && ((stmt_up.starts_with("DROP TABLE ") && !stmt_up.contains("IF EXISTS"))
+            || stmt_up.starts_with("TRUNCATE TABLE ") || stmt_up.starts_with("TRUNCATE "));
+        if !down_file && is_destructive
             && !is_suppressed("sql_destructive_migration", inline_ign.as_deref(), prev_ignore.as_deref())
         {
             push_finding(
-                out,
-                rel,
-                ln,
-                "high",
-                "sql_destructive_migration",
+                out, rel, ln, "high", "sql_destructive_migration",
                 "Unguarded destructive DROP/TRUNCATE statement in SQL migration",
             );
         }
-
         if (stmt_up.contains("IDENTIFIED BY '") || stmt_up.contains("WITH PASSWORD '"))
             && !is_suppressed("sql_hardcoded_password", inline_ign.as_deref(), prev_ignore.as_deref())
         {
             push_finding(
-                out,
-                rel,
-                ln,
-                "critical",
-                "sql_hardcoded_password",
+                out, rel, ln, "critical", "sql_hardcoded_password",
                 "Hardcoded database password literal in SQL script",
             );
         }
@@ -1062,71 +741,19 @@ fn all_matchers_complete(matchers: &[Option<EcoMatcher>; 4]) -> bool {
     matchers.iter().all(|m| m.as_ref().is_none_or(EcoMatcher::is_complete))
 }
 
-#[cfg(test)]
-fn scan_sources_for_deps(
-    matchers: &mut [Option<EcoMatcher>; 4],
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
-    source_paths: &[(Eco, PathBuf)],
-) {
-    if let Some(map) = preloaded {
-        for (rel, bytes) in map {
-            let eco = Eco::from_ext(&ext_of(rel));
-            if let Some(m) = matchers[eco.idx()].as_mut() {
-                m.scan_bytes(bytes);
-            }
-            if all_matchers_complete(matchers) {
-                return;
-            }
-        }
-        return;
-    }
-
-    for (eco, abs) in source_paths {
-        let Some(m) = matchers[eco.idx()].as_mut() else { continue };
-        if m.is_complete() {
-            continue;
-        }
-        if let Ok(bytes) = fs::read(abs) {
-            m.scan_bytes(&bytes);
-        }
-        if all_matchers_complete(matchers) {
-            return;
-        }
-    }
-}
-
 fn collect_unused_from_matchers(
     parsed: Vec<ParsedDep>,
     matchers: &[Option<EcoMatcher>; 4],
 ) -> Vec<UnusedDep> {
-    let mut unused = Vec::new();
-    for dep in parsed {
-        let used = matchers[dep.eco.idx()]
-            .as_ref()
-            .is_some_and(|m| m.hits.contains(dep.slot));
-        if !used {
-            unused.push(UnusedDep {
-                manifest: dep.manifest,
-                ecosystem: dep.ecosystem.into(),
-                package: dep.package,
-            });
-        }
-    }
-    unused
-}
-
-#[cfg(test)]
-fn find_unused_deps(
-    manifests: &[(String, String, String)],
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
-    source_paths: &[(Eco, PathBuf)],
-) -> Vec<UnusedDep> {
-    if manifests.is_empty() {
-        return Vec::new();
-    }
-    let (parsed, mut matchers) = collect_manifest_deps(manifests);
-    scan_sources_for_deps(&mut matchers, preloaded, source_paths);
-    collect_unused_from_matchers(parsed, &matchers)
+    parsed
+        .into_iter()
+        .filter(|dep| !matchers[dep.eco.idx()].as_ref().is_some_and(|m| m.hits.contains(dep.slot)))
+        .map(|dep| UnusedDep {
+            manifest: dep.manifest,
+            ecosystem: dep.ecosystem.into(),
+            package: dep.package,
+        })
+        .collect()
 }
 
 #[cfg(test)]

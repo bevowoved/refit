@@ -93,111 +93,67 @@ struct LookupTables {
 }
 
 pub fn locate_stem(hint: Option<&Path>) -> Option<PathBuf> {
-    if let Some(h) = hint.filter(|p| p.exists()) {
-        return Some(h.to_path_buf());
-    }
+    if let Some(h) = hint.filter(|p| p.exists()) { return Some(h.to_path_buf()); }
     if let Ok(env_bin) = std::env::var("REFIT_STEM_BIN") {
         let p = PathBuf::from(env_bin);
-        if p.exists() {
-            return Some(p);
-        }
+        if p.exists() { return Some(p); }
     }
-
     let bin = if cfg!(windows) { "stem.exe" } else { "stem" };
-    let sibling = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(bin)));
-    sibling
-        .into_iter()
-        .chain(std::iter::once(PathBuf::from(".tools").join(bin)))
-        .find(|c| c.exists())
+    let sibling = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(bin)));
+    sibling.into_iter().chain(std::iter::once(PathBuf::from(".tools").join(bin))).find(|c| c.exists())
 }
 
 pub fn scan_edges(
-    repo_root: &Path,
-    stem_bin_hint: Option<&Path>,
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
+    repo_root: &Path, stem_bin_hint: Option<&Path>, preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> EdgeScan {
     let started = Instant::now();
     let (mut disc, _, _, _) = discover_internal(repo_root, preloaded, None);
     let mut edge_set: HashSet<(String, String)> = disc.edges.into_iter().collect();
     let mut rt_set: HashSet<(String, String)> = disc.runtime_edges.into_iter().collect();
-
-    let want_ext = stem_bin_hint.is_some()
-        || std::env::var("REFIT_USE_STEM_BIN").as_deref() == Ok("1");
+    let want_ext = stem_bin_hint.is_some() || std::env::var("REFIT_USE_STEM_BIN").as_deref() == Ok("1");
     if want_ext && query_ext(repo_root, stem_bin_hint, &mut edge_set) {
         disc.used_stem = true;
         rt_set.extend(edge_set.iter().cloned());
     }
-
     let mut edges: Vec<(String, String)> = edge_set.into_iter().collect();
     let mut runtime_edges: Vec<(String, String)> = rt_set.into_iter().collect();
     edges.sort();
     runtime_edges.sort();
-    EdgeScan {
-        used_stem: disc.used_stem,
-        index_ms: started.elapsed().as_millis() as u64,
-        edges,
-        runtime_edges,
-    }
+    EdgeScan { used_stem: disc.used_stem, index_ms: started.elapsed().as_millis() as u64, edges, runtime_edges }
 }
 
-fn query_ext(
-    repo_root: &Path,
-    hint: Option<&Path>,
-    edge_set: &mut HashSet<(String, String)>,
-) -> bool {
+fn query_ext(repo_root: &Path, hint: Option<&Path>, edge_set: &mut HashSet<(String, String)>) -> bool {
     let Some(stem_bin) = locate_stem(hint) else { return false };
     let stem_home = repo_root.join(".refit/stem-home");
-    if mkdir_private(&stem_home).is_err() {
-        return false;
-    }
+    if mkdir_private(&stem_home).is_err() { return false; }
 
     let mut cmd = Command::new(&stem_bin);
-    cmd.arg("mcp")
-        .current_dir(repo_root)
-        .env_clear()
-        .env("HOME", &stem_home)
-        .env("USERPROFILE", &stem_home)
+    cmd.arg("mcp").current_dir(repo_root).env_clear()
+        .env("HOME", &stem_home).env("USERPROFILE", &stem_home)
         .env("STEM_MCP_TOOLS", "defs,refs,callers,impls,symbols,sql,brief")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     for k in ["PATH", "SYSTEMROOT", "TEMP", "TMP"] {
-        if let Ok(v) = std::env::var(k) {
-            cmd.env(k, v);
-        }
+        if let Ok(v) = std::env::var(k) { cmd.env(k, v); }
     }
-
     let Ok(mut child) = cmd.spawn() else { return false };
     let init = json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": { "name": "refit", "version": "0.5.0" }
-        }
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": { "name": "refit", "version": "0.5.0" } }
     });
     let call = json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": { "name": "sql", "arguments": { "query": STEM_SQL } }
     });
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = writeln!(stdin, "{init}\n{call}");
-    }
-
+    if let Some(mut stdin) = child.stdin.take() { let _ = writeln!(stdin, "{init}\n{call}"); }
     let Ok(out) = child.wait_with_output() else { return false };
-    if !out.status.success() {
-        return false;
-    }
+    if !out.status.success() { return false; }
 
     let mut used = false;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
         let id = v["id"].as_u64().unwrap_or(0);
         used |= id == 1 && v.get("result").is_some();
-        if id == 2
-            && let Some(rows) = v["result"]["structuredContent"]["rows"].as_array()
-        {
+        if id == 2 && let Some(rows) = v["result"]["structuredContent"]["rows"].as_array() {
             for row in rows {
                 if let (Some(s), Some(d)) = (row["src"].as_str(), row["dst"].as_str()) {
                     edge_set.insert((s.replace('\\', "/"), d.replace('\\', "/")));
@@ -209,10 +165,7 @@ fn query_ext(
 }
 
 #[cfg(test)]
-pub fn index_repo(
-    repo_root: &Path,
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
-) -> (EdgeScan, SymbolGraph) {
+pub fn index_repo(repo_root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8>>>) -> (EdgeScan, SymbolGraph) {
     let (disc, _, _, snap) = discover_internal(repo_root, preloaded, None);
     (disc, snap)
 }
@@ -223,81 +176,47 @@ pub fn index_repo_snap(repo_root: &Path, snap: &RepoSnapshot) -> (EdgeScan, Symb
     (disc, graph)
 }
 
-pub fn load_symbols(
-    repo_root: &Path,
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
-) -> SymbolGraph {
+pub fn load_symbols(repo_root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8>>>) -> SymbolGraph {
     discover_internal(repo_root, preloaded, None).3
 }
 
+fn file_edge_lists(edges: &[(String, String)], norm: &str) -> (Vec<String>, Vec<String>) {
+    let deps = edges.iter().filter(|(s, _)| s == norm).map(|(_, d)| d.clone()).collect();
+    let dependents = edges.iter().filter(|(_, d)| d == norm).map(|(s, _)| s.clone()).collect();
+    (deps, dependents)
+}
+
 pub fn query_symbols(repo_root: &Path, symbol: Option<&str>, file: Option<&str>) -> Value {
-    if symbol.is_none()
-        && let Some(f) = file
-    {
+    if symbol.is_none() && let Some(f) = file {
         let norm = f.replace('\\', "/");
         if let Some(hit) = sst::query_file_sst(repo_root, CACHE_VERSION, &norm) {
-            let deps: Vec<String> = hit
-                .edges
-                .iter()
-                .filter(|(s, _)| s == &norm)
-                .map(|(_, d)| d.clone())
-                .collect();
-            let dependents: Vec<String> = hit
-                .edges
-                .iter()
-                .filter(|(_, d)| d == &norm)
-                .map(|(s, _)| s.clone())
-                .collect();
+            let (deps, dependents) = file_edge_lists(&hit.edges, &norm);
             let fan_in = hit.runtime_edges.iter().filter(|(_, d)| d == &norm).count();
             let fan_out = hit.runtime_edges.iter().filter(|(s, _)| s == &norm).count();
             return json!({
-                "file": norm,
-                "defs": hit.sym.defs,
-                "imports": hit.sym.imports,
-                "deps": deps, "dependents": dependents,
-                "fan_in": fan_in, "fan_out": fan_out
+                "file": norm, "defs": hit.sym.defs, "imports": hit.sym.imports,
+                "deps": deps, "dependents": dependents, "fan_in": fan_in, "fan_out": fan_out
             });
         }
     }
-
-    let snap = load_symbols(repo_root, None);
-    query_symbol_graph(&snap, symbol, file)
+    query_symbol_graph(&load_symbols(repo_root, None), symbol, file)
 }
 
 pub fn query_symbol_graph(snap: &SymbolGraph, symbol: Option<&str>, file: Option<&str>) -> Value {
     if let Some(sym) = symbol {
-        let definers: Vec<String> = snap
-            .defs_by_file
-            .iter()
-            .filter(|(_, defs)| defs.iter().any(|d| d == sym))
-            .map(|(f, _)| f.clone())
-            .collect();
-        let callers: Vec<String> = snap
-            .refs_by_file
-            .iter()
+        let definers: Vec<String> = snap.defs_by_file.iter()
+            .filter(|(_, defs)| defs.iter().any(|d| d == sym)).map(|(f, _)| f.clone()).collect();
+        let callers: Vec<String> = snap.refs_by_file.iter()
             .filter(|(f, refs)| !definers.contains(*f) && refs.iter().any(|r| r == sym))
-            .map(|(f, _)| f.clone())
-            .collect();
+            .map(|(f, _)| f.clone()).collect();
         return json!({
             "symbol": sym, "definers": definers, "callers": callers,
             "is_dead": !definers.is_empty() && callers.is_empty()
         });
     }
-
     if let Some(f) = file {
         let norm = f.replace('\\', "/");
-        let deps: Vec<String> = snap
-            .edges
-            .iter()
-            .filter(|(s, _)| s == &norm)
-            .map(|(_, d)| d.clone())
-            .collect();
-        let dependents: Vec<String> = snap
-            .edges
-            .iter()
-            .filter(|(_, d)| d == &norm)
-            .map(|(s, _)| s.clone())
-            .collect();
+        let (deps, dependents) = file_edge_lists(&snap.edges, &norm);
         return json!({
             "file": norm,
             "defs": snap.defs_by_file.get(&norm).cloned().unwrap_or_default(),
@@ -307,14 +226,11 @@ pub fn query_symbol_graph(snap: &SymbolGraph, symbol: Option<&str>, file: Option
             "fan_out": snap.fan_out.get(&norm).copied().unwrap_or(0)
         });
     }
-
     json!({
-        "indexed_files": snap.defs_by_file.len(),
-        "total_edges": snap.edges.len(),
+        "indexed_files": snap.defs_by_file.len(), "total_edges": snap.edges.len(),
         "dead_symbols_count": snap.dead_symbols.len(),
         "dead_symbols": snap.dead_symbols.iter().take(40).collect::<Vec<_>>(),
-        "top_fan_in": top_fan(&snap.fan_in, 10),
-        "top_fan_out": top_fan(&snap.fan_out, 10)
+        "top_fan_in": top_fan(&snap.fan_in, 10), "top_fan_out": top_fan(&snap.fan_out, 10)
     })
 }
 
@@ -332,13 +248,13 @@ pub fn index_stats(repo_root: &Path) -> (EdgeScan, usize, usize) {
 }
 
 fn resolve_tsconfig_base(rel_dir: &str, base_url: &str) -> String {
-    let clean_base = base_url.trim_start_matches("./").trim_matches('/');
+    let clean = base_url.trim_start_matches("./").trim_matches('/');
     if rel_dir.is_empty() {
-        clean_base.to_string()
-    } else if clean_base.is_empty() || clean_base == "." {
+        clean.to_string()
+    } else if clean.is_empty() || clean == "." {
         rel_dir.to_string()
     } else {
-        format!("{rel_dir}/{clean_base}")
+        format!("{rel_dir}/{clean}")
     }
 }
 
@@ -353,64 +269,42 @@ fn map_tsconfig_target(effective_base: &str, raw_target: &str) -> String {
 }
 
 fn apply_tsconfig_paths(
-    paths: &serde_json::Map<String, Value>,
-    effective_base: &str,
-    aliases: &mut Vec<(String, String)>,
+    paths: &serde_json::Map<String, Value>, effective_base: &str, aliases: &mut Vec<(String, String)>,
 ) {
     for (alias, targets) in paths {
         let prefix = alias.trim_end_matches('*');
-        let Some(arr) = (!prefix.is_empty()).then(|| targets.as_array()).flatten() else {
-            continue;
-        };
+        let Some(arr) = (!prefix.is_empty()).then(|| targets.as_array()).flatten() else { continue };
         aliases.retain(|(existing, _)| existing != prefix);
         for target in arr.iter().filter_map(Value::as_str) {
-            let raw_target = target.trim_start_matches("./").trim_end_matches('*');
-            aliases.push((prefix.to_string(), map_tsconfig_target(effective_base, raw_target)));
+            let raw = target.trim_start_matches("./").trim_end_matches('*');
+            aliases.push((prefix.to_string(), map_tsconfig_target(effective_base, raw)));
         }
     }
 }
 
-fn load_tsconfig_resolved(
-    repo_root: &Path,
-    cfg_path: &Path,
-    depth: usize,
-) -> (String, Vec<(String, String)>) {
-    if depth > 8 {
-        return (String::new(), Vec::new());
-    }
-    let Ok(raw) = std::fs::read_to_string(cfg_path) else {
-        return (String::new(), Vec::new());
-    };
-    let cleaned = strip_jsonc(&raw);
-    let Ok(val) = serde_json::from_str::<Value>(&cleaned) else {
-        return (String::new(), Vec::new());
-    };
+fn load_tsconfig_resolved(repo_root: &Path, cfg_path: &Path, depth: usize) -> (String, Vec<(String, String)>) {
+    if depth > 8 { return (String::new(), Vec::new()); }
+    let Ok(raw) = std::fs::read_to_string(cfg_path) else { return (String::new(), Vec::new()) };
+    let Ok(val) = serde_json::from_str::<Value>(&strip_jsonc(&raw)) else { return (String::new(), Vec::new()) };
 
     let cfg_dir = cfg_path.parent().unwrap_or(repo_root);
     let (mut base, mut aliases) = if let Some(ext_rel) = val["extends"].as_str() {
         let mut parent = cfg_dir.join(ext_rel);
-        if !parent.exists() && parent.extension().is_none() {
-            parent.set_extension("json");
-        }
-        let canon_parent = dunce::canonicalize(&parent).unwrap_or(parent);
-        load_tsconfig_resolved(repo_root, &canon_parent, depth + 1)
+        if !parent.exists() && parent.extension().is_none() { parent.set_extension("json"); }
+        load_tsconfig_resolved(repo_root, &dunce::canonicalize(&parent).unwrap_or(parent), depth + 1)
     } else {
         (String::new(), Vec::new())
     };
-
     let canon_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let canon_dir = dunce::canonicalize(cfg_dir).unwrap_or_else(|_| cfg_dir.to_path_buf());
-    let rel_dir = rel_norm(&canon_root, &canon_dir)
-        .or_else(|| rel_norm(repo_root, cfg_dir))
-        .unwrap_or_default();
+    let rel_dir = rel_norm(&canon_root, &canon_dir).or_else(|| rel_norm(repo_root, cfg_dir)).unwrap_or_default();
     if let Some(base_url) = val["compilerOptions"]["baseUrl"].as_str() {
         base = resolve_tsconfig_base(&rel_dir, base_url);
     }
     if let Some(paths) = val["compilerOptions"]["paths"].as_object() {
-        let effective_base = if base.is_empty() { rel_dir.as_str() } else { base.as_str() };
-        apply_tsconfig_paths(paths, effective_base, &mut aliases);
+        let eff = if base.is_empty() { rel_dir.as_str() } else { base.as_str() };
+        apply_tsconfig_paths(paths, eff, &mut aliases);
     }
-
     (base, aliases)
 }
 
@@ -420,32 +314,22 @@ fn discover_ts_scopes(repo_root: &Path, pre_ts_configs: Option<&[PathBuf]>) -> V
         cfg_paths.extend(found.iter().cloned());
     } else {
         let root_cfg = repo_root.join("tsconfig.json");
-        if root_cfg.exists() {
-            cfg_paths.push(root_cfg);
-        }
+        if root_cfg.exists() { cfg_paths.push(root_cfg); }
         for p in walk_files(repo_root, None) {
             if let Some(name) = p.file_name().and_then(|s| s.to_str())
-                && matches!(name, "tsconfig.json" | "jsconfig.json")
-                && !cfg_paths.contains(&p)
+                && matches!(name, "tsconfig.json" | "jsconfig.json") && !cfg_paths.contains(&p)
             {
                 cfg_paths.push(p);
             }
         }
     }
-
     let mut scopes = Vec::new();
     for cfg in cfg_paths {
         let (_, aliases) = load_tsconfig_resolved(repo_root, &cfg, 0);
-        if aliases.is_empty() {
-            continue;
-        }
-        let pkg_dir = cfg
-            .parent()
-            .and_then(|d| rel_norm(repo_root, d))
-            .unwrap_or_default();
+        if aliases.is_empty() { continue; }
+        let pkg_dir = cfg.parent().and_then(|d| rel_norm(repo_root, d)).unwrap_or_default();
         scopes.push(TsConfigScope { pkg_dir, aliases });
     }
-    // Longest `pkg_dir` first for most-specific package scope matching.
     scopes.sort_by(|a, b| b.pkg_dir.len().cmp(&a.pkg_dir.len()).then_with(|| a.pkg_dir.cmp(&b.pkg_dir)));
     scopes
 }
@@ -453,63 +337,34 @@ fn discover_ts_scopes(repo_root: &Path, pre_ts_configs: Option<&[PathBuf]>) -> V
 fn parse_go_work_dirs(work_text: &str, mod_dirs: &mut Vec<PathBuf>) {
     let mut in_use = false;
     for line in work_text.lines().map(str::trim) {
-        if line.starts_with("use (") {
-            in_use = true;
-            continue;
-        }
-        if in_use && line.starts_with(')') {
-            in_use = false;
-            continue;
-        }
+        if line.starts_with("use (") { in_use = true; continue; }
+        if in_use && line.starts_with(')') { in_use = false; continue; }
         let cand = if in_use { Some(line) } else { line.strip_prefix("use ") };
         if let Some(raw) = cand {
-            let cleaned = raw
-                .split("//")
-                .next()
-                .unwrap_or("")
-                .trim()
-                .trim_matches('"')
-                .trim_start_matches("./");
-            if !cleaned.is_empty() {
-                mod_dirs.push(PathBuf::from(cleaned));
-            }
+            let cleaned = raw.split("//").next().unwrap_or("").trim().trim_matches('"').trim_start_matches("./");
+            if !cleaned.is_empty() { mod_dirs.push(PathBuf::from(cleaned)); }
         }
     }
 }
 
 fn read_go_mod_path(go_mod_path: &Path) -> Option<String> {
     let txt = std::fs::read_to_string(go_mod_path).ok()?;
-    for line in txt.lines().map(str::trim) {
-        if let Some(rest) = line.strip_prefix("module ") {
-            let mod_path = rest.split_whitespace().next().unwrap_or("").trim_matches('"');
-            return (!mod_path.is_empty()).then(|| mod_path.to_string());
-        }
-    }
-    None
+    txt.lines().map(str::trim).find_map(|line| {
+        let mod_path = line.strip_prefix("module ")?.split_whitespace().next()?.trim_matches('"');
+        (!mod_path.is_empty()).then(|| mod_path.to_string())
+    })
 }
 
 fn discover_go_modules(repo_root: &Path) -> Vec<(String, String)> {
     let mut mod_dirs = Vec::new();
-    if repo_root.join("go.mod").exists() {
-        mod_dirs.push(PathBuf::new());
-    }
+    if repo_root.join("go.mod").exists() { mod_dirs.push(PathBuf::new()); }
     if let Ok(work) = std::fs::read_to_string(repo_root.join("go.work")) {
         parse_go_work_dirs(&work, &mut mod_dirs);
     }
-
-    let mut out = Vec::new();
-    for sub in mod_dirs {
-        let gm = if sub.as_os_str().is_empty() {
-            repo_root.join("go.mod")
-        } else {
-            repo_root.join(&sub).join("go.mod")
-        };
-        if let Some(mod_path) = read_go_mod_path(&gm) {
-            let dir_str = sub.to_string_lossy().replace('\\', "/");
-            out.push((dir_str, mod_path));
-        }
-    }
-    out
+    mod_dirs.into_iter().filter_map(|sub| {
+        let gm = if sub.as_os_str().is_empty() { repo_root.join("go.mod") } else { repo_root.join(&sub).join("go.mod") };
+        read_go_mod_path(&gm).map(|m| (sub.to_string_lossy().replace('\\', "/"), m))
+    }).collect()
 }
 
 fn join_rel(base_dir: &str, rel_import: &str) -> String {
@@ -517,88 +372,51 @@ fn join_rel(base_dir: &str, rel_import: &str) -> String {
     for seg in base_dir.split('/').chain(rel_import.split('/')) {
         match seg {
             "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
+            ".." => { parts.pop(); }
             other => parts.push(other),
         }
     }
-    let trailing_slash = rel_import.ends_with('/');
     let mut joined = parts.join("/");
-    if trailing_slash && !joined.is_empty() {
-        joined.push('/');
-    }
+    if rel_import.ends_with('/') && !joined.is_empty() { joined.push('/'); }
     joined
 }
 
-fn register_py_init_files(
-    all_files: &[(String, String, Option<PathBuf>)],
-    mod_to_rel: &mut FxHashMap<String, String>,
-) {
+fn register_py_init_files(all_files: &[(String, String, Option<PathBuf>)], mod_to_rel: &mut FxHashMap<String, String>) {
     for (rel, ext, _) in all_files {
-        if ext == "py" && rel.ends_with("/__init__.py") {
-            let pkg = rel.trim_end_matches("/__init__.py");
+        if ext == "py" && let Some(pkg) = rel.strip_suffix("/__init__.py") {
             mod_to_rel.insert(pkg.replace('/', "."), rel.clone());
-            if let Some(stripped) = pkg.strip_prefix("src/") {
-                mod_to_rel.insert(stripped.replace('/', "."), rel.clone());
-            }
+            if let Some(s) = pkg.strip_prefix("src/") { mod_to_rel.insert(s.replace('/', "."), rel.clone()); }
         }
     }
 }
 
 fn register_py_source(rel: &str, mod_to_rel: &mut FxHashMap<String, String>) {
-    let py_mod = rel.trim_end_matches(".py").replace('/', ".");
-    mod_to_rel.insert(py_mod, rel.to_string());
+    mod_to_rel.insert(rel.trim_end_matches(".py").replace('/', "."), rel.to_string());
     if let Some(stripped) = rel.strip_prefix("src/") {
-        let src_mod = stripped.trim_end_matches(".py").replace('/', ".");
-        mod_to_rel.entry(src_mod).or_insert_with(|| rel.to_string());
+        mod_to_rel.entry(stripped.trim_end_matches(".py").replace('/', ".")).or_insert_with(|| rel.to_string());
     }
 }
 
-fn register_rs_source(
-    rel: &str,
-    mod_to_rel: &mut FxHashMap<String, String>,
-    crate_roots: &mut FxHashSet<String>,
-) {
-    if let Some(mod_dir) = rel.strip_suffix("/mod.rs") {
-        mod_to_rel.insert(mod_dir.to_string(), rel.to_string());
-    }
-    if rel == "src/lib.rs" || rel == "src/main.rs" {
+fn register_rs_source(rel: &str, mod_to_rel: &mut FxHashMap<String, String>, crate_roots: &mut FxHashSet<String>) {
+    if let Some(mod_dir) = rel.strip_suffix("/mod.rs") { mod_to_rel.insert(mod_dir.to_string(), rel.to_string()); }
+    if rel == "src/lib.rs" || rel == "src/main.rs" || rel.starts_with("src/") {
         crate_roots.insert("src".to_string());
-    } else if let Some(prefix) = rel
-        .strip_suffix("/src/lib.rs")
-        .or_else(|| rel.strip_suffix("/src/main.rs"))
-    {
-        crate_roots.insert(format!("{prefix}/src"));
-    } else if rel.starts_with("src/") {
-        crate_roots.insert("src".to_string());
+    } else if let Some(p) = rel.strip_suffix("/src/lib.rs").or_else(|| rel.strip_suffix("/src/main.rs")) {
+        crate_roots.insert(format!("{p}/src"));
     }
 }
 
 fn go_full_pkg_path(rel_dir: &str, mod_dir: &str, mod_path: &str) -> Option<String> {
     if mod_dir.is_empty() {
-        return Some(if rel_dir.is_empty() {
-            mod_path.to_string()
-        } else {
-            format!("{mod_path}/{rel_dir}")
-        });
+        return Some(if rel_dir.is_empty() { mod_path.to_string() } else { format!("{mod_path}/{rel_dir}") });
     }
-    if rel_dir == mod_dir {
-        return Some(mod_path.to_string());
-    }
-    rel_dir
-        .strip_prefix(&format!("{mod_dir}/"))
-        .map(|sub| format!("{mod_path}/{sub}"))
+    if rel_dir == mod_dir { return Some(mod_path.to_string()); }
+    rel_dir.strip_prefix(&format!("{mod_dir}/")).map(|sub| format!("{mod_path}/{sub}"))
 }
 
-fn register_go_source(
-    rel: &str,
-    path: &Path,
-    go_mods: &[(String, String)],
-    tbl: &mut LookupTables,
-) {
+fn register_go_source(rel: &str, path: &Path, go_mods: &[(String, String)], tbl: &mut LookupTables) {
     let rel_dir = dir_of(rel);
-    if let Some(dir) = path.parent().and_then(|parent| parent.file_name()).and_then(|s| s.to_str()) {
+    if let Some(dir) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) {
         tbl.go_pkg_rels.entry(dir.to_string()).or_default().push(rel.to_string());
     }
     for (mod_dir, mod_path) in go_mods {
@@ -609,32 +427,26 @@ fn register_go_source(
 }
 
 fn build_tables(
-    repo_root: &Path,
-    sources: &[(String, String, Option<PathBuf>)],
-    all_files: &[(String, String, Option<PathBuf>)],
-    pre_ts_configs: Option<&[PathBuf]>,
+    repo_root: &Path, sources: &[(String, String, Option<PathBuf>)],
+    all_files: &[(String, String, Option<PathBuf>)], pre_ts_configs: Option<&[PathBuf]>,
 ) -> LookupTables {
     let go_mods = discover_go_modules(repo_root);
     let mut tbl = LookupTables {
         all_rels: FxHashSet::with_capacity_and_hasher(sources.len(), Default::default()),
         mod_to_rel: FxHashMap::with_capacity_and_hasher(sources.len() * 2, Default::default()),
-        stem_to_rels: FxHashMap::default(),
-        go_pkg_rels: FxHashMap::default(),
+        stem_to_rels: FxHashMap::default(), go_pkg_rels: FxHashMap::default(),
         go_full_pkg_rels: FxHashMap::default(),
-        ts_scopes: discover_ts_scopes(repo_root, pre_ts_configs),
-        rs_crate_roots: Vec::new(),
+        ts_scopes: discover_ts_scopes(repo_root, pre_ts_configs), rs_crate_roots: Vec::new(),
     };
-
     let mut crate_roots = FxHashSet::default();
     register_py_init_files(all_files, &mut tbl.mod_to_rel);
-
     for (rel, ext, _) in sources {
         tbl.all_rels.insert(rel.clone());
         let path = Path::new(rel);
         if ext == "py" {
             register_py_source(rel, &mut tbl.mod_to_rel);
         } else {
-            let no_ext = rel.rsplit_once('.').map_or(rel.as_str(), |(head, _)| head);
+            let no_ext = rel.rsplit_once('.').map_or(rel.as_str(), |(h, _)| h);
             tbl.mod_to_rel.insert(no_ext.to_string(), rel.clone());
             if ext == "rs" {
                 register_rs_source(rel, &mut tbl.mod_to_rel, &mut crate_roots);
@@ -643,13 +455,10 @@ fn build_tables(
             }
         }
         let stem = stem_of(path);
-        if !stem.is_empty() {
-            tbl.stem_to_rels.entry(stem.to_string()).or_default().push(rel.clone());
-        }
+        if !stem.is_empty() { tbl.stem_to_rels.entry(stem.to_string()).or_default().push(rel.clone()); }
     }
-
     let mut roots: Vec<String> = crate_roots.into_iter().collect();
-    roots.sort_by(|lhs, rhs| rhs.len().cmp(&lhs.len()).then_with(|| lhs.cmp(rhs)));
+    roots.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     tbl.rs_crate_roots = roots;
     tbl
 }
@@ -1022,18 +831,13 @@ fn build_graph(
     let mut arena = PathArena::with_capacity(files.len() + test_hashes.len());
     let mut witnesses: FxHashMap<u64, RefWitness> =
         FxHashMap::with_capacity_and_hasher(files.len() * 16 + 64, Default::default());
-
     record_source_witnesses(&files, glob_targets, &mut arena, &mut witnesses);
     for (trel, (_, hashes)) in test_hashes {
         let tid = arena.intern(trel);
-        for &hash in hashes {
-            witnesses.entry(hash).or_default().record_test(tid);
-        }
+        for &hash in hashes { witnesses.entry(hash).or_default().record_test(tid); }
     }
-
-    let (mut defs_by, mut refs_by, mut imps_by, mut metrics_by) =
-        (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
-    let mut dead = Vec::new();
+    let (mut defs_by, mut refs_by, mut imps_by, mut metrics_by, mut dead) =
+        (BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), BTreeMap::new(), Vec::new());
     for (rel, entry) in files {
         let fid = arena.id_of(&rel).unwrap_or(analysis::NO_FILE);
         collect_dead_symbols_for_file(&rel, fid, &entry, glob_targets, &witnesses, &mut dead);
@@ -1042,164 +846,91 @@ fn build_graph(
         imps_by.insert(rel.clone(), entry.imports);
         metrics_by.insert(rel, entry.metrics);
     }
-
     SymbolGraph {
-        defs_by_file: defs_by,
-        refs_by_file: refs_by,
-        imports_by_file: imps_by,
-        edges: edges.to_vec(),
-        runtime_edges: runtime_edges.to_vec(),
-        fan_in,
-        fan_out,
-        dead_symbols: dead,
-        metrics_by_file: metrics_by,
+        defs_by_file: defs_by, refs_by_file: refs_by, imports_by_file: imps_by,
+        edges: edges.to_vec(), runtime_edges: runtime_edges.to_vec(),
+        fan_in, fan_out, dead_symbols: dead, metrics_by_file: metrics_by,
     }
 }
 
 fn strip_js_ext(p: &str) -> &str {
-    for ext in [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".mts", ".cts"] {
-        if let Some(s) = p.strip_suffix(ext) {
-            return s;
-        }
-    }
-    p
+    [".tsx", ".ts", ".jsx", ".js", ".mjs", ".cjs", ".mts", ".cts"]
+        .iter().find_map(|ext| p.strip_suffix(ext)).unwrap_or(p)
 }
 
 fn resolve_relative_import(imp: &str, src_dir: &str, tbl: &LookupTables) -> Option<String> {
-    if !imp.starts_with("./") && !imp.starts_with("../") {
-        return None;
-    }
+    if !imp.starts_with("./") && !imp.starts_with("../") { return None; }
     let base = join_rel(src_dir, strip_js_ext(imp));
-    for cand in [base.clone(), format!("{base}/index")] {
-        if let Some(hit) = tbl.mod_to_rel.get(&cand) {
-            return Some(hit.clone());
-        }
-    }
-    tbl.all_rels.contains(&base).then_some(base)
-}
-
-fn scope_matches_dir(pkg_dir: &str, src_dir: &str) -> bool {
-    pkg_dir.is_empty() || src_dir == pkg_dir || src_dir.starts_with(&format!("{pkg_dir}/"))
+    tbl.mod_to_rel.get(&base)
+        .or_else(|| tbl.mod_to_rel.get(&format!("{base}/index"))).cloned()
+        .or_else(|| tbl.all_rels.contains(&base).then_some(base))
 }
 
 fn resolve_ts_scope_import(imp: &str, src_dir: &str, tbl: &LookupTables) -> Option<String> {
     for scope in &tbl.ts_scopes {
-        if !scope_matches_dir(&scope.pkg_dir, src_dir) {
-            continue;
-        }
+        let in_scope = scope.pkg_dir.is_empty() || src_dir == scope.pkg_dir
+            || src_dir.starts_with(&format!("{}/", scope.pkg_dir));
+        if !in_scope { continue; }
         for (alias, target_prefix) in &scope.aliases {
-            let Some(rest) = imp.strip_prefix(alias.as_str()) else {
-                continue;
-            };
+            let Some(rest) = imp.strip_prefix(alias.as_str()) else { continue };
             let mapped = format!("{target_prefix}{}", strip_js_ext(rest));
-            if let Some(hit) = tbl
-                .mod_to_rel
-                .get(&mapped)
+            if let Some(hit) = tbl.mod_to_rel.get(&mapped)
                 .or_else(|| tbl.mod_to_rel.get(&format!("{mapped}/index")))
-            {
-                return Some(hit.clone());
-            }
+            { return Some(hit.clone()); }
         }
     }
     None
 }
 
-fn resolve_rs_import(
-    imp: &str,
-    src_rel: &str,
-    src_dir: &str,
-    tbl: &LookupTables,
-) -> Option<String> {
+fn resolve_rs_import(imp: &str, src_rel: &str, src_dir: &str, tbl: &LookupTables) -> Option<String> {
     if let Some(sym) = imp.strip_prefix("super::") {
         let parent = dir_of(src_dir);
         let cand = if parent.is_empty() { sym.into() } else { format!("{parent}/{sym}") };
-        if let Some(hit) = tbl.mod_to_rel.get(&cand) {
-            return Some(hit.clone());
-        }
+        if let Some(hit) = tbl.mod_to_rel.get(&cand) { return Some(hit.clone()); }
     }
-    if !src_dir.is_empty() {
-        let sub = format!("{src_dir}/{imp}");
-        if let Some(hit) = tbl.mod_to_rel.get(&sub) {
-            return Some(hit.clone());
-        }
+    if !src_dir.is_empty() && let Some(hit) = tbl.mod_to_rel.get(&format!("{src_dir}/{imp}")) {
+        return Some(hit.clone());
     }
-    let root = tbl
-        .rs_crate_roots
-        .iter()
-        .find(|cand_root| src_rel.starts_with(&format!("{cand_root}/")))?;
-    let cand = format!("{root}/{imp}");
-    tbl.mod_to_rel.get(&cand).cloned()
-}
-
-fn resolve_go_import(imp: &str, tbl: &LookupTables) -> Option<Vec<String>> {
-    if let Some(files) = tbl.go_full_pkg_rels.get(imp) {
-        return Some(files.clone());
-    }
-    let last = imp.rsplit('/').next().unwrap_or(imp);
-    tbl.go_pkg_rels.get(last).cloned()
+    let root = tbl.rs_crate_roots.iter().find(|r| src_rel.starts_with(&format!("{r}/")))?;
+    tbl.mod_to_rel.get(&format!("{root}/{imp}")).cloned()
 }
 
 fn resolve_import(
-    imp: &str,
-    src_rel: &str,
-    src_dir: &str,
-    src_ext: &str,
-    tbl: &LookupTables,
+    imp: &str, src_rel: &str, src_dir: &str, src_ext: &str, tbl: &LookupTables,
 ) -> Vec<String> {
-    if let Some(hit) = resolve_relative_import(imp, src_dir, tbl) {
+    if let Some(hit) = resolve_relative_import(imp, src_dir, tbl) { return vec![hit]; }
+    if src_ext == "py" && imp.starts_with('.') && let Some(hit) = resolve_pyrel(imp, src_dir, tbl) {
         return vec![hit];
     }
-    if src_ext == "py"
-        && imp.starts_with('.')
-        && let Some(hit) = resolve_pyrel(imp, src_dir, tbl)
-    {
-        return vec![hit];
-    }
-    if let Some(hit) = resolve_ts_scope_import(imp, src_dir, tbl) {
-        return vec![hit];
-    }
-    if src_ext == "rs"
-        && let Some(hit) = resolve_rs_import(imp, src_rel, src_dir, tbl)
-    {
+    if let Some(hit) = resolve_ts_scope_import(imp, src_dir, tbl) { return vec![hit]; }
+    if src_ext == "rs" && let Some(hit) = resolve_rs_import(imp, src_rel, src_dir, tbl) {
         return vec![hit];
     }
     if src_ext == "go"
-        && let Some(files) = resolve_go_import(imp, tbl)
+        && let Some(files) = tbl.go_full_pkg_rels.get(imp)
+            .or_else(|| tbl.go_pkg_rels.get(imp.rsplit('/').next().unwrap_or(imp)))
     {
-        return files;
+        return files.clone();
     }
-    if let Some(hit) = tbl.mod_to_rel.get(imp) {
-        return vec![hit.clone()];
-    }
+    if let Some(hit) = tbl.mod_to_rel.get(imp) { return vec![hit.clone()]; }
     resolve_stem(imp, src_dir, src_ext, tbl)
 }
 
 fn resolve_pyrel(imp: &str, src_dir: &str, tbl: &LookupTables) -> Option<String> {
     let dots = imp.bytes().take_while(|&b| b == b'.').count();
     let mut parts: Vec<&str> = src_dir.split('/').filter(|s| !s.is_empty()).collect();
-    for _ in 1..dots {
-        parts.pop();
-    }
+    for _ in 1..dots { parts.pop(); }
     parts.extend(imp[dots..].split('.').filter(|s| !s.is_empty()));
     tbl.mod_to_rel.get(&parts.join(".")).cloned()
 }
 
 fn resolve_stem(imp: &str, src_dir: &str, src_ext: &str, tbl: &LookupTables) -> Vec<String> {
     let key = imp.strip_prefix("super::").unwrap_or(imp);
-    let Some(cands) = tbl.stem_to_rels.get(key) else {
-        return Vec::new();
-    };
-
-    if !imp.starts_with("super::")
-        && let Some(same) = cands.iter().find(|c| dir_of(c) == src_dir)
-    {
+    let Some(cands) = tbl.stem_to_rels.get(key) else { return Vec::new() };
+    if !imp.starts_with("super::") && let Some(same) = cands.iter().find(|c| dir_of(c) == src_dir) {
         return vec![same.clone()];
     }
-
-    let matches: Vec<&String> = cands
-        .iter()
-        .filter(|c| same_family(src_ext, &ext_of(c)))
-        .collect();
+    let matches: Vec<&String> = cands.iter().filter(|c| same_family(src_ext, &ext_of(c))).collect();
     if matches.len() == 1 { vec![matches[0].clone()] } else { Vec::new() }
 }
 

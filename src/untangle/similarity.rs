@@ -39,17 +39,11 @@ const SEED_FB: u64 = 0xbf58_476d_1ce4_e5b9;
 const SEED_L2: u64 = 0x94d0_49bb_1331_11eb;
 
 #[derive(Clone, Copy)]
-struct LineFeat {
-    norm_hash: u64,
-    valid: bool,
-}
+struct LineFeat { norm_hash: u64, valid: bool }
 
 fn build_log2_lut() -> [f32; 256] {
     let mut lut = [0.0f32; 256];
-    for (i, slot) in lut.iter_mut().enumerate().skip(1) {
-        let f = i as f32;
-        *slot = f * f.log2();
-    }
+    for (i, slot) in lut.iter_mut().enumerate().skip(1) { *slot = (i as f32) * (i as f32).log2(); }
     lut
 }
 
@@ -64,61 +58,34 @@ fn is_clone_keyword(tok: &[u8]) -> bool {
 }
 
 #[inline]
-fn is_ignored_line_prefix(trimmed: &[u8]) -> bool {
-    trimmed.len() < 12
-        || trimmed.starts_with(b"//")
-        || trimmed.starts_with(b"#")
-        || trimmed.starts_with(b"/*")
-        || trimmed.starts_with(b"* ")
-        || trimmed.starts_with(b"import ")
-        || trimmed.starts_with(b"from ")
-        || trimmed.starts_with(b"use ")
-        || trimmed.starts_with(b"package ")
+fn is_ignored_line_prefix(t: &[u8]) -> bool {
+    t.len() < 12 || [
+        b"//".as_slice(), b"#", b"/*", b"* ", b"import ", b"from ", b"use ", b"package ",
+    ].iter().any(|p| t.starts_with(p))
 }
 
 fn shannon_entropy(bytes: &[u8], lut: &[f32; 256]) -> f32 {
     let mut counts = [0u16; 128];
-    for &byte in bytes {
-        counts[(byte & 0x7f) as usize] += 1;
-    }
-    let mut sum_c_log_c = 0.0f32;
-    for &count in &counts {
-        if count > 0 {
-            sum_c_log_c += lut[(count as usize).min(255)];
-        }
-    }
-    let total = bytes.len();
-    let total_f = total as f32;
-    let n_log_n = if total < 256 { lut[total] } else { total_f * total_f.log2() };
-    (n_log_n - sum_c_log_c) / total_f
+    for &b in bytes { counts[(b & 0x7f) as usize] += 1; }
+    let sum_c: f32 = counts.iter().filter(|&&c| c > 0).map(|&c| lut[(c as usize).min(255)]).sum();
+    let (n, nf) = (bytes.len(), bytes.len() as f32);
+    let n_log_n = if n < 256 { lut[n] } else { nf * nf.log2() };
+    (n_log_n - sum_c) / nf
 }
 
 struct AlphaRenamer {
-    hash: u64,
-    var_slot: u32,
-    local_map: [(u64, u32); 16],
-    local_len: usize,
-    distinct_toks: u16,
-    op_count: u16,
+    hash: u64, var_slot: u32, local_map: [(u64, u32); 16], local_len: usize,
+    distinct_toks: u16, op_count: u16,
 }
 
 impl AlphaRenamer {
     fn new() -> Self {
-        Self {
-            hash: 0x99u64,
-            var_slot: 0,
-            local_map: [(0, 0); 16],
-            local_len: 0,
-            distinct_toks: 0,
-            op_count: 0,
-        }
+        Self { hash: 0x99, var_slot: 0, local_map: [(0, 0); 16], local_len: 0, distinct_toks: 0, op_count: 0 }
     }
 
     fn intern_var(&mut self, tok_hash: u64) -> u32 {
-        for &(key, val) in &self.local_map[..self.local_len] {
-            if key == tok_hash {
-                return val;
-            }
+        if let Some(&(_, v)) = self.local_map[..self.local_len].iter().find(|&&(k, _)| k == tok_hash) {
+            return v;
         }
         let id = self.var_slot;
         self.var_slot += 1;
@@ -132,21 +99,17 @@ impl AlphaRenamer {
 
     fn feed_ident(&mut self, tok: &[u8]) {
         if is_clone_keyword(tok) {
-            let kh = rapid_hash64(tok, 0x11);
-            self.hash = rapid_hash_u64(kh, self.hash);
+            self.hash = rapid_hash_u64(rapid_hash64(tok, 0x11), self.hash);
             self.distinct_toks += 1;
             return;
         }
         let id = self.intern_var(rapid_hash64(tok, 0x77));
-        self.hash = rapid_hash_u64(0x1000_0000u64 | (id as u64), self.hash);
+        self.hash = rapid_hash_u64(0x1000_0000 | (id as u64), self.hash);
     }
 
     fn feed_symbol(&mut self, byte: u8) {
-        self.hash = rapid_hash_u64(0x3000_0000u64 | (byte as u64), self.hash);
-        if matches!(
-            byte,
-            b'+' | b'-' | b'*' | b'/' | b'^' | b'|' | b'&' | b'=' | b'<' | b'>' | b'?' | b'(' | b'.'
-        ) {
+        self.hash = rapid_hash_u64(0x3000_0000 | (byte as u64), self.hash);
+        if matches!(byte, b'+' | b'-' | b'*' | b'/' | b'^' | b'|' | b'&' | b'=' | b'<' | b'>' | b'?' | b'(' | b'.') {
             self.op_count += 1;
         }
     }
@@ -157,114 +120,65 @@ fn scan_line_type2(raw: &[u8], lut: &[f32; 256]) -> LineFeat {
     if is_ignored_line_prefix(bytes) || shannon_entropy(bytes, lut) < 2.75 {
         return LineFeat { norm_hash: 0, valid: false };
     }
-
-    let mut scanner = AlphaRenamer::new();
-    let mut idx = 0usize;
+    let (mut scanner, mut idx) = (AlphaRenamer::new(), 0usize);
     while idx < bytes.len() {
         let byte = bytes[idx];
         if byte.is_ascii_whitespace() {
             idx += 1;
         } else if matches!(byte, b'"' | b'\'' | b'`') {
             idx = quoted_lit(bytes, idx, byte != b'`', false).0;
-            scanner.hash = rapid_hash_u64(0x2000_0001u64, scanner.hash);
+            scanner.hash = rapid_hash_u64(0x2000_0001, scanner.hash);
         } else if byte.is_ascii_alphabetic() || byte == b'_' {
             let start = idx;
-            while idx < bytes.len() && ident_byte(bytes[idx]) {
-                idx += 1;
-            }
+            while idx < bytes.len() && ident_byte(bytes[idx]) { idx += 1; }
             scanner.feed_ident(&bytes[start..idx]);
         } else if byte.is_ascii_digit() {
-            while idx < bytes.len() && ident_byte(bytes[idx]) {
-                idx += 1;
-            }
-            scanner.hash = rapid_hash_u64(0x2000_0000u64, scanner.hash);
+            while idx < bytes.len() && ident_byte(bytes[idx]) { idx += 1; }
+            scanner.hash = rapid_hash_u64(0x2000_0000, scanner.hash);
         } else {
             scanner.feed_symbol(byte);
             idx += 1;
         }
     }
-
-    LineFeat {
-        norm_hash: scanner.hash,
-        valid: scanner.distinct_toks >= 4 && scanner.op_count >= 2,
-    }
+    LineFeat { norm_hash: scanner.hash, valid: scanner.distinct_toks >= 4 && scanner.op_count >= 2 }
 }
 
 #[inline]
 fn kgram_hash(feats: &[LineFeat], i: usize) -> u64 {
-    let mut h = 0x1337u64;
-    h = rapid_hash_u64(feats[i].norm_hash, h);
-    h = rapid_hash_u64(feats[i + 1].norm_hash, h);
-    h = rapid_hash_u64(feats[i + 2].norm_hash, h);
-    rapid_hash_u64(feats[i + 3].norm_hash, h)
+    feats[i..i + 4].iter().fold(0x1337u64, |h, f| rapid_hash_u64(f.norm_hash, h))
 }
 
 #[inline]
-fn is_valid_kgram(feats: &[LineFeat], idx: usize) -> bool {
-    feats[idx].valid && feats[idx + 1].valid && feats[idx + 2].valid && feats[idx + 3].valid
-}
+fn is_valid_kgram(f: &[LineFeat], i: usize) -> bool { f[i..i + 4].iter().all(|x| x.valid) }
 
 #[inline]
-fn mark_boiler_window(boiler_mask: &mut [bool], pos: usize) {
-    boiler_mask[pos] = true;
-    boiler_mask[pos + 1] = true;
-    boiler_mask[pos + 2] = true;
-    boiler_mask[pos + 3] = true;
-}
+fn mark_boiler_window(mask: &mut [bool], pos: usize) { mask[pos..pos + 4].fill(true); }
 
-fn filter_boiler_kgrams(
-    raw_kgrams: &[(u64, u32)],
-    boiler_mask: &[bool],
-    out: &mut Vec<(u64, u32)>,
-) {
+fn filter_boiler_kgrams(raw: &[(u64, u32)], mask: &[bool], out: &mut Vec<(u64, u32)>) {
     out.clear();
-    for &(hash, pos) in raw_kgrams {
-        let idx = pos as usize;
-        if !(boiler_mask[idx]
-            || boiler_mask[idx + 1]
-            || boiler_mask[idx + 2]
-            || boiler_mask[idx + 3])
-        {
-            out.push((hash, pos));
-        }
-    }
+    out.extend(raw.iter().copied().filter(|&(_, p)| !mask[p as usize..p as usize + 4].iter().any(|&b| b)));
 }
 
 fn winnow_run(run: &[(u64, u32)], on_pick: &mut impl FnMut(u64, u32)) {
     if run.len() < 3 {
-        let mut best = run[0];
-        for &item in &run[1..] {
-            if item.0 <= best.0 {
-                best = item;
-            }
-        }
+        let best = run[1..].iter().copied().fold(run[0], |b, x| if x.0 <= b.0 { x } else { b });
         on_pick(best.0, best.1);
         return;
     }
     let mut last_picked = u32::MAX;
-    for win in 0..=run.len() - 3 {
-        let mut best = run[win];
-        if run[win + 1].0 <= best.0 {
-            best = run[win + 1];
-        }
-        if run[win + 2].0 <= best.0 {
-            best = run[win + 2];
-        }
-        if best.1 != last_picked {
-            last_picked = best.1;
-            on_pick(best.0, best.1);
-        }
+    for w in run.windows(3) {
+        let mut best = w[0];
+        if w[1].0 <= best.0 { best = w[1]; }
+        if w[2].0 <= best.0 { best = w[2]; }
+        if best.1 != last_picked { last_picked = best.1; on_pick(best.0, best.1); }
     }
 }
 
 fn winnow_contiguous(win_slice: &[(u64, u32)], mut on_pick: impl FnMut(u64, u32)) {
-    let n = win_slice.len();
-    let mut run_start = 0usize;
+    let (n, mut run_start) = (win_slice.len(), 0usize);
     while run_start < n {
         let mut run_end = run_start + 1;
-        while run_end < n && win_slice[run_end].1 == win_slice[run_end - 1].1 + 1 {
-            run_end += 1;
-        }
+        while run_end < n && win_slice[run_end].1 == win_slice[run_end - 1].1 + 1 { run_end += 1; }
         winnow_run(&win_slice[run_start..run_end], &mut on_pick);
         run_start = run_end;
     }
@@ -272,10 +186,7 @@ fn winnow_contiguous(win_slice: &[(u64, u32)], mut on_pick: impl FnMut(u64, u32)
 
 fn scan_bytes_feats(bytes: &[u8], lut: &[f32; 256], out: &mut Vec<LineFeat>) {
     out.clear();
-    for line in bytes.split(|&b| b == b'\n') {
-        let stripped = line.strip_suffix(b"\r").unwrap_or(line);
-        out.push(scan_line_type2(stripped, lut));
-    }
+    out.extend(bytes.split(|&b| b == b'\n').map(|l| scan_line_type2(l.strip_suffix(b"\r").unwrap_or(l), lut)));
 }
 
 fn extract_line(bytes: &[u8], line_idx: usize) -> String {
@@ -772,65 +683,40 @@ fn simhash64_idf(tok_weights: &[(u64, f32)]) -> u64 {
     let mut v = [0.0f32; 64];
     for &(h, w) in tok_weights {
         for (bit, acc) in v.iter_mut().enumerate() {
-            if (h & (1u64 << bit)) != 0 {
-                *acc += w;
-            } else {
-                *acc -= w;
-            }
+            *acc += if (h & (1u64 << bit)) != 0 { w } else { -w };
         }
     }
     let mut fp = 0u64;
     for (bit, &acc) in v.iter().enumerate() {
-        if acc > 0.0 {
-            fp |= 1u64 << bit;
-        }
+        if acc > 0.0 { fp |= 1u64 << bit; }
     }
     fp
 }
 
 fn weighted_jaccard(a: &[(u64, f32)], b: &[(u64, f32)]) -> f64 {
-    let (mut i, mut j) = (0usize, 0usize);
-    let (mut inter, mut uni) = (0.0f64, 0.0f64);
+    let (mut i, mut j, mut inter, mut uni) = (0usize, 0usize, 0.0f64, 0.0f64);
     while i < a.len() && j < b.len() {
-        if a[i].0 == b[j].0 {
-            inter += a[i].1.min(b[j].1) as f64;
-            uni += a[i].1.max(b[j].1) as f64;
-            i += 1;
-            j += 1;
-        } else if a[i].0 < b[j].0 {
-            uni += a[i].1 as f64;
-            i += 1;
-        } else {
-            uni += b[j].1 as f64;
-            j += 1;
+        match a[i].0.cmp(&b[j].0) {
+            std::cmp::Ordering::Equal => {
+                inter += a[i].1.min(b[j].1) as f64;
+                uni += a[i].1.max(b[j].1) as f64;
+                i += 1; j += 1;
+            }
+            std::cmp::Ordering::Less => { uni += a[i].1 as f64; i += 1; }
+            std::cmp::Ordering::Greater => { uni += b[j].1 as f64; j += 1; }
         }
     }
-    while i < a.len() {
-        uni += a[i].1 as f64;
-        i += 1;
-    }
-    while j < b.len() {
-        uni += b[j].1 as f64;
-        j += 1;
-    }
+    uni += a[i..].iter().map(|x| x.1 as f64).sum::<f64>() + b[j..].iter().map(|x| x.1 as f64).sum::<f64>();
     if uni > 0.0 { inter / uni } else { 0.0 }
 }
 
 fn extract_domain_token_hashes(body: &[u8], filter_syntax: bool) -> Vec<u64> {
-    let mut toks = Vec::with_capacity(24);
-    let mut stack_buf = [0u8; 64];
-    for raw in iter_idents(body) {
-        if raw.len() < 2 {
-            continue;
-        }
+    let (mut toks, mut stack_buf) = (Vec::with_capacity(24), [0u8; 64]);
+    for raw in iter_idents(body).filter(|r| r.len() >= 2) {
         let hash = if raw.len() <= stack_buf.len() {
-            for (dst, &src) in stack_buf[..raw.len()].iter_mut().zip(raw) {
-                *dst = src.to_ascii_lowercase();
-            }
+            for (dst, &src) in stack_buf[..raw.len()].iter_mut().zip(raw) { *dst = src.to_ascii_lowercase(); }
             let lower = &stack_buf[..raw.len()];
-            if filter_syntax && SYNTAX_STOP.contains(&lower) {
-                continue;
-            }
+            if filter_syntax && SYNTAX_STOP.contains(&lower) { continue; }
             rapid_hash64(lower, 0x333)
         } else {
             let owned: Vec<u8> = raw.iter().map(u8::to_ascii_lowercase).collect();
@@ -846,98 +732,54 @@ fn extract_domain_token_hashes(body: &[u8], filter_syntax: bool) -> Vec<u64> {
 type WeightedDocs = Vec<Vec<(u64, f32)>>;
 type SparseLshBands = FxHashMap<u16, SmallVec<[u32; 4]>>;
 
-fn build_weighted_docs_and_fps(
-    items: &[SimiItem<'_>],
-    filter_syntax: bool,
-) -> (WeightedDocs, Vec<u64>) {
+fn build_weighted_docs_and_fps(items: &[SimiItem<'_>], filter_syntax: bool) -> (WeightedDocs, Vec<u64>) {
     let n = items.len();
-    let mut tok_df: FxHashMap<u64, u32> =
-        FxHashMap::with_capacity_and_hasher(n * 8 + 64, Default::default());
+    let mut tok_df: FxHashMap<u64, u32> = FxHashMap::with_capacity_and_hasher(n * 8 + 64, Default::default());
     let mut raw_doc_toks = Vec::with_capacity(n);
     for item in items {
         let toks = extract_domain_token_hashes(item.body, filter_syntax);
-        for &h in &toks {
-            *tok_df.entry(h).or_insert(0) += 1;
-        }
+        for &h in &toks { *tok_df.entry(h).or_insert(0) += 1; }
         raw_doc_toks.push(toks);
     }
-
-    let df_stop_cap = (n / 10).max(8) as u32;
-    let n_f = (n as f64) + 1.0;
-    let mut doc_vecs = Vec::with_capacity(n);
-    let mut fps = Vec::with_capacity(n);
+    let (df_stop_cap, n_f) = ((n / 10).max(8) as u32, (n as f64) + 1.0);
+    let (mut doc_vecs, mut fps) = (Vec::with_capacity(n), Vec::with_capacity(n));
     for toks in raw_doc_toks {
-        let mut weighted = Vec::with_capacity(toks.len());
-        for hash in toks {
-            let df = tok_df.get(&hash).copied().unwrap_or(1);
-            if df <= df_stop_cap {
-                let idf = ((n_f / ((df as f64) + 1.0)).ln() + 1.0) as f32;
-                weighted.push((hash, idf));
-            }
-        }
-        let fp = if weighted.len() >= 3 { simhash64_idf(&weighted) } else { 0 };
-        fps.push(fp);
+        let weighted: Vec<(u64, f32)> = toks.into_iter().filter_map(|h| {
+            let df = tok_df.get(&h).copied().unwrap_or(1);
+            (df <= df_stop_cap).then(|| (h, ((n_f / ((df as f64) + 1.0)).ln() + 1.0) as f32))
+        }).collect();
+        fps.push(if weighted.len() >= 3 { simhash64_idf(&weighted) } else { 0 });
         doc_vecs.push(weighted);
     }
     (doc_vecs, fps)
 }
 
-fn collect_pairwise_candidates(fps: &[u64]) -> FxHashSet<(usize, usize)> {
-    let mut cands: FxHashSet<(usize, usize)> = FxHashSet::default();
-    for (lo, &fp_a) in fps.iter().enumerate() {
-        if fp_a == 0 {
-            continue;
-        }
-        for (hi, &fp_b) in fps.iter().enumerate().skip(lo + 1) {
-            if fp_b != 0 && (fp_a ^ fp_b).count_ones() <= HAMMING_MAX {
-                cands.insert((lo, hi));
-            }
-        }
-    }
-    cands
-}
-
-fn add_bucket_pairs(bucket: &[u32], fps: &[u64], cands: &mut FxHashSet<(usize, usize)>) {
-    for (i, &first_u32) in bucket.iter().enumerate() {
-        let first = first_u32 as usize;
-        for &other_u32 in &bucket[i + 1..] {
-            let other = other_u32 as usize;
-            let (lo, hi) = if first < other { (first, other) } else { (other, first) };
-            if (fps[lo] ^ fps[hi]).count_ones() <= HAMMING_MAX {
-                cands.insert((lo, hi));
-            }
-        }
-    }
-}
-
 fn collect_candidates(fps: &[u64]) -> (FxHashSet<(usize, usize)>, usize) {
+    let mut cands: FxHashSet<(usize, usize)> = FxHashSet::default();
     if fps.len() <= DIRECT_PAIRWISE_MAX {
-        return (collect_pairwise_candidates(fps), 0);
-    }
-
-    let mut bands: SparseLshBands =
-        FxHashMap::with_capacity_and_hasher(fps.len() * 4, Default::default());
-    for (idx, &fp) in fps.iter().enumerate() {
-        if fp == 0 {
-            continue;
+        for (lo, &a) in fps.iter().enumerate().filter(|&(_, &f)| f != 0) {
+            for (hi, &b) in fps.iter().enumerate().skip(lo + 1) {
+                if b != 0 && (a ^ b).count_ones() <= HAMMING_MAX { cands.insert((lo, hi)); }
+            }
         }
+        return (cands, 0);
+    }
+    let mut bands: SparseLshBands = FxHashMap::with_capacity_and_hasher(fps.len() * 4, Default::default());
+    for (idx, &fp) in fps.iter().enumerate().filter(|&(_, &f)| f != 0) {
         for band_idx in 0..N_BANDS {
             let key = ((fp.rotate_left((band_idx * 4) as u32)) & 0xff) as u16;
             bands.entry(((band_idx as u16) << 8) | key).or_default().push(idx as u32);
         }
     }
-
-    let mut cands: FxHashSet<(usize, usize)> = FxHashSet::default();
     let mut hot_capped = 0usize;
-    for bucket in bands.values() {
-        if bucket.len() < 2 {
-            continue;
+    for bucket in bands.values().filter(|b| b.len() >= 2) {
+        if bucket.len() > B_MAX { hot_capped += 1; continue; }
+        for (i, &u) in bucket.iter().enumerate() {
+            for &v in &bucket[i + 1..] {
+                let (lo, hi) = if u < v { (u as usize, v as usize) } else { (v as usize, u as usize) };
+                if (fps[lo] ^ fps[hi]).count_ones() <= HAMMING_MAX { cands.insert((lo, hi)); }
+            }
         }
-        if bucket.len() > B_MAX {
-            hot_capped += 1;
-            continue;
-        }
-        add_bucket_pairs(bucket, fps, &mut cands);
     }
     (cands, hot_capped)
 }
@@ -948,145 +790,88 @@ pub fn find_similar_items(items: &[SimiItem<'_>], filter_syntax: bool) -> SimiSt
     }
     let (doc_vecs, fps) = build_weighted_docs_and_fps(items, filter_syntax);
     let (lsh_cands, hot_buckets_capped) = collect_candidates(&fps);
-    let mut matches = Vec::new();
-    for &(lo, hi) in &lsh_cands {
+    let mut matches: Vec<SimiMatch> = lsh_cands.iter().filter_map(|&(lo, hi)| {
         let wj = weighted_jaccard(&doc_vecs[lo], &doc_vecs[hi]);
-        if wj < WEIGHTED_JACCARD_MIN {
-            continue;
-        }
-        if jaro_winkler(&items[lo].name, &items[hi].name) >= JARO_WINKLER_MIN
-            || wj >= STRONG_BODY_JACCARD
-        {
-            matches.push(SimiMatch { a: lo, b: hi });
-        }
-    }
+        let ok = wj >= WEIGHTED_JACCARD_MIN
+            && (jaro_winkler(&items[lo].name, &items[hi].name) >= JARO_WINKLER_MIN || wj >= STRONG_BODY_JACCARD);
+        ok.then_some(SimiMatch { a: lo, b: hi })
+    }).collect();
     matches.sort_by_key(|m| (m.a, m.b));
     SimiStats { matches, lsh_candidates: lsh_cands.len(), hot_buckets_capped }
 }
 
 fn split_ident_lower(s: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
+    let (mut tokens, mut cur) = (Vec::new(), String::new());
     for ch in s.chars() {
-        let camel = ch.is_ascii_uppercase()
-            && cur.chars().last().is_some_and(|c| c.is_ascii_lowercase());
+        let camel = ch.is_ascii_uppercase() && cur.chars().last().is_some_and(|c| c.is_ascii_lowercase());
         if !ch.is_ascii_alphanumeric() {
-            if !cur.is_empty() {
-                tokens.push(cur.to_ascii_lowercase());
-                cur.clear();
-            }
+            if !cur.is_empty() { tokens.push(cur.to_ascii_lowercase()); cur.clear(); }
         } else if camel {
             tokens.push(cur.to_ascii_lowercase());
             cur.clear();
             cur.push(ch);
-        } else {
-            cur.push(ch);
-        }
+        } else { cur.push(ch); }
     }
-    if !cur.is_empty() {
-        tokens.push(cur.to_ascii_lowercase());
-    }
+    if !cur.is_empty() { tokens.push(cur.to_ascii_lowercase()); }
     tokens
 }
 
 fn canonical_stem(rel: &str) -> String {
-    let p = Path::new(rel);
-    let stem = stem_of(p);
+    let (p, stem) = (Path::new(rel), stem_of(Path::new(rel)));
     if matches!(stem, "index" | "mod" | "lib" | "main")
         && let Some(dir) = p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str())
-    {
-        return dir.to_ascii_lowercase();
-    }
+    { return dir.to_ascii_lowercase(); }
     stem.to_ascii_lowercase()
 }
 
 fn infer_capability_label(files: &[String]) -> String {
     let mut counts: FxHashMap<String, usize> = FxHashMap::default();
     for rel in files {
-        let st = canonical_stem(rel);
-        for tok in split_ident_lower(&st) {
-            if tok.len() >= 2
-                && !tok.bytes().all(|b| b.is_ascii_digit())
+        for tok in split_ident_lower(&canonical_stem(rel)) {
+            if tok.len() >= 2 && !tok.bytes().all(|b| b.is_ascii_digit())
                 && !matches!(tok.as_str(), "v1" | "v2" | "v3")
-            {
-                *counts.entry(tok).or_insert(0) += 1;
-            }
+            { *counts.entry(tok).or_insert(0) += 1; }
         }
     }
-    counts
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-        .map(|(k, _)| k)
-        .unwrap_or_else(|| "shared_helper".to_string())
+    counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map_or_else(|| "shared_helper".into(), |(k, _)| k)
 }
 
 /// Discover duplicated capability/helper modules borrowing directly from preloaded `&[u8]`.
-pub fn find_capability_clusters(
-    source_rels: &[String],
-    preloaded: &BTreeMap<String, Vec<u8>>,
-) -> Vec<RoleCluster> {
-    if source_rels.len() < 2 {
-        return Vec::new();
-    }
-    let items: Vec<SimiItem<'_>> = source_rels
-        .iter()
-        .map(|rel| SimiItem {
-            name: Cow::Owned(canonical_stem(rel)),
-            body: preloaded.get(rel).map(Vec::as_slice).unwrap_or(&[]),
-        })
-        .collect();
-
+pub fn find_capability_clusters(source_rels: &[String], preloaded: &BTreeMap<String, Vec<u8>>) -> Vec<RoleCluster> {
+    if source_rels.len() < 2 { return Vec::new(); }
+    let items: Vec<SimiItem<'_>> = source_rels.iter().map(|rel| SimiItem {
+        name: Cow::Owned(canonical_stem(rel)),
+        body: preloaded.get(rel).map(Vec::as_slice).unwrap_or(&[]),
+    }).collect();
     let stats = find_similar_items(&items, true);
     tracing::debug!(
-        lsh_candidates = stats.lsh_candidates,
-        hot_buckets_capped = stats.hot_buckets_capped,
-        matches = stats.matches.len(),
-        "simiflow capability clustering complete"
+        lsh_candidates = stats.lsh_candidates, hot_buckets_capped = stats.hot_buckets_capped,
+        matches = stats.matches.len(), "simiflow capability clustering complete"
     );
-    if stats.matches.is_empty() {
-        return Vec::new();
-    }
+    if stats.matches.is_empty() { return Vec::new(); }
 
     let mut parent: Vec<usize> = (0..source_rels.len()).collect();
-    fn find_root(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
+    fn find_root(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x { p[x] = p[p[x]]; x = p[x]; }
         x
     }
     for m in &stats.matches {
         let (ra, rb) = (find_root(&mut parent, m.a), find_root(&mut parent, m.b));
-        if ra != rb {
-            parent[rb] = ra;
-        }
+        if ra != rb { parent[rb] = ra; }
     }
-
     let mut groups: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     for (i, rel) in source_rels.iter().enumerate() {
         groups.entry(find_root(&mut parent, i)).or_default().push(rel.clone());
     }
-
-    let mut clusters: Vec<RoleCluster> = groups
-        .into_values()
-        .filter(|g| g.len() >= 2)
-        .map(|mut files| {
-            files.sort();
-            let cap = infer_capability_label(&files);
-            RoleCluster {
-                recommendation: format!(
-                    "Detected {} structurally similar `{cap}` modules; consolidate into one canonical module",
-                    files.len()
-                ),
-                capability: cap,
-                files,
-            }
-        })
-        .collect();
+    let mut clusters: Vec<RoleCluster> = groups.into_values().filter(|g| g.len() >= 2).map(|mut files| {
+        files.sort();
+        let cap = infer_capability_label(&files);
+        let rec = format!("Detected {} structurally similar `{cap}` modules; consolidate into one canonical module", files.len());
+        RoleCluster { recommendation: rec, capability: cap, files }
+    }).collect();
     clusters.sort_by(|a, b| {
-        b.files
-            .len()
-            .cmp(&a.files.len())
+        b.files.len().cmp(&a.files.len())
             .then_with(|| a.capability.cmp(&b.capability))
             .then_with(|| a.files.cmp(&b.files))
     });

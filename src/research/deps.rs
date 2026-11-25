@@ -188,40 +188,26 @@ pub fn counterexample_keep_guard(crate_name: &str) -> Option<&'static str> {
 
 /// Classify a dependency and compute its SemVer hop plan over intermediate releases.
 pub fn plan_dep_hops(
-    eco: Ecosystem,
-    name: &str,
-    installed: &str,
-    releases: &[ReleaseNoteRef],
-    project_msrv_minor: u32,
+    eco: Ecosystem, name: &str, installed: &str, releases: &[ReleaseNoteRef], project_msrv_minor: u32,
 ) -> HopPlan {
     let installed_ver = parse_semver_lenient(installed);
-    let mut newer: Vec<(Version, &ReleaseNoteRef)> = releases
-        .iter()
-        .filter_map(|rel| {
-            let inst = installed_ver.as_ref()?;
-            let v = parse_semver_lenient(&rel.version)?;
-            (v > *inst).then_some((v, rel))
-        })
-        .collect();
+    let mut newer: Vec<(Version, &ReleaseNoteRef)> = releases.iter().filter_map(|rel| {
+        let (inst, v) = (installed_ver.as_ref()?, parse_semver_lenient(&rel.version)?);
+        (v > *inst).then_some((v, rel))
+    }).collect();
     newer.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut hops = Vec::with_capacity(newer.len());
-    let (mut breaking_count, mut security_count) = (0usize, 0usize);
+    let (mut hops, mut breaking_count, mut security_count) = (Vec::with_capacity(newer.len()), 0usize, 0usize);
     let mut prev_ver = installed_ver.clone();
     for (v, rel) in &newer {
         hops.push(rel.version.clone());
         let semver_break = prev_ver.as_ref().is_some_and(|p| {
             v.major > p.major || (v.major == 0 && p.major == 0 && v.minor > p.minor)
         });
-        if rel.breaking || semver_break {
-            breaking_count += 1;
-        }
-        if rel.security {
-            security_count += 1;
-        }
+        if rel.breaking || semver_break { breaking_count += 1; }
+        if rel.security { security_count += 1; }
         prev_ver = Some(v.clone());
     }
-
     let latest = hops.last().cloned().unwrap_or_else(|| installed.to_string());
     let keep_guard = (eco == Ecosystem::Cargo).then(|| counterexample_keep_guard(name)).flatten();
     let verdict = if eco == Ecosystem::Cargo {
@@ -239,17 +225,9 @@ pub fn plan_dep_hops(
     } else {
         ReuseVerdict::KeepUpToDate
     };
-
     HopPlan {
-        ecosystem: eco,
-        name: name.to_string(),
-        installed: installed.to_string(),
-        latest,
-        hops,
-        breaking_count,
-        security_count,
-        verdict,
-        keep_guard,
+        ecosystem: eco, name: name.to_string(), installed: installed.to_string(), latest,
+        hops, breaking_count, security_count, verdict, keep_guard,
     }
 }
 
@@ -267,16 +245,11 @@ fn read_bounded_utf8(reader: impl Read) -> Option<String> {
 pub fn extract_cargo_lock(reader: impl Read, direct_names: &FxHashSet<String>) -> Vec<LockedDep> {
     let Some(txt) = read_bounded_utf8(reader) else { return Vec::new() };
     let Ok(doc) = toml::from_str::<CargoLockDoc>(&txt) else { return Vec::new() };
-    doc.package
-        .into_iter()
+    doc.package.into_iter()
         .filter(|p| p.source.is_some() && !p.name.is_empty() && !p.version.is_empty())
         .map(|p| LockedDep {
-            ecosystem: Ecosystem::Cargo,
-            direct: direct_names.contains(p.name.as_str()),
-            name: p.name,
-            version: p.version,
-            marker: None,
-            integrity_verified: true,
+            ecosystem: Ecosystem::Cargo, direct: direct_names.contains(p.name.as_str()),
+            name: p.name, version: p.version, marker: None, integrity_verified: true,
         })
         .collect()
 }
@@ -285,32 +258,19 @@ pub fn extract_cargo_lock(reader: impl Read, direct_names: &FxHashSet<String>) -
 pub fn extract_uv_lock(reader: impl Read, direct_names: &FxHashSet<String>) -> Vec<LockedDep> {
     let Some(txt) = read_bounded_utf8(reader) else { return Vec::new() };
     let Ok(doc) = toml::from_str::<UvLockDoc>(&txt) else { return Vec::new() };
-    let mut markers: FxHashMap<String, String> = FxHashMap::default();
-    let mut pkgs = Vec::new();
-
+    let (mut markers, mut pkgs) = (FxHashMap::default(), Vec::new());
     for pkg in doc.package {
         for dep in pkg.dependencies {
-            if let Some(m) = dep.marker {
-                markers.entry(dep.name).or_insert(m);
-            }
+            if let Some(m) = dep.marker { markers.entry(dep.name).or_insert(m); }
         }
-        let is_virtual = pkg.source.as_ref().and_then(toml::Value::as_table).is_some_and(|t| {
-            t.contains_key("virtual") || t.contains_key("editable")
-        });
-        if !is_virtual && !pkg.name.is_empty() && !pkg.version.is_empty() {
-            pkgs.push((pkg.name, pkg.version));
-        }
+        let is_virt = pkg.source.as_ref().and_then(toml::Value::as_table)
+            .is_some_and(|t| t.contains_key("virtual") || t.contains_key("editable"));
+        if !is_virt && !pkg.name.is_empty() && !pkg.version.is_empty() { pkgs.push((pkg.name, pkg.version)); }
     }
-    pkgs.into_iter()
-        .map(|(name, version)| LockedDep {
-            ecosystem: Ecosystem::PyPi,
-            direct: direct_names.contains(name.as_str()),
-            marker: markers.get(&name).cloned(),
-            name,
-            version,
-            integrity_verified: true,
-        })
-        .collect()
+    pkgs.into_iter().map(|(name, version)| LockedDep {
+        ecosystem: Ecosystem::PyPi, direct: direct_names.contains(name.as_str()),
+        marker: markers.get(&name).cloned(), name, version, integrity_verified: true,
+    }).collect()
 }
 
 /// Stream-parse `pnpm-lock.yaml` v9 (`packages:` only; skips `snapshots:` and peer suffixes).
@@ -319,23 +279,17 @@ pub fn extract_pnpm_lock_v9(mut reader: impl BufRead) -> Vec<LockedDep> {
     enum Sec { Other, Importers, Packages, Snapshots }
 
     let (mut sec, mut in_deps) = (Sec::Other, false);
-    let mut direct: FxHashSet<String> = FxHashSet::default();
-    let mut raw_pkgs: Vec<(String, String)> = Vec::new();
-    let mut seen: FxHashSet<(String, String)> = FxHashSet::default();
+    let (mut direct, mut raw_pkgs, mut seen) = (FxHashSet::default(), Vec::new(), FxHashSet::default());
     let mut line = String::new();
-
     while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
         let raw = line.trim_end_matches(['\r', '\n']);
-        let indent = raw.bytes().take_while(|&b| b == b' ').count();
-        let trimmed = raw.trim();
+        let (indent, trimmed) = (raw.bytes().take_while(|&b| b == b' ').count(), raw.trim());
         if !trimmed.is_empty() && !trimmed.starts_with('#') {
             if indent == 0 {
                 in_deps = false;
                 sec = match trimmed {
-                    "importers:" => Sec::Importers,
-                    "packages:" => Sec::Packages,
-                    "snapshots:" => Sec::Snapshots,
-                    _ => Sec::Other,
+                    "importers:" => Sec::Importers, "packages:" => Sec::Packages,
+                    "snapshots:" => Sec::Snapshots, _ => Sec::Other,
                 };
             } else if sec == Sec::Importers && indent == 4 {
                 in_deps = trimmed == "dependencies:" || trimmed == "optionalDependencies:";
@@ -343,9 +297,7 @@ pub fn extract_pnpm_lock_v9(mut reader: impl BufRead) -> Vec<LockedDep> {
                 && let Some(k) = trimmed.strip_suffix(':')
             {
                 let pkg = k.trim().trim_matches(['\'', '"']);
-                if !pkg.is_empty() {
-                    direct.insert(pkg.to_string());
-                }
+                if !pkg.is_empty() { direct.insert(pkg.to_string()); }
             } else if sec == Sec::Packages && indent == 2
                 && let Some(k) = trimmed.strip_suffix(':')
                 && let Some((name, ver)) = split_pnpm_pkg_key(k)
@@ -356,18 +308,10 @@ pub fn extract_pnpm_lock_v9(mut reader: impl BufRead) -> Vec<LockedDep> {
         }
         line.clear();
     }
-
-    raw_pkgs
-        .into_iter()
-        .map(|(name, version)| LockedDep {
-            ecosystem: Ecosystem::Npm,
-            direct: direct.contains(&name),
-            name,
-            version,
-            marker: None,
-            integrity_verified: true,
-        })
-        .collect()
+    raw_pkgs.into_iter().map(|(name, version)| LockedDep {
+        ecosystem: Ecosystem::Npm, direct: direct.contains(&name),
+        name, version, marker: None, integrity_verified: true,
+    }).collect()
 }
 
 fn split_pnpm_pkg_key(raw_key: &str) -> Option<(String, String)> {
@@ -393,7 +337,6 @@ pub fn extract_go_mod_and_sum(mut go_mod: impl BufRead, go_sum: Option<impl BufR
             line.clear();
         }
     }
-
     let (mut out, mut in_req, mut line) = (Vec::new(), false, String::new());
     while go_mod.read_line(&mut line).is_ok_and(|n| n > 0) {
         let t = line.trim();
@@ -409,12 +352,8 @@ pub fn extract_go_mod_and_sum(mut go_mod: impl BufRead, go_sum: Option<impl BufR
             if let (Some(m), Some(v)) = (toks.next(), toks.next()) {
                 let verified = sum_hashes.is_empty() || sum_hashes.contains(&(m.to_string(), v.to_string()));
                 out.push(LockedDep {
-                    ecosystem: Ecosystem::Go,
-                    name: m.to_string(),
-                    version: v.to_string(),
-                    direct,
-                    marker: None,
-                    integrity_verified: verified,
+                    ecosystem: Ecosystem::Go, name: m.to_string(), version: v.to_string(),
+                    direct, marker: None, integrity_verified: verified,
                 });
             }
         }
@@ -423,12 +362,15 @@ pub fn extract_go_mod_and_sum(mut go_mod: impl BufRead, go_sum: Option<impl BufR
     out
 }
 
-/// Read project Rust MSRV minor version from `Cargo.toml` (`rust-version = "1.100"` -> `100`).
+/// Read project Rust MSRV minor version from `Cargo.toml` (`[package]` or `[workspace.package]`).
 pub fn project_msrv_minor(repo_root: &Path) -> u32 {
     let Ok(txt) = fs::read_to_string(repo_root.join("Cargo.toml")) else { return 100 };
     toml::from_str::<toml::Value>(&txt)
         .ok()
-        .and_then(|v| v.get("package")?.get("rust-version")?.as_str().and_then(parse_semver_lenient))
+        .and_then(|v| {
+            let pkg = v.get("package").or_else(|| v.get("workspace")?.get("package"))?;
+            pkg.get("rust-version")?.as_str().and_then(parse_semver_lenient)
+        })
         .map_or(100, |v| v.minor as u32)
 }
 
@@ -457,14 +399,14 @@ pub fn extract_repo_lockfiles(repo_root: &Path) -> Vec<LockedDep> {
     deps
 }
 
-/// Return up to 12 deduplicated direct external Cargo crate names for sparse-index lookup.
-pub fn direct_cargo_crates(repo_root: &Path) -> Vec<String> {
+/// Return up to 12 deduplicated direct external Cargo crate names from parsed lockfiles.
+pub fn direct_cargo_crates_from(locked: &[LockedDep]) -> Vec<String> {
     let mut seen = FxHashSet::default();
-    extract_repo_lockfiles(repo_root)
-        .into_iter()
-        .filter(|d| d.ecosystem == Ecosystem::Cargo && d.direct && seen.insert(d.name.clone()))
+    locked
+        .iter()
+        .filter(|d| d.ecosystem == Ecosystem::Cargo && d.direct && seen.insert(d.name.as_str()))
         .take(MAX_CRATES_INDEX_CRATES)
-        .map(|d| d.name)
+        .map(|d| d.name.clone())
         .collect()
 }
 
@@ -473,29 +415,19 @@ fn parse_sparse_index_versions(body: &str) -> Vec<String> {
     for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let Ok(row) = serde_json::from_str::<SparseIndexLine>(line) else { continue };
         let Ok(v) = Version::parse(&row.vers) else { continue };
-        if row.yanked || !v.pre.is_empty() {
-            continue;
-        }
+        if row.yanked || !v.pre.is_empty() { continue; }
         let bucket = (v.major, if v.major == 0 { v.minor } else { 0 });
-        buckets
-            .entry(bucket)
-            .and_modify(|cur| {
-                if v > *cur {
-                    *cur = v.clone();
-                }
-            })
-            .or_insert(v);
+        buckets.entry(bucket).and_modify(|cur| { if v > *cur { *cur = v.clone(); } }).or_insert(v);
     }
     buckets.into_values().map(|v| v.to_string()).collect()
 }
 
 fn versions_to_release_refs(versions: &[String]) -> Vec<ReleaseNoteRef> {
-    let mut parsed: Vec<(Version, &str)> =
-        versions.iter().filter_map(|s| Version::parse(s).ok().map(|v| (v, s.as_str()))).collect();
+    let mut parsed: Vec<(Version, &str)> = versions.iter()
+        .filter_map(|s| Version::parse(s).ok().map(|v| (v, s.as_str()))).collect();
     parsed.sort_by(|a, b| a.0.cmp(&b.0));
     parsed.dedup_by(|a, b| a.0 == b.0);
-    let mut out = Vec::with_capacity(parsed.len());
-    let mut prev: Option<&Version> = None;
+    let (mut out, mut prev) = (Vec::with_capacity(parsed.len()), None::<&Version>);
     for (v, raw) in &parsed {
         let breaking = prev.is_some_and(|p| v.major > p.major || (v.major == 0 && p.major == 0 && v.minor > p.minor));
         out.push(ReleaseNoteRef { version: (*raw).to_string(), breaking, security: false });
@@ -511,26 +443,13 @@ enum IndexFetchOutcome {
 }
 
 async fn fetch_single_crate_index(
-    client: &reqwest::Client,
-    base_url: &str,
-    name: &str,
-    prev_etag: Option<&str>,
+    client: &reqwest::Client, base_url: &str, name: &str, prev_etag: Option<&str>,
 ) -> IndexFetchOutcome {
     let rel = crates_index_rel_path(name);
-    if rel.is_empty() {
-        return IndexFetchOutcome::Failed;
-    }
+    if rel.is_empty() { return IndexFetchOutcome::Failed; }
     let mut req = client.get(format!("{}/{rel}", base_url.trim_end_matches('/'))).timeout(Duration::from_secs(5));
-    if let Some(tag) = prev_etag {
-        req = req.header(reqwest::header::IF_NONE_MATCH, tag);
-    }
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::debug!(crate_name = name, error = %err, "crates.io sparse index fetch failed");
-            return IndexFetchOutcome::Failed;
-        }
-    };
+    if let Some(tag) = prev_etag { req = req.header(reqwest::header::IF_NONE_MATCH, tag); }
+    let Ok(resp) = req.send().await else { return IndexFetchOutcome::Failed };
     let etag = resp.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_string);
     match resp.status().as_u16() {
         304 => IndexFetchOutcome::NotModified(etag),
@@ -538,58 +457,32 @@ async fn fetch_single_crate_index(
             let body = super::read_body_capped(resp, MAX_INDEX_BODY_BYTES).await;
             IndexFetchOutcome::Fresh { etag, versions: parse_sparse_index_versions(&body) }
         }
-        code => {
-            tracing::debug!(crate_name = name, status = code, "crates.io sparse index non-200");
-            IndexFetchOutcome::Failed
-        }
+        _ => IndexFetchOutcome::Failed,
     }
 }
 
-/// Fetch non-yanked crate versions with persistent ETag `304 Not Modified` cache
-/// at `.refit/cache/crates_index.zst` (24h TTL, <= 6 concurrent requests, 5s timeout, top 12 crates).
+/// Fetch non-yanked crate versions with persistent ETag `304 Not Modified` cache.
 pub async fn fetch_crates_io_releases(
-    client: &reqwest::Client,
-    base_url: &str,
-    cache_path: &Path,
-    crate_names: &[&str],
+    client: &reqwest::Client, base_url: &str, cache_path: &Path, crate_names: &[&str],
 ) -> FxHashMap<String, Vec<ReleaseNoteRef>> {
-    let mut cache = read_zstd::<CratesIndexCache>(cache_path).unwrap_or_default();
-    let now = now_ms();
-    let mut seen = FxHashSet::default();
-    let targets: Vec<String> = crate_names
-        .iter()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|k| !k.is_empty() && seen.insert(k.clone()))
-        .take(MAX_CRATES_INDEX_CRATES)
-        .collect();
-
-    let to_fetch: Vec<(String, Option<String>)> = targets
-        .iter()
-        .filter(|name| {
-            !cache.entries.get(*name).is_some_and(|e| now.saturating_sub(e.fetched_ms) < CRATES_INDEX_TTL_MS)
-        })
-        .map(|name| (name.clone(), cache.entries.get(name).and_then(|e| e.etag.clone())))
-        .collect();
+    let (mut cache, now, mut seen) = (read_zstd::<CratesIndexCache>(cache_path).unwrap_or_default(), now_ms(), FxHashSet::default());
+    let targets: Vec<String> = crate_names.iter().map(|s| s.trim().to_ascii_lowercase())
+        .filter(|k| !k.is_empty() && seen.insert(k.clone())).take(MAX_CRATES_INDEX_CRATES).collect();
+    let to_fetch: Vec<(String, Option<String>)> = targets.iter()
+        .filter(|n| !cache.entries.get(*n).is_some_and(|e| now.saturating_sub(e.fetched_ms) < CRATES_INDEX_TTL_MS))
+        .map(|n| (n.clone(), cache.entries.get(n).and_then(|e| e.etag.clone()))).collect();
 
     let mut dirty = false;
     if !to_fetch.is_empty() {
         let fetched: Vec<(String, IndexFetchOutcome)> = stream::iter(to_fetch)
-            .map(|(name, etag)| async move {
-                let res = fetch_single_crate_index(client, base_url, &name, etag.as_deref()).await;
-                (name, res)
-            })
-            .buffer_unordered(MAX_CRATES_INDEX_CONCURRENCY)
-            .collect()
-            .await;
-
+            .map(|(n, etag)| async move { (n.clone(), fetch_single_crate_index(client, base_url, &n, etag.as_deref()).await) })
+            .buffer_unordered(MAX_CRATES_INDEX_CONCURRENCY).collect().await;
         for (name, outcome) in fetched {
             match outcome {
                 IndexFetchOutcome::NotModified(new_etag) => {
                     if let Some(entry) = cache.entries.get_mut(&name) {
                         entry.fetched_ms = now;
-                        if new_etag.is_some() {
-                            entry.etag = new_etag;
-                        }
+                        if new_etag.is_some() { entry.etag = new_etag; }
                         dirty = true;
                     }
                 }
@@ -601,18 +494,12 @@ pub async fn fetch_crates_io_releases(
             }
         }
     }
-
     if dirty {
-        if let Some(parent) = cache_path.parent() {
-            ensure_cachedir_tag(parent);
-        }
+        if let Some(parent) = cache_path.parent() { ensure_cachedir_tag(parent); }
         let _ = write_zstd(cache_path, &cache);
     }
-
-    targets
-        .into_iter()
-        .filter_map(|name| cache.entries.get(&name).map(|e| (name, versions_to_release_refs(&e.versions))))
-        .collect()
+    targets.into_iter()
+        .filter_map(|n| cache.entries.get(&n).map(|e| (n, versions_to_release_refs(&e.versions)))).collect()
 }
 
 fn format_changelog_query(dep: &LockedDep, plan: &HopPlan) -> String {
@@ -623,12 +510,8 @@ fn format_changelog_query(dep: &LockedDep, plan: &HopPlan) -> String {
     } else {
         format!(" latest={} hops={} brk={} sec={}", plan.latest, plan.hops.len(), plan.breaking_count, plan.security_count)
     };
-    format!(
-        "{} {} {}{marker}{sum}{hop} changelog breaking changes security advisories 2026",
-        plan.ecosystem.as_str(),
-        plan.name,
-        plan.installed
-    )
+    format!("{} {} {}{marker}{sum}{hop} changelog breaking changes security advisories 2026",
+        plan.ecosystem.as_str(), plan.name, plan.installed)
 }
 
 fn plan_manifest_fallback_queries(repo_root: &Path) -> Vec<String> {
@@ -642,92 +525,72 @@ fn plan_manifest_fallback_queries(repo_root: &Path) -> Vec<String> {
     for &(file, tpl) in SPECS {
         let Ok(txt) = fs::read_to_string(repo_root.join(file)) else { continue };
         for dep in parse_deps(file, &txt).into_iter().filter(|d| !d.is_local).take(4) {
-            let query = tpl.replace("{p}", &dep.package);
-            if seen.insert(query.clone()) {
-                queries.push(query);
-                if queries.len() >= 6 {
-                    return queries;
-                }
+            let q = tpl.replace("{p}", &dep.package);
+            if seen.insert(q.clone()) {
+                queries.push(q);
+                if queries.len() >= 6 { return queries; }
             }
         }
     }
     queries
 }
 
-/// Evaluate lockfiles + sparse-index releases into BOTH structured `DepAdvisory` findings
-/// and prioritized changelog search queries (up to 8).
+/// Evaluate lockfiles + sparse-index releases into `DepAdvisory` findings and changelog search queries.
 pub fn evaluate_repo_deps(
-    repo_root: &Path,
-    releases_by_crate: &FxHashMap<String, Vec<ReleaseNoteRef>>,
+    repo_root: &Path, releases_by_crate: &FxHashMap<String, Vec<ReleaseNoteRef>>,
+) -> (Vec<DepAdvisory>, Vec<String>) {
+    let locked = extract_repo_lockfiles(repo_root);
+    evaluate_repo_deps_from(repo_root, &locked, releases_by_crate)
+}
+
+pub fn evaluate_repo_deps_from(
+    repo_root: &Path, locked: &[LockedDep], releases_by_crate: &FxHashMap<String, Vec<ReleaseNoteRef>>,
 ) -> (Vec<DepAdvisory>, Vec<String>) {
     let msrv_minor = project_msrv_minor(repo_root);
-    let locked = extract_repo_lockfiles(repo_root);
     let (mut advisories, mut seen_adv) = (Vec::new(), FxHashSet::default());
     let (mut queries, mut seen_q) = (Vec::new(), BTreeSet::new());
 
     for dep in locked.iter().filter(|d| d.direct || rustsec_unmaintained(&d.name).is_some()) {
         let rels = releases_by_crate.get(&dep.name.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or(&[]);
         let plan = plan_dep_hops(dep.ecosystem, &dep.name, &dep.version, rels, msrv_minor);
-
         let adv = match plan.verdict {
             ReuseVerdict::ReplaceWithStd { since_minor, replacement } => Some((
-                "std_replacement",
-                format!("Replace with {replacement} (stabilized in Rust 1.{since_minor})"),
-                None,
+                "std_replacement", format!("Replace with {replacement} (stabilized in Rust 1.{since_minor})"), None,
             )),
             ReuseVerdict::ReplaceUnmaintained { advisory, replacement } => Some((
-                "rustsec_unmaintained",
-                format!("{advisory}: replace unmaintained crate with {replacement}"),
-                Some(format!(
-                    "{} {} {} {advisory} unmaintained canonical replacement {replacement} migration 2026",
-                    plan.ecosystem.as_str(),
-                    plan.name,
-                    plan.installed
-                )),
+                "rustsec_unmaintained", format!("{advisory}: replace unmaintained crate with {replacement}"),
+                Some(format!("{} {} {} {advisory} unmaintained canonical replacement {replacement} migration 2026",
+                    plan.ecosystem.as_str(), plan.name, plan.installed)),
             )),
             ReuseVerdict::UpgradeWithChangelog => Some((
                 "major_upgrade_hops",
                 if plan.breaking_count > 0 {
                     format!("Upgrade across {} breaking hop(s) to {}", plan.breaking_count, plan.latest)
-                } else {
-                    format!("Upgrade to {}", plan.latest)
-                },
+                } else { format!("Upgrade to {}", plan.latest) },
                 Some(format_changelog_query(dep, &plan)),
             )),
             ReuseVerdict::KeepUpToDate => {
                 if queries.len() < 8 {
                     let q = format_changelog_query(dep, &plan);
-                    if seen_q.insert(q.clone()) {
-                        queries.push(q);
-                    }
+                    if seen_q.insert(q.clone()) { queries.push(q); }
                 }
                 None
             }
         };
-
         if let Some((kind, recommendation, opt_q)) = adv {
             if seen_adv.insert((plan.ecosystem, plan.name.clone(), plan.installed.clone(), kind)) {
                 advisories.push(DepAdvisory {
-                    ecosystem: plan.ecosystem.as_str().to_string(),
-                    name: plan.name.clone(),
+                    ecosystem: plan.ecosystem.as_str().to_string(), name: plan.name.clone(),
                     installed: plan.installed.clone(),
                     latest: (plan.latest != plan.installed).then(|| plan.latest.clone()),
-                    kind: kind.to_string(),
-                    recommendation,
-                    hops: plan.hops.clone(),
-                    breaking_hops: plan.breaking_count,
-                    keep_guard: plan.keep_guard.map(String::from),
+                    kind: kind.to_string(), recommendation, hops: plan.hops.clone(),
+                    breaking_hops: plan.breaking_count, keep_guard: plan.keep_guard.map(String::from),
                 });
             }
-            if let Some(q) = opt_q && queries.len() < 8 && seen_q.insert(q.clone()) {
-                queries.push(q);
-            }
+            if let Some(q) = opt_q && queries.len() < 8 && seen_q.insert(q.clone()) { queries.push(q); }
         }
     }
-
-    if queries.is_empty() && locked.is_empty() {
-        queries = plan_manifest_fallback_queries(repo_root);
-    }
+    if queries.is_empty() && locked.is_empty() { queries = plan_manifest_fallback_queries(repo_root); }
     (advisories, queries)
 }
 

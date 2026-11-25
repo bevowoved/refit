@@ -604,13 +604,34 @@ mod tests {
         (dir, store)
     }
 
+    fn prep_entry(
+        path: &str, old_b3: String, new_b3: String, created: bool, deleted: bool,
+    ) -> WalFileEntry {
+        WalFileEntry { path: path.into(), old_blake3: old_b3, new_blake3: new_b3, created, deleted }
+    }
+
+    fn write_prep(store: &MvccStore, tx_id: &str, module_id: &str, files: Vec<WalFileEntry>) {
+        store.append_wal(&WalRecord::Prepared {
+            tx_id: tx_id.into(), module_id: module_id.into(), ts_ms: now_ms(), files,
+        }).unwrap();
+    }
+
+    fn append_raw_wal(path: &Path, bytes: &[u8]) {
+        let mut f = OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
     #[test]
     fn test_mvcc_cas_recovery_and_rollback() {
         let (dir, store) = open_repo("mvcc_cas", "cas-probe", &[("mod_a.py", MOD_A)]);
         let real_hash = dir.hash("mod_a.py");
         let next = "def f() -> int:\n    return 2\n";
 
-        match store.commit_tx("mod_a", &map1("mod_a.py", "deadbeef".into()), &map1("mod_a.py", next.as_bytes().to_vec()), &[]).unwrap() {
+        let res = store.commit_tx(
+            "mod_a", &map1("mod_a.py", "deadbeef".into()),
+            &map1("mod_a.py", next.as_bytes().to_vec()), &[],
+        ).unwrap();
+        match res {
             CommitOutcome::CasConflict { path, expected, actual } => {
                 assert_eq!((path.as_str(), expected.as_str(), actual), ("mod_a.py", "deadbeef", real_hash));
             }
@@ -622,51 +643,44 @@ mod tests {
         assert_eq!(rev, 1);
 
         let torn = b"def f() -> int:\n    return 999_TORN\n";
-        let entry = WalFileEntry {
-            path: "mod_a.py".into(), old_blake3: h1.clone(),
-            new_blake3: store.store_cas(torn).unwrap(), created: false, deleted: false,
-        };
-        store.append_wal(&WalRecord::Prepared {
-            tx_id: "tx-crash-sim".into(), module_id: "mod_a".into(), ts_ms: now_ms(), files: vec![entry],
-        }).unwrap();
-        let mut opts = OpenOptions::new();
-        let mut wal_f = opts.append(true).open(&store.wal_path).unwrap();
-        wal_f.write_all(b"{\"kind\":\"committed\",\"tx_id\":\"trunca").unwrap();
+        let entry = prep_entry("mod_a.py", h1.clone(), store.store_cas(torn).unwrap(), false, false);
+        write_prep(&store, "tx-crash-sim", "mod_a", vec![entry]);
+        append_raw_wal(&store.wal_path, b"{\"kind\":\"committed\",\"tx_id\":\"trunca");
         dir.write("mod_a.py", torn);
 
         let rep = store.recover_wal().unwrap();
         assert_eq!((rep.rolled_back_txs, rep.head_rev), (1, 1));
-        assert_eq!((dir.read("mod_a.py").as_str(), rep.committed_modules["mod_a"]["mod_a.py"].as_str()), (next, h1.as_str()));
+        assert_eq!(dir.read("mod_a.py").as_str(), next);
+        assert_eq!(rep.committed_modules["mod_a"]["mod_a.py"].as_str(), h1.as_str());
 
         fs::create_dir_all(dir.join("z_dir")).unwrap();
-        let bad_io = BTreeMap::from([("mod_a.py".into(), b"A = 999\n".to_vec()), ("z_dir".into(), b"impossible".to_vec())]);
+        let bad_io = BTreeMap::from([
+            ("mod_a.py".into(), b"A = 999\n".to_vec()),
+            ("z_dir".into(), b"impossible".to_vec()),
+        ]);
         assert!(store.commit_tx("scc_pair", &map1("mod_a.py", h1), &bad_io, &[]).is_err());
         assert_eq!(dir.read("mod_a.py"), next);
-        let tl = MvccStore::wal_timeline(dir.path()).unwrap();
-        assert!(tl.iter().any(|e| e.state == "ROLLED_BACK"));
+        assert!(MvccStore::wal_timeline(dir.path()).unwrap().iter().any(|e| e.state == "ROLLED_BACK"));
     }
 
     #[test]
     fn test_mvcc_parallel_commits() {
         let (dir, raw) = open_repo("mvcc_par", "conc-probe", &[]);
         let store = Arc::new(raw);
-        for i in 0..8 {
-            dir.write(&format!("m{i}.py"), format!("X = {i}\n"));
-        }
-
+        for i in 0..8 { dir.write(&format!("m{i}.py"), format!("X = {i}\n")); }
         std::thread::scope(|s| {
             for i in 0..8 {
                 let (st, root) = (store.clone(), dir.path().to_path_buf());
                 s.spawn(move || {
-                    let _ = commit_file(&st, &root, &format!("m{i}"), &format!("m{i}.py"), format!("X = {}\n", i + 100));
+                    let _ = commit_file(
+                        &st, &root, &format!("m{i}"), &format!("m{i}.py"),
+                        format!("X = {}\n", i + 100),
+                    );
                 });
             }
         });
-
         assert_eq!(store.head_rev(), 8);
-        for i in 0..8 {
-            assert_eq!(dir.read(&format!("m{i}.py")), format!("X = {}\n", i + 100));
-        }
+        for i in 0..8 { assert_eq!(dir.read(&format!("m{i}.py")), format!("X = {}\n", i + 100)); }
     }
 
     #[test]
@@ -701,7 +715,10 @@ mod tests {
     #[test]
     fn test_mvcc_create_delete_and_gc() {
         let (dir, s1) = open_repo("mvcc_gc", "r1", &[("old.py", "OLD = 1\n")]);
-        let r1 = s1.commit_tx("split", &map1("old.py", dir.hash("old.py")), &map1("new_mod.py", b"NEW = 2\n".to_vec()), &["old.py".into()]).unwrap();
+        let r1 = s1.commit_tx(
+            "split", &map1("old.py", dir.hash("old.py")),
+            &map1("new_mod.py", b"NEW = 2\n".to_vec()), &["old.py".into()],
+        ).unwrap();
         assert!(matches!(r1, CommitOutcome::Committed { head_rev: 1, .. }));
         assert!(!dir.has("old.py") && dir.has("new_mod.py"));
 
@@ -713,285 +730,159 @@ mod tests {
 
     #[test]
     fn wal_crash_points_7_of_7() {
-        // 0. RFC 3720 Castagnoli CRC32C verification (slice-by-8 across short and long buffers).
-        assert_eq!(wal::crc32c(b"123456789"), 0xE306_9283);
-        assert_eq!(wal::crc32c(b""), 0x0000_0000);
+        // 0. RFC 3720 Castagnoli CRC32C verification across short & long buffers.
+        assert_eq!((wal::crc32c(b"123456789"), wal::crc32c(b"")), (0xE306_9283, 0));
         let long_buf: Vec<u8> = (0..137u8).collect();
-        let expected_long = {
-            let mut crc = 0xFFFF_FFFFu32;
-            for &b in &long_buf {
-                crc ^= b as u32;
-                for _ in 0..8 {
-                    crc = if (crc & 1) != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
-                }
-            }
-            !crc
-        };
-        assert_eq!(wal::crc32c(&long_buf), expected_long);
+        let ref_crc = !long_buf.iter().fold(0xFFFF_FFFFu32, |mut c, &b| {
+            c ^= b as u32;
+            for _ in 0..8 { c = if (c & 1) != 0 { (c >> 1) ^ 0x82F6_3B78 } else { c >> 1 }; }
+            c
+        });
+        assert_eq!(wal::crc32c(&long_buf), ref_crc);
 
         // CP-1: Crash after store_cas writes blobs, before Prepared WAL append.
         {
-            let (dir, store) = open_repo("cp1_cas_only", "cp1", &[("a.rs", "pub fn v() -> i32 { 1 }\n")]);
-            let pre_hash = dir.hash("a.rs");
-            let _orphan = store.store_cas(b"pub fn v() -> i32 { 2 }\n").unwrap();
-            let rec = store.recover_wal().unwrap();
-            assert_eq!((rec.rolled_back_txs, rec.head_rev), (0, 0));
-            assert_eq!(dir.hash("a.rs"), pre_hash);
-            assert!(store.gc_cas(1).unwrap() >= 1);
+            let (dir, st) = open_repo("cp1_cas", "cp1", &[("a.rs", "pub fn v() -> i32 { 1 }\n")]);
+            let pre = dir.hash("a.rs");
+            let _ = st.store_cas(b"pub fn v() -> i32 { 2 }\n").unwrap();
+            let rec = st.recover_wal().unwrap();
+            assert_eq!((rec.rolled_back_txs, rec.head_rev, dir.hash("a.rs")), (0, 0, pre));
+            assert!(st.gc_cas(1).unwrap() >= 1);
         }
 
-        // CP-2: Crash mid-write of Prepared record (truncated partial tail) + all-zero EOF sentinel.
+        // CP-2: Crash mid-write of Prepared record + all-zero EOF sentinel.
         {
-            let (dir, store) = open_repo("cp2_torn_prep", "cp2", &[("a.rs", "pub fn v() -> i32 { 1 }\n")]);
-            let pre_hash = dir.hash("a.rs");
+            let (dir, st) = open_repo("cp2_torn", "cp2", &[("a.rs", "pub fn v() -> i32 { 1 }\n")]);
+            let pre = dir.hash("a.rs");
             let prep = WalRecord::Prepared {
-                tx_id: "tx-torn-prep".into(),
-                module_id: "a".into(),
-                ts_ms: now_ms(),
-                files: vec![],
+                tx_id: "tx-torn".into(), module_id: "a".into(), ts_ms: now_ms(), files: vec![],
             };
-            let raw_frame = wal::encode_wal_frame(2, serde_json::to_string(&prep).unwrap().as_bytes()).unwrap();
-            {
-                let mut f = OpenOptions::new().append(true).open(&store.wal_path).unwrap();
-                f.write_all(&raw_frame[..13]).unwrap();
-            }
-            let rec = store.recover_wal().unwrap();
-            assert_eq!((rec.rolled_back_txs, rec.head_rev), (0, 0));
-            assert_eq!(dir.hash("a.rs"), pre_hash);
-            // All-zero EOF sentinel auto-truncates cleanly.
-            {
-                let mut f = OpenOptions::new().append(true).open(&store.wal_path).unwrap();
-                f.write_all(&[0u8; 64]).unwrap();
-            }
-            let rec_z = store.recover_wal().unwrap();
-            assert_eq!(rec_z.rolled_back_txs, 0);
-            // Subsequent commit heals cleanly and advances head_rev.
-            let (rev, _, _) = commit_file(&store, dir.path(), "a", "a.rs", "pub fn v() -> i32 { 2 }\n");
-            assert_eq!(rev, 1);
+            let raw = wal::encode_wal_frame(2, serde_json::to_string(&prep).unwrap().as_bytes()).unwrap();
+            append_raw_wal(&st.wal_path, &raw[..13]);
+            let rec = st.recover_wal().unwrap();
+            assert_eq!((rec.rolled_back_txs, rec.head_rev, dir.hash("a.rs")), (0, 0, pre));
+            append_raw_wal(&st.wal_path, &[0u8; 64]);
+            assert_eq!(st.recover_wal().unwrap().rolled_back_txs, 0);
+            assert_eq!(commit_file(&st, dir.path(), "a", "a.rs", "pub fn v() -> i32 { 2 }\n").0, 1);
         }
 
         // CP-3: Crash after Prepared fsynced, before apply_io mutates any file.
         {
-            let (dir, store) = open_repo("cp3_prep_only", "cp3", &[("a.rs", "let x = 1;\n")]);
-            let h_old = store.store_cas(b"let x = 1;\n").unwrap();
-            let h_new = store.store_cas(b"let x = 2;\n").unwrap();
-            store.append_wal(&WalRecord::Prepared {
-                tx_id: "tx-cp3".into(),
-                module_id: "a".into(),
-                ts_ms: now_ms(),
-                files: vec![WalFileEntry {
-                    path: "a.rs".into(),
-                    old_blake3: h_old.clone(),
-                    new_blake3: h_new,
-                    created: false,
-                    deleted: false,
-                }],
-            }).unwrap();
-            let rec = store.recover_wal().unwrap();
-            assert_eq!((rec.rolled_back_txs, rec.head_rev), (1, 0));
-            assert_eq!(dir.hash("a.rs"), h_old);
+            let (dir, st) = open_repo("cp3_prep", "cp3", &[("a.rs", "let x = 1;\n")]);
+            let h_old = st.store_cas(b"let x = 1;\n").unwrap();
+            let h_new = st.store_cas(b"let x = 2;\n").unwrap();
+            write_prep(&st, "tx-cp3", "a", vec![prep_entry("a.rs", h_old.clone(), h_new, false, false)]);
+            let rec = st.recover_wal().unwrap();
+            assert_eq!((rec.rolled_back_txs, rec.head_rev, dir.hash("a.rs")), (1, 0, h_old));
         }
 
         // CP-4: Crash mid-apply_io in a 4-file batch (2 edits + 1 create + 1 delete).
         {
-            let (dir, store) = open_repo(
-                "cp4_mid_batch",
-                "cp4",
+            let (dir, st) = open_repo(
+                "cp4_batch", "cp4",
                 &[("e1.rs", "E1 = 1\n"), ("e2.rs", "E2 = 1\n"), ("del.rs", "DEL = 1\n")],
             );
-            let h_e1 = store.store_cas(b"E1 = 1\n").unwrap();
-            let h_e2 = store.store_cas(b"E2 = 1\n").unwrap();
-            let h_del = store.store_cas(b"DEL = 1\n").unwrap();
-            let h_empty = store.store_cas(b"").unwrap();
-            let h_new = store.store_cas(b"NEW = 2\n").unwrap();
-            store.append_wal(&WalRecord::Prepared {
-                tx_id: "tx-cp4".into(),
-                module_id: "batch4".into(),
-                ts_ms: now_ms(),
-                files: vec![
-                    WalFileEntry { path: "e1.rs".into(), old_blake3: h_e1.clone(), new_blake3: h_new.clone(), created: false, deleted: false },
-                    WalFileEntry { path: "e2.rs".into(), old_blake3: h_e2.clone(), new_blake3: h_new.clone(), created: false, deleted: false },
-                    WalFileEntry { path: "created.rs".into(), old_blake3: h_empty.clone(), new_blake3: h_new, created: true, deleted: false },
-                    WalFileEntry { path: "del.rs".into(), old_blake3: h_del.clone(), new_blake3: h_empty, created: false, deleted: true },
-                ],
-            }).unwrap();
-            // Simulate partial disk mutation: e1 written, created written, e2 & del untouched.
+            let (h1, h2) = (st.store_cas(b"E1 = 1\n").unwrap(), st.store_cas(b"E2 = 1\n").unwrap());
+            let (hd, he) = (st.store_cas(b"DEL = 1\n").unwrap(), st.store_cas(b"").unwrap());
+            let hn = st.store_cas(b"NEW = 2\n").unwrap();
+            write_prep(&st, "tx-cp4", "batch4", vec![
+                prep_entry("e1.rs", h1.clone(), hn.clone(), false, false),
+                prep_entry("e2.rs", h2.clone(), hn.clone(), false, false),
+                prep_entry("created.rs", he.clone(), hn, true, false),
+                prep_entry("del.rs", hd.clone(), he, false, true),
+            ]);
             dir.write("e1.rs", "E1 = CORRUPT\n");
             dir.write("created.rs", "CREATED = 99\n");
-
-            let rec = store.recover_wal().unwrap();
+            let rec = st.recover_wal().unwrap();
             assert_eq!((rec.rolled_back_txs, rec.head_rev), (1, 0));
-            assert_eq!(dir.hash("e1.rs"), h_e1);
-            assert_eq!(dir.hash("e2.rs"), h_e2);
-            assert_eq!(dir.hash("del.rs"), h_del);
+            assert_eq!((dir.hash("e1.rs"), dir.hash("e2.rs"), dir.hash("del.rs")), (h1, h2, hd));
             assert!(!dir.has("created.rs"));
         }
 
         // CP-5: Crash after ALL apply_io writes and deletes succeed, before Committed WAL append.
         {
-            let (dir, store) = open_repo("cp5_pre_commit", "cp5", &[("keep.rs", "K=1\n"), ("gone.rs", "G=1\n")]);
-            let h_k = store.store_cas(b"K=1\n").unwrap();
-            let h_g = store.store_cas(b"G=1\n").unwrap();
-            let h_e = store.store_cas(b"").unwrap();
-            store.append_wal(&WalRecord::Prepared {
-                tx_id: "tx-cp5".into(),
-                module_id: "m5".into(),
-                ts_ms: now_ms(),
-                files: vec![
-                    WalFileEntry { path: "keep.rs".into(), old_blake3: h_k.clone(), new_blake3: store.store_cas(b"K=2\n").unwrap(), created: false, deleted: false },
-                    WalFileEntry { path: "gone.rs".into(), old_blake3: h_g.clone(), new_blake3: h_e, created: false, deleted: true },
-                ],
-            }).unwrap();
+            let (dir, st) = open_repo("cp5_pre", "cp5", &[("keep.rs", "K=1\n"), ("gone.rs", "G=1\n")]);
+            let (hk, hg) = (st.store_cas(b"K=1\n").unwrap(), st.store_cas(b"G=1\n").unwrap());
+            let (he, hk2) = (st.store_cas(b"").unwrap(), st.store_cas(b"K=2\n").unwrap());
+            write_prep(&st, "tx-cp5", "m5", vec![
+                prep_entry("keep.rs", hk.clone(), hk2, false, false),
+                prep_entry("gone.rs", hg.clone(), he, false, true),
+            ]);
             dir.write("keep.rs", "K=2\n");
             fs::remove_file(dir.join("gone.rs")).unwrap();
-
-            let rec = store.recover_wal().unwrap();
-            assert_eq!((rec.rolled_back_txs, rec.head_rev), (1, 0));
-            assert_eq!(dir.hash("keep.rs"), h_k);
-            assert_eq!(dir.hash("gone.rs"), h_g);
+            let rec = st.recover_wal().unwrap();
+            assert_eq!((rec.rolled_back_txs, rec.head_rev, dir.hash("keep.rs"), dir.hash("gone.rs")), (1, 0, hk, hg));
         }
 
-        // CP-6: Crash mid-write of Committed record (truncated tail after Prepared + full disk writes).
+        // CP-6: Crash mid-write of Committed record (truncated tail after Prepared + disk writes).
         {
-            let (dir, store) = open_repo("cp6_torn_commit", "cp6", &[("m.rs", "M=1\n")]);
-            let h_old = store.store_cas(b"M=1\n").unwrap();
-            store.append_wal(&WalRecord::Prepared {
-                tx_id: "tx-cp6".into(),
-                module_id: "m6".into(),
-                ts_ms: now_ms(),
-                files: vec![WalFileEntry {
-                    path: "m.rs".into(),
-                    old_blake3: h_old.clone(),
-                    new_blake3: store.store_cas(b"M=2\n").unwrap(),
-                    created: false,
-                    deleted: false,
-                }],
-            }).unwrap();
+            let (dir, st) = open_repo("cp6_torn", "cp6", &[("m.rs", "M=1\n")]);
+            let h_old = st.store_cas(b"M=1\n").unwrap();
+            let h_new = st.store_cas(b"M=2\n").unwrap();
+            write_prep(&st, "tx-cp6", "m6", vec![prep_entry("m.rs", h_old.clone(), h_new, false, false)]);
             dir.write("m.rs", "M=2\n");
-            {
-                let mut f = OpenOptions::new().append(true).open(&store.wal_path).unwrap();
-                f.write_all(b"{\"kind\":\"committed\",\"tx_id\":\"tx-cp6\"").unwrap();
-            }
-            let rec = store.recover_wal().unwrap();
-            assert_eq!((rec.rolled_back_txs, rec.head_rev), (1, 0));
-            assert_eq!(dir.hash("m.rs"), h_old);
-            assert_eq!(commit_file(&store, dir.path(), "m6", "m.rs", "M=3\n").0, 1);
+            append_raw_wal(&st.wal_path, b"{\"kind\":\"committed\",\"tx_id\":\"tx-cp6\"");
+            let rec = st.recover_wal().unwrap();
+            assert_eq!((rec.rolled_back_txs, rec.head_rev, dir.hash("m.rs")), (1, 0, h_old));
+            assert_eq!(commit_file(&st, dir.path(), "m6", "m.rs", "M=3\n").0, 1);
         }
 
         // CP-7: Double-crash during recover_wal + leftover .refit.tmp.* files -> idempotent recovery.
         {
-            let (dir, store) = open_repo("cp7_double_crash", "cp7", &[("a.rs", "A=1\n"), ("b.rs", "B=1\n")]);
-            let h_a = store.store_cas(b"A=1\n").unwrap();
-            let h_b = store.store_cas(b"B=1\n").unwrap();
-            store.append_wal(&WalRecord::Prepared {
-                tx_id: "tx-cp7".into(),
-                module_id: "m7".into(),
-                ts_ms: now_ms(),
-                files: vec![
-                    WalFileEntry { path: "a.rs".into(), old_blake3: h_a.clone(), new_blake3: store.store_cas(b"A=2\n").unwrap(), created: false, deleted: false },
-                    WalFileEntry { path: "b.rs".into(), old_blake3: h_b.clone(), new_blake3: store.store_cas(b"B=2\n").unwrap(), created: false, deleted: false },
-                ],
-            }).unwrap();
-            // Simulate partial restore during crashed first recovery + leftover .refit.tmp.* files.
+            let (dir, st) = open_repo("cp7_dbl", "cp7", &[("a.rs", "A=1\n"), ("b.rs", "B=1\n")]);
+            let (ha, hb) = (st.store_cas(b"A=1\n").unwrap(), st.store_cas(b"B=1\n").unwrap());
+            let (ha2, hb2) = (st.store_cas(b"A=2\n").unwrap(), st.store_cas(b"B=2\n").unwrap());
+            write_prep(&st, "tx-cp7", "m7", vec![
+                prep_entry("a.rs", ha.clone(), ha2, false, false),
+                prep_entry("b.rs", hb.clone(), hb2, false, false),
+            ]);
             dir.write("a.rs", "A=1\n");
             dir.write("b.rs", "B=2\n");
             dir.write(".refit.tmp.99999.1.b.rs", "LEFTOVER");
-            fs::write(store.cas_dir.join(".refit.tmp.99999.2.blob"), b"LEFTOVER").unwrap();
-
-            let r1 = store.recover_wal().unwrap();
-            assert_eq!(r1.rolled_back_txs, 1);
-            assert_eq!((dir.hash("a.rs"), dir.hash("b.rs")), (h_a, h_b));
-            let r2 = store.recover_wal().unwrap();
-            assert_eq!(r2.rolled_back_txs, 0);
-            assert_eq!(commit_file(&store, dir.path(), "m7", "a.rs", "A=3\n").0, 1);
+            fs::write(st.cas_dir.join(".refit.tmp.99999.2.blob"), b"LEFTOVER").unwrap();
+            assert_eq!(st.recover_wal().unwrap().rolled_back_txs, 1);
+            assert_eq!((dir.hash("a.rs"), dir.hash("b.rs")), (ha, hb));
+            assert_eq!(st.recover_wal().unwrap().rolled_back_txs, 0);
+            assert_eq!(commit_file(&st, dir.path(), "m7", "a.rs", "A=3\n").0, 1);
         }
 
-        // Strict PM-V7 clean-halt vectors: mid-file 1-bit flip, line fusion, seq gap, missing/corrupt CAS, legacy upgrade.
+        // Strict PM-V7 clean-halt vectors: mid-file flip, line fusion, seq gap, legacy upgrade, bad CAS.
         {
-            let dir = TempRepo::new("pmv7_clean_halt");
+            let dir = TempRepo::new("pmv7_halt");
             let wal = dir.join("framed.wal");
             let r1 = serde_json::to_vec(&WalRecord::RunStart { run_id: "r".into(), ts_ms: 1, repo_root: ".".into() }).unwrap();
-            let r2 = serde_json::to_vec(&WalRecord::Rollback { tx_id: "t1".into(), module_id: "m".into(), gate: "g".into(), reason: "ok".into(), ts_ms: 2 }).unwrap();
-            let r3 = serde_json::to_vec(&WalRecord::Rollback { tx_id: "t2".into(), module_id: "m".into(), gate: "g".into(), reason: "ok".into(), ts_ms: 3 }).unwrap();
-            wal::append_framed_record(&wal, 1, &r1).unwrap();
-            wal::append_framed_record(&wal, 2, &r2).unwrap();
-            wal::append_framed_record(&wal, 3, &r3).unwrap();
+            let mk_rb = |id: &str, ts: u64| serde_json::to_vec(&WalRecord::Rollback {
+                tx_id: id.into(), module_id: "m".into(), gate: "g".into(), reason: "ok".into(), ts_ms: ts,
+            }).unwrap();
+            let (r2, r3) = (mk_rb("t1", 2), mk_rb("t2", 3));
+            for (seq, raw) in [(1, &r1), (2, &r2), (3, &r3)] { wal::append_framed_record(&wal, seq, raw).unwrap(); }
 
-            // Mid-file 1-bit flip -> Clean-Halt MidFileCorruption.
             let mut flipped = fs::read(&wal).unwrap();
             let mid = flipped.len() / 2;
             flipped[mid] ^= 0x01;
-            assert!(matches!(
-                wal::scan_wal_bytes(&flipped, &mut |_| {}),
-                Err(WalHaltError::MidFileCorruption(_))
-            ));
-
-            // Frame line fusion (truncated frame #2 directly glued to valid frame #3) -> Clean-Halt.
             let f1 = wal::encode_wal_frame(1, &r1).unwrap();
             let f2 = wal::encode_wal_frame(2, &r2).unwrap();
             let f3 = wal::encode_wal_frame(3, &r3).unwrap();
-            let mut fused = Vec::new();
-            fused.extend_from_slice(&f1);
-            fused.extend_from_slice(&f2[..f2.len() - 4]);
-            fused.extend_from_slice(&f3);
-            assert!(matches!(
-                wal::scan_wal_bytes(&fused, &mut |_| {}),
-                Err(WalHaltError::MidFileCorruption(_))
-            ));
-
-            // Monotonic sequence gap (1 -> 3) -> Clean-Halt.
-            let mut gapped = Vec::new();
-            gapped.extend_from_slice(&f1);
-            gapped.extend_from_slice(&f3);
-            assert!(matches!(
-                wal::scan_wal_bytes(&gapped, &mut |_| {}),
-                Err(WalHaltError::MidFileCorruption(_))
-            ));
-
-            // Legacy JSONL seamlessly upgraded to RFWL framed records.
-            let mut upgraded = Vec::new();
-            upgraded.extend_from_slice(&r1);
-            upgraded.push(b'\n');
-            upgraded.extend_from_slice(&f2);
-            upgraded.extend_from_slice(&f3);
+            let fused = [&f1[..], &f2[..f2.len() - 4], &f3[..]].concat();
+            let gapped = [&f1[..], &f3[..]].concat();
+            for bad in [&flipped, &fused, &gapped] {
+                assert!(matches!(wal::scan_wal_bytes(bad, &mut |_| {}), Err(WalHaltError::MidFileCorruption(_))));
+            }
+            let upgraded = [&r1[..], b"\n", &f2[..], &f3[..]].concat();
             let mut count = 0usize;
             let stats = wal::scan_wal_bytes(&upgraded, &mut |_| count += 1).unwrap();
             assert_eq!((count, stats.valid_records, stats.next_seq, stats.has_framed), (3, 3, 4, true));
         }
-
-        // Missing or corrupt pre-image CAS blob -> Clean-Halt UnrecoverableRollback (NEVER fake Rollback!).
         {
-            let (dir, store) = open_repo("pmv7_bad_cas", "cas", &[("lost.rs", "ORIG\n")]);
-            store.append_wal(&WalRecord::Prepared {
-                tx_id: "tx-missing-cas".into(),
-                module_id: "lost".into(),
-                ts_ms: now_ms(),
-                files: vec![WalFileEntry {
-                    path: "lost.rs".into(),
-                    old_blake3: "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000".into(),
-                    new_blake3: store.store_cas(b"NEW\n").unwrap(),
-                    created: false,
-                    deleted: false,
-                }],
-            }).unwrap();
-            let err = store.recover_wal().unwrap_err();
-            assert!(matches!(
-                err.downcast_ref::<WalHaltError>(),
-                Some(WalHaltError::UnrecoverableRollback(_))
-            ));
-            let tl = MvccStore::wal_timeline(dir.path()).unwrap();
-            assert!(tl.is_empty(), "must NEVER append fake Rollback on missing CAS: {tl:?}");
-
-            // Now place a corrupt CAS blob at the expected hash -> still Clean-Halt!
-            fs::write(
-                store.cas_dir.join("deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000"),
-                b"CORRUPTED_BYTES",
-            ).unwrap();
-            let err2 = store.recover_wal().unwrap_err();
-            assert!(matches!(
-                err2.downcast_ref::<WalHaltError>(),
-                Some(WalHaltError::UnrecoverableRollback(_))
-            ));
+            let (dir, st) = open_repo("pmv7_cas", "cas", &[("lost.rs", "ORIG\n")]);
+            let missing = "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000";
+            let hn = st.store_cas(b"NEW\n").unwrap();
+            write_prep(&st, "tx-miss", "lost", vec![prep_entry("lost.rs", missing.into(), hn, false, false)]);
+            let is_unrec = |e: anyhow::Error| matches!(e.downcast_ref::<WalHaltError>(), Some(WalHaltError::UnrecoverableRollback(_)));
+            assert!(is_unrec(st.recover_wal().unwrap_err()));
+            assert!(MvccStore::wal_timeline(dir.path()).unwrap().is_empty());
+            fs::write(st.cas_dir.join(missing), b"CORRUPTED_BYTES").unwrap();
+            assert!(is_unrec(st.recover_wal().unwrap_err()));
         }
     }
 }

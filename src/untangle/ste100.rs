@@ -365,9 +365,10 @@ pub fn normalize_clarity_verbs(text: &str) -> String {
 
 fn rewrite_plain_segment(segment: &str, out: &mut String) {
     let (bytes, mut cursor) = (segment.as_bytes(), 0usize);
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     for m in CLARITY_AC.find_iter(segment) {
-        let before_ok = m.start() == 0 || !bytes[m.start() - 1].is_ascii_alphabetic();
-        let after_ok = m.end() == bytes.len() || !bytes[m.end()].is_ascii_alphabetic();
+        let before_ok = m.start() == 0 || !is_word(bytes[m.start() - 1]);
+        let after_ok = m.end() == bytes.len() || !is_word(bytes[m.end()]);
         if !before_ok || !after_ok {
             continue;
         }

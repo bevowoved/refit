@@ -204,20 +204,13 @@ impl TaskStore {
         valid.then(|| self.dir.join(format!("{task_id}.json")))
     }
 
-    pub fn create(&self, tool: &str, initial_msg: Option<String>) -> Result<(TaskRecord, Arc<AtomicBool>)> {
+    pub fn create(&self, tool: &str, msg: Option<String>) -> Result<(TaskRecord, Arc<AtomicBool>)> {
         let ts = now_ms();
         let task_id = format!("task-{ts}-{}", TASK_SEQ.fetch_add(1, Ordering::Relaxed));
         let rec = TaskRecord {
-            task_id: task_id.clone(),
-            tool: tool.to_string(),
-            status: TaskState::Working,
-            created_ms: ts,
-            updated_ms: ts,
-            progress: Some(0.0),
-            status_message: initial_msg,
-            continuation_token: None,
-            result: None,
-            error: None,
+            task_id: task_id.clone(), tool: tool.to_string(), status: TaskState::Working,
+            created_ms: ts, updated_ms: ts, progress: Some(0.0), status_message: msg,
+            continuation_token: None, result: None, error: None,
         };
         self.save(&rec)?;
         let flag = Arc::new(AtomicBool::new(false));
@@ -226,19 +219,17 @@ impl TaskStore {
     }
 
     pub fn save(&self, rec: &TaskRecord) -> Result<()> {
-        let path = self.record_path(&rec.task_id).ok_or_else(|| anyhow::anyhow!("invalid taskId `{}`", rec.task_id))?;
+        let path = self.record_path(&rec.task_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid taskId `{}`", rec.task_id))?;
         ensure_cachedir_tag(&self.dir);
         write_atomic(&path, &serde_json::to_vec_pretty(rec).context("encode task record")?)
     }
 
     pub fn load(&self, task_id: &str) -> Option<TaskRecord> {
-        let raw = fs::read_to_string(self.record_path(task_id)?).ok()?;
-        serde_json::from_str(&raw).ok()
+        serde_json::from_str(&fs::read_to_string(self.record_path(task_id)?).ok()?).ok()
     }
 
-    pub fn clear_flag(&self, task_id: &str) {
-        self.cancel_flags.lock().remove(task_id);
-    }
+    pub fn clear_flag(&self, task_id: &str) { self.cancel_flags.lock().remove(task_id); }
 
     pub fn cancel(&self, task_id: &str) -> std::result::Result<TaskRecord, String> {
         let _guard = self.state_lock.lock();
@@ -256,12 +247,8 @@ impl TaskStore {
     }
 
     pub fn update(
-        &self,
-        task_id: &str,
-        next_status: Option<TaskState>,
-        progress: Option<f64>,
-        message: Option<String>,
-        continuation: Option<String>,
+        &self, task_id: &str, next_status: Option<TaskState>, progress: Option<f64>,
+        message: Option<String>, continuation: Option<String>,
     ) -> std::result::Result<TaskRecord, String> {
         let _guard = self.state_lock.lock();
         let mut rec = self.load(task_id).ok_or_else(|| format!("unknown taskId `{task_id}`"))?;
@@ -270,13 +257,11 @@ impl TaskStore {
         }
         if let Some(status) = next_status {
             rec.status = status;
-            if status.is_terminal() {
-                self.clear_flag(task_id);
-            }
+            if status.is_terminal() { self.clear_flag(task_id); }
         }
-        if let Some(prog) = progress { rec.progress = Some(prog.clamp(0.0, 1.0)); }
-        if let Some(msg) = message { rec.status_message = Some(msg); }
-        if let Some(tok) = continuation { rec.continuation_token = Some(tok); }
+        if let Some(p) = progress { rec.progress = Some(p.clamp(0.0, 1.0)); }
+        if let Some(m) = message { rec.status_message = Some(m); }
+        if let Some(t) = continuation { rec.continuation_token = Some(t); }
         rec.updated_ms = now_ms();
         self.save(&rec).map_err(|e| e.to_string())?;
         Ok(rec)
@@ -286,9 +271,7 @@ impl TaskStore {
         let _guard = self.state_lock.lock();
         self.clear_flag(task_id);
         let Some(mut rec) = self.load(task_id) else { return };
-        if rec.status.is_terminal() {
-            return;
-        }
+        if rec.status.is_terminal() { return; }
         rec.updated_ms = now_ms();
         match outcome {
             Ok(val) => { rec.status = TaskState::Completed; rec.progress = Some(1.0); rec.result = Some(val); }
@@ -545,35 +528,52 @@ fn snapshot_epoch_sync(tool: &str, args: &Value) -> (u64, u64) {
     (reg.global_epoch(), reg.slot_epoch(args["path"].as_str().unwrap_or(tool)))
 }
 
-async fn run_complete_tool_call(state: &Arc<McpV2State>, id: Option<Value>, name: String, args: Value) -> (StatusCode, Option<Value>) {
-    let gate = MemGate::global();
-    let Ok(mem_permit) = gate.try_admit(estimate_tool_bytes(&name).min(gate.capacity())) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Some(rpc_err(id.unwrap_or(Value::Null), ERR_OVERLOADED, "server busy: MemGate admission limit reached")));
-    };
-    let tool_for_ep = name.clone();
-    let args_for_ep = args.clone();
-    let payload = if name == "refit_search" {
-        let res = state.backend.dispatch_search(
-            args["language"].as_str().unwrap_or("Rust").to_string(),
-            args["capability"].as_str().unwrap_or("rate limiter").to_string(),
-        ).await;
-        drop(mem_permit);
-        res
-    } else if name == "refit_audit"
+async fn dispatch_tool(
+    backend: &Arc<dyn McpBackend>,
+    name: String,
+    args: Value,
+    cancel: Option<&AtomicBool>,
+) -> std::result::Result<Value, String> {
+    if name == "refit_search" {
+        let lang = args["language"].as_str().unwrap_or("Rust").to_string();
+        let cap = args["capability"].as_str().unwrap_or("rate limiter").to_string();
+        return Ok(backend.dispatch_search(lang, cap).await);
+    }
+    if name == "refit_audit"
         && args["research"].as_bool().unwrap_or(false)
-        && let Some(fut) = state.backend.dispatch_audit_research(args.clone())
+        && let Some(fut) = backend.dispatch_audit_research(args.clone())
     {
-        let res = fut.await;
-        drop(mem_permit);
-        res
-    } else {
-        let _sem = state.backend.blocking_sem().acquire().await.ok();
-        let backend = state.backend.clone();
-        tokio::task::spawn_blocking(move || { let _held = mem_permit; backend.dispatch_sync(&name, &args) })
-            .await
-            .unwrap_or_else(|e| json!({"error": format!("mcp worker join error: {e}")}))
+        return Ok(fut.await);
+    }
+    let _sem = backend.blocking_sem().acquire().await.ok();
+    if cancel.is_some_and(|f| f.load(Ordering::Acquire)) {
+        return Err("cancelled before execution".into());
+    }
+    let b = backend.clone();
+    tokio::task::spawn_blocking(move || b.dispatch_sync(&name, &args))
+        .await
+        .map_err(|e| format!("task join error: {e}"))
+}
+
+async fn run_complete_tool_call(
+    state: &Arc<McpV2State>,
+    id: Option<Value>,
+    name: String,
+    args: Value,
+) -> (StatusCode, Option<Value>) {
+    let gate = MemGate::global();
+    let Ok(permit) = gate.try_admit(estimate_tool_bytes(&name).min(gate.capacity())) else {
+        let e = rpc_err(id.unwrap_or(Value::Null), ERR_OVERLOADED, "server busy: MemGate limit");
+        return (StatusCode::SERVICE_UNAVAILABLE, Some(e));
     };
-    let (epoch, slot_epoch) = snapshot_epoch_sync(&tool_for_ep, &args_for_ep);
+    let (tool_ep, args_ep) = (name.clone(), args.clone());
+    let payload = {
+        let _held = permit;
+        dispatch_tool(&state.backend, name, args, None)
+            .await
+            .unwrap_or_else(|e| json!({"error": e}))
+    };
+    let (epoch, slot_epoch) = snapshot_epoch_sync(&tool_ep, &args_ep);
     (StatusCode::OK, Some(wrap_complete_result(id, &payload, epoch, slot_epoch)))
 }
 
@@ -586,52 +586,39 @@ fn wrap_complete_result(id: Option<Value>, payload: &Value, epoch: u64, slot_epo
     }))
 }
 
-fn spawn_durable_task(state: &Arc<McpV2State>, id: Option<Value>, name: String, args: Value) -> (StatusCode, Option<Value>) {
+fn spawn_durable_task(
+    state: &Arc<McpV2State>,
+    id: Option<Value>,
+    name: String,
+    args: Value,
+) -> (StatusCode, Option<Value>) {
     let (epoch, _) = snapshot_epoch_sync(&name, &args);
     let gate = MemGate::global();
-    let Ok(mem_permit) = gate.try_admit(estimate_tool_bytes(&name).min(gate.capacity())) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Some(rpc_err(id.unwrap_or(Value::Null), ERR_OVERLOADED, "server busy: MemGate denied task admission")));
+    let Ok(permit) = gate.try_admit(estimate_tool_bytes(&name).min(gate.capacity())) else {
+        let e = rpc_err(id.unwrap_or(Value::Null), ERR_OVERLOADED, "server busy: MemGate denied");
+        return (StatusCode::SERVICE_UNAVAILABLE, Some(e));
     };
     let (record, cancel_flag) = match state.tasks.create(&name, Some("queued for execution".into())) {
         Ok(pair) => pair,
         Err(err) => {
-            drop(mem_permit);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Some(rpc_err(id.unwrap_or(Value::Null), -32603, err.to_string())));
+            drop(permit);
+            let e = rpc_err(id.unwrap_or(Value::Null), -32603, err.to_string());
+            return (StatusCode::INTERNAL_SERVER_ERROR, Some(e));
         }
     };
-    let (task_id, tasks_store, backend) = (record.task_id.clone(), state.tasks.clone(), state.backend.clone());
+    let (tid, store, backend) = (record.task_id.clone(), state.tasks.clone(), state.backend.clone());
     tokio::spawn(async move {
-        let _held = mem_permit;
+        let _held = permit;
         if cancel_flag.load(Ordering::Acquire) {
-            tasks_store.clear_flag(&task_id);
+            store.clear_flag(&tid);
             return;
         }
-        let outcome = if name == "refit_search" {
-            Ok(backend.dispatch_search(
-                args["language"].as_str().unwrap_or("Rust").to_string(),
-                args["capability"].as_str().unwrap_or("rate limiter").to_string(),
-            ).await)
-        } else if name == "refit_audit"
-            && args["research"].as_bool().unwrap_or(false)
-            && let Some(fut) = backend.dispatch_audit_research(args.clone())
-        {
-            Ok(fut.await)
-        } else {
-            let _sem = backend.blocking_sem().acquire().await.ok();
-            if cancel_flag.load(Ordering::Acquire) {
-                Err("cancelled before execution".into())
-            } else {
-                let b = backend.clone();
-                tokio::task::spawn_blocking(move || b.dispatch_sync(&name, &args))
-                    .await
-                    .map_err(|e| format!("task join error: {e}"))
-            }
-        };
+        let outcome = dispatch_tool(&backend, name, args, Some(&cancel_flag)).await;
         if cancel_flag.load(Ordering::Acquire) {
-            tasks_store.clear_flag(&task_id);
+            store.clear_flag(&tid);
             return;
         }
-        tasks_store.finish(&task_id, outcome);
+        store.finish(&tid, outcome);
     });
     (StatusCode::OK, Some(rpc_ok(id, json!({
         "resultType": "task", "taskId": record.task_id, "status": record.status,
@@ -643,12 +630,16 @@ fn task_id_param(params: &Value) -> &str {
     params["taskId"].as_str().or_else(|| params["task_id"].as_str()).unwrap_or("")
 }
 
+fn task_reply(id: Option<Value>, res: std::result::Result<TaskRecord, String>) -> Value {
+    match res {
+        Ok(rec) => rpc_ok(id, json!(rec)),
+        Err(msg) => rpc_err(id.unwrap_or(Value::Null), ERR_INVALID_PARAMS, msg),
+    }
+}
+
 fn handle_tasks_get(state: &Arc<McpV2State>, id: Option<Value>, params: &Value) -> Value {
     let tid = task_id_param(params);
-    match state.tasks.load(tid) {
-        Some(rec) => rpc_ok(id, json!(rec)),
-        None => rpc_err(id.unwrap_or(Value::Null), ERR_INVALID_PARAMS, format!("unknown taskId `{tid}`")),
-    }
+    task_reply(id, state.tasks.load(tid).ok_or_else(|| format!("unknown taskId `{tid}`")))
 }
 
 fn handle_tasks_update(state: &Arc<McpV2State>, id: Option<Value>, params: &Value) -> Value {
@@ -657,23 +648,18 @@ fn handle_tasks_update(state: &Arc<McpV2State>, id: Option<Value>, params: &Valu
         None => None,
         Some(v) => match serde_json::from_value::<TaskState>(v.clone()) {
             Ok(st) => Some(st),
-            Err(err) => return rpc_err(id.unwrap_or(Value::Null), ERR_INVALID_PARAMS, format!("invalid task status: {err}")),
+            Err(e) => return rpc_err(id.unwrap_or(Value::Null), ERR_INVALID_PARAMS, format!("invalid task status: {e}")),
         },
     };
     let progress = params.get("progress").and_then(Value::as_f64);
-    let message = params.get("statusMessage").or_else(|| params.get("status_message")).and_then(Value::as_str).map(String::from);
+    let msg = params.get("statusMessage").or_else(|| params.get("status_message"))
+        .and_then(Value::as_str).map(String::from);
     let cont = params.get("continuationToken").and_then(Value::as_str).map(String::from);
-    match state.tasks.update(tid, next_status, progress, message, cont) {
-        Ok(rec) => rpc_ok(id, json!(rec)),
-        Err(msg) => rpc_err(id.unwrap_or(Value::Null), ERR_INVALID_PARAMS, msg),
-    }
+    task_reply(id, state.tasks.update(tid, next_status, progress, msg, cont))
 }
 
 fn handle_tasks_cancel(state: &Arc<McpV2State>, id: Option<Value>, params: &Value) -> Value {
-    match state.tasks.cancel(task_id_param(params)) {
-        Ok(rec) => rpc_ok(id, json!(rec)),
-        Err(msg) => rpc_err(id.unwrap_or(Value::Null), ERR_INVALID_PARAMS, msg),
-    }
+    task_reply(id, state.tasks.cancel(task_id_param(params)))
 }
 
 fn json_response(status: StatusCode, body: Value, retry_after: bool) -> Response {
@@ -687,25 +673,31 @@ fn json_response(status: StatusCode, body: Value, retry_after: bool) -> Response
 }
 
 async fn handle_health() -> Response {
-    json_response(
-        StatusCode::OK,
-        json!({ "ok": true, "protocolVersion": PROTOCOL_V2, "stateless": true, "catalogDigest": catalog_digest() }),
-        false,
-    )
+    let body = json!({
+        "ok": true, "protocolVersion": PROTOCOL_V2,
+        "stateless": true, "catalogDigest": catalog_digest(),
+    });
+    json_response(StatusCode::OK, body, false)
 }
 
-async fn handle_http_mcp(State(state): State<Arc<McpV2State>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle_http_mcp(
+    State(state): State<Arc<McpV2State>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(err) => return json_response(StatusCode::BAD_REQUEST, rpc_err(Value::Null, ERR_PARSE, format!("Parse error: {err}")), false),
+        Err(err) => {
+            let e = rpc_err(Value::Null, ERR_PARSE, format!("Parse error: {err}"));
+            return json_response(StatusCode::BAD_REQUEST, e, false);
+        }
     };
     if parsed.is_array() {
         return json_response(StatusCode::BAD_REQUEST, batch_rejection_error(), false);
     }
     if let Err(detail) = validate_sep2243_headers(&headers, &parsed) {
-        let req_id = parsed.get("id").cloned().unwrap_or(Value::Null);
         let err_body = json!({
-            "jsonrpc": "2.0", "id": req_id,
+            "jsonrpc": "2.0", "id": parsed.get("id").cloned().unwrap_or(Value::Null),
             "error": {
                 "code": ERR_HEADER_MISMATCH,
                 "message": format!("HeaderMismatchError: {detail}"),

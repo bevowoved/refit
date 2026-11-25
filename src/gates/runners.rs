@@ -78,6 +78,12 @@ pub(super) fn run_fmt(
 #[derive(serde::Deserialize, Default)]
 struct CargoEditionDoc {
     package: Option<CargoEditionPkg>,
+    workspace: Option<CargoEditionWs>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CargoEditionWs {
+    package: Option<CargoEditionPkg>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -89,11 +95,11 @@ pub(super) fn rust_edition(stage_root: &Path) -> String {
     let Ok(src) = fs::read_to_string(stage_root.join("Cargo.toml")) else {
         return "2021".into();
     };
-    let found = toml::from_str::<CargoEditionDoc>(&src)
-        .ok()
-        .and_then(|d| d.package)
-        .and_then(|p| p.edition)
-        .and_then(|v| v.as_str().map(str::to_string));
+    let found = toml::from_str::<CargoEditionDoc>(&src).ok().and_then(|d| {
+        let pkg = d.package.as_ref().and_then(|p| p.edition.as_ref()).and_then(toml::Value::as_str);
+        let ws = d.workspace.as_ref().and_then(|w| w.package.as_ref()).and_then(|p| p.edition.as_ref()).and_then(toml::Value::as_str);
+        pkg.or(ws).map(str::to_string)
+    });
     found
         .filter(|e| matches!(e.as_str(), "2015" | "2018" | "2021" | "2024"))
         .unwrap_or_else(|| "2021".into())

@@ -89,36 +89,21 @@ struct SchedState {
 }
 
 pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
-    let wall_start = Instant::now();
-    let run_id = format!("refit-{}-{}", now_ms(), std::process::id());
-
-    let isolated_wt = opts
-        .worktree
-        .then(|| open_worktree(&opts.repo_root, &run_id, opts.include_dirty_worktree))
-        .transpose()?;
-    let active_repo = isolated_wt
-        .as_ref()
-        .map_or_else(|| opts.repo_root.clone(), |w| w.worktree_path.clone());
-
+    let (wall_start, run_id) = (Instant::now(), format!("refit-{}-{}", now_ms(), std::process::id()));
+    let isolated_wt = opts.worktree
+        .then(|| open_worktree(&opts.repo_root, &run_id, opts.include_dirty_worktree)).transpose()?;
+    let active_repo = isolated_wt.as_ref().map_or_else(|| opts.repo_root.clone(), |w| w.worktree_path.clone());
     let sys_prompt = read_prompt(&opts.skill_path);
-    let explicit_tok = std::env::var("REFIT_PROXY_TOKEN")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let explicit_tok = std::env::var("REFIT_PROXY_TOKEN").ok().filter(|s| !s.trim().is_empty());
     let client_tok = explicit_tok.clone().unwrap_or_else(|| "refit-local-proxy".into());
 
     let telemetry = TelemetryHub::open_hub(opts.telemetry_path.clone(), opts.resume)?;
     let proxy_cfg = ProxyConfig {
-        listen_addr: opts.proxy_addr.clone(),
-        upstream_base_url: opts.upstream_base_url.clone(),
-        api_key: opts.api_key.clone(),
-        model_override: opts.model.clone(),
-        ui_index_path: opts.ui_index_path.clone(),
-        static_prefix_override: Some(sys_prompt.clone()),
-        cache_retention: opts.cache_retention,
-        keep_warm: opts.keep_warm,
-        auth_token: explicit_tok,
-        lang_prefixes: prefix_map(&sys_prompt),
-        preserve_tools: opts.preserve_tools,
+        listen_addr: opts.proxy_addr.clone(), upstream_base_url: opts.upstream_base_url.clone(),
+        api_key: opts.api_key.clone(), model_override: opts.model.clone(),
+        ui_index_path: opts.ui_index_path.clone(), static_prefix_override: Some(sys_prompt.clone()),
+        cache_retention: opts.cache_retention, keep_warm: opts.keep_warm, auth_token: explicit_tok,
+        lang_prefixes: prefix_map(&sys_prompt), preserve_tools: opts.preserve_tools,
     };
     let (proxy_state, proxy_handle) = start_proxy(proxy_cfg, telemetry.clone()).await?;
     proxy_state.bind_repo(active_repo.clone());
@@ -132,7 +117,7 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
 
     let (committed_map, rolled_back) = if opts.resume {
         let rep = mvcc.recover_wal()?;
-        tracing::info!("WAL resume: rolled_back={} committed={} rev={}", rep.rolled_back_txs, rep.committed_modules.len(), rep.head_rev);
+        tracing::info!("WAL resume: rb={} ok={} rev={}", rep.rolled_back_txs, rep.committed_modules.len(), rep.head_rev);
         (rep.committed_modules, rep.rolled_back_txs)
     } else {
         (HashMap::new(), 0)
@@ -146,15 +131,10 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
     let research = WebClient::for_repo(&active_repo, Some(shared_state.clone()));
     let phase0_res = if research.is_online() {
         WebClient::format_snippets(&research.audit_deps(&active_repo).await)
-    } else {
-        String::new()
-    };
+    } else { String::new() };
 
-    let pool_max = crate::platform::budget().http_pool_max;
-    let client = stream_http("refit-runner/0.5.0", 15, 600, pool_max)?;
-    let (chat_url, chat_bearer, chat_model, via_oc) =
-        chat_endpoint(&client, &opts, &client_tok).await;
-
+    let client = stream_http("refit-runner/0.5.0", 15, 600, crate::platform::budget().http_pool_max)?;
+    let (chat_url, chat_bearer, chat_model, via_oc) = chat_endpoint(&client, &opts, &client_tok).await;
     let (rewind_index, file_to_unit) = if cfg!(any(feature = "live-rewind", test)) {
         build_rewind_index(&active_repo, &bundle, &gate_cfg)
     } else {
@@ -162,37 +142,18 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
     };
 
     let ctx = Arc::new(WorkerCtx {
-        run_id,
-        repo_root: active_repo.clone(),
-        client,
-        chat_url,
-        chat_bearer,
-        chat_model,
-        static_sys: sys_prompt,
-        baseline_diags: bundle.audit.per_file_diagnostics.clone(),
-        hygiene: hygiene.clone(),
-        gate_cfg: gate_cfg.clone(),
-        mvcc,
-        learn,
-        rewind_index: Arc::new(rewind_index),
-        file_to_unit: Arc::new(file_to_unit),
-        proxy: proxy_state,
-        shared_state,
-        research,
-        phase0_research: phase0_res,
-        telemetry: telemetry.clone(),
-        max_retries: opts.max_retries,
+        run_id, repo_root: active_repo.clone(), client, chat_url, chat_bearer, chat_model,
+        static_sys: sys_prompt, baseline_diags: bundle.audit.per_file_diagnostics.clone(),
+        hygiene: hygiene.clone(), gate_cfg: gate_cfg.clone(), mvcc, learn,
+        rewind_index: Arc::new(rewind_index), file_to_unit: Arc::new(file_to_unit),
+        proxy: proxy_state, shared_state, research, phase0_research: phase0_res,
+        telemetry: telemetry.clone(), max_retries: opts.max_retries,
     });
-
     emit_start(&ctx, &opts, &bundle, via_oc, rolled_back)?;
     let (pending, completed, skipped) = filter_pending(&ctx, &bundle, &opts, &committed_map);
-
-    let totals =
-        run_sched(ctx.clone(), &bundle.plan.units, pending, completed, skipped, &opts).await;
-    let fallback: Vec<String> =
-        bundle.plan.units.iter().flat_map(|u| u.files.clone()).collect();
+    let totals = run_sched(ctx.clone(), &bundle.plan.units, pending, completed, skipped, &opts).await;
+    let fallback: Vec<String> = bundle.plan.units.iter().flat_map(|u| u.files.clone()).collect();
     let audit_rel = final_files(&active_repo, fallback);
-
     let final_audit = if totals.committed == totals.skipped {
         bundle.audit.clone()
     } else {
@@ -201,24 +162,11 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
     hygiene.flush_cache();
 
     let bench = run_bench(&opts, &gate_cfg, &active_repo, &telemetry);
-    let summary = build_summary(
-        &ctx,
-        SummaryInput {
-            opts: &opts,
-            wall_start,
-            bundle: &bundle,
-            final_audit: &final_audit,
-            audit_rel: &audit_rel,
-            tot: totals,
-            bench,
-            wt: &isolated_wt,
-            via_oc,
-        },
-    );
-
-    if opts.hold_server_secs > 0 {
-        tokio::time::sleep(Duration::from_secs(opts.hold_server_secs)).await;
-    }
+    let summary = build_summary(&ctx, SummaryInput {
+        opts: &opts, wall_start, bundle: &bundle, final_audit: &final_audit,
+        audit_rel: &audit_rel, tot: totals, bench, wt: &isolated_wt, via_oc,
+    });
+    if opts.hold_server_secs > 0 { tokio::time::sleep(Duration::from_secs(opts.hold_server_secs)).await; }
     proxy_handle.abort();
     Ok(summary)
 }
@@ -263,19 +211,13 @@ fn emit_start(
 }
 
 fn filter_pending(
-    ctx: &WorkerCtx,
-    bundle: &ScanCache,
-    opts: &RunOptions,
+    ctx: &WorkerCtx, bundle: &ScanCache, opts: &RunOptions,
     committed: &HashMap<String, BTreeMap<String, String>>,
 ) -> (Vec<ModuleUnit>, HashSet<String>, usize) {
     let (plan, audit) = (&bundle.plan, &bundle.audit);
     let (mut pending, mut done, mut skipped) = (Vec::new(), HashSet::new(), 0usize);
-
     for u in &plan.units {
-        let has_diags = u
-            .files
-            .iter()
-            .any(|f| audit.per_file_diagnostics.get(f).is_some_and(|v| !v.is_empty()));
+        let has_diags = u.files.iter().any(|f| audit.per_file_diagnostics.get(f).is_some_and(|v| !v.is_empty()));
         if !has_diags && u.baseline_hygiene >= ctx.gate_cfg.min_hygiene_target {
             skipped += 1;
             done.insert(u.id.clone());
@@ -284,31 +226,21 @@ fn filter_pending(
         if opts.resume && resumed_ok(&ctx.repo_root, u, committed.get(&u.id)) {
             skipped += 1;
             done.insert(u.id.clone());
-            let data = json!({"skipped_resumed": true, "head_rev": ctx.mvcc.head_rev()});
-            ctx.telemetry.emit_unit("mvcc_commit", u, data);
+            ctx.telemetry.emit_unit("mvcc_commit", u, json!({"skipped_resumed": true, "head_rev": ctx.mvcc.head_rev()}));
             continue;
         }
         pending.push(u.clone());
     }
-
     let cp = critical_depths(&plan.units);
     pending.sort_by(|a, b| {
-        let da = cp.get(&a.id).copied().unwrap_or(0);
-        let db = cp.get(&b.id).copied().unwrap_or(0);
+        let (da, db) = (cp.get(&a.id).copied().unwrap_or(0), cp.get(&b.id).copied().unwrap_or(0));
         a.wave.cmp(&b.wave).then_with(|| db.cmp(&da)).then_with(|| a.id.cmp(&b.id))
     });
-
-    if let Some(lim) = opts.max_units
-        && pending.len() > lim
-    {
-        for dropped in pending.drain(lim..) {
-            done.insert(dropped.id);
-        }
+    if let Some(lim) = opts.max_units && pending.len() > lim {
+        for dropped in pending.drain(lim..) { done.insert(dropped.id); }
     }
     for u in &plan.units {
-        if !pending.iter().any(|p| p.id == u.id) {
-            done.insert(u.id.clone());
-        }
+        if !pending.iter().any(|p| p.id == u.id) { done.insert(u.id.clone()); }
     }
     (pending, done, skipped)
 }
@@ -316,48 +248,28 @@ fn filter_pending(
 fn resumed_ok(repo: &Path, u: &ModuleUnit, saved: Option<&BTreeMap<String, String>>) -> bool {
     let Some(hashes) = saved else { return false };
     u.files.iter().all(|rel| {
-        hashes.get(rel).is_some_and(|exp| {
-            MvccStore::hash_file(&repo.join(rel)).ok().is_some_and(|act| &act == exp)
-        })
+        hashes.get(rel).is_some_and(|exp| MvccStore::hash_file(&repo.join(rel)).ok().is_some_and(|a| &a == exp))
     })
 }
 
 async fn run_sched(
-    ctx: Arc<WorkerCtx>,
-    all_units: &[ModuleUnit],
-    pending: Vec<ModuleUnit>,
-    completed: HashSet<String>,
-    skipped: usize,
-    opts: &RunOptions,
+    ctx: Arc<WorkerCtx>, all_units: &[ModuleUnit], pending: Vec<ModuleUnit>,
+    completed: HashSet<String>, skipped: usize, opts: &RunOptions,
 ) -> RunTotals {
     let mut s = SchedState {
-        pending,
-        completed,
-        rewound_once: HashSet::new(),
-        in_flight: HashMap::new(),
-        task_map: HashMap::new(),
-        join_set: JoinSet::new(),
+        pending, completed, rewound_once: HashSet::new(), in_flight: HashMap::new(),
+        task_map: HashMap::new(), join_set: JoinSet::new(),
         tot: RunTotals { committed: skipped, skipped, ..Default::default() },
         k: opts.initial_k.clamp(2, opts.max_k.max(2)),
     };
-
     loop {
         ctx.shared_state.await_resume().await;
-        if ctx.shared_state.abort_asked() {
-            s.pending.clear();
-        }
-        if let Some(k_ov) = ctx.shared_state.k_override() {
-            s.k = k_ov.clamp(1, opts.max_k.max(2));
-        }
-
+        if ctx.shared_state.abort_asked() { s.pending.clear(); }
+        if let Some(k_ov) = ctx.shared_state.k_override() { s.k = k_ov.clamp(1, opts.max_k.max(2)); }
         drain_skipped(&ctx, &mut s);
         apply_rewind_events(&ctx, all_units, &mut s);
         spawn_ready(&ctx, all_units, &mut s);
-        if s.in_flight.is_empty() {
-            mark_blocked(&ctx, &mut s);
-            break;
-        }
-
+        if s.in_flight.is_empty() { mark_blocked(&ctx, &mut s); break; }
         match s.join_set.join_next().await {
             Some(Ok(out)) => apply_outcome(out, &ctx.shared_state, &mut s, opts.max_k),
             Some(Err(err)) => handle_panic(&ctx, err, &mut s),
@@ -374,43 +286,33 @@ async fn run_sched(
 }
 
 fn build_rewind_index(
-    repo_root: &Path,
-    bundle: &ScanCache,
-    gate_cfg: &GateConfig,
+    repo_root: &Path, bundle: &ScanCache, gate_cfg: &GateConfig,
 ) -> (InvertedRewindIndex, HashMap<String, String>) {
     let total_files: usize = bundle.plan.units.iter().map(|u| u.files.len()).sum();
     let mut file_to_unit = HashMap::with_capacity(total_files);
     let mut unit_files: HashMap<&str, &[String]> = HashMap::with_capacity(bundle.plan.units.len());
-    let mut dur_by_file: rustc_hash::FxHashMap<&str, Durability> =
-        rustc_hash::FxHashMap::with_capacity_and_hasher(total_files, Default::default());
+    let mut dur_by_file = rustc_hash::FxHashMap::with_capacity_and_hasher(total_files, Default::default());
 
     for unit in &bundle.plan.units {
         unit_files.insert(unit.id.as_str(), unit.files.as_slice());
-        let has_diags = unit
-            .files
-            .iter()
+        let has_diags = unit.files.iter()
             .any(|rel| bundle.audit.per_file_diagnostics.get(rel).is_some_and(|v| !v.is_empty()));
-        let durability = if !has_diags && unit.baseline_hygiene >= gate_cfg.min_hygiene_target {
+        let dur = if !has_diags && unit.baseline_hygiene >= gate_cfg.min_hygiene_target {
             Durability::High
         } else {
             Durability::Low
         };
         for rel in &unit.files {
             file_to_unit.insert(rel.clone(), unit.id.clone());
-            dur_by_file.insert(rel.as_str(), durability);
+            dur_by_file.insert(rel.as_str(), dur);
         }
     }
-
-    let snap = load_symbols(repo_root, None);
-    let mut index = InvertedRewindIndex::from_symbol_graph(&snap, &dur_by_file);
-
+    let mut index = InvertedRewindIndex::from_symbol_graph(&load_symbols(repo_root, None), &dur_by_file);
     for unit in &bundle.plan.units {
         let Some(src_file) = unit.files.first() else { continue };
         for dep_id in &unit.deps {
             if let Some(dep_files) = unit_files.get(dep_id.as_str()) {
-                for dep_file in *dep_files {
-                    index.add_dep_by_path(src_file, dep_file);
-                }
+                for dep_file in *dep_files { index.add_dep_by_path(src_file, dep_file); }
             }
         }
     }
@@ -418,16 +320,10 @@ fn build_rewind_index(
 }
 
 fn apply_rewind_events(ctx: &WorkerCtx, all_units: &[ModuleUnit], s: &mut SchedState) {
-    let events = ctx.shared_state.drain_rewind_events();
-    if events.is_empty() {
-        return;
-    }
-    for (_, flagged_units) in events {
+    for (_, flagged_units) in ctx.shared_state.drain_rewind_events() {
         for uid in flagged_units {
-            if s.rewound_once.contains(&uid)
-                || ctx.shared_state.is_skipped(&uid)
-                || s.in_flight.contains_key(&uid)
-                || s.pending.iter().any(|u| u.id == uid)
+            if s.rewound_once.contains(&uid) || ctx.shared_state.is_skipped(&uid)
+                || s.in_flight.contains_key(&uid) || s.pending.iter().any(|u| u.id == uid)
             {
                 continue;
             }
@@ -443,41 +339,28 @@ fn apply_rewind_events(ctx: &WorkerCtx, all_units: &[ModuleUnit], s: &mut SchedS
 fn drain_skipped(ctx: &WorkerCtx, s: &mut SchedState) {
     let mut skipped_now = Vec::new();
     s.pending.retain(|u| {
-        if ctx.shared_state.is_skipped(&u.id) {
-            skipped_now.push(u.id.clone());
-            false
-        } else {
-            true
-        }
+        if ctx.shared_state.is_skipped(&u.id) { skipped_now.push(u.id.clone()); false } else { true }
     });
-
     for sid in skipped_now {
         s.completed.insert(sid.clone());
         let data = json!({"reason": "live_steer_skip"});
-        ctx.telemetry.emit(
-            "unit_skipped",
-            EventSpec { module_id: Some(sid), data: Some(data), ..EventSpec::default() },
-        );
+        ctx.telemetry.emit("unit_skipped", EventSpec { module_id: Some(sid), data: Some(data), ..EventSpec::default() });
     }
 }
 
 fn spawn_ready(ctx: &Arc<WorkerCtx>, all_units: &[ModuleUnit], s: &mut SchedState) {
     while s.in_flight.len() < s.k {
         let ready = |c: &ModuleUnit| {
-            c.deps.iter().all(|d| s.completed.contains(d))
-                && !s.in_flight.values().any(|a| units_interfere(c, a))
+            c.deps.iter().all(|d| s.completed.contains(d)) && !s.in_flight.values().any(|a| units_interfere(c, a))
         };
-        let steered = ctx
-            .shared_state
+        let steered = ctx.shared_state
             .pop_ready(|pid| s.pending.iter().any(|c| c.id == pid && ready(c)))
             .and_then(|pid| s.pending.iter().position(|c| c.id == pid));
         let Some(idx) = steered.or_else(|| s.pending.iter().position(ready)) else { break };
-
         let unit = s.pending.remove(idx);
         let deps_abi = deps_context(&unit, all_units, &ctx.repo_root);
         s.in_flight.insert(unit.id.clone(), unit.clone());
         ctx.shared_state.step_inflight(1);
-
         let (ctx_c, u_map, k_cur) = (ctx.clone(), unit.clone(), s.k);
         let h = s.join_set.spawn(async move { run_unit(ctx_c, unit, deps_abi, k_cur).await });
         s.task_map.insert(h.id(), u_map);
@@ -486,12 +369,7 @@ fn spawn_ready(ctx: &Arc<WorkerCtx>, all_units: &[ModuleUnit], s: &mut SchedStat
 
 fn mark_blocked(ctx: &WorkerCtx, s: &mut SchedState) {
     for stuck in s.pending.drain(..) {
-        let unmet: Vec<String> = stuck
-            .deps
-            .iter()
-            .filter(|d| !s.completed.contains(*d))
-            .cloned()
-            .collect();
+        let unmet: Vec<String> = stuck.deps.iter().filter(|d| !s.completed.contains(*d)).cloned().collect();
         let reason = format!("unsatisfied_dependencies: {}", unmet.join(", "));
         ctx.shared_state.mark_blocked(&stuck.id, &reason);
         ctx.telemetry.emit_unit("unit_blocked", &stuck, json!({"reason": reason, "unmet_deps": unmet}));
@@ -503,10 +381,7 @@ fn apply_outcome(out: WorkerOutcome, state: &RunState, s: &mut SchedState, max_k
     s.task_map.retain(|_, u| u.id != out.unit.id);
     state.step_inflight(-1);
     s.completed.insert(out.unit.id);
-
-    if out.committed && !out.skipped_resumed {
-        s.tot.committed += 1;
-    }
+    if out.committed && !out.skipped_resumed { s.tot.committed += 1; }
     s.tot.cas_conflicts += out.cas_conflicts;
     s.tot.rollbacks_g0 += out.rollbacks_g0;
     s.tot.rollbacks_g1 += out.rollbacks_g1;
@@ -516,7 +391,6 @@ fn apply_outcome(out: WorkerOutcome, state: &RunState, s: &mut SchedState, max_k
     s.tot.formatted += out.formatted_files;
     s.tot.queue_ms.extend(out.queue_ms_samples);
     s.tot.decode_tps.extend(out.decode_tps_samples);
-
     if out.saw_429 {
         s.k = (s.k / 2).max(2);
     } else if out.committed && s.k < max_k {
@@ -535,194 +409,110 @@ fn handle_panic(ctx: &WorkerCtx, err: tokio::task::JoinError, s: &mut SchedState
 }
 
 fn final_files(repo: &Path, fallback: Vec<String>) -> Vec<String> {
-    let found: Vec<String> = walk_files(repo, None)
-        .into_iter()
-        .filter_map(|p| {
-            if !supported_ext(ext_str(&p)) {
-                return None;
-            }
-            let rel = rel_norm(repo, &p)?;
-            source_rel(&rel).then_some(rel)
-        })
-        .collect();
+    let found: Vec<String> = walk_files(repo, None).into_iter().filter_map(|p| {
+        if !supported_ext(ext_str(&p)) { return None; }
+        let rel = rel_norm(repo, &p)?;
+        source_rel(&rel).then_some(rel)
+    }).collect();
     if found.is_empty() { fallback } else { found }
 }
 
-fn run_bench(
-    opts: &RunOptions,
-    gate_cfg: &GateConfig,
-    repo: &Path,
-    telemetry: &TelemetryHub,
-) -> Option<BenchReport> {
+fn run_bench(opts: &RunOptions, gate_cfg: &GateConfig, repo: &Path, telemetry: &TelemetryHub) -> Option<BenchReport> {
     let base = opts.baseline_copy.as_deref().filter(|p| p.exists())?;
     let res = if let Some(cmd) = opts.bench_cmd.as_deref() {
         bench_command(cmd, base, repo, 5)
     } else {
-        let script = opts.bench_script.as_deref().filter(|p| p.exists())?;
-        bench_python(&gate_cfg.python_bin, script, base, repo, 5)
+        bench_python(&gate_cfg.python_bin, opts.bench_script.as_deref().filter(|p| p.exists())?, base, repo, 5)
     };
-
     match res {
         Ok(b) => {
-            if let Ok(val) = serde_json::to_value(&b) {
-                telemetry.emit_data("bench_result", val);
-            }
+            if let Ok(val) = serde_json::to_value(&b) { telemetry.emit_data("bench_result", val); }
             Some(b)
         }
-        Err(e) => {
-            tracing::warn!("Alternating bench skipped due to error: {e}");
-            None
-        }
+        Err(e) => { tracing::warn!("Alternating bench skipped due to error: {e}"); None }
     }
 }
 
 struct SummaryInput<'a> {
-    opts: &'a RunOptions,
-    wall_start: Instant,
-    bundle: &'a ScanCache,
-    final_audit: &'a AuditStats,
-    audit_rel: &'a [String],
-    tot: RunTotals,
-    bench: Option<BenchReport>,
-    wt: &'a Option<Worktree>,
-    via_oc: bool,
+    opts: &'a RunOptions, wall_start: Instant, bundle: &'a ScanCache, final_audit: &'a AuditStats,
+    audit_rel: &'a [String], tot: RunTotals, bench: Option<BenchReport>, wt: &'a Option<Worktree>, via_oc: bool,
 }
 
 fn build_summary(ctx: &WorkerCtx, mut inp: SummaryInput<'_>) -> RunSummary {
     let (plan, base_audit) = (&inp.bundle.plan, &inp.bundle.audit);
-    let loc_after: usize = inp
-        .audit_rel
-        .iter()
-        .map(|rel| fs::read(ctx.repo_root.join(rel)).map_or(0, |b| count_lines(&b)))
-        .sum();
+    let loc_after: usize = inp.audit_rel.iter()
+        .map(|rel| fs::read(ctx.repo_root.join(rel)).map_or(0, |b| count_lines(&b))).sum();
     let digest = ctx.shared_state.digest();
-    let (_, raw_bytes, zst_bytes) = ctx
-        .telemetry
-        .flush_zstd()
+    let (_, raw_bytes, zst_bytes) = ctx.telemetry.flush_zstd()
         .unwrap_or_else(|_| (PathBuf::new(), ctx.telemetry.bytes_written(), 0));
-
-    let p_snap = ctx.proxy.snapshot();
-    let (pq, ptps) = ctx.proxy.timing_samples();
-    if inp.tot.queue_ms.is_empty() {
-        inp.tot.queue_ms = pq;
-    }
-    if inp.tot.decode_tps.is_empty() {
-        inp.tot.decode_tps = ptps;
-    }
-
-    let avg_queue_s = if inp.tot.queue_ms.is_empty() {
-        0.0
-    } else {
+    let (p_snap, (pq, ptps)) = (ctx.proxy.snapshot(), ctx.proxy.timing_samples());
+    if inp.tot.queue_ms.is_empty() { inp.tot.queue_ms = pq; }
+    if inp.tot.decode_tps.is_empty() { inp.tot.decode_tps = ptps; }
+    let avg_queue_s = if inp.tot.queue_ms.is_empty() { 0.0 } else {
         (inp.tot.queue_ms.iter().sum::<f64>() / inp.tot.queue_ms.len() as f64) / 1000.0
     };
     let cache_pct = if p_snap.total_prompt_tokens > 0 {
         (p_snap.total_cached_tokens as f64 / p_snap.total_prompt_tokens as f64) * 100.0
-    } else {
-        0.0
-    };
+    } else { 0.0 };
 
     let summary = RunSummary {
-        run_id: ctx.run_id.clone(),
-        host_os: os_tag(),
-        model: inp.opts.model.clone(),
-        provider_label: inp.opts.provider_label.clone(),
-        total_files: plan.total_files,
-        total_loc: plan.total_loc,
-        total_units: plan.units.len(),
-        committed_units: inp.tot.committed,
-        skipped_resumed_units: inp.tot.skipped,
-        total_wall_s: inp.wall_start.elapsed().as_secs_f64(),
-        avg_queue_s,
-        median_decode_tps: quantile(&mut inp.tot.decode_tps, 0.5),
-        hygiene_before_median: base_audit.hygiene_median,
-        hygiene_before_p10: base_audit.hygiene_p10,
-        hygiene_after_median: inp.final_audit.hygiene_median,
-        hygiene_after_p10: inp.final_audit.hygiene_p10,
+        run_id: ctx.run_id.clone(), host_os: os_tag(), model: inp.opts.model.clone(),
+        provider_label: inp.opts.provider_label.clone(), total_files: plan.total_files,
+        total_loc: plan.total_loc, total_units: plan.units.len(), committed_units: inp.tot.committed,
+        skipped_resumed_units: inp.tot.skipped, total_wall_s: inp.wall_start.elapsed().as_secs_f64(),
+        avg_queue_s, median_decode_tps: quantile(&mut inp.tot.decode_tps, 0.5),
+        hygiene_before_median: base_audit.hygiene_median, hygiene_before_p10: base_audit.hygiene_p10,
+        hygiene_after_median: inp.final_audit.hygiene_median, hygiene_after_p10: inp.final_audit.hygiene_p10,
         tests_total: inp.final_audit.tests_total.max(base_audit.tests_total),
-        tests_before_fail: base_audit.tests_failed,
-        tests_after_fail: inp.final_audit.tests_failed,
-        gate3_before_ruff: base_audit.ruff_errors,
-        gate3_before_ty: base_audit.ty_errors,
-        gate3_after_ruff: inp.final_audit.ruff_errors,
-        gate3_after_ty: inp.final_audit.ty_errors,
-        cas_conflicts: inp.tot.cas_conflicts,
-        rollbacks_g0: inp.tot.rollbacks_g0,
-        rollbacks_g1: inp.tot.rollbacks_g1,
-        rollbacks_g2: inp.tot.rollbacks_g2,
-        rollbacks_g3: inp.tot.rollbacks_g3,
-        retries_total: inp.tot.retries,
-        http_429_count: p_snap.http_429_count,
-        circuit_pauses: p_snap.circuit_pauses,
-        prefix_drift_events: p_snap.prefix_drift_events,
-        prefix_cache_hit_pct: cache_pct,
-        uncached_tpm_cap: p_snap.uncached_tpm_cap,
-        total_uncached_tokens: p_snap.total_uncached_tokens,
+        tests_before_fail: base_audit.tests_failed, tests_after_fail: inp.final_audit.tests_failed,
+        gate3_before_ruff: base_audit.ruff_errors, gate3_before_ty: base_audit.ty_errors,
+        gate3_after_ruff: inp.final_audit.ruff_errors, gate3_after_ty: inp.final_audit.ty_errors,
+        cas_conflicts: inp.tot.cas_conflicts, rollbacks_g0: inp.tot.rollbacks_g0,
+        rollbacks_g1: inp.tot.rollbacks_g1, rollbacks_g2: inp.tot.rollbacks_g2,
+        rollbacks_g3: inp.tot.rollbacks_g3, retries_total: inp.tot.retries,
+        http_429_count: p_snap.http_429_count, circuit_pauses: p_snap.circuit_pauses,
+        prefix_drift_events: p_snap.prefix_drift_events, prefix_cache_hit_pct: cache_pct,
+        uncached_tpm_cap: p_snap.uncached_tpm_cap, total_uncached_tokens: p_snap.total_uncached_tokens,
         total_cached_tokens: p_snap.total_cached_tokens,
         engine_rss_mb: (self_metrics().rss_bytes as f64) / (1024.0 * 1024.0),
-        bench: inp.bench,
-        loc_before: plan.total_loc,
-        loc_after,
-        telemetry_raw_bytes: raw_bytes,
-        telemetry_zstd_bytes: zst_bytes,
-        stage_hardlinked_files: stage_hardlinks(),
-        research_queries: digest.research_queries,
+        bench: inp.bench, loc_before: plan.total_loc, loc_after,
+        telemetry_raw_bytes: raw_bytes, telemetry_zstd_bytes: zst_bytes,
+        stage_hardlinked_files: stage_hardlinks(), research_queries: digest.research_queries,
         research_cache_hits: digest.research_cache_hits,
         worktree_branch: inp.wt.as_ref().map(|w| w.branch.clone()),
         worktree_path: inp.wt.as_ref().map(|w| w.worktree_path.display().to_string()),
-        ready_for_manual_merge: inp.wt.is_some(),
-        detected_languages: inp.bundle.detected_languages.clone(),
-        blocked_units: ctx.shared_state.blocked_count(),
-        formatted_files_total: inp.tot.formatted,
+        ready_for_manual_merge: inp.wt.is_some(), detected_languages: inp.bundle.detected_languages.clone(),
+        blocked_units: ctx.shared_state.blocked_count(), formatted_files_total: inp.tot.formatted,
     };
-
-    let wt_meta = inp.wt.as_ref().map(|w| {
-        json!({
-            "core_repo": w.core_repo.display().to_string(),
-            "branch": w.branch,
-            "carried_dirty_changes": w.carried_dirty_changes,
-            "diff_stat": diffstat(w)
-        })
-    });
+    let wt_meta = inp.wt.as_ref().map(|w| json!({
+        "core_repo": w.core_repo.display().to_string(), "branch": w.branch,
+        "carried_dirty_changes": w.carried_dirty_changes, "diff_stat": diffstat(w)
+    }));
     let (rules, helpful) = ctx.learn.stats();
     let end_data = json!({
         "via_openclaw": inp.via_oc, "learn_rules": rules, "learn_helpful": helpful,
-        "tracked_units": digest.tracked_units,
-        "blocked_units": ctx.shared_state.blocked_count(),
+        "tracked_units": digest.tracked_units, "blocked_units": ctx.shared_state.blocked_count(),
         "rewind_triggers": ctx.shared_state.rewind_count(),
-        "telemetry_dedup_skipped": ctx.telemetry.dedup_skipped(),
-        "worktree": wt_meta
+        "telemetry_dedup_skipped": ctx.telemetry.dedup_skipped(), "worktree": wt_meta
     });
-    ctx.telemetry.emit(
-        "run_end",
-        EventSpec {
-            uncached_tpm: Some(p_snap.uncached_tpm_rolling),
-            data: Some(end_data),
-            summary: Some(summary.clone()),
-            ..EventSpec::default()
-        },
-    );
+    ctx.telemetry.emit("run_end", EventSpec {
+        uncached_tpm: Some(p_snap.uncached_tpm_rolling), data: Some(end_data),
+        summary: Some(summary.clone()), ..EventSpec::default()
+    });
     summary
 }
 
-async fn chat_endpoint(
-    client: &reqwest::Client,
-    opts: &RunOptions,
-    proxy_token: &str,
-) -> (String, String, String, bool) {
+async fn chat_endpoint(client: &reqwest::Client, opts: &RunOptions, proxy_token: &str) -> (String, String, String, bool) {
     if let Some(oc_base) = &opts.openclaw_base_url {
         let base = oc_base.trim_end_matches('/');
         let mut req = client.get(format!("{base}/models")).timeout(Duration::from_secs(2));
-        if let Some(tok) = &opts.openclaw_token {
-            req = req.bearer_auth(tok);
-        }
+        if let Some(tok) = &opts.openclaw_token { req = req.bearer_auth(tok); }
         if req.send().await.is_ok_and(|r| r.status().as_u16() < 500) {
             let bearer = opts.openclaw_token.clone().unwrap_or_else(|| "refit-local-gateway".into());
             return (format!("{base}/chat/completions"), bearer, opts.openclaw_model.clone(), true);
         }
     }
-
-    let url = format!("http://{}/v1/chat/completions", opts.proxy_addr);
-    (url, proxy_token.to_string(), opts.model.clone(), false)
+    (format!("http://{}/v1/chat/completions", opts.proxy_addr), proxy_token.to_string(), opts.model.clone(), false)
 }
 
 #[cfg(test)]

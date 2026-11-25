@@ -37,27 +37,17 @@ pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditR
 
 /// Scoped repository audit allowing `sustain` to skip genome, simiflow, deep-module, and doc-drift.
 pub fn untangle_repo_with_scope(
-    repo_root: &Path,
-    hygiene: &HygieneScorer,
-    scope: AuditScope,
+    repo_root: &Path, hygiene: &HygieneScorer, scope: AuditScope,
 ) -> Result<AuditReport> {
     let repo_snap = RepoSnapshot::capture(repo_root, true);
-    let source_rels = &repo_snap.source_rels;
-    let preloaded = &repo_snap.preloaded;
-    tracing::debug!(
-        sources = source_rels.len(),
-        preloaded_bytes = repo_snap.total_preloaded_bytes,
-        "captured single-walk repository snapshot"
-    );
+    let (source_rels, preloaded) = (&repo_snap.source_rels, &repo_snap.preloaded);
+    tracing::debug!(sources = source_rels.len(), preloaded_bytes = repo_snap.total_preloaded_bytes, "snapshot");
 
     let (_discovery, sym_graph) = index_repo_snap(repo_root, &repo_snap);
-    let (hygiene_median, hygiene_p10, per_file_h) =
-        hygiene.score_files(repo_root, source_rels, Some(preloaded));
-
+    let (hygiene_median, hygiene_p10, per_file_h) = hygiene.score_files(repo_root, source_rels, Some(preloaded));
     let (csr, _) = analysis::CsrGraph::from_named_edges(source_rels, &sym_graph.runtime_edges);
     let sccs = csr.pearce_scc();
     let scc_count = sccs.iter().filter(|c| c.len() >= 2).count();
-
     let clone_clusters = similarity::find_clones(source_rels, preloaded);
     let (god_files, orphan_files) = rank_files(repo_root, source_rels, preloaded, &per_file_h, &sym_graph);
     let (total_infra_files, unused_deps, infra_findings) = infra::scan_parts_snap(repo_root, &repo_snap);
@@ -67,88 +57,44 @@ pub fn untangle_repo_with_scope(
             let caps = similarity::find_capability_clusters(source_rels, preloaded);
             let drift = if cfg!(any(feature = "doc-drift", test)) {
                 scan_doc_drift(repo_root, &repo_snap, &sym_graph)
-            } else {
-                Vec::new()
-            };
-            let genome_summary = analysis::analyze_git_cochange(repo_root, source_rels);
-            let twins = analysis::format_genome_twins(&genome_summary, 25);
+            } else { Vec::new() };
+            let genome = analysis::analyze_git_cochange(repo_root, source_rels);
+            let twins = analysis::format_genome_twins(&genome, 25);
             let arch = analysis::ArchGraphRef {
-                all_edges: &sym_graph.edges,
-                runtime_edges: &sym_graph.runtime_edges,
+                all_edges: &sym_graph.edges, runtime_edges: &sym_graph.runtime_edges,
                 metrics: &sym_graph.metrics_by_file,
-                defs_by_file: Some(&sym_graph.defs_by_file),
-                refs_by_file: Some(&sym_graph.refs_by_file),
+                defs_by_file: Some(&sym_graph.defs_by_file), refs_by_file: Some(&sym_graph.refs_by_file),
             };
-            let ego_map = analysis::build_ego_contexts(
-                source_rels,
-                &sccs,
-                &arch,
-                &genome_summary.file_commits,
-                &clone_clusters,
-            );
-            let deep = analysis::deep_module_findings_with_csr(source_rels, &sccs, &arch, &ego_map);
+            let ego = analysis::build_ego_contexts(source_rels, &sccs, &arch, &genome.file_commits, &clone_clusters);
+            let deep = analysis::deep_module_findings_with_csr(source_rels, &sccs, &arch, &ego);
             (caps, drift, twins, deep)
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
-    let triage_plan = build_triage(
-        &infra_findings,
-        &capability_clusters,
-        &god_files,
-        &unused_deps,
-        &orphan_files,
-    );
-
+    let triage_plan = build_triage(&infra_findings, &capability_clusters, &god_files, &unused_deps, &orphan_files);
     Ok(AuditReport {
-        repo_root: repo_root.display().to_string(),
-        total_source_files: source_rels.len(),
-        total_infra_files,
-        hygiene_median,
-        hygiene_p10,
-        scc_count,
+        repo_root: repo_root.display().to_string(), total_source_files: source_rels.len(),
+        total_infra_files, hygiene_median, hygiene_p10, scc_count,
         dead_symbols: sym_graph.dead_symbols.into_iter().take(80).collect(),
-        orphan_files,
-        clone_clusters,
-        god_files,
-        capability_clusters,
-        unused_deps,
-        infra_findings,
-        triage_plan,
-        genome_twins,
-        deep_module_findings,
-        doc_drift_findings,
-        dep_advisories: Vec::new(),
+        orphan_files, clone_clusters, god_files, capability_clusters, unused_deps, infra_findings,
+        triage_plan, genome_twins, deep_module_findings, doc_drift_findings, dep_advisories: Vec::new(),
     })
 }
 
 fn rank_files(
-    repo_root: &Path,
-    source_rels: &[String],
-    preloaded: &BTreeMap<String, Vec<u8>>,
-    per_file_h: &HashMap<String, crate::types::HygieneResult>,
-    snap: &crate::stem::SymbolGraph,
+    repo_root: &Path, source_rels: &[String], preloaded: &BTreeMap<String, Vec<u8>>,
+    per_file_h: &HashMap<String, crate::types::HygieneResult>, snap: &crate::stem::SymbolGraph,
 ) -> (Vec<GodFileScore>, Vec<String>) {
-    let mut god_files = Vec::new();
-    let mut orphans = Vec::new();
-
+    let (mut god_files, mut orphans) = (Vec::new(), Vec::new());
     for rel in source_rels {
-        let loc = preloaded
-            .get(rel)
-            .map(|b| count_lines(b))
-            .or_else(|| read_bytes(repo_root, rel, None).map(|b| count_lines(&b)))
-            .unwrap_or(0);
-        let h_score = per_file_h.get(rel).map(|h| h.score).unwrap_or(0.90);
+        let loc = preloaded.get(rel).map(|b| count_lines(b))
+            .or_else(|| read_bytes(repo_root, rel, None).map(|b| count_lines(&b))).unwrap_or(0);
+        let h_score = per_file_h.get(rel).map_or(0.90, |h| h.score);
         let fi = snap.fan_in.get(rel).copied().unwrap_or(0);
         let fo = snap.fan_out.get(rel).copied().unwrap_or(0);
-
-        if fi == 0 && fo == 0 && !entrypoint(rel) {
-            orphans.push(rel.clone());
-        }
-
-        let risk = (1.0 - h_score).max(0.02)
-            * (loc.max(2) as f64).ln()
-            * (1.0 + (fi + fo) as f64);
+        if fi == 0 && fo == 0 && !entrypoint(rel) { orphans.push(rel.clone()); }
+        let risk = (1.0 - h_score).max(0.02) * (loc.max(2) as f64).ln() * (1.0 + (fi + fo) as f64);
         let rec = if loc >= 500 && h_score < 0.75 {
             "split_god_file"
         } else if h_score < 0.85 {
@@ -156,58 +102,34 @@ fn rank_files(
         } else {
             "keep"
         };
-
         if rec != "keep" || risk >= 6.0 {
             god_files.push(GodFileScore {
-                file: rel.clone(),
-                loc,
-                hygiene_score: h_score,
-                fan_in: fi,
-                fan_out: fo,
-                risk_score: (risk * 100.0).round() / 100.0,
-                recommendation: rec.into(),
+                file: rel.clone(), loc, hygiene_score: h_score, fan_in: fi, fan_out: fo,
+                risk_score: (risk * 100.0).round() / 100.0, recommendation: rec.into(),
             });
         }
     }
-
-    god_files.sort_by(|a, b| {
-        b.risk_score
-            .partial_cmp(&a.risk_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    god_files.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap_or(std::cmp::Ordering::Equal));
     god_files.truncate(25);
     (god_files, orphans)
 }
 
 fn build_triage(
-    infra: &[InfraFinding],
-    caps: &[RoleCluster],
-    gods: &[GodFileScore],
-    unused: &[UnusedDep],
-    orphans: &[String],
+    infra: &[InfraFinding], caps: &[RoleCluster], gods: &[GodFileScore],
+    unused: &[UnusedDep], orphans: &[String],
 ) -> Vec<TriageEntry> {
     let mut plan = Vec::new();
     let mut push = |file: String, action: &str, reason: String, priority: u32| {
-        plan.push(TriageEntry {
-            file,
-            action: action.into(),
-            reason,
-            priority,
-        });
+        plan.push(TriageEntry { file, action: action.into(), reason, priority });
     };
-
     for f in infra.iter().filter(|f| matches!(f.severity.as_str(), "critical" | "high")).take(15) {
         let prio = if f.severity == "critical" { 1 } else { 2 };
         push(f.file.clone(), "harden_infra", format!("[{}] L{}: {}", f.rule_id, f.line, f.message), prio);
     }
-    for cap in caps {
-        push(cap.files.join(", "), "consolidate", cap.recommendation.clone(), 2);
-    }
+    for cap in caps { push(cap.files.join(", "), "consolidate", cap.recommendation.clone(), 2); }
     for g in gods.iter().filter(|g| g.recommendation == "split_god_file").take(10) {
-        let msg = format!(
-            "{} LOC, hygiene {:.3}, fan_in={}, fan_out={} (risk {:.1})",
-            g.loc, g.hygiene_score, g.fan_in, g.fan_out, g.risk_score
-        );
+        let msg = format!("{} LOC, hygiene {:.3}, fan_in={}, fan_out={} (risk {:.1})",
+            g.loc, g.hygiene_score, g.fan_in, g.fan_out, g.risk_score);
         push(g.file.clone(), "split", msg, 2);
     }
     for u in unused.iter().take(15) {
@@ -216,7 +138,6 @@ fn build_triage(
     for o in orphans.iter().take(10) {
         push(o.clone(), "review_delete", "Zero graph edges (candidate dead file)".into(), 4);
     }
-
     plan.sort_by_key(|t| (t.priority, t.file.clone()));
     plan
 }
@@ -225,36 +146,22 @@ pub fn render_audit(report: &AuditReport) -> String {
     let mut md = format!(
         concat!(
             "# refit Phase 0 Untangle Audit Report\n\n",
-            "- **Repository:** `{}`\n",
-            "- **Source files:** {} | **Infra/Config files:** {}\n",
+            "- **Repository:** `{}`\n- **Source files:** {} | **Infra/Config files:** {}\n",
             "- **Hygiene (codehygiene v0.7.0):** median `{:.3}`, p10 `{:.3}`\n",
             "- **SCC Cycles:** {} | **Dead Exported Symbols:** {} | ",
             "**Cross-File Clones:** {} | **Unused Deps:** {} | **Infra Findings:** {}\n\n"
         ),
-        report.repo_root,
-        report.total_source_files,
-        report.total_infra_files,
-        report.hygiene_median,
-        report.hygiene_p10,
-        report.scc_count,
-        report.dead_symbols.len(),
-        report.clone_clusters.len(),
-        report.unused_deps.len(),
-        report.infra_findings.len()
+        report.repo_root, report.total_source_files, report.total_infra_files,
+        report.hygiene_median, report.hygiene_p10, report.scc_count, report.dead_symbols.len(),
+        report.clone_clusters.len(), report.unused_deps.len(), report.infra_findings.len()
     );
-
     if !report.triage_plan.is_empty() {
-        md.push_str("## Prioritized Triage Plan\n\n");
-        md.push_str("| Priority | Action | Target | Reason |\n| :--- | :--- | :--- | :--- |\n");
+        md.push_str("## Prioritized Triage Plan\n\n| Priority | Action | Target | Reason |\n| :--- | :--- | :--- | :--- |\n");
         for t in report.triage_plan.iter().take(25) {
-            md.push_str(&format!(
-                "| P{} | `{}` | `{}` | {} |\n",
-                t.priority, t.action, t.file, t.reason
-            ));
+            md.push_str(&format!("| P{} | `{}` | `{}` | {} |\n", t.priority, t.action, t.file, t.reason));
         }
         md.push('\n');
     }
-
     if !report.god_files.is_empty() {
         md.push_str("## Top Structural Risk / God Files\n\n");
         for g in report.god_files.iter().take(10) {
@@ -265,34 +172,23 @@ pub fn render_audit(report: &AuditReport) -> String {
         }
         md.push('\n');
     }
-
-    if !report.deep_module_findings.is_empty() {
-        md.push_str("## Deep-Module Architectural Findings\n\n");
-        for f in report.deep_module_findings.iter().take(15) {
-            md.push_str(&format!("- {f}\n"));
+    for (hdr, items) in [
+        ("## Deep-Module Architectural Findings\n\n", &report.deep_module_findings),
+        ("## Top Git Co-Change Twins (Clean-Room NPMI)\n\n", &report.genome_twins),
+    ] {
+        if !items.is_empty() {
+            md.push_str(hdr);
+            for s in items.iter().take(15) { md.push_str(&format!("- {s}\n")); }
+            md.push('\n');
         }
-        md.push('\n');
     }
-
-    if !report.genome_twins.is_empty() {
-        md.push_str("## Top Git Co-Change Twins (Clean-Room NPMI)\n\n");
-        for tw in report.genome_twins.iter().take(15) {
-            md.push_str(&format!("- {tw}\n"));
-        }
-        md.push('\n');
-    }
-
     if !report.doc_drift_findings.is_empty() {
         md.push_str("## Documentation & Comment Drift (ReCite / DOCER)\n\n");
         for df in report.doc_drift_findings.iter().take(20) {
-            md.push_str(&format!(
-                "- `{}` L{} [{}]: `{}` — {}\n",
-                df.file, df.line, df.kind, df.reference, df.message
-            ));
+            md.push_str(&format!("- `{}` L{} [{}]: `{}` — {}\n", df.file, df.line, df.kind, df.reference, df.message));
         }
         md.push('\n');
     }
-
     if !report.dep_advisories.is_empty() {
         md.push_str("## Dependency Advisories & SemVer Hops\n\n");
         for adv in report.dep_advisories.iter().take(25) {
@@ -302,11 +198,7 @@ pub fn render_audit(report: &AuditReport) -> String {
             } else {
                 format!(" (hops: {}, breaking: {})", adv.hops.join(" -> "), adv.breaking_hops)
             };
-            let guard = adv
-                .keep_guard
-                .as_deref()
-                .map(|g| format!(" [keep-guard: {g}]"))
-                .unwrap_or_default();
+            let guard = adv.keep_guard.as_deref().map(|g| format!(" [keep-guard: {g}]")).unwrap_or_default();
             md.push_str(&format!(
                 "- [{}] `{}/{}` `{}` -> `{}`{} — {}{}\n",
                 adv.kind, adv.ecosystem, adv.name, adv.installed, latest, hops, adv.recommendation, guard
@@ -496,64 +388,42 @@ struct DriftCtx<'a> {
     npm_scripts: Option<&'a BTreeSet<String>>,
 }
 
+fn push_drift(out: &mut Vec<DocDriftFinding>, file: &str, line: usize, kind: &str, reference: String, message: String) {
+    out.push(DocDriftFinding { file: file.to_string(), line, kind: kind.into(), reference, message });
+}
+
 /// Zero-LLM ReCite / DOCER scanner reusing `RepoSnapshot` and `LexCursor` (`!in_test`).
-fn scan_doc_drift(
-    repo_root: &Path,
-    repo_snap: &RepoSnapshot,
-    snap: &SymbolGraph,
-) -> Vec<DocDriftFinding> {
-    let known_symbols: BTreeSet<String> = snap
-        .defs_by_file
-        .values()
-        .chain(snap.refs_by_file.values())
-        .flat_map(|syms| syms.iter().cloned())
-        .collect();
-    let mut repo_files = BTreeSet::new();
-    let mut repo_dirs = BTreeSet::new();
+fn scan_doc_drift(repo_root: &Path, repo_snap: &RepoSnapshot, snap: &SymbolGraph) -> Vec<DocDriftFinding> {
+    let known_symbols: BTreeSet<String> = snap.defs_by_file.values()
+        .chain(snap.refs_by_file.values()).flat_map(|s| s.iter().cloned()).collect();
+    let (mut repo_files, mut repo_dirs) = (BTreeSet::new(), BTreeSet::new());
     for rel in &repo_snap.all_rels {
         repo_files.insert(rel.clone());
-        if let Some((top, _)) = rel.split_once('/') {
-            repo_dirs.insert(top.to_string());
-        }
+        if let Some((top, _)) = rel.split_once('/') { repo_dirs.insert(top.to_string()); }
     }
     let npm_scripts = load_package_scripts(repo_root);
     let ctx = DriftCtx {
-        repo_root,
-        repo_files: &repo_files,
-        repo_dirs: &repo_dirs,
-        known_symbols: &known_symbols,
-        npm_scripts: npm_scripts.as_ref(),
+        repo_root, repo_files: &repo_files, repo_dirs: &repo_dirs,
+        known_symbols: &known_symbols, npm_scripts: npm_scripts.as_ref(),
     };
-
     let mut findings = Vec::new();
     for (rel, abs) in &repo_snap.doc_rels {
-        if let Ok(content) = fs::read_to_string(abs) {
-            scan_markdown_doc(&ctx, rel, &content, &mut findings);
-        }
+        if let Ok(content) = fs::read_to_string(abs) { scan_markdown_doc(&ctx, rel, &content, &mut findings); }
     }
-    for rel in &repo_snap.source_rels {
-        if test_path(rel) {
-            continue;
-        }
+    for rel in repo_snap.source_rels.iter().filter(|r| !test_path(r)) {
         let Some(bytes) = read_bytes(repo_root, rel, Some(&repo_snap.preloaded)) else { continue };
-        let content = String::from_utf8_lossy(&bytes);
-        scan_source_comments(&ctx, rel, &content, &mut findings);
+        scan_source_comments(&ctx, rel, &String::from_utf8_lossy(&bytes), &mut findings);
     }
-
     findings.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.kind.cmp(&b.kind))
-            .then_with(|| a.reference.cmp(&b.reference))
+        a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.kind.cmp(&b.kind)).then_with(|| a.reference.cmp(&b.reference))
     });
     findings.dedup_by(|a, b| a.file == b.file && a.line == b.line && a.reference == b.reference);
     findings
 }
 
 fn load_package_scripts(repo_root: &Path) -> Option<BTreeSet<String>> {
-    let raw = fs::read_to_string(repo_root.join("package.json")).ok()?;
-    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&fs::read_to_string(repo_root.join("package.json")).ok()?).ok()?;
     Some(val.get("scripts")?.as_object()?.keys().cloned().collect())
 }
 
@@ -561,75 +431,43 @@ fn scan_markdown_doc(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec
     let mut in_fence = false;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence || trimmed.is_empty() || contains_ignore_marker(trimmed) {
-            continue;
-        }
-        for span in iter_backtick_spans(line) {
-            check_doc_span(ctx, rel, idx + 1, span, out);
-        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") { in_fence = !in_fence; continue; }
+        if in_fence || trimmed.is_empty() || contains_ignore_marker(trimmed) { continue; }
+        for span in iter_backtick_spans(line) { check_doc_span(ctx, rel, idx + 1, span, out); }
     }
 }
 
-fn contains_ignore_marker(text: &str) -> bool {
-    find_ascii_ci(text.as_bytes(), b"refit: ignore").is_some()
-}
+fn contains_ignore_marker(text: &str) -> bool { find_ascii_ci(text.as_bytes(), b"refit: ignore").is_some() }
 
 fn check_doc_span(ctx: &DriftCtx<'_>, doc_file: &str, ln: usize, span: &str, out: &mut Vec<DocDriftFinding>) {
     if let Some(script) = extract_cli_script_ref(span) {
-        if let Some(scripts) = ctx.npm_scripts
-            && !scripts.contains(script)
-            && !is_placeholder_text(script)
-        {
-            out.push(DocDriftFinding {
-                file: doc_file.to_string(),
-                line: ln,
-                kind: "doc_stale_cli".into(),
-                reference: span.to_string(),
-                message: format!("Documented script `{script}` missing from package.json scripts"),
-            });
+        if let Some(scripts) = ctx.npm_scripts && !scripts.contains(script) && !is_placeholder_text(script) {
+            let msg = format!("Documented script `{script}` missing from package.json scripts");
+            push_drift(out, doc_file, ln, "doc_stale_cli", span.to_string(), msg);
         }
         return;
     }
     if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs) {
         if !ctx.repo_files.contains(clean_path) && !ctx.repo_root.join(clean_path).exists() {
-            out.push(DocDriftFinding {
-                file: doc_file.to_string(),
-                line: ln,
-                kind: "doc_stale_path".into(),
-                reference: clean_path.to_string(),
-                message: format!("Referenced file path `{clean_path}` does not exist in repository"),
-            });
+            let msg = format!("Referenced file path `{clean_path}` does not exist in repository");
+            push_drift(out, doc_file, ln, "doc_stale_path", clean_path.to_string(), msg);
         }
         return;
     }
     if !ctx.known_symbols.is_empty()
         && let Some(sym) = parse_backtick_call_symbol(span)
-        && !is_ignored_symbol(sym)
-        && !ctx.known_symbols.contains(sym)
+        && !is_ignored_symbol(sym) && !ctx.known_symbols.contains(sym)
     {
-        out.push(DocDriftFinding {
-            file: doc_file.to_string(),
-            line: ln,
-            kind: "doc_stale_symbol".into(),
-            reference: format!("{sym}()"),
-            message: format!("Referenced symbol `{sym}()` not found in live codebase"),
-        });
+        let msg = format!("Referenced symbol `{sym}()` not found in live codebase");
+        push_drift(out, doc_file, ln, "doc_stale_symbol", format!("{sym}()"), msg);
     }
 }
 
 fn extract_cli_script_ref(span: &str) -> Option<&str> {
-    let rest = span
-        .strip_prefix("npm run ")
-        .or_else(|| span.strip_prefix("pnpm run "))
+    let rest = span.strip_prefix("npm run ").or_else(|| span.strip_prefix("pnpm run "))
         .or_else(|| span.strip_prefix("yarn run "))?;
     let name = rest.split_whitespace().next()?;
-    let ok = !name.is_empty()
-        && !name.starts_with('-')
-        && !has_placeholder_chars(name)
+    let ok = !name.is_empty() && !name.starts_with('-') && !has_placeholder_chars(name)
         && !BUILTIN_PKG_SCRIPTS.contains(&name);
     ok.then_some(name)
 }
@@ -645,10 +483,8 @@ fn is_placeholder_text(text: &str) -> bool {
 }
 
 fn parse_repo_path_candidate<'a>(span: &'a str, repo_dirs: &BTreeSet<String>) -> Option<&'a str> {
-    if span.contains(char::is_whitespace)
-        || span.contains("://")
-        || span.starts_with(['/', '~', '@'])
-        || has_placeholder_chars(span)
+    if span.contains(char::is_whitespace) || span.contains("://")
+        || span.starts_with(['/', '~', '@']) || has_placeholder_chars(span)
     {
         return None;
     }
@@ -664,58 +500,32 @@ fn parse_repo_path_candidate<'a>(span: &'a str, repo_dirs: &BTreeSet<String>) ->
         return None;
     }
     let (top, _) = clean.split_once('/')?;
-    if !KNOWN_PATH_ROOTS.contains(&top) && !repo_dirs.contains(top) {
-        return None;
-    }
+    if !KNOWN_PATH_ROOTS.contains(&top) && !repo_dirs.contains(top) { return None; }
     let (_, ext) = clean.rsplit_once('.')?;
     KNOWN_FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str()).then_some(clean)
 }
 
 fn parse_backtick_call_symbol(span: &str) -> Option<&str> {
-    if span.contains(char::is_whitespace) || has_placeholder_chars(span) {
-        return None;
-    }
+    if span.contains(char::is_whitespace) || has_placeholder_chars(span) { return None; }
     let head = span.strip_suffix("()")?;
     let sym = head.rsplit("::").next().unwrap_or(head);
-    if sym.contains(['.', '/']) || sym.len() < 4 || is_placeholder_text(sym) {
-        return None;
-    }
-    let valid = sym.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && sym.as_bytes()[0].is_ascii_alphabetic();
+    if sym.contains(['.', '/']) || sym.len() < 4 || is_placeholder_text(sym) { return None; }
+    let valid = sym.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && sym.as_bytes()[0].is_ascii_alphabetic();
     valid.then_some(sym)
 }
 
-fn is_ignored_symbol(sym: &str) -> bool {
-    IGNORED_SYMBOLS.contains(&sym.to_ascii_lowercase().as_str())
-}
+fn is_ignored_symbol(sym: &str) -> bool { IGNORED_SYMBOLS.contains(&sym.to_ascii_lowercase().as_str()) }
 
-fn check_comment_line(
-    ctx: &DriftCtx<'_>,
-    rel: &str,
-    ln: usize,
-    comment: &str,
-    out: &mut Vec<DocDriftFinding>,
-) {
-    if comment.is_empty() || contains_ignore_marker(comment) {
-        return;
-    }
+fn check_comment_line(ctx: &DriftCtx<'_>, rel: &str, ln: usize, comment: &str, out: &mut Vec<DocDriftFinding>) {
+    if comment.is_empty() || contains_ignore_marker(comment) { return; }
     for span in iter_backtick_spans(comment) {
         if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs)
-            && !ctx.repo_files.contains(clean_path)
-            && !ctx.repo_root.join(clean_path).exists()
+            && !ctx.repo_files.contains(clean_path) && !ctx.repo_root.join(clean_path).exists()
         {
-            out.push(DocDriftFinding {
-                file: rel.to_string(),
-                line: ln,
-                kind: "doc_stale_path".into(),
-                reference: clean_path.to_string(),
-                message: format!("Comment cites missing file `{clean_path}`"),
-            });
+            push_drift(out, rel, ln, "doc_stale_path", clean_path.to_string(), format!("Comment cites missing file `{clean_path}`"));
         }
     }
-    if !ctx.known_symbols.is_empty() {
-        scan_comment_call_refs(ctx, rel, ln, comment, out);
-    }
+    if !ctx.known_symbols.is_empty() { scan_comment_call_refs(ctx, rel, ln, comment, out); }
 }
 
 fn scan_source_comments(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec<DocDriftFinding>) {
@@ -723,62 +533,33 @@ fn scan_source_comments(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut 
     if ext == "rs" {
         let mut cursor = LexCursor::new(LangKind::Rust, content.as_bytes());
         while let Some(tok) = cursor.next_token() {
-            if !matches!(tok.kind, LexKind::LineComment | LexKind::BlockComment) || tok.flags.in_test() {
-                continue;
-            }
-            for (offset, raw_line) in tok.as_str().lines().enumerate() {
-                if let Some(comment) = extract_comment_body("rs", raw_line) {
-                    check_comment_line(ctx, rel, (tok.line as usize) + offset, comment, out);
+            if !matches!(tok.kind, LexKind::LineComment | LexKind::BlockComment) || tok.flags.in_test() { continue; }
+            for (off, raw_line) in tok.as_str().lines().enumerate() {
+                if let Some(c) = extract_comment_body("rs", raw_line) {
+                    check_comment_line(ctx, rel, (tok.line as usize) + off, c, out);
                 }
             }
         }
         return;
     }
-
     for (idx, line) in content.lines().enumerate() {
-        if let Some(comment) = extract_comment_body(&ext, line) {
-            check_comment_line(ctx, rel, idx + 1, comment, out);
-        }
+        if let Some(c) = extract_comment_body(&ext, line) { check_comment_line(ctx, rel, idx + 1, c, out); }
     }
 }
 
-fn scan_comment_call_refs(
-    ctx: &DriftCtx<'_>,
-    rel: &str,
-    ln: usize,
-    comment: &str,
-    out: &mut Vec<DocDriftFinding>,
-) {
-    let bytes = comment.as_bytes();
-    let mut pos = 0usize;
+fn scan_comment_call_refs(ctx: &DriftCtx<'_>, rel: &str, ln: usize, comment: &str, out: &mut Vec<DocDriftFinding>) {
+    let (bytes, mut pos) = (comment.as_bytes(), 0usize);
     while pos + 2 < bytes.len() {
-        if !(bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'_') {
-            pos += 1;
-            continue;
-        }
+        if !(bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'_') { pos += 1; continue; }
         let start = pos;
         pos += 1;
-        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
-            pos += 1;
-        }
+        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') { pos += 1; }
         let is_call = pos + 1 < bytes.len() && bytes[pos] == b'(' && bytes[pos + 1] == b')';
-        let preceded_by_dot = start > 0 && bytes[start - 1] == b'.';
-        if !is_call || preceded_by_dot {
-            continue;
-        }
+        if !is_call || (start > 0 && bytes[start - 1] == b'.') { continue; }
         let sym = &comment[start..pos];
-        if sym.len() >= 5
-            && !is_ignored_symbol(sym)
-            && !is_placeholder_text(sym)
-            && !ctx.known_symbols.contains(sym)
-        {
-            out.push(DocDriftFinding {
-                file: rel.to_string(),
-                line: ln,
-                kind: "doc_stale_symbol".into(),
-                reference: format!("{sym}()"),
-                message: format!("Stale comment reference `{sym}()` not found in live codebase"),
-            });
+        if sym.len() >= 5 && !is_ignored_symbol(sym) && !is_placeholder_text(sym) && !ctx.known_symbols.contains(sym) {
+            let msg = format!("Stale comment reference `{sym}()` not found in live codebase");
+            push_drift(out, rel, ln, "doc_stale_symbol", format!("{sym}()"), msg);
         }
     }
 }

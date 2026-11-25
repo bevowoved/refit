@@ -27,65 +27,34 @@ static CARGO_EPHEMERAL_SEQ: AtomicU64 = AtomicU64::new(100);
 static RUST_WRAPPER_CACHE: OnceLock<Option<(RustCacheBackend, PathBuf)>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CloneOutcome {
-    Reflinked,
-    HardLinked,
-    Copied,
-}
+pub enum CloneOutcome { Reflinked, HardLinked, Copied }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RustCacheBackend {
-    Mbx,
-    Kache,
-    CargoBuildDir,
-}
+pub enum RustCacheBackend { Mbx, Kache }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct CacheGcStats {
-    pub evicted_entries: usize,
-    pub freed_bytes: u64,
-    pub remaining_bytes: u64,
-}
+pub struct CacheGcStats { pub evicted_entries: usize, pub freed_bytes: u64, pub remaining_bytes: u64 }
 
-pub fn stage_hardlinks() -> u64 {
-    STAGE_HARDLINKS_TOTAL.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-pub fn stage_copies() -> u64 {
-    STAGE_COPIED_TOTAL.load(Ordering::Relaxed)
-}
+pub fn stage_hardlinks() -> u64 { STAGE_HARDLINKS_TOTAL.load(Ordering::Relaxed) }
+#[cfg(test)] pub fn stage_copies() -> u64 { STAGE_COPIED_TOTAL.load(Ordering::Relaxed) }
 
 /// Zero-spawn process-wide PATH probe (`mbx` then `kache`) cached once via `OnceLock`.
 pub fn detect_rust_wrapper() -> Option<(RustCacheBackend, &'static Path)> {
-    RUST_WRAPPER_CACHE
-        .get_or_init(|| {
-            find_tool_on_path("mbx")
-                .map(|p| (RustCacheBackend::Mbx, p))
-                .or_else(|| find_tool_on_path("kache").map(|p| (RustCacheBackend::Kache, p)))
-        })
-        .as_ref()
-        .map(|(backend, path)| (*backend, path.as_path()))
+    RUST_WRAPPER_CACHE.get_or_init(|| {
+        find_tool_on_path("mbx").map(|p| (RustCacheBackend::Mbx, p))
+            .or_else(|| find_tool_on_path("kache").map(|p| (RustCacheBackend::Kache, p)))
+    }).as_ref().map(|(b, p)| (*b, p.as_path()))
 }
 
 fn is_copy_fallback_err(err: &io::Error, include_emlink: bool) -> bool {
-    if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists) {
-        return false;
-    }
-    if matches!(
-        err.kind(),
-        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
-    ) {
+    if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists) { return false; }
+    if matches!(err.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices) {
         return true;
     }
     let Some(raw) = err.raw_os_error() else { return false };
-    if matches!(raw, 1 | 18 | 22 | 38 | 45 | 78 | 95) || (include_emlink && raw == 31) {
-        return true;
-    }
+    if matches!(raw, 1 | 18 | 22 | 38 | 45 | 78 | 95) || (include_emlink && raw == 31) { return true; }
     #[cfg(windows)]
-    if matches!(raw, 5 | 17 | 50 | 87) || (include_emlink && raw == 1142) {
-        return true;
-    }
+    if matches!(raw, 5 | 17 | 50 | 87) || (include_emlink && raw == 1142) { return true; }
     false
 }
 
@@ -95,10 +64,7 @@ pub fn clone_or_copy(src: &Path, dst: &Path) -> Result<CloneOutcome> {
 }
 
 fn clone_or_copy_cascade<R, H>(src: &Path, dst: &Path, reflink_fn: R, hardlink_fn: H) -> Result<CloneOutcome>
-where
-    R: FnOnce(&Path, &Path) -> io::Result<()>,
-    H: FnOnce(&Path, &Path) -> io::Result<()>,
-{
+where R: FnOnce(&Path, &Path) -> io::Result<()>, H: FnOnce(&Path, &Path) -> io::Result<()> {
     match reflink_fn(src, dst) {
         Ok(()) => return Ok(CloneOutcome::Reflinked),
         Err(err) if is_copy_fallback_err(&err, false) => {}
@@ -109,33 +75,22 @@ where
         Err(err) if is_copy_fallback_err(&err, true) => {}
         Err(err) => anyhow::bail!("clone_or_copy hard_link failed for {} -> {}: {err}", src.display(), dst.display()),
     }
-    verified_copy(src, dst)
-        .with_context(|| format!("clone_or_copy verified copy failed for {} -> {}", src.display(), dst.display()))?;
+    verified_copy(src, dst).with_context(|| format!("clone_or_copy copy failed for {} -> {}", src.display(), dst.display()))?;
     Ok(CloneOutcome::Copied)
 }
 
 fn try_reflink_native(src: &Path, dst: &Path) -> io::Result<()> {
     #[cfg(feature = "build-cache")]
-    {
-        reflink_copy::reflink(src, dst)
-    }
+    { reflink_copy::reflink(src, dst) }
     #[cfg(not(feature = "build-cache"))]
-    {
-        let _ = (src, dst);
-        Err(io::Error::new(io::ErrorKind::Unsupported, "build-cache feature disabled"))
-    }
+    { let _ = (src, dst); Err(io::Error::new(io::ErrorKind::Unsupported, "build-cache feature disabled")) }
 }
 
 fn verified_copy(src: &Path, dst: &Path) -> io::Result<u64> {
-    let expected = fs::metadata(src)?.len();
-    let copied = fs::copy(src, dst)?;
+    let (expected, copied) = (fs::metadata(src)?.len(), fs::copy(src, dst)?);
     if copied != expected {
         let _ = fs::remove_file(dst);
-        return Err(io::Error::other(format!(
-            "short copy {} -> {} ({copied} != {expected})",
-            src.display(),
-            dst.display()
-        )));
+        return Err(io::Error::other(format!("short copy {} -> {} ({copied} != {expected})", src.display(), dst.display())));
     }
     Ok(copied)
 }
@@ -147,9 +102,7 @@ pub fn ensure_cache_dirs_tagged(repo: &Path) -> [PathBuf; 3] {
         work_dir(repo, ".refit-stages", "refit-stages"),
         work_dir(repo, ".refit-tx", "refit-tx"),
     ];
-    for dir in &dirs {
-        ensure_cachedir_tag(dir);
-    }
+    for dir in &dirs { ensure_cachedir_tag(dir); }
     dirs
 }
 
@@ -165,18 +118,12 @@ pub fn prune_repo_caches(repo: &Path, max_bytes: u64) -> Result<CacheGcStats> {
 
 fn prune_cache_dirs_lru(dirs: &[PathBuf], max_bytes: u64) -> Result<CacheGcStats> {
     let mut entries: Vec<(u64, PathBuf, bool, u64)> = Vec::new();
-    for dir in dirs {
-        collect_lru_entries(dir, &mut entries)?;
-    }
-
+    for dir in dirs { collect_lru_entries(dir, &mut entries)?; }
     let mut total: u64 = entries.iter().map(|e| e.3).sum();
     entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
     let (mut evicted_entries, mut freed_bytes) = (0usize, 0u64);
     for (_, path, is_dir, size) in entries {
-        if total <= max_bytes {
-            break;
-        }
+        if total <= max_bytes { break; }
         let ok = if is_dir { fs::remove_dir_all(&path).is_ok() } else { fs::remove_file(&path).is_ok() };
         if ok {
             evicted_entries += 1;
@@ -188,68 +135,52 @@ fn prune_cache_dirs_lru(dirs: &[PathBuf], max_bytes: u64) -> Result<CacheGcStats
 }
 
 fn is_protected_stage_entry(path: &Path, name: &str, meta: &fs::Metadata) -> bool {
-    if name == "CACHEDIR.TAG" {
-        return true;
-    }
-    if name == "cargo-slots" && cargo_slots_has_active_lock(path) {
-        return true;
-    }
-    name.starts_with("tx-")
-        && meta.is_dir()
-        && meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age.as_secs() < 600)
+    name == "CACHEDIR.TAG"
+        || (name == "cargo-slots" && cargo_slots_has_active_lock(path))
+        || (name.starts_with("tx-") && meta.is_dir()
+            && meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age.as_secs() < 600))
 }
 
 fn cargo_slots_has_active_lock(slots_dir: &Path) -> bool {
     let Ok(rd) = fs::read_dir(slots_dir) else { return false };
     rd.flatten().any(|item| {
         let lossy = item.file_name().to_string_lossy().into_owned();
-        lossy.starts_with("slot-")
-            && lossy.ends_with(".lock")
-            && matches!(SidecarLock::try_acquire(&item.path()), Ok(None))
+        lossy.starts_with("slot-") && lossy.ends_with(".lock")
+            && !matches!(SidecarLock::try_acquire(&item.path()), Ok(Some(_)))
     })
 }
 
 fn collect_lru_entries(dir: &Path, out: &mut Vec<(u64, PathBuf, bool, u64)>) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
+    if !dir.exists() { return Ok(()); }
     for item in fs::read_dir(dir).with_context(|| format!("read cache dir {}", dir.display()))?.flatten() {
-        let name = item.file_name().to_string_lossy().into_owned();
-        let path = item.path();
+        let (name, path) = (item.file_name().to_string_lossy().into_owned(), item.path());
         let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-        if is_protected_stage_entry(&path, &name, &meta) {
-            continue;
-        }
-        let is_dir = meta.is_dir();
-        let fallback_mtime = system_time_ns(meta.modified().ok());
-        let (size, mtime_ns) =
-            if is_dir { measure_dir_tree(&path, fallback_mtime) } else { (meta.len(), fallback_mtime) };
+        if is_protected_stage_entry(&path, &name, &meta) { continue; }
+        let (is_dir, fb) = (meta.is_dir(), system_time_ns(meta.modified().ok()));
+        let (size, mtime_ns) = if is_dir { measure_dir_tree(&path, fb) } else { (meta.len(), fb) };
         out.push((mtime_ns, path, is_dir, size));
     }
     Ok(())
 }
 
 fn measure_dir_tree(root: &Path, fallback_mtime: u64) -> (u64, u64) {
-    let mut stack = vec![root.to_path_buf()];
-    let (mut total_bytes, mut newest, mut saw_file) = (0u64, 0u64, false);
+    let (mut stack, mut total, mut newest, mut saw) = (vec![root.to_path_buf()], 0u64, 0u64, false);
     while let Some(cur) = stack.pop() {
         let Ok(rd) = fs::read_dir(&cur) else { continue };
         for entry in rd.flatten() {
             let path = entry.path();
             let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
+            if meta.file_type().is_symlink() { continue; }
             if meta.is_dir() {
                 stack.push(path);
             } else {
-                saw_file = true;
-                total_bytes = total_bytes.saturating_add(meta.len());
+                saw = true;
+                total = total.saturating_add(meta.len());
                 newest = newest.max(system_time_ns(meta.modified().ok()));
             }
         }
     }
-    (total_bytes, if saw_file { newest } else { fallback_mtime })
+    (total, if saw { newest } else { fallback_mtime })
 }
 
 fn system_time_ns(ts: Option<SystemTime>) -> u64 {
@@ -302,13 +233,9 @@ fn env_truthy(var: &str) -> bool {
 }
 
 fn build_rust_cache_env_core(
-    repo_root: &Path,
-    slot_dir: &Path,
-    ephemeral_stage: bool,
-    wrapper: Option<(RustCacheBackend, &Path)>,
-    effective_mem_bytes: u64,
-    constrained: bool,
-    blaze_opt_in: bool,
+    repo_root: &Path, slot_dir: &Path, ephemeral_stage: bool,
+    wrapper: Option<(RustCacheBackend, &Path)>, effective_mem_bytes: u64,
+    constrained: bool, blaze_opt_in: bool,
 ) -> Vec<(String, String)> {
     let build_dir = slot_dir.join("build-dir");
     let _ = fs::create_dir_all(&build_dir);
@@ -318,11 +245,8 @@ fn build_rust_cache_env_core(
         ("MALLOC_ARENA_MAX".into(), "1".into()),
         ("MIMALLOC_PURGE_DELAY".into(), "0".into()),
     ];
-    if ephemeral_stage || constrained {
-        env.push(("CARGO_INCREMENTAL".into(), "0".into()));
-    }
-    let (backend, wrapper_bin) = wrapper.map_or((RustCacheBackend::CargoBuildDir, None), |(b, p)| (b, Some(p)));
-    if let Some(bin) = wrapper_bin {
+    if ephemeral_stage || constrained { env.push(("CARGO_INCREMENTAL".into(), "0".into())); }
+    if let Some((backend, bin)) = wrapper {
         let cache_root = repo_root.join(".refit/cache/rust");
         env.push(("RUSTC_WRAPPER".into(), bin.display().to_string()));
         env.push(("MBX_EXCLUDE_OUT_DIR".into(), "1".into()));
@@ -330,14 +254,12 @@ fn build_rust_cache_env_core(
             RustCacheBackend::Mbx => {
                 env.push(("MBX_CACHE_DIR".into(), cache_root.display().to_string()));
                 if cfg!(any(target_os = "linux", target_os = "macos"))
-                    && effective_mem_bytes >= BLAZE_MIN_MEM_BYTES
-                    && blaze_opt_in
+                    && effective_mem_bytes >= BLAZE_MIN_MEM_BYTES && blaze_opt_in
                 {
                     env.push(("MBX_BLAZE".into(), "1".into()));
                 }
             }
             RustCacheBackend::Kache => env.push(("KACHE_DIR".into(), cache_root.display().to_string())),
-            RustCacheBackend::CargoBuildDir => {}
         }
     }
     env
@@ -348,31 +270,19 @@ pub fn build_rust_cache_env(repo_root: &Path, slot_dir: &Path, ephemeral_stage: 
     ensure_cache_dirs_tagged(repo_root);
     let b = budget();
     build_rust_cache_env_core(
-        repo_root,
-        slot_dir,
-        ephemeral_stage,
-        detect_rust_wrapper(),
-        b.effective_mem_bytes,
-        b.is_constrained(),
-        env_truthy("MBX_BLAZE"),
+        repo_root, slot_dir, ephemeral_stage, detect_rust_wrapper(),
+        b.effective_mem_bytes, b.is_constrained(), env_truthy("MBX_BLAZE"),
     )
 }
 
 pub(super) struct CargoSlot {
-    #[cfg(test)]
-    pub(super) slot: usize,
-    #[cfg(not(test))]
-    slot: usize,
-    pooled: bool,
-    pub(super) dir: PathBuf,
-    _lock: Option<SidecarLock>,
+    #[cfg(test)] pub(super) slot: usize,
+    #[cfg(not(test))] slot: usize,
+    pooled: bool, pub(super) dir: PathBuf, _lock: Option<SidecarLock>,
 }
 
 fn max_cargo_slots() -> usize {
-    std::env::var("REFIT_CARGO_SLOTS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .map_or(2, |n| n.clamp(1, 2))
+    std::env::var("REFIT_CARGO_SLOTS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(2, |n| n.clamp(1, 2))
 }
 
 impl CargoSlot {
@@ -382,9 +292,7 @@ impl CargoSlot {
         let slots_root = stages_dir(repo_root).join("cargo-slots");
         ensure_cachedir_tag(&stages_dir(repo_root));
         ensure_cachedir_tag(&slots_root);
-
-        let mut skipped = Vec::new();
-        let mut chosen: Option<(usize, SidecarLock)> = None;
+        let (mut skipped, mut chosen) = (Vec::new(), None::<(usize, SidecarLock)>);
         while let Some(s) = pool.lock().pop() {
             if let Ok(Some(lk)) = SidecarLock::try_acquire(&slots_root.join(format!("slot-{s}.lock"))) {
                 chosen = Some((s, lk));
@@ -392,10 +300,7 @@ impl CargoSlot {
             }
             skipped.push(s);
         }
-        if !skipped.is_empty() {
-            pool.lock().extend(skipped);
-        }
-
+        if !skipped.is_empty() { pool.lock().extend(skipped); }
         let (slot, pooled, lock) = match chosen {
             Some((s, lk)) => (s, true, Some(lk)),
             None => (CARGO_EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed) as usize, false, None),
@@ -414,34 +319,24 @@ impl Drop for CargoSlot {
     fn drop(&mut self) {
         self._lock = None;
         if self.pooled {
-            if let Some(pool) = CARGO_SLOT_POOL.get() {
-                pool.lock().push(self.slot);
-            }
+            if let Some(pool) = CARGO_SLOT_POOL.get() { pool.lock().push(self.slot); }
         } else {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
 }
 
-pub(super) fn stages_dir(repo_root: &Path) -> PathBuf {
-    work_dir(repo_root, ".refit-stages", "refit-stages")
-}
+pub(super) fn stages_dir(repo_root: &Path) -> PathBuf { work_dir(repo_root, ".refit-stages", "refit-stages") }
 
 pub fn sweep_stages(repo_root: &Path, max_age_secs: u64) -> usize {
     let Ok(rd) = fs::read_dir(stages_dir(repo_root)) else { return 0 };
     let cutoff = SystemTime::now().checked_sub(Duration::from_secs(max_age_secs)).unwrap_or(UNIX_EPOCH);
-    let mut swept = 0usize;
-    for entry in rd.flatten() {
+    rd.flatten().filter(|entry| {
         let p = entry.path();
-        if p.is_dir()
-            && entry.file_name().to_string_lossy().starts_with("tx-")
+        p.is_dir() && entry.file_name().to_string_lossy().starts_with("tx-")
             && fs::metadata(&p).and_then(|m| m.modified()).is_ok_and(|m| m <= cutoff)
             && fs::remove_dir_all(&p).is_ok()
-        {
-            swept += 1;
-        }
-    }
-    swept
+    }).count()
 }
 
 #[cfg(test)]
@@ -453,8 +348,7 @@ pub fn encode_lsp(payload: &serde_json::Value) -> Vec<u8> {
 #[cfg(test)]
 pub fn decode_lsp(raw: &[u8]) -> Option<(serde_json::Value, usize)> {
     let hdr_end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let hdr = std::str::from_utf8(&raw[..hdr_end]).ok()?;
-    let len: usize = hdr.lines().find_map(|l| {
+    let len: usize = std::str::from_utf8(&raw[..hdr_end]).ok()?.lines().find_map(|l| {
         let (k, v) = l.split_once(':')?;
         k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok()).flatten()
     })?;
@@ -471,25 +365,19 @@ fn link_or_copy_file(src: &Path, dst: &Path) -> Result<(u64, u64)> {
 }
 
 fn link_or_copy_pairs(pairs: &[(PathBuf, PathBuf)]) -> Result<(u64, u64)> {
+    let step = |(hl, cp): (u64, u64), (s, d): &(PathBuf, PathBuf)| -> Result<(u64, u64)> {
+        let (dh, dc) = link_or_copy_file(s, d)?;
+        Ok((hl + dh, cp + dc))
+    };
     if budget().is_constrained() {
-        return pairs.iter().try_fold((0u64, 0u64), |(hl, cp), (s, d)| {
-            let (dh, dc) = link_or_copy_file(s, d)?;
-            Ok((hl + dh, cp + dc))
-        });
+        return pairs.iter().try_fold((0u64, 0u64), step);
     }
-    pairs
-        .par_iter()
-        .try_fold(|| (0u64, 0u64), |(hl, cp), (s, d)| {
-            let (dh, dc) = link_or_copy_file(s, d)?;
-            Ok((hl + dh, cp + dc))
-        })
+    pairs.par_iter().try_fold(|| (0u64, 0u64), step)
         .try_reduce(|| (0u64, 0u64), |a, b| Ok((a.0 + b.0, a.1 + b.1)))
 }
 
 pub(super) fn materialize_stage(
-    repo_root: &Path,
-    candidates: &BTreeMap<String, String>,
-    deleted: &[String],
+    repo_root: &Path, candidates: &BTreeMap<String, String>, deleted: &[String],
 ) -> Result<DropGuard<PathBuf, impl FnOnce(PathBuf) + use<>>> {
     let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
     ensure_cache_dirs_tagged(repo_root);
@@ -497,39 +385,23 @@ pub(super) fn materialize_stage(
         let _ = sweep_stages(repo_root, 1800);
         let _ = prune_cache_lru(&repo_root.join(".refit/cache"), DEFAULT_CACHE_CAP_BYTES);
     }
-
     let stage_dir = stages_dir(repo_root).join(format!("tx-{}-{seq}", now_ms()));
     fs::create_dir_all(&stage_dir)?;
-    let guard = DropGuard::new(stage_dir, |dir| {
-        let _ = fs::remove_dir_all(dir);
-    });
+    let guard = DropGuard::new(stage_dir, |dir| { let _ = fs::remove_dir_all(dir); });
     let del_set: BTreeSet<String> = deleted.iter().map(|s| s.replace('\\', "/")).collect();
-
-    let to_link: Vec<(PathBuf, PathBuf)> = walk_files(repo_root, None)
-        .into_iter()
-        .filter_map(|path| {
-            let rel = rel_norm(repo_root, &path)?;
-            (!candidates.contains_key(&rel) && !del_set.contains(&rel)).then(|| (path, guard.join(&rel)))
-        })
-        .collect();
-
+    let to_link: Vec<(PathBuf, PathBuf)> = walk_files(repo_root, None).into_iter().filter_map(|path| {
+        let rel = rel_norm(repo_root, &path)?;
+        (!candidates.contains_key(&rel) && !del_set.contains(&rel)).then(|| (path, guard.join(&rel)))
+    }).collect();
     for p in to_link.iter().filter_map(|(_, d)| d.parent()).collect::<BTreeSet<_>>() {
         fs::create_dir_all(p).with_context(|| format!("create staged parent dir {}", p.display()))?;
     }
-
     let (hl, cp) = link_or_copy_pairs(&to_link)?;
-    if hl > 0 {
-        STAGE_HARDLINKS_TOTAL.fetch_add(hl, Ordering::Relaxed);
-    }
-    if cp > 0 {
-        STAGE_COPIED_TOTAL.fetch_add(cp, Ordering::Relaxed);
-    }
-
+    if hl > 0 { STAGE_HARDLINKS_TOTAL.fetch_add(hl, Ordering::Relaxed); }
+    if cp > 0 { STAGE_COPIED_TOTAL.fetch_add(cp, Ordering::Relaxed); }
     for (rel, content) in candidates {
         let dst = guard.join(rel);
-        if let Some(p) = dst.parent() {
-            fs::create_dir_all(p)?;
-        }
+        if let Some(p) = dst.parent() { fs::create_dir_all(p)?; }
         fs::write(&dst, content.as_bytes()).with_context(|| format!("write staged candidate {}", dst.display()))?;
     }
     Ok(guard)

@@ -1,15 +1,12 @@
 use super::ops::{
-    EvalScratch, MAX_COLS, PEAK_WINDOW, RIBBON_GUARD, axis_conv_row, encode_grid_into,
-    eval_span_block01_scalar, norm_sketch, sigmoid_f64, sink_attention_scalar,
+    EvalOptions, EvalScratch, MAX_COLS, PEAK_WINDOW, RIBBON_GUARD, SparseAttnTelemetry,
+    axis_conv_row, encode_grid_into, eval_span_block01_with, norm_sketch, sigmoid_f64,
+    sink_attention_with,
 };
 #[cfg(target_arch = "x86_64")]
-use super::ops::{eval_span_block01_avx2, sink_attention_avx2};
-use super::simd::{linear_sparse_direct_csr, sparse_parts_direct_csr};
-#[cfg(target_arch = "x86_64")]
-use super::simd::{linear_sparse_width_gated_avx2, sparse_parts_width_gated_avx2};
-use super::weights::ResolvedWeights;
-#[cfg(any(feature = "neural-v6", test))]
-use super::weights::{CompactConv, CompactCsr};
+use super::simd::Avx2Kernel;
+use super::simd::{CsOp, HygieneKernel, ScalarKernel, linear_sparse_direct_csr};
+use super::weights::{CompactConv, CompactCsr, ResolvedWeights};
 use crate::types::{HygieneResult, Squiggle};
 use std::cell::RefCell;
 
@@ -34,16 +31,20 @@ thread_local! {
     static EVAL_SCRATCH: RefCell<EvalScratch> = RefCell::new(EvalScratch::new());
 }
 
-pub(super) fn score_v07_with_weights(content: &str, w: &ResolvedWeights) -> HygieneResult {
+pub(super) fn score_v07_with_opts(
+    content: &str,
+    w: &ResolvedWeights,
+    opts: EvalOptions,
+) -> (HygieneResult, Option<SparseAttnTelemetry>) {
     EVAL_SCRATCH.with(|cell| {
         let mut sc_guard = cell.borrow_mut();
         let sc = &mut *sc_guard;
         sc.ensure_span_buffers(w);
         let num_lines = encode_grid_into(content, &mut sc.grid, &mut sc.row_lens);
 
-        let res = dispatch_eval(w, num_lines, sc);
+        let out = dispatch_eval(w, num_lines, opts, sc);
         sc.shrink_if_oversized(num_lines, SCRATCH_SHRINK_LINES);
-        res
+        out
     })
 }
 
@@ -54,35 +55,50 @@ pub(super) fn score_v07_scalar_only(content: &str, w: &ResolvedWeights) -> Hygie
         let sc = &mut *sc_guard;
         sc.ensure_span_buffers(w);
         let num_lines = encode_grid_into(content, &mut sc.grid, &mut sc.row_lens);
-        let res = eval_file_scalar(w, num_lines, sc);
+        // SAFETY: `ScalarKernel` has no target-feature requirements.
+        let (res, _) = unsafe { eval_file_with::<ScalarKernel>(w, num_lines, EvalOptions::default(), sc) };
         sc.shrink_if_oversized(num_lines, SCRATCH_SHRINK_LINES);
         res
     })
 }
 
-fn dispatch_eval(w: &ResolvedWeights, num_lines: usize, sc: &mut EvalScratch) -> HygieneResult {
+#[cfg(test)]
+pub(super) fn reset_and_check_sparse_alloc_on_default(content: &str, w: &ResolvedWeights) -> (HygieneResult, bool) {
+    EVAL_SCRATCH.with(|cell| {
+        let mut sc_guard = cell.borrow_mut();
+        let sc = &mut *sc_guard;
+        sc.sparse = None;
+        sc.ensure_span_buffers(w);
+        let num_lines = encode_grid_into(content, &mut sc.grid, &mut sc.row_lens);
+        let (res, _) = dispatch_eval(w, num_lines, EvalOptions::default(), sc);
+        let allocated = sc.sparse.is_some();
+        sc.shrink_if_oversized(num_lines, SCRATCH_SHRINK_LINES);
+        (res, allocated)
+    })
+}
+
+fn dispatch_eval(
+    w: &ResolvedWeights,
+    num_lines: usize,
+    opts: EvalOptions,
+    sc: &mut EvalScratch,
+) -> (HygieneResult, Option<SparseAttnTelemetry>) {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
         // SAFETY: `is_x86_feature_detected!("avx2")` confirmed AVX2 support on this CPU.
-        return unsafe { eval_file_avx2(w, num_lines, sc) };
+        return unsafe { eval_file_avx2(w, num_lines, opts, sc) };
     }
-    eval_file_scalar(w, num_lines, sc)
+    // SAFETY: `ScalarKernel` has no target-feature requirements.
+    unsafe { eval_file_with::<ScalarKernel>(w, num_lines, opts, sc) }
 }
 
 fn prepare_file_buffers(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
-    let cs_len = n * w.col_sum_proj.cols as usize;
-    let c3_len = n * w.conv3_w.cols;
-    let c7_len = n * w.conv7_w.cols;
-    let sk_len = n * w.sketch_w.cols;
-    let dl_len = n * w.ml_proj.cols as usize;
-    let st_len = n * w.state_dim;
-
-    resize_zero(&mut sc.col_sums, cs_len);
-    resize_zero(&mut sc.conv3, c3_len);
-    resize_zero(&mut sc.conv7, c7_len);
-    resize_zero(&mut sc.sketch, sk_len);
-    resize_zero(&mut sc.deltas, dl_len);
-    resize_zero(&mut sc.state, st_len);
+    resize_zero(&mut sc.col_sums, n * w.col_sum_proj.cols as usize);
+    resize_zero(&mut sc.conv3, n * w.conv3_w.cols);
+    resize_zero(&mut sc.conv7, n * w.conv7_w.cols);
+    resize_zero(&mut sc.sketch, n * w.sketch_w.cols);
+    resize_zero(&mut sc.deltas, n * w.ml_proj.cols as usize);
+    resize_zero(&mut sc.state, n * w.state_dim);
     resize_zero(&mut sc.gate, n);
 }
 
@@ -94,43 +110,27 @@ fn resize_zero(buf: &mut Vec<f32>, needed: usize) {
     buf[..needed].fill(0.0);
 }
 
-fn eval_file_scalar(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneResult {
-    prepare_file_buffers(w, n, sc);
-
-    let mut first_nb: Option<(usize, usize)> = None;
-    let mut paired_done = false;
-    for row in 0..n {
-        let raw_len = sc.row_lens[row] as usize;
-        if raw_len == 0 {
-            continue;
-        }
-        let slen = (raw_len + RIBBON_GUARD).min(MAX_COLS);
-        if !paired_done {
-            if let Some((row0, slen0)) = first_nb {
-                eval_span_block01_scalar(w, row0, slen0, Some((row, slen)), true, sc);
-                paired_done = true;
-            } else {
-                first_nb = Some((row, slen));
-            }
-        } else {
-            eval_span_block01_scalar(w, row, slen, None, false, sc);
-        }
-    }
-    if !paired_done
-        && let Some((row0, slen0)) = first_nb
-    {
-        eval_span_block01_scalar(w, row0, slen0, None, true, sc);
-    }
-
-    build_state_scalar(w, n, sc);
-    run_context_scalar(w, n, sc);
-    finish_heads(w, n, sc)
-}
-
 // SAFETY: Caller must guarantee AVX2 is available on the executing x86_64 CPU.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn eval_file_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneResult {
+unsafe fn eval_file_avx2(
+    w: &ResolvedWeights,
+    n: usize,
+    opts: EvalOptions,
+    sc: &mut EvalScratch,
+) -> (HygieneResult, Option<SparseAttnTelemetry>) {
+    // SAFETY: AVX2 is active in this function and propagates into `#[inline(always)]` `eval_file_with`.
+    unsafe { eval_file_with::<Avx2Kernel>(w, n, opts, sc) }
+}
+
+// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+#[inline(always)]
+unsafe fn eval_file_with<K: HygieneKernel>(
+    w: &ResolvedWeights,
+    n: usize,
+    opts: EvalOptions,
+    sc: &mut EvalScratch,
+) -> (HygieneResult, Option<SparseAttnTelemetry>) {
     prepare_file_buffers(w, n, sc);
 
     let mut first_nb: Option<(usize, usize)> = None;
@@ -143,36 +143,30 @@ unsafe fn eval_file_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) ->
         let slen = (raw_len + RIBBON_GUARD).min(MAX_COLS);
         if !paired_done {
             if let Some((row0, slen0)) = first_nb {
-                // SAFETY: AVX2 is active in this function.
-                unsafe {
-                    eval_span_block01_avx2(w, row0, slen0, Some((row, slen)), true, sc);
-                }
+                // SAFETY: Enclosing caller guarantees `K` invariants.
+                unsafe { eval_span_block01_with::<K>(w, row0, slen0, Some((row, slen)), true, sc) };
                 paired_done = true;
             } else {
                 first_nb = Some((row, slen));
             }
         } else {
-            // SAFETY: AVX2 is active in this function.
-            unsafe {
-                eval_span_block01_avx2(w, row, slen, None, false, sc);
-            }
+            // SAFETY: Enclosing caller guarantees `K` invariants.
+            unsafe { eval_span_block01_with::<K>(w, row, slen, None, false, sc) };
         }
     }
     if !paired_done
         && let Some((row0, slen0)) = first_nb
     {
-        // SAFETY: AVX2 is active in this function.
-        unsafe {
-            eval_span_block01_avx2(w, row0, slen0, None, true, sc);
-        }
+        // SAFETY: Enclosing caller guarantees `K` invariants.
+        unsafe { eval_span_block01_with::<K>(w, row0, slen0, None, true, sc) };
     }
 
-    // SAFETY: AVX2 is active in this function.
-    unsafe {
-        build_state_avx2(w, n, sc);
-        run_context_avx2(w, n, sc);
-    }
-    finish_heads(w, n, sc)
+    // SAFETY: Enclosing caller guarantees `K` invariants.
+    let telemetry = unsafe {
+        build_state_with::<K>(w, n, sc);
+        run_context_with::<K>(w, n, opts, sc)
+    };
+    (finish_heads(w, n, sc), telemetry)
 }
 
 fn fill_ml_tile(w: &ResolvedWeights, n: usize, row_start: usize, b: usize, sc: &mut EvalScratch) {
@@ -201,9 +195,7 @@ fn fill_ml_tile(w: &ResolvedWeights, n: usize, row_start: usize, b: usize, sc: &
         &sc.excl_tile[..b * ml_cols],
         b,
         ml_cols,
-        &w.ml_gate_w,
-        Some(&w.ml_gate_b),
-        true,
+        CsOp::new(&w.ml_gate_w, Some(&w.ml_gate_b), true),
         &mut sc.saw_tile[..b * w.ml_gate_w.cols as usize],
     );
 }
@@ -222,7 +214,9 @@ fn copy_tile_into_state(w: &ResolvedWeights, row_start: usize, b: usize, sc: &mu
     }
 }
 
-fn build_state_scalar(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
+// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+#[inline(always)]
+unsafe fn build_state_with<K: HygieneKernel>(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
     let cc = w.col_sum_proj.cols as usize;
     let c3c = w.conv3_w.cols;
     let c7c = w.conv7_w.cols;
@@ -233,77 +227,15 @@ fn build_state_scalar(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
     let ls_cols = w.lmlp2_w.cols as usize;
 
     norm_sketch(&mut sc.sketch, n, w.sketch_w.cols);
-    sparse_parts_direct_csr(
-        &[&sc.col_sums[..n * cc], &sc.conv3[..n * c3c], &sc.conv7[..n * c7c]],
-        &w.ml_proj_ranges,
-        n,
-        &w.ml_proj,
-        None,
-        false,
-        &mut sc.deltas[..n * ml_cols],
-    );
-    sc.running_delta[..ml_cols].fill(0.0);
-
-    let mut row_start = 0usize;
-    while row_start < n {
-        let b = (n - row_start).min(8);
-        fill_ml_tile(w, n, row_start, b, sc);
-        let row_end = row_start + b;
-        sparse_parts_direct_csr(
-            &[
-                &sc.col_sums[row_start * cc..row_end * cc],
-                &sc.conv3[row_start * c3c..row_end * c3c],
-                &sc.conv7[row_start * c7c..row_end * c7c],
-                &sc.saw_tile[..b * saw_cols],
-                &sc.paren_tile[..b * paren_cols],
-            ],
-            &w.lmlp1_ranges,
-            b,
-            &w.lmlp1_w,
-            Some(&w.lmlp1_b),
-            true,
-            &mut sc.hidden_tile[..b * h_cols],
-        );
-        linear_sparse_direct_csr(
-            &sc.hidden_tile[..b * h_cols],
-            b,
-            h_cols,
-            &w.lmlp2_w,
-            Some(&w.lmlp2_b),
-            false,
-            &mut sc.stats_tile[..b * ls_cols],
-        );
-        copy_tile_into_state(w, row_start, b, sc);
-        row_start = row_end;
-    }
-}
-
-// SAFETY: Caller must guarantee AVX2 is available on the executing x86_64 CPU.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn build_state_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
-    let cc = w.col_sum_proj.cols as usize;
-    let c3c = w.conv3_w.cols;
-    let c7c = w.conv7_w.cols;
-    let ml_cols = w.ml_proj.cols as usize;
-    let saw_cols = w.ml_gate_w.cols as usize;
-    let paren_cols = w.ml_paren_w.cols;
-    let h_cols = w.lmlp1_w.cols as usize;
-    let ls_cols = w.lmlp2_w.cols as usize;
-
-    norm_sketch(&mut sc.sketch, n, w.sketch_w.cols);
-    // SAFETY: AVX2 is active in this function.
+    // SAFETY: Enclosing caller guarantees `K` invariants.
     unsafe {
-        sparse_parts_width_gated_avx2(
+        K::sparse_parts(
             &[&sc.col_sums[..n * cc], &sc.conv3[..n * c3c], &sc.conv7[..n * c7c]],
             &w.ml_proj_ranges,
             n,
-            &w.ml_proj,
-            None,
-            false,
+            CsOp::new(&w.ml_proj, None, false),
             &mut sc.deltas[..n * ml_cols],
-            &mut sc.tile_in,
-            &mut sc.tile_acc,
+            &mut sc.tile,
         );
     }
     sc.running_delta[..ml_cols].fill(0.0);
@@ -313,9 +245,9 @@ unsafe fn build_state_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) 
         let b = (n - row_start).min(8);
         fill_ml_tile(w, n, row_start, b, sc);
         let row_end = row_start + b;
-        // SAFETY: AVX2 is active in this function.
+        // SAFETY: Enclosing caller guarantees `K` invariants.
         unsafe {
-            sparse_parts_width_gated_avx2(
+            K::sparse_parts(
                 &[
                     &sc.col_sums[row_start * cc..row_end * cc],
                     &sc.conv3[row_start * c3c..row_end * c3c],
@@ -325,23 +257,17 @@ unsafe fn build_state_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) 
                 ],
                 &w.lmlp1_ranges,
                 b,
-                &w.lmlp1_w,
-                Some(&w.lmlp1_b),
-                true,
+                CsOp::new(&w.lmlp1_w, Some(&w.lmlp1_b), true),
                 &mut sc.hidden_tile[..b * h_cols],
-                &mut sc.tile_in,
-                &mut sc.tile_acc,
+                &mut sc.tile,
             );
-            linear_sparse_width_gated_avx2(
+            K::linear_sparse(
                 &sc.hidden_tile[..b * h_cols],
                 b,
                 h_cols,
-                &w.lmlp2_w,
-                Some(&w.lmlp2_b),
-                false,
+                CsOp::new(&w.lmlp2_w, Some(&w.lmlp2_b), false),
                 &mut sc.stats_tile[..b * ls_cols],
-                &mut sc.tile_in,
-                &mut sc.tile_acc,
+                &mut sc.tile,
             );
         }
         copy_tile_into_state(w, row_start, b, sc);
@@ -349,54 +275,21 @@ unsafe fn build_state_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) 
     }
 }
 
-fn run_context_scalar(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
+// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+#[inline(always)]
+unsafe fn run_context_with<K: HygieneKernel>(
+    w: &ResolvedWeights,
+    n: usize,
+    opts: EvalOptions,
+    sc: &mut EvalScratch,
+) -> Option<SparseAttnTelemetry> {
     let dim = w.state_dim;
-    for layer in &w.ctx_layers {
-        sink_attention_scalar(&layer.attn, n, dim, sc);
-        for idx in 0..n * dim {
-            sc.state[idx] += sc.attn_out[idx];
-        }
-        let h_cols = layer.cmlp_w.cols as usize;
-        let mut row_start = 0usize;
-        while row_start < n {
-            let b = (n - row_start).min(8);
-            let lo = row_start * dim;
-            let hi = (row_start + b) * dim;
-            linear_sparse_direct_csr(
-                &sc.state[lo..hi],
-                b,
-                dim,
-                &layer.cmlp_w,
-                Some(&layer.cmlp_b),
-                true,
-                &mut sc.ctx_h_tile[..b * h_cols],
-            );
-            linear_sparse_direct_csr(
-                &sc.ctx_h_tile[..b * h_cols],
-                b,
-                h_cols,
-                &layer.cmlp2_w,
-                Some(&layer.cmlp2_b),
-                false,
-                &mut sc.ctx_o_tile[..b * dim],
-            );
-            for idx in 0..b * dim {
-                sc.state[lo + idx] += sc.ctx_o_tile[idx];
-            }
-            row_start += b;
-        }
-    }
-}
+    let mut telemetry = (opts.approx_long && n > opts.approx_threshold).then(SparseAttnTelemetry::default);
 
-// SAFETY: Caller must guarantee AVX2 is available on the executing x86_64 CPU.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn run_context_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
-    let dim = w.state_dim;
-    for layer in &w.ctx_layers {
-        // SAFETY: AVX2 is active in this function.
+    for (layer_idx, layer) in w.ctx_layers.iter().enumerate() {
+        // SAFETY: Enclosing caller guarantees `K` invariants.
         unsafe {
-            sink_attention_avx2(&layer.attn, n, dim, sc);
+            sink_attention_with::<K>(&layer.attn, layer_idx, n, dim, sc, telemetry.as_mut());
         }
         for idx in 0..n * dim {
             sc.state[idx] += sc.attn_out[idx];
@@ -407,29 +300,23 @@ unsafe fn run_context_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) 
             let b = (n - row_start).min(8);
             let lo = row_start * dim;
             let hi = (row_start + b) * dim;
-            // SAFETY: AVX2 is active in this function.
+            // SAFETY: Enclosing caller guarantees `K` invariants.
             unsafe {
-                linear_sparse_width_gated_avx2(
+                K::linear_sparse(
                     &sc.state[lo..hi],
                     b,
                     dim,
-                    &layer.cmlp_w,
-                    Some(&layer.cmlp_b),
-                    true,
+                    CsOp::new(&layer.cmlp_w, Some(&layer.cmlp_b), true),
                     &mut sc.ctx_h_tile[..b * h_cols],
-                    &mut sc.tile_in,
-                    &mut sc.tile_acc,
+                    &mut sc.tile,
                 );
-                linear_sparse_width_gated_avx2(
+                K::linear_sparse(
                     &sc.ctx_h_tile[..b * h_cols],
                     b,
                     h_cols,
-                    &layer.cmlp2_w,
-                    Some(&layer.cmlp2_b),
-                    false,
+                    CsOp::new(&layer.cmlp2_w, Some(&layer.cmlp2_b), false),
                     &mut sc.ctx_o_tile[..b * dim],
-                    &mut sc.tile_in,
-                    &mut sc.tile_acc,
+                    &mut sc.tile,
                 );
             }
             for idx in 0..b * dim {
@@ -438,6 +325,7 @@ unsafe fn run_context_avx2(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) 
             row_start += b;
         }
     }
+    telemetry
 }
 
 fn finish_heads(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneResult {
@@ -454,10 +342,22 @@ fn finish_heads(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneR
 
     for row in 0..n {
         let slice = &sc.state[row * dim..(row + 1) * dim];
-        linear_sparse_direct_csr(slice, 1, dim, &w.pool_gate_w, Some(&w.pool_gate_b), false, &mut gate_row);
+        linear_sparse_direct_csr(
+            slice,
+            1,
+            dim,
+            CsOp::new(&w.pool_gate_w, Some(&w.pool_gate_b), false),
+            &mut gate_row,
+        );
         sc.gate[row] = sigmoid_f64(gate_row[0] as f64) as f32;
 
-        linear_sparse_direct_csr(slice, 1, dim, &w.sq_w, Some(&w.sq_b), false, &mut sq_row);
+        linear_sparse_direct_csr(
+            slice,
+            1,
+            dim,
+            CsOp::new(&w.sq_w, Some(&w.sq_b), false),
+            &mut sq_row,
+        );
         let max_logit = sq_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         if max_logit < SQUIGGLE_LOGIT_PREFILTER {
             continue;
@@ -503,15 +403,19 @@ fn finish_heads(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneR
 
     let doc_v = pool_doc_ring(n, dim, sc);
     let mut doc_h = vec![0.0f32; w.doc1_w.cols as usize];
-    linear_sparse_direct_csr(&doc_v, 1, dim * 2, &w.doc1_w, Some(&w.doc1_b), true, &mut doc_h);
+    linear_sparse_direct_csr(
+        &doc_v,
+        1,
+        dim * 2,
+        CsOp::new(&w.doc1_w, Some(&w.doc1_b), true),
+        &mut doc_h,
+    );
     let mut doc_l = [0.0f32; 1];
     linear_sparse_direct_csr(
         &doc_h,
         1,
         w.doc1_w.cols as usize,
-        &w.doc2_w,
-        Some(&w.doc2_b),
-        false,
+        CsOp::new(&w.doc2_w, Some(&w.doc2_b), false),
         &mut doc_l,
     );
     let score = (sigmoid_f64(doc_l[0] as f64) * 10000.0).round() / 10000.0;
@@ -532,20 +436,17 @@ fn finish_heads(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneR
     }
 }
 
-#[cfg(any(feature = "neural-v6", test))]
 fn add_csr_counts(total: &mut u64, nnz: &mut u64, mat: &CompactCsr) {
     *total += (mat.rows as u64) * (mat.cols as u64);
     *nnz += mat.non_zero_count as u64;
 }
 
-#[cfg(any(feature = "neural-v6", test))]
 fn add_conv_counts(total: &mut u64, nnz: &mut u64, conv: &CompactConv) {
     *total += (conv.k_size as u64) * (conv.rows as u64) * (conv.cols as u64);
     *nnz += conv.non_zero_count as u64;
 }
 
 /// Compute aggregate ternary weight zero ratio across all layers in `ResolvedWeights`.
-#[cfg(any(feature = "neural-v6", test))]
 pub(super) fn weight_zero_ratio(weights: &ResolvedWeights) -> f64 {
     let mut total = 0u64;
     let mut nnz = 0u64;
@@ -643,8 +544,8 @@ fn pool_doc_ring(n: usize, dim: usize, sc: &mut EvalScratch) -> Vec<f32> {
         }
     }
 
-    for ch in 0..dim {
-        doc[ch] = (sc.mean_acc[ch] / g_sum) as f32;
+    for (dst, &acc) in doc.iter_mut().zip(sc.mean_acc.iter()).take(dim) {
+        *dst = (acc / g_sum) as f32;
     }
     doc[dim..].copy_from_slice(&sc.peak[..dim]);
     doc

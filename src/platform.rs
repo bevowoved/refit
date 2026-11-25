@@ -193,7 +193,7 @@ impl FileBuf {
     pub fn hash_file_blake3(&mut self, path: &Path) -> Result<(u64, String)> {
         let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
-        advise_sequential_if_medium(&f, file_len);
+        advise_file(&f, file_len, false);
 
         let mut hasher = blake3::Hasher::new();
         let mut total = 0u64;
@@ -205,7 +205,7 @@ impl FileBuf {
             hasher.update(&self.buf[..n]);
             total += n as u64;
         }
-        advise_dontneed_if_large(&f, total);
+        advise_file(&f, total, true);
         Ok((total, hasher.finalize().to_hex().to_string()))
     }
 }
@@ -219,90 +219,60 @@ impl Default for FileBuf {
 /// Write the standard 43-byte `CACHEDIR.TAG` marker inside `dir`.
 pub fn ensure_cachedir_tag(dir: &Path) {
     let tag = dir.join("CACHEDIR.TAG");
-    if tag.exists() {
-        return;
-    }
+    if tag.exists() { return; }
     let _ = fs::create_dir_all(dir);
     let _ = fs::write(&tag, CACHEDIR_TAG_BODY);
 }
 
 #[inline]
 pub fn has_cachedir_tag(dir: &Path) -> bool {
-    let tag = dir.join("CACHEDIR.TAG");
-    let Ok(mut f) = File::open(&tag) else { return false };
+    let Ok(mut f) = File::open(dir.join("CACHEDIR.TAG")) else { return false };
     let mut head = [0u8; 43];
     f.read_exact(&mut head).is_ok() && head.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55")
 }
 
-fn advise_sequential_if_medium(file: &File, len: u64) {
+fn advise_file(file: &File, len: u64, dontneed: bool) {
     #[cfg(target_os = "linux")]
-    if (FADV_SEQ_MIN..FADV_DONTNEED_MIN).contains(&len) {
-        let _ = nix::fcntl::posix_fadvise(
-            file,
-            0,
-            0,
-            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
-        );
+    {
+        use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
+        let adv = if dontneed && len >= FADV_DONTNEED_MIN {
+            Some(PosixFadviseAdvice::POSIX_FADV_DONTNEED)
+        } else if !dontneed && (FADV_SEQ_MIN..FADV_DONTNEED_MIN).contains(&len) {
+            Some(PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL)
+        } else {
+            None
+        };
+        if let Some(a) = adv { let _ = posix_fadvise(file, 0, 0, a); }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (file, len);
-}
-
-fn advise_dontneed_if_large(file: &File, len: u64) {
-    #[cfg(target_os = "linux")]
-    if len >= FADV_DONTNEED_MIN {
-        let _ = nix::fcntl::posix_fadvise(
-            file,
-            0,
-            0,
-            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
-        );
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = (file, len);
+    let _ = (file, len, dontneed);
 }
 
 /// Cross-OS durability barrier (`fdatasync` on Linux, `F_FULLFSYNC` on macOS, `sync_data` on Win).
 pub fn sync_file_barrier(file: &File) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_FULLFSYNC).is_ok() {
-        return Ok(());
-    }
+    if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_FULLFSYNC).is_ok() { return Ok(()); }
     file.sync_data()
 }
 
 fn write_atomic_with<T>(target: &Path, write_fn: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
-    let parent = target
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create parent dir {}", parent.display()))?;
-
+    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("create parent dir {}", parent.display()))?;
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = u32::from_le_bytes(os_random_bytes::<4>().unwrap_or([0; 4]));
     let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
-    let tmp_path = parent.join(format!(".refit.tmp.{}.{seq}.{nonce:08x}.{name}", std::process::id()));
+    let tmp = parent.join(format!(".refit.tmp.{}.{seq}.{nonce:08x}.{name}", std::process::id()));
 
     let outcome = (|| -> Result<T> {
-        let mut f = File::create(&tmp_path)
-            .with_context(|| format!("create temp file {}", tmp_path.display()))?;
+        let mut f = File::create(&tmp).with_context(|| format!("create temp file {}", tmp.display()))?;
         let res = write_fn(&mut f)?;
         sync_file_barrier(&f)?;
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-        advise_dontneed_if_large(&f, len);
+        advise_file(&f, f.metadata().map(|m| m.len()).unwrap_or(0), true);
         Ok(res)
     })();
-
     match outcome {
-        Ok(val) => {
-            replace_file(&tmp_path, target, parent)?;
-            Ok(val)
-        }
-        Err(err) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(err)
-        }
+        Ok(val) => { replace_file(&tmp, target, parent)?; Ok(val) }
+        Err(err) => { let _ = fs::remove_file(&tmp); Err(err) }
     }
 }
 
@@ -319,10 +289,9 @@ pub fn write_zstd<T: Serialize>(path: &Path, val: &T) -> Result<()> {
 pub fn read_zstd<T: DeserializeOwned>(path: &Path) -> Option<T> {
     let f = File::open(path).ok()?;
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    advise_sequential_if_medium(&f, len);
-    let dec = zstd::stream::Decoder::new(&f).ok()?;
-    let out = serde_json::from_reader(dec).ok();
-    advise_dontneed_if_large(&f, len);
+    advise_file(&f, len, false);
+    let out = serde_json::from_reader(zstd::stream::Decoder::new(&f).ok()?).ok();
+    advise_file(&f, len, true);
     out
 }
 
@@ -330,31 +299,24 @@ pub fn read_zstd<T: DeserializeOwned>(path: &Path) -> Option<T> {
 pub fn compress_file_zstd(src: &Path, dst: &Path, level: i32) -> Result<(u64, u64)> {
     write_atomic_with(dst, |writer| {
         let mut reader = File::open(src).with_context(|| format!("open {}", src.display()))?;
-        let src_len = reader.metadata().map(|m| m.len()).unwrap_or(0);
-        advise_sequential_if_medium(&reader, src_len);
-
+        advise_file(&reader, reader.metadata().map(|m| m.len()).unwrap_or(0), false);
         let mut enc = zstd::stream::Encoder::new(&mut *writer, level)?;
         let _ = enc.window_log(ZSTD_STREAM_WLOG);
-        let mut buf = vec![0u8; FILE_BUF_SIZE];
-        let mut raw_total = 0u64;
+        let (mut buf, mut raw_total) = (vec![0u8; FILE_BUF_SIZE], 0u64);
         loop {
             let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
+            if n == 0 { break; }
             enc.write_all(&buf[..n])?;
             raw_total += n as u64;
         }
-        advise_dontneed_if_large(&reader, raw_total);
+        advise_file(&reader, raw_total, true);
         enc.finish()?;
-        let out_len = writer.metadata().map(|m| m.len()).unwrap_or(0);
-        Ok((raw_total, out_len))
+        Ok((raw_total, writer.metadata().map(|m| m.len()).unwrap_or(0)))
     })
 }
 
 pub fn mkdir_private(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("create private directory {}", path.display()))?;
+    fs::create_dir_all(path).with_context(|| format!("create private directory {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -375,55 +337,49 @@ pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatEntry {
-    pub mtime_ns: u64,
-    pub size: u64,
-    pub blake3: String,
-}
+pub struct StatEntry { pub mtime_ns: u64, pub size: u64, pub blake3: String }
 
 pub fn file_mtime_size(path: &Path) -> Option<(u64, u64)> {
     let meta = fs::metadata(path).ok()?;
-    let mtime_ns = meta
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as u64;
+    let mtime_ns = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
     Some((mtime_ns, meta.len()))
 }
 
 pub fn now_unix_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
 
 /// Racy-git 2-second guard: only trust a stat cache hit when `now - mtime_ns >= 2s`.
 #[inline]
 pub fn stat_cache_fresh(entry: &StatEntry, mtime_ns: u64, size: u64, now_ns: u64) -> bool {
-    entry.size == size
-        && entry.mtime_ns == mtime_ns
-        && now_ns.saturating_sub(mtime_ns) >= RACY_GIT_NS
+    entry.size == size && entry.mtime_ns == mtime_ns && now_ns.saturating_sub(mtime_ns) >= RACY_GIT_NS
 }
 
 pub fn load_stat_cache(path: &Path) -> BTreeMap<String, StatEntry> {
     let Ok(raw) = fs::read(path) else { return BTreeMap::new() };
     let Ok(dec) = zstd::stream::Decoder::new(raw.as_slice()) else { return BTreeMap::new() };
     let mut out = Vec::new();
-    if dec.take(STAT_MAX_DECODE_BYTES).read_to_end(&mut out).is_err() {
-        return BTreeMap::new();
-    }
+    if dec.take(STAT_MAX_DECODE_BYTES).read_to_end(&mut out).is_err() { return BTreeMap::new(); }
     decode_stat_map(&out).unwrap_or_default()
 }
 
 pub fn save_stat_cache(path: &Path, map: &BTreeMap<String, StatEntry>) -> Result<()> {
-    if let Some(p) = path.parent() {
-        ensure_cachedir_tag(p);
-    }
-    let raw = encode_stat_map(map);
-    let compressed = zstd::bulk::compress(&raw, 1)?;
-    write_atomic(path, &compressed)
+    if let Some(p) = path.parent() { ensure_cachedir_tag(p); }
+    write_atomic(path, &zstd::bulk::compress(&encode_stat_map(map), 1)?)
+}
+
+fn write_u16_str(out: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    let n = b.len().min(u16::MAX as usize);
+    let _ = out.write_u16::<LittleEndian>(n as u16);
+    out.extend_from_slice(&b[..n]);
+}
+
+fn read_u16_str(rd: &mut Cursor<&[u8]>) -> Option<String> {
+    let n = rd.read_u16::<LittleEndian>().ok()? as usize;
+    let mut buf = vec![0u8; n];
+    rd.read_exact(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
 }
 
 fn encode_stat_map(map: &BTreeMap<String, StatEntry>) -> Vec<u8> {
@@ -431,38 +387,24 @@ fn encode_stat_map(map: &BTreeMap<String, StatEntry>) -> Vec<u8> {
     out.extend_from_slice(STAT_MAGIC);
     let _ = out.write_u32::<LittleEndian>(map.len() as u32);
     for (rel, e) in map {
-        let rb = rel.as_bytes();
-        let rlen = rb.len().min(u16::MAX as usize);
-        let hb = e.blake3.as_bytes();
-        let hlen = hb.len().min(u16::MAX as usize);
-        let _ = out.write_u16::<LittleEndian>(rlen as u16);
-        out.extend_from_slice(&rb[..rlen]);
+        write_u16_str(&mut out, rel);
         let _ = out.write_u64::<LittleEndian>(e.mtime_ns);
         let _ = out.write_u64::<LittleEndian>(e.size);
-        let _ = out.write_u16::<LittleEndian>(hlen as u16);
-        out.extend_from_slice(&hb[..hlen]);
+        write_u16_str(&mut out, &e.blake3);
     }
     out
 }
 
 fn decode_stat_map(buf: &[u8]) -> Option<BTreeMap<String, StatEntry>> {
-    if buf.len() < 12 || &buf[..8] != STAT_MAGIC {
-        return None;
-    }
+    if buf.len() < 12 || &buf[..8] != STAT_MAGIC { return None; }
     let mut rd = Cursor::new(&buf[8..]);
     let count = rd.read_u32::<LittleEndian>().ok()? as usize;
     let mut map = BTreeMap::new();
     for _ in 0..count {
-        let rlen = rd.read_u16::<LittleEndian>().ok()? as usize;
-        let mut rbuf = vec![0u8; rlen];
-        rd.read_exact(&mut rbuf).ok()?;
-        let rel = String::from_utf8(rbuf).ok()?;
+        let rel = read_u16_str(&mut rd)?;
         let mtime_ns = rd.read_u64::<LittleEndian>().ok()?;
         let size = rd.read_u64::<LittleEndian>().ok()?;
-        let hlen = rd.read_u16::<LittleEndian>().ok()? as usize;
-        let mut hbuf = vec![0u8; hlen];
-        rd.read_exact(&mut hbuf).ok()?;
-        let blake3 = String::from_utf8(hbuf).ok()?;
+        let blake3 = read_u16_str(&mut rd)?;
         map.insert(rel, StatEntry { mtime_ns, size, blake3 });
     }
     Some(map)
@@ -632,29 +574,26 @@ struct SieveState<K, V> {
 }
 
 impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
+    fn clamp_hand(&mut self) {
+        self.hand = if self.map.is_empty() { 0 } else { self.hand % self.map.len() };
+    }
+
     fn evict_one_except(&mut self, protected: Option<&K>) -> bool {
         let len = self.map.len();
-        if len == 0 || (len == 1 && protected.is_some()) {
-            return false;
-        }
+        if len == 0 || (len == 1 && protected.is_some()) { return false; }
         let mut idx = self.hand % len;
-        let max_steps = len.saturating_mul(2).saturating_add(2);
-        for _ in 0..max_steps {
-            let is_protected = self.map.get_index(idx).is_some_and(|(k, _)| protected == Some(k));
-            if is_protected {
+        for _ in 0..len.saturating_mul(2).saturating_add(2) {
+            if self.map.get_index(idx).is_some_and(|(k, _)| protected == Some(k)) {
                 idx = (idx + 1) % len;
                 continue;
             }
-            let visited = self.map.get_index_mut(idx).is_some_and(|(_, (_, _, v))| {
-                let was = *v;
-                *v = false;
-                was
-            });
+            let visited = self.map.get_index_mut(idx).is_some_and(|(_, (_, _, v))| std::mem::replace(v, false));
             if !visited {
                 if let Some((_, (_, w, _))) = self.map.shift_remove_index(idx) {
                     self.total_weight = self.total_weight.saturating_sub(w);
                 }
-                self.hand = if self.map.is_empty() { 0 } else { idx % self.map.len() };
+                self.hand = idx;
+                self.clamp_hand();
                 return true;
             }
             idx = (idx + 1) % len;
@@ -665,30 +604,16 @@ impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
     fn insert(&mut self, key: K, val: V, weight: usize) -> Option<V> {
         let w = weight.max(1);
         if w > self.max_bytes {
-            if let Some((_, (prev, old_w, _))) = self.map.shift_remove_full(&key).map(|(i, k, v)| {
-                if i < self.hand {
-                    self.hand = self.hand.saturating_sub(1);
-                } else if !self.map.is_empty() {
-                    self.hand %= self.map.len();
-                } else {
-                    self.hand = 0;
-                }
-                (k, v)
-            }) {
-                self.total_weight = self.total_weight.saturating_sub(old_w);
-                return Some(prev);
-            }
-            return None;
+            let (i, _, (prev, old_w, _)) = self.map.shift_remove_full(&key)?;
+            if i < self.hand { self.hand = self.hand.saturating_sub(1); } else { self.clamp_hand(); }
+            self.total_weight = self.total_weight.saturating_sub(old_w);
+            return Some(prev);
         }
         if let Some((slot_val, slot_w, visited)) = self.map.get_mut(&key) {
             self.total_weight = self.total_weight.saturating_sub(*slot_w).saturating_add(w);
-            *slot_w = w;
-            *visited = true;
+            (*slot_w, *visited) = (w, true);
             let prev = std::mem::replace(slot_val, val);
-            while self.total_weight > self.max_bytes
-                && self.map.len() > 1
-                && self.evict_one_except(Some(&key))
-            {}
+            while self.total_weight > self.max_bytes && self.map.len() > 1 && self.evict_one_except(Some(&key)) {}
             return Some(prev);
         }
         while (self.map.len() >= self.max_entries
@@ -701,19 +626,14 @@ impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
     }
 }
 
-pub struct SieveCache<K, V> {
-    inner: Mutex<SieveState<K, V>>,
-}
+pub struct SieveCache<K, V> { inner: Mutex<SieveState<K, V>> }
 
 impl<K: Eq + Hash + Clone, V: Clone> SieveCache<K, V> {
     pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(SieveState {
                 map: IndexMap::with_hasher(FxBuildHasher),
-                hand: 0,
-                total_weight: 0,
-                max_entries: max_entries.max(1),
-                max_bytes: max_bytes.max(1),
+                hand: 0, total_weight: 0, max_entries: max_entries.max(1), max_bytes: max_bytes.max(1),
             }),
         }
     }
@@ -744,17 +664,11 @@ impl<K: Eq + Hash + Clone, V: Clone> SieveCache<K, V> {
         let mut g = self.inner.lock();
         let (v, w, _) = g.map.swap_remove(key)?;
         g.total_weight = g.total_weight.saturating_sub(w);
-        if !g.map.is_empty() {
-            g.hand %= g.map.len();
-        } else {
-            g.hand = 0;
-        }
+        g.clamp_hand();
         Some(v)
     }
 
-    pub fn len(&self) -> usize {
-        self.inner.lock().map.len()
-    }
+    pub fn len(&self) -> usize { self.inner.lock().map.len() }
 
     pub fn snapshot(&self) -> Vec<(K, V)> {
         self.inner.lock().map.iter().map(|(k, (v, _, _))| (k.clone(), v.clone())).collect()
@@ -762,37 +676,23 @@ impl<K: Eq + Hash + Clone, V: Clone> SieveCache<K, V> {
 }
 
 /// Lock-free monotonic epoch registry (`global_epoch` + 64 atomic key slots).
-pub struct EpochRegistry {
-    global_epoch: AtomicU64,
-    slots: [AtomicU64; EPOCH_SLOTS],
-}
+pub struct EpochRegistry { global_epoch: AtomicU64, slots: [AtomicU64; EPOCH_SLOTS] }
 
 impl EpochRegistry {
     pub fn new() -> Self {
-        Self {
-            global_epoch: AtomicU64::new(1),
-            slots: std::array::from_fn(|_| AtomicU64::new(1)),
-        }
+        Self { global_epoch: AtomicU64::new(1), slots: std::array::from_fn(|_| AtomicU64::new(1)) }
     }
 
     #[cfg(any(feature = "mcp-v2", test))]
-    pub fn global() -> &'static Self {
-        Self::global_arc_slot().as_ref()
-    }
-
-    pub fn global_arc() -> std::sync::Arc<Self> {
-        Self::global_arc_slot().clone()
-    }
+    pub fn global() -> &'static Self { Self::global_arc_slot().as_ref() }
+    pub fn global_arc() -> std::sync::Arc<Self> { Self::global_arc_slot().clone() }
 
     fn global_arc_slot() -> &'static std::sync::Arc<Self> {
         static GLOBAL: OnceLock<std::sync::Arc<EpochRegistry>> = OnceLock::new();
         GLOBAL.get_or_init(|| std::sync::Arc::new(Self::new()))
     }
 
-    #[inline]
-    pub fn global_epoch(&self) -> u64 {
-        self.global_epoch.load(Ordering::Acquire)
-    }
+    #[inline] pub fn global_epoch(&self) -> u64 { self.global_epoch.load(Ordering::Acquire) }
 
     #[inline]
     fn slot_idx(key: &str) -> usize {
@@ -802,9 +702,7 @@ impl EpochRegistry {
     }
 
     #[inline]
-    pub fn slot_epoch(&self, key: &str) -> u64 {
-        self.slots[Self::slot_idx(key)].load(Ordering::Acquire)
-    }
+    pub fn slot_epoch(&self, key: &str) -> u64 { self.slots[Self::slot_idx(key)].load(Ordering::Acquire) }
 
     /// Single-authority monotonic publish (`+1` exact) for ABI cutoff or single-key updates.
     #[inline]
@@ -819,17 +717,13 @@ impl EpochRegistry {
     pub fn publish_batch(&self, module_id: &str, files: &[String], _head_rev: u64) -> u64 {
         let next = self.global_epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         self.slots[Self::slot_idx(module_id)].fetch_max(next, Ordering::Release);
-        for f in files {
-            self.slots[Self::slot_idx(f)].fetch_max(next, Ordering::Release);
-        }
+        for f in files { self.slots[Self::slot_idx(f)].fetch_max(next, Ordering::Release); }
         next
     }
 }
 
 impl Default for EpochRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 #[cfg(test)]

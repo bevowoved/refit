@@ -3,118 +3,67 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-#[inline]
-pub fn ext_str(p: &Path) -> &str {
-    p.extension().and_then(|s| s.to_str()).unwrap_or("")
-}
-
-pub fn ext_of(p: impl AsRef<Path>) -> String {
-    ext_str(p.as_ref()).to_ascii_lowercase()
-}
-
-#[inline]
-pub fn stem_of(p: &Path) -> &str {
-    p.file_stem().and_then(|s| s.to_str()).unwrap_or("")
-}
+#[inline] pub fn ext_str(p: &Path) -> &str { p.extension().and_then(|s| s.to_str()).unwrap_or("") }
+pub fn ext_of(p: impl AsRef<Path>) -> String { ext_str(p.as_ref()).to_ascii_lowercase() }
+#[inline] pub fn stem_of(p: &Path) -> &str { p.file_stem().and_then(|s| s.to_str()).unwrap_or("") }
 
 pub fn dir_of(p: impl AsRef<Path>) -> String {
-    let Some(d) = p.as_ref().parent() else { return String::new() };
-    d.to_string_lossy().replace('\\', "/")
+    p.as_ref().parent().map_or_else(String::new, |d| d.to_string_lossy().replace('\\', "/"))
 }
 
 pub fn rel_norm(root: &Path, abs: &Path) -> Option<String> {
     let rel = abs.strip_prefix(root).ok()?;
-    if rel.as_os_str().is_empty() {
-        return None;
-    }
-    Some(rel.to_string_lossy().replace('\\', "/"))
+    (!rel.as_os_str().is_empty()).then(|| rel.to_string_lossy().replace('\\', "/"))
 }
 
 pub fn work_dir(repo_root: &Path, dot_name: &str, tmp_name: &str) -> PathBuf {
     let resolved = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let parent = resolved.parent().filter(|p| !p.as_os_str().is_empty());
-    match parent {
-        Some(p) => p.join(dot_name),
-        None => std::env::temp_dir().join(tmp_name),
-    }
+    resolved.parent().filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| std::env::temp_dir().join(tmp_name), |p| p.join(dot_name))
 }
 
 /// Count logical text lines from raw bytes without UTF-8 decoding.
 #[inline]
 pub fn count_lines(bytes: &[u8]) -> usize {
-    if bytes.is_empty() {
-        return 0;
-    }
-    let nl = memchr::memchr_iter(b'\n', bytes).count();
-    nl + usize::from(bytes.last() != Some(&b'\n'))
+    if bytes.is_empty() { return 0; }
+    memchr::memchr_iter(b'\n', bytes).count() + usize::from(bytes.last() != Some(&b'\n'))
 }
 
 /// Compute quantile `q` in `[0.0, 1.0]` by sorting `vals` in place.
 pub fn quantile(vals: &mut [f64], q: f64) -> f64 {
-    if vals.is_empty() {
-        return 0.0;
-    }
+    if vals.is_empty() { return 0.0; }
     vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = if (q - 0.5).abs() < 1e-9 {
-        vals.len() / 2
-    } else {
-        ((vals.len() as f64) * q).floor() as usize
-    };
+    let idx = if (q - 0.5).abs() < 1e-9 { vals.len() / 2 } else { ((vals.len() as f64) * q).floor() as usize };
     vals[idx.min(vals.len() - 1)]
 }
 
 #[inline]
 pub fn is_js(ext: &str) -> bool {
-    const JS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
-    JS.iter().any(|&e| ext.eq_ignore_ascii_case(e))
+    ["ts", "tsx", "js", "jsx", "mjs", "cjs"].iter().any(|&e| ext.eq_ignore_ascii_case(e))
 }
 
 pub fn ext_lang(ext: &str) -> Option<&'static str> {
-    if ext.eq_ignore_ascii_case("py") {
-        return Some("python");
+    match ext.to_ascii_lowercase().as_str() {
+        "py" => Some("python"), "rs" => Some("rust"), "go" => Some("go"),
+        "ts" | "tsx" => Some("typescript"),
+        "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
+        _ => None,
     }
-    if ext.eq_ignore_ascii_case("rs") {
-        return Some("rust");
-    }
-    if ext.eq_ignore_ascii_case("go") {
-        return Some("go");
-    }
-    if ext.eq_ignore_ascii_case("ts") || ext.eq_ignore_ascii_case("tsx") {
-        return Some("typescript");
-    }
-    is_js(ext).then_some("javascript")
 }
 
-#[inline]
-pub fn supported_ext(ext: &str) -> bool {
-    ext_lang(ext).is_some()
-}
-
-#[inline]
-pub fn same_family(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b) || (is_js(a) && is_js(b))
-}
+#[inline] pub fn supported_ext(ext: &str) -> bool { ext_lang(ext).is_some() }
+#[inline] pub fn same_family(a: &str, b: &str) -> bool { a.eq_ignore_ascii_case(b) || (is_js(a) && is_js(b)) }
 
 pub fn test_path(rel: &str) -> bool {
-    rel.starts_with("tests/")
-        || rel.starts_with("test_")
-        || rel.contains("/test_")
-        || rel.ends_with("_test.go")
-        || rel.contains(".test.")
-        || rel.contains(".spec.")
+    rel.starts_with("tests/") || rel.starts_with("test_") || rel.contains("/test_")
+        || rel.ends_with("_test.go") || rel.contains(".test.") || rel.contains(".spec.")
 }
 
-#[inline]
-pub fn source_rel(rel: &str) -> bool {
-    !rel.ends_with("__init__.py") && !test_path(rel)
-}
+#[inline] pub fn source_rel(rel: &str) -> bool { !rel.ends_with("__init__.py") && !test_path(rel) }
 
 pub fn entrypoint(rel: &str) -> bool {
-    const ENTRIES: &[&str] = &[
-        "main.rs", "lib.rs", "main.py", "main.go",
-        "index.ts", "index.js", "page.tsx", "route.ts",
-    ];
-    ENTRIES.iter().any(|e| rel.ends_with(e))
+    ["main.rs", "lib.rs", "main.py", "main.go", "index.ts", "index.js", "page.tsx", "route.ts"]
+        .iter().any(|e| rel.ends_with(e))
 }
 
 pub struct RepoScan {
@@ -126,25 +75,15 @@ pub struct RepoScan {
 /// Partition repository source and test files in a single pass.
 pub fn scan_files(root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8>>>) -> RepoScan {
     let mut out = RepoScan { sources: Vec::new(), tests: Vec::new(), all: Vec::new() };
-
     let mut push = |rel: String, ext: String, abs: Option<PathBuf>| {
         out.all.push((rel.clone(), ext.clone(), abs.clone()));
-        if rel.ends_with("__init__.py") {
-            return;
-        }
-        if test_path(&rel) {
-            out.tests.push((rel, ext, abs));
-        } else {
-            out.sources.push((rel, ext, abs));
-        }
+        if rel.ends_with("__init__.py") { return; }
+        if test_path(&rel) { out.tests.push((rel, ext, abs)); } else { out.sources.push((rel, ext, abs)); }
     };
-
     if let Some(map) = preloaded {
         for rel in map.keys() {
             let ext = ext_of(rel);
-            if supported_ext(&ext) {
-                push(rel.clone(), ext, None);
-            }
+            if supported_ext(&ext) { push(rel.clone(), ext, None); }
         }
     } else {
         for path in walk_files(root, None) {
@@ -154,7 +93,6 @@ pub fn scan_files(root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8>>>) ->
             }
         }
     }
-
     out.sources.sort_by(|a, b| a.0.cmp(&b.0));
     out.tests.sort_by(|a, b| a.0.cmp(&b.0));
     out.all.sort_by(|a, b| a.0.cmp(&b.0));
@@ -199,37 +137,23 @@ impl RepoSnapshot {
             32 * MIB
         };
 
-        let mut all_rels = Vec::new();
-        let mut source_rels = Vec::new();
-        let mut doc_rels = Vec::new();
-        let mut seen_docs = BTreeSet::new();
-        let mut infra_rels = Vec::new();
-        let mut manifest_rels = Vec::new();
-        let mut ts_configs = Vec::new();
-        let mut preloaded = BTreeMap::new();
-        let mut total_preloaded_bytes = 0usize;
+        let (mut all_rels, mut source_rels, mut doc_rels, mut seen_docs) = (Vec::new(), Vec::new(), Vec::new(), BTreeSet::new());
+        let (mut infra_rels, mut manifest_rels, mut ts_configs) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut preloaded, mut total_preloaded_bytes) = (BTreeMap::new(), 0usize);
 
         for abs in walk_tree(repo_root, None, include_hidden_configs) {
             let Some(rel) = rel_norm(repo_root, &abs) else { continue };
-            let fname = abs.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let ext = ext_str(&abs);
+            let (fname, ext) = (abs.file_name().and_then(|s| s.to_str()).unwrap_or(""), ext_str(&abs));
             all_rels.push(rel.clone());
-
-            if matches!(fname, "tsconfig.json" | "jsconfig.json") {
-                ts_configs.push(abs.clone());
-            }
+            if matches!(fname, "tsconfig.json" | "jsconfig.json") { ts_configs.push(abs.clone()); }
             if matches!(fname, "package.json" | "Cargo.toml" | "pyproject.toml" | "go.mod") {
                 manifest_rels.push((rel.clone(), fname.to_string(), abs.clone()));
             }
-
             if supported_ext(ext) {
-                if source_rel(&rel) {
-                    source_rels.push(rel.clone());
-                }
+                if source_rel(&rel) { source_rels.push(rel.clone()); }
                 if total_preloaded_bytes < max_preload {
                     let len = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(u64::MAX);
-                    if len <= MAX_SINGLE_PRELOAD
-                        && total_preloaded_bytes.saturating_add(len as usize) <= max_preload
+                    if len <= MAX_SINGLE_PRELOAD && total_preloaded_bytes.saturating_add(len as usize) <= max_preload
                         && let Ok(bytes) = std::fs::read(&abs)
                     {
                         total_preloaded_bytes += bytes.len();
@@ -241,51 +165,27 @@ impl RepoSnapshot {
                 let fname_lo = lower.rsplit('/').next().unwrap_or(&lower);
                 let is_doc = SNAP_DOC_FILENAMES.contains(&fname_lo)
                     || (lower.starts_with("docs/") && lower.ends_with(".md"));
-                if is_doc && seen_docs.insert(rel.clone()) {
-                    doc_rels.push((rel.clone(), abs.clone()));
-                }
-                let ext_lo = ext.to_ascii_lowercase();
-                if is_snap_infra_file(&rel, fname, &ext_lo) {
-                    infra_rels.push((rel, abs));
-                }
+                if is_doc && seen_docs.insert(rel.clone()) { doc_rels.push((rel.clone(), abs.clone())); }
+                if is_snap_infra_file(&rel, fname, &ext.to_ascii_lowercase()) { infra_rels.push((rel, abs)); }
             }
         }
-
         let cursor_rules = repo_root.join(".cursorrules");
         if cursor_rules.is_file() && seen_docs.insert(".cursorrules".into()) {
             doc_rels.push((".cursorrules".into(), cursor_rules));
         }
-
         source_rels.sort();
         doc_rels.sort_by(|a, b| a.0.cmp(&b.0));
-        Self {
-            all_rels,
-            source_rels,
-            doc_rels,
-            infra_rels,
-            manifest_rels,
-            ts_configs,
-            preloaded,
-            total_preloaded_bytes,
-        }
+        Self { all_rels, source_rels, doc_rels, infra_rels, manifest_rels, ts_configs, preloaded, total_preloaded_bytes }
     }
 
     pub fn to_repo_scan(&self) -> RepoScan {
         let mut out = RepoScan { sources: Vec::new(), tests: Vec::new(), all: Vec::new() };
         for rel in &self.all_rels {
             let ext = ext_of(rel);
-            if !supported_ext(&ext) {
-                continue;
-            }
+            if !supported_ext(&ext) { continue; }
             out.all.push((rel.clone(), ext.clone(), None));
-            if rel.ends_with("__init__.py") {
-                continue;
-            }
-            if test_path(rel) {
-                out.tests.push((rel.clone(), ext, None));
-            } else {
-                out.sources.push((rel.clone(), ext, None));
-            }
+            if rel.ends_with("__init__.py") { continue; }
+            if test_path(rel) { out.tests.push((rel.clone(), ext, None)); } else { out.sources.push((rel.clone(), ext, None)); }
         }
         out.sources.sort_by(|a, b| a.0.cmp(&b.0));
         out.tests.sort_by(|a, b| a.0.cmp(&b.0));
@@ -295,35 +195,19 @@ impl RepoSnapshot {
 }
 
 /// Borrow bytes from `preloaded` without cloning, or read from disk once.
-pub fn read_bytes<'a>(
-    root: &Path,
-    rel: &str,
-    preloaded: Option<&'a BTreeMap<String, Vec<u8>>>,
-) -> Option<Cow<'a, [u8]>> {
-    if let Some(bytes) = preloaded.and_then(|m| m.get(rel)) {
-        return Some(Cow::Borrowed(bytes.as_slice()));
-    }
-    std::fs::read(root.join(rel)).ok().map(Cow::Owned)
+pub fn read_bytes<'a>(root: &Path, rel: &str, preloaded: Option<&'a BTreeMap<String, Vec<u8>>>) -> Option<Cow<'a, [u8]>> {
+    preloaded.and_then(|m| m.get(rel)).map(|b| Cow::Borrowed(b.as_slice()))
+        .or_else(|| std::fs::read(root.join(rel)).ok().map(Cow::Owned))
 }
 
 /// Borrow UTF-8 text from `preloaded` with zero copies when valid UTF-8.
-pub fn read_text<'a>(
-    root: &Path,
-    rel: &str,
-    preloaded: Option<&'a BTreeMap<String, Vec<u8>>>,
-) -> Option<Cow<'a, str>> {
-    if let Some(bytes) = preloaded.and_then(|m| m.get(rel)) {
-        return Some(String::from_utf8_lossy(bytes));
-    }
-    std::fs::read_to_string(root.join(rel)).ok().map(Cow::Owned)
+pub fn read_text<'a>(root: &Path, rel: &str, preloaded: Option<&'a BTreeMap<String, Vec<u8>>>) -> Option<Cow<'a, str>> {
+    preloaded.and_then(|m| m.get(rel)).map(|b| String::from_utf8_lossy(b))
+        .or_else(|| std::fs::read_to_string(root.join(rel)).ok().map(Cow::Owned))
 }
 
 #[derive(Debug, Clone)]
-pub struct ManifestDep {
-    pub ecosystem: &'static str,
-    pub package: String,
-    pub is_local: bool,
-}
+pub struct ManifestDep { pub ecosystem: &'static str, pub package: String, pub is_local: bool }
 
 /// Parse dependencies from `package.json`, `Cargo.toml`, `pyproject.toml`, or `go.mod`.
 pub fn parse_deps(file_name: &str, txt: &str) -> Vec<ManifestDep> {
@@ -344,116 +228,74 @@ fn push_dep(out: &mut Vec<ManifestDep>, eco: &'static str, pkg: &str, is_local: 
 
 fn npm_deps(txt: &str, out: &mut Vec<ManifestDep>) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(txt) else { return };
-    let Some(deps) = v.get("dependencies").and_then(|d| d.as_object()) else { return };
-    for pkg in deps.keys() {
-        push_dep(out, "npm", pkg, false);
+    if let Some(deps) = v.get("dependencies").and_then(|d| d.as_object()) {
+        for pkg in deps.keys() { push_dep(out, "npm", pkg, false); }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CargoDepKind {
-    Normal,
-    Dev,
-    Build,
-    Target,
-    Workspace,
-}
+pub enum CargoDepKind { Normal, Dev, Build, Target, Workspace }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CargoDepDetail {
-    pub key: String,
-    pub package: String,
-    pub kind: CargoDepKind,
-    pub is_local: bool,
-    pub workspace_inherited: bool,
-    pub target_cfg: Option<String>,
+    pub key: String, pub package: String, pub kind: CargoDepKind,
+    pub is_local: bool, pub workspace_inherited: bool, pub target_cfg: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
 struct CargoManifest {
     package: Option<toml::Value>,
-    #[serde(default)]
-    dependencies: BTreeMap<String, CargoDepSpec>,
-    #[serde(default, rename = "dev-dependencies")]
-    dev_dependencies: BTreeMap<String, CargoDepSpec>,
-    #[serde(default, rename = "build-dependencies")]
-    build_dependencies: BTreeMap<String, CargoDepSpec>,
-    #[serde(default)]
-    workspace: Option<CargoWorkspaceSection>,
-    #[serde(default)]
-    target: BTreeMap<String, CargoTargetSection>,
+    #[serde(default)] dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default, rename = "dev-dependencies")] dev_dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default, rename = "build-dependencies")] build_dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default)] workspace: Option<CargoWorkspaceSection>,
+    #[serde(default)] target: BTreeMap<String, CargoTargetSection>,
 }
 
 #[derive(serde::Deserialize, Default)]
-struct CargoWorkspaceSection {
-    #[serde(default)]
-    dependencies: BTreeMap<String, CargoDepSpec>,
-}
+struct CargoWorkspaceSection { #[serde(default)] dependencies: BTreeMap<String, CargoDepSpec> }
 
 #[derive(serde::Deserialize, Default)]
 struct CargoTargetSection {
-    #[serde(default)]
-    dependencies: BTreeMap<String, CargoDepSpec>,
-    #[serde(default, rename = "dev-dependencies")]
-    dev_dependencies: BTreeMap<String, CargoDepSpec>,
-    #[serde(default, rename = "build-dependencies")]
-    build_dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default)] dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default, rename = "dev-dependencies")] dev_dependencies: BTreeMap<String, CargoDepSpec>,
+    #[serde(default, rename = "build-dependencies")] build_dependencies: BTreeMap<String, CargoDepSpec>,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
-enum CargoDepSpec {
-    Detailed(CargoDepTable),
-    Simple(String),
-}
+enum CargoDepSpec { Detailed(CargoDepTable), Simple(String) }
 
 #[derive(serde::Deserialize, Default)]
-struct CargoDepTable {
-    package: Option<String>,
-    path: Option<String>,
-    #[serde(default)]
-    workspace: bool,
-}
+struct CargoDepTable { package: Option<String>, path: Option<String>, #[serde(default)] workspace: bool }
 
 fn push_cargo_table(
-    tbl: &BTreeMap<String, CargoDepSpec>,
-    kind: CargoDepKind,
-    target_cfg: Option<&str>,
-    ws_locals: &std::collections::BTreeSet<String>,
-    out: &mut Vec<CargoDepDetail>,
+    tbl: &BTreeMap<String, CargoDepSpec>, kind: CargoDepKind, target_cfg: Option<&str>,
+    ws_locals: &BTreeSet<String>, out: &mut Vec<CargoDepDetail>,
 ) {
     for (key, spec) in tbl {
         let (package, is_local, workspace_inherited) = match spec {
             CargoDepSpec::Simple(ver) => (key.clone(), ver.trim().is_empty(), false),
-            CargoDepSpec::Detailed(d) => {
-                let pkg = d.package.clone().unwrap_or_else(|| key.clone());
-                let inherited_local = d.workspace && ws_locals.contains(key);
-                (pkg, d.path.is_some() || inherited_local, d.workspace)
-            }
+            CargoDepSpec::Detailed(d) => (
+                d.package.clone().unwrap_or_else(|| key.clone()),
+                d.path.is_some() || (d.workspace && ws_locals.contains(key)),
+                d.workspace,
+            ),
         };
         out.push(CargoDepDetail {
-            key: key.clone(),
-            package,
-            kind,
-            is_local,
-            workspace_inherited,
+            key: key.clone(), package, kind, is_local, workspace_inherited,
             target_cfg: target_cfg.map(str::to_string),
         });
     }
 }
 
 fn parse_cargo_manifest_details(manifest: &CargoManifest) -> Vec<CargoDepDetail> {
-    let mut ws_locals = std::collections::BTreeSet::new();
+    let mut ws_locals = BTreeSet::new();
     if let Some(ws) = manifest.workspace.as_ref() {
         for (k, spec) in &ws.dependencies {
-            if let CargoDepSpec::Detailed(d) = spec
-                && d.path.is_some()
-            {
-                ws_locals.insert(k.clone());
-            }
+            if let CargoDepSpec::Detailed(d) = spec && d.path.is_some() { ws_locals.insert(k.clone()); }
         }
     }
-
     let mut details = Vec::new();
     push_cargo_table(&manifest.dependencies, CargoDepKind::Normal, None, &ws_locals, &mut details);
     push_cargo_table(&manifest.dev_dependencies, CargoDepKind::Dev, None, &ws_locals, &mut details);
@@ -469,109 +311,61 @@ fn parse_cargo_manifest_details(manifest: &CargoManifest) -> Vec<CargoDepDetail>
     details
 }
 
-/// Parse all Cargo dependency tables including `[workspace.dependencies]`, `.workspace = true`,
-/// renamed `alias = { package = "..." }`, `[dev-dependencies]`, `[build-dependencies]`,
-/// and target-gated `[target.'cfg(...)'.dependencies]`.
+/// Parse all Cargo dependency tables including workspace, renamed aliases, dev/build, and target-gated.
 #[cfg(test)]
 pub fn parse_cargo_deps_detailed(txt: &str) -> Vec<CargoDepDetail> {
-    let Ok(manifest) = toml::from_str::<CargoManifest>(txt) else {
-        return Vec::new();
-    };
-    parse_cargo_manifest_details(&manifest)
+    toml::from_str::<CargoManifest>(txt).map_or_else(|_| Vec::new(), |m| parse_cargo_manifest_details(&m))
 }
 
 fn cargo_deps(txt: &str, out: &mut Vec<ManifestDep>) {
-    let Ok(manifest) = toml::from_str::<CargoManifest>(txt) else {
-        return;
-    };
-    let is_virtual_workspace = manifest.package.is_none();
-    let details = parse_cargo_manifest_details(&manifest);
-    let mut seen = std::collections::BTreeSet::new();
-    for dep in details {
+    let Ok(manifest) = toml::from_str::<CargoManifest>(txt) else { return };
+    let (is_virt, mut seen) = (manifest.package.is_none(), BTreeSet::new());
+    for dep in parse_cargo_manifest_details(&manifest) {
         let include = match dep.kind {
             CargoDepKind::Normal => true,
             CargoDepKind::Target => dep.target_cfg.as_deref().is_some_and(|c| !c.is_empty()),
-            CargoDepKind::Workspace => is_virtual_workspace,
+            CargoDepKind::Workspace => is_virt,
             CargoDepKind::Dev | CargoDepKind::Build => false,
         };
-        if !include {
-            continue;
-        }
-        let emit_name = if dep.workspace_inherited && dep.package.is_empty() {
-            dep.key.as_str()
-        } else {
-            dep.package.as_str()
-        };
-        if !emit_name.is_empty() && seen.insert(emit_name.to_string()) {
-            push_dep(out, "cargo", emit_name, dep.is_local);
-        }
+        if !include { continue; }
+        let name = if dep.workspace_inherited && dep.package.is_empty() { dep.key.as_str() } else { dep.package.as_str() };
+        if !name.is_empty() && seen.insert(name.to_string()) { push_dep(out, "cargo", name, dep.is_local); }
     }
 }
 
 #[derive(serde::Deserialize, Default)]
-struct PyProjectManifest {
-    project: Option<PyProjectSection>,
-    tool: Option<PyToolSection>,
-}
-
+struct PyProjectManifest { project: Option<PyProjectSection>, tool: Option<PyToolSection> }
 #[derive(serde::Deserialize, Default)]
-struct PyProjectSection {
-    #[serde(default)]
-    dependencies: Vec<String>,
-}
-
+struct PyProjectSection { #[serde(default)] dependencies: Vec<String> }
 #[derive(serde::Deserialize, Default)]
-struct PyToolSection {
-    poetry: Option<PyPoetrySection>,
-}
-
+struct PyToolSection { poetry: Option<PyPoetrySection> }
 #[derive(serde::Deserialize, Default)]
-struct PyPoetrySection {
-    #[serde(default)]
-    dependencies: BTreeMap<String, toml::Value>,
-}
+struct PyPoetrySection { #[serde(default)] dependencies: BTreeMap<String, toml::Value> }
 
 fn py_deps(txt: &str, out: &mut Vec<ManifestDep>) {
     let Ok(doc) = toml::from_str::<PyProjectManifest>(txt) else { return };
-    if let Some(proj) = doc.project {
-        for item in &proj.dependencies {
-            push_py(item, out);
-        }
-    }
+    if let Some(proj) = doc.project { for item in &proj.dependencies { push_py(item, out); } }
     if let Some(poetry) = doc.tool.and_then(|t| t.poetry) {
-        for name in poetry.dependencies.keys() {
-            push_py(name, out);
-        }
+        for name in poetry.dependencies.keys() { push_py(name, out); }
     }
 }
 
 fn push_py(raw: &str, out: &mut Vec<ManifestDep>) {
     let cleaned = raw.trim().trim_matches(|c: char| matches!(c, '"' | '\'' | ','));
     let pkg = cleaned.split(['=', '>', '<', '~', '!', '[', ' ']).next().unwrap_or("");
-    if pkg.is_empty() || pkg.starts_with('#') || pkg.eq_ignore_ascii_case("python") {
-        return;
+    if !pkg.is_empty() && !pkg.starts_with('#') && !pkg.eq_ignore_ascii_case("python") {
+        push_dep(out, "python", pkg, false);
     }
-    push_dep(out, "python", pkg, false);
 }
 
 fn go_deps(txt: &str, out: &mut Vec<ManifestDep>) {
     let mut in_req = false;
     for line in txt.lines().map(str::trim) {
-        if line.starts_with("require (") {
-            in_req = true;
-            continue;
-        }
-        if in_req && line.starts_with(')') {
-            in_req = false;
-            continue;
-        }
+        if line.starts_with("require (") { in_req = true; continue; }
+        if in_req && line.starts_with(')') { in_req = false; continue; }
         let body = if in_req { Some(line) } else { line.strip_prefix("require ") };
-        let Some(b) = body.filter(|s| !s.contains("// indirect") && !s.starts_with("//")) else {
-            continue;
-        };
-        if let Some(m) = b.split_whitespace().next().filter(|s| !s.is_empty()) {
-            push_dep(out, "go", m, false);
-        }
+        let Some(b) = body.filter(|s| !s.contains("// indirect") && !s.starts_with("//")) else { continue };
+        if let Some(m) = b.split_whitespace().next().filter(|s| !s.is_empty()) { push_dep(out, "go", m, false); }
     }
 }
 

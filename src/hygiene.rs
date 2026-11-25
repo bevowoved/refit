@@ -1,10 +1,10 @@
 mod model;
-#[cfg(any(feature = "neural-v6", test))]
-pub mod multiscale;
 mod ops;
 mod simd;
 pub mod strict;
 mod weights;
+
+pub use ops::{EvalOptions, SparseAttnTelemetry};
 
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
@@ -13,7 +13,7 @@ use crate::platform::{
     write_atomic,
 };
 use crate::source::{quantile, read_text};
-use crate::types::{HygieneResult, Squiggle};
+use crate::types::{FileEgoContext, HygieneResult, Squiggle};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -42,66 +42,47 @@ pub struct StyleConfig {
 /// Read repository formatter configuration.
 pub fn repo_style(repo_root: &Path) -> StyleConfig {
     let mut cfg = StyleConfig { max_line_width: 88, indent_width: 4 };
-    if toml_style(&repo_root.join("pyproject.toml"), "line-length", "indent-width", &mut cfg) {
+    if toml_style(&repo_root.join("pyproject.toml"), "line-length", "indent-width", &mut cfg)
+        || toml_style(&repo_root.join("rustfmt.toml"), "max_width", "tab_spaces", &mut cfg)
+        || json_style(repo_root, &mut cfg)
+    {
         return cfg;
     }
-    if toml_style(&repo_root.join("rustfmt.toml"), "max_width", "tab_spaces", &mut cfg) {
-        return cfg;
-    }
-    if json_style(repo_root, &mut cfg) {
-        return cfg;
-    }
-
     if repo_root.join("Cargo.toml").exists() {
-        cfg.max_line_width = 100;
-        cfg.indent_width = 4;
+        cfg = StyleConfig { max_line_width: 100, indent_width: 4 };
     } else if repo_root.join("package.json").exists() {
-        cfg.max_line_width = 100;
-        cfg.indent_width = 2;
+        cfg = StyleConfig { max_line_width: 100, indent_width: 2 };
     }
     cfg
 }
 
 fn find_toml_usize(val: &toml::Value, key: &str) -> Option<usize> {
     let tbl = val.as_table()?;
-    if let Some(n) = tbl.get(key).and_then(toml::Value::as_integer).and_then(|v| usize::try_from(v).ok()) {
-        return Some(n);
-    }
-    tbl.values().find_map(|child| find_toml_usize(child, key))
+    tbl.get(key)
+        .and_then(toml::Value::as_integer)
+        .and_then(|v| usize::try_from(v).ok())
+        .or_else(|| tbl.values().find_map(|c| find_toml_usize(c, key)))
 }
 
 fn toml_style(path: &Path, w_key: &str, i_key: &str, cfg: &mut StyleConfig) -> bool {
     let Ok(raw) = fs::read_to_string(path) else { return false };
     let Ok(parsed) = toml::from_str::<toml::Value>(&raw) else { return false };
-    let mut found = false;
-    if let Some(n) = find_toml_usize(&parsed, w_key) {
-        cfg.max_line_width = n.clamp(60, 160);
-        found = true;
-    }
-    if let Some(n) = find_toml_usize(&parsed, i_key) {
-        cfg.indent_width = n.clamp(2, 8);
-        found = true;
-    }
-    found
+    let (w, ind) = (find_toml_usize(&parsed, w_key), find_toml_usize(&parsed, i_key));
+    if let Some(n) = w { cfg.max_line_width = n.clamp(60, 160); }
+    if let Some(n) = ind { cfg.indent_width = n.clamp(2, 8); }
+    w.is_some() || ind.is_some()
 }
 
 fn json_num(v: &serde_json::Value, top: &str, nested: &str) -> Option<usize> {
-    let direct = v[top].as_u64();
-    let fallback = v["formatter"][nested].as_u64();
-    direct.or(fallback).map(|n| n as usize)
+    v[top].as_u64().or_else(|| v["formatter"][nested].as_u64()).map(|n| n as usize)
 }
 
 fn json_style(repo_root: &Path, cfg: &mut StyleConfig) -> bool {
-    const FILES: [&str; 4] = [".prettierrc", ".prettierrc.json", "biome.json", "biome.jsonc"];
-    for f in FILES {
+    for f in [".prettierrc", ".prettierrc.json", "biome.json", "biome.jsonc"] {
         let Ok(raw) = fs::read_to_string(repo_root.join(f)) else { continue };
-        let cleaned = strip_jsonc(&raw);
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&cleaned) else { continue };
-
-        let w = json_num(&v, "printWidth", "lineWidth").unwrap_or(100);
-        let ind = json_num(&v, "tabWidth", "indentWidth").unwrap_or(2);
-        cfg.max_line_width = w.clamp(60, 160);
-        cfg.indent_width = ind.clamp(2, 8);
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(&raw)) else { continue };
+        cfg.max_line_width = json_num(&v, "printWidth", "lineWidth").unwrap_or(100).clamp(60, 160);
+        cfg.indent_width = json_num(&v, "tabWidth", "indentWidth").unwrap_or(2).clamp(2, 8);
         return true;
     }
     false
@@ -121,34 +102,51 @@ fn read_str_u16(rd: &mut Cursor<&[u8]>) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-/// Safe explicit little-endian binary codec for `HygieneResult` caches (`RFHG0002`, zero `#[repr(C)]` UB).
+fn write_opt_f64(out: &mut Vec<u8>, v: Option<f64>) {
+    if let Some(x) = v { let _ = out.write_f64::<LittleEndian>(x); }
+}
+
+fn read_opt_f64(rd: &mut Cursor<&[u8]>, flags: u8, bit: u8) -> Option<Option<f64>> {
+    if (flags & bit) != 0 {
+        Some(Some(rd.read_f64::<LittleEndian>().ok()?))
+    } else {
+        Some(None)
+    }
+}
+
+/// Safe explicit little-endian binary codec for `HygieneResult` caches (`RFHG0002`, zero UB).
 fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + map.len() * 96);
     out.extend_from_slice(CACHE_MAGIC);
     let _ = out.write_u32::<LittleEndian>(map.len() as u32);
-    for (key, res) in map {
+    for (key, r) in map {
         write_str_u16(&mut out, key);
-        let _ = out.write_f64::<LittleEndian>(res.score);
-        let _ = out.write_u64::<LittleEndian>(res.latency_us);
-        let flags = (u8::from(res.strict_score.is_some()))
-            | (u8::from(res.veto_cap.is_some()) << 1)
-            | (u8::from(res.total_squiggles.is_some()) << 2)
-            | (u8::from(res.event_load.is_some()) << 3)
-            | (u8::from(res.multiscale_score.is_some()) << 4)
-            | (u8::from(res.calibration_log.is_some()) << 5);
+        let _ = out.write_f64::<LittleEndian>(r.score);
+        let _ = out.write_u64::<LittleEndian>(r.latency_us);
+        let flags = u8::from(r.strict_score.is_some())
+            | (u8::from(r.veto_cap.is_some()) << 1)
+            | (u8::from(r.total_squiggles.is_some()) << 2)
+            | (u8::from(r.event_load.is_some()) << 3)
+            | (u8::from(r.multiscale_score.is_some()) << 4)
+            | (u8::from(r.calibration_log.is_some()) << 5);
         out.push(flags);
-        if let Some(v) = res.strict_score { let _ = out.write_f64::<LittleEndian>(v); }
-        if let Some(v) = res.veto_cap { let _ = out.write_f64::<LittleEndian>(v); }
-        if let Some(v) = res.total_squiggles { let _ = out.write_u32::<LittleEndian>(v.min(u32::MAX as usize) as u32); }
-        if let Some(v) = res.event_load { let _ = out.write_f64::<LittleEndian>(v); }
-        if let Some(v) = res.multiscale_score { let _ = out.write_f64::<LittleEndian>(v); }
-        if let Some(ref s) = res.calibration_log { write_str_u16(&mut out, s); }
+        write_opt_f64(&mut out, r.strict_score);
+        write_opt_f64(&mut out, r.veto_cap);
+        if let Some(v) = r.total_squiggles {
+            let _ = out.write_u32::<LittleEndian>(v.min(u32::MAX as usize) as u32);
+        }
+        write_opt_f64(&mut out, r.event_load);
+        write_opt_f64(&mut out, r.multiscale_score);
+        if let Some(ref s) = r.calibration_log { write_str_u16(&mut out, s); }
 
-        let sq_cnt = res.squiggles.len().min(u16::MAX as usize);
+        let sq_cnt = r.squiggles.len().min(u16::MAX as usize);
         let _ = out.write_u16::<LittleEndian>(sq_cnt as u16);
-        for sq in res.squiggles.iter().take(sq_cnt) {
+        for sq in r.squiggles.iter().take(sq_cnt) {
             let _ = out.write_u32::<LittleEndian>(sq.line.min(u32::MAX as usize) as u32);
-            if let Some(idx) = model::SQUIGGLE_SPEC.iter().position(|(k, m, _)| *k == sq.kind && *m == sq.message) {
+            let spec_idx = model::SQUIGGLE_SPEC
+                .iter()
+                .position(|(k, m, _)| *k == sq.kind && *m == sq.message);
+            if let Some(idx) = spec_idx {
                 out.push(idx as u8);
             } else {
                 out.push(255);
@@ -157,35 +155,31 @@ fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
             }
             let _ = out.write_f64::<LittleEndian>(sq.probability);
         }
-        let veto_cnt = res.triggered_vetoes.len().min(u16::MAX as usize);
+        let veto_cnt = r.triggered_vetoes.len().min(u16::MAX as usize);
         let _ = out.write_u16::<LittleEndian>(veto_cnt as u16);
-        for veto in res.triggered_vetoes.iter().take(veto_cnt) {
-            write_str_u16(&mut out, veto);
-        }
+        for veto in r.triggered_vetoes.iter().take(veto_cnt) { write_str_u16(&mut out, veto); }
     }
     out
 }
 
 fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> {
-    if !bytes.starts_with(CACHE_MAGIC) {
-        return None;
-    }
+    if !bytes.starts_with(CACHE_MAGIC) { return None; }
     let mut rd = Cursor::new(&bytes[8..]);
     let count = rd.read_u32::<LittleEndian>().ok()? as usize;
-    if count > 1_000_000 {
-        return None;
-    }
+    if count > 1_000_000 { return None; }
     let mut map = HashMap::with_capacity(count.min(4096));
     for _ in 0..count {
         let key = read_str_u16(&mut rd)?;
         let score = rd.read_f64::<LittleEndian>().ok()?;
         let latency_us = rd.read_u64::<LittleEndian>().ok()?;
         let flags = rd.read_u8().ok()?;
-        let strict_score = if (flags & 1) != 0 { Some(rd.read_f64::<LittleEndian>().ok()?) } else { None };
-        let veto_cap = if (flags & 2) != 0 { Some(rd.read_f64::<LittleEndian>().ok()?) } else { None };
-        let total_squiggles = if (flags & 4) != 0 { Some(rd.read_u32::<LittleEndian>().ok()? as usize) } else { None };
-        let event_load = if (flags & 8) != 0 { Some(rd.read_f64::<LittleEndian>().ok()?) } else { None };
-        let multiscale_score = if (flags & 16) != 0 { Some(rd.read_f64::<LittleEndian>().ok()?) } else { None };
+        let strict_score = read_opt_f64(&mut rd, flags, 1)?;
+        let veto_cap = read_opt_f64(&mut rd, flags, 2)?;
+        let total_squiggles = if (flags & 4) != 0 {
+            Some(rd.read_u32::<LittleEndian>().ok()? as usize)
+        } else { None };
+        let event_load = read_opt_f64(&mut rd, flags, 8)?;
+        let multiscale_score = read_opt_f64(&mut rd, flags, 16)?;
         let calibration_log = if (flags & 32) != 0 { Some(read_str_u16(&mut rd)?) } else { None };
 
         let sq_cnt = rd.read_u16::<LittleEndian>().ok()? as usize;
@@ -193,37 +187,21 @@ fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> 
         for _ in 0..sq_cnt {
             let line = rd.read_u32::<LittleEndian>().ok()? as usize;
             let kind_id = rd.read_u8().ok()?;
-            let (kind, message) = if let Some(&(sk, sm, _)) = model::SQUIGGLE_SPEC.get(kind_id as usize) {
-                (sk.to_string(), sm.to_string())
-            } else if kind_id == 255 {
-                (read_str_u16(&mut rd)?, read_str_u16(&mut rd)?)
-            } else {
-                return None;
+            let (kind, message) = match model::SQUIGGLE_SPEC.get(kind_id as usize) {
+                Some(&(sk, sm, _)) => (sk.to_string(), sm.to_string()),
+                None if kind_id == 255 => (read_str_u16(&mut rd)?, read_str_u16(&mut rd)?),
+                None => return None,
             };
             let probability = rd.read_f64::<LittleEndian>().ok()?;
             squiggles.push(Squiggle { line, kind, probability, message });
         }
         let veto_cnt = rd.read_u16::<LittleEndian>().ok()? as usize;
         let mut triggered_vetoes = Vec::with_capacity(veto_cnt.min(32));
-        for _ in 0..veto_cnt {
-            triggered_vetoes.push(read_str_u16(&mut rd)?);
-        }
-        map.insert(
-            key,
-            HygieneResult {
-                score,
-                squiggles,
-                cached: false,
-                latency_us,
-                strict_score,
-                veto_cap,
-                total_squiggles,
-                event_load,
-                triggered_vetoes,
-                multiscale_score,
-                calibration_log,
-            },
-        );
+        for _ in 0..veto_cnt { triggered_vetoes.push(read_str_u16(&mut rd)?); }
+        map.insert(key, HygieneResult {
+            score, squiggles, cached: false, latency_us, strict_score, veto_cap,
+            total_squiggles, event_load, triggered_vetoes, multiscale_score, calibration_log,
+        });
     }
     Some(map)
 }
@@ -238,37 +216,34 @@ fn write_compact_cache_zstd(path: &Path, map: &HashMap<String, HygieneResult>) -
 }
 
 fn read_hygiene_cache(path: &Path, active_prefix: &str) -> Option<HashMap<String, HygieneResult>> {
-    let raw = fs::read(path).ok()?;
-    let decoded = zstd::stream::decode_all(raw.as_slice()).ok()?;
-    if decoded.starts_with(CACHE_MAGIC) {
-        return decode_compact_cache(&decoded);
-    }
+    let decoded = zstd::stream::decode_all(fs::read(path).ok()?.as_slice()).ok()?;
+    if decoded.starts_with(CACHE_MAGIC) { return decode_compact_cache(&decoded); }
     let legacy: HashMap<String, HygieneResult> = serde_json::from_slice(&decoded).ok()?;
-    let default_prefix = weights::default_weights_hash_prefix();
-    let mut migrated = HashMap::with_capacity(legacy.len());
-    for (k, v) in legacy {
-        let normalized = if active_prefix == default_prefix
+    let def_pfx = weights::default_weights_hash_prefix();
+    Some(legacy.into_iter().map(|(k, v)| {
+        let nk = if active_prefix == def_pfx
             && let Some(rest) = k.strip_prefix("v07:")
             && !rest.contains(':')
         {
-            format!("v07:{default_prefix}:{rest}")
-        } else {
-            k
-        };
-        migrated.insert(normalized, v);
-    }
-    Some(migrated)
+            format!("v07:{def_pfx}:{rest}")
+        } else { k };
+        (nk, v)
+    }).collect())
 }
 
 fn hygiene_entry_weight(key: &str, res: &HygieneResult) -> usize {
-    let sq_bytes = res.squiggles.len().saturating_mul(96);
-    let veto_bytes: usize = res.triggered_vetoes.iter().map(String::len).sum();
-    let cal_bytes = res.calibration_log.as_ref().map_or(0, String::len);
+    let veto_b: usize = res.triggered_vetoes.iter().map(String::len).sum();
+    let cal_b = res.calibration_log.as_ref().map_or(0, String::len);
     key.len()
         .saturating_add(160)
-        .saturating_add(sq_bytes)
-        .saturating_add(veto_bytes)
-        .saturating_add(cal_bytes)
+        .saturating_add(res.squiggles.len().saturating_mul(96))
+        .saturating_add(veto_b)
+        .saturating_add(cal_b)
+}
+
+fn env_approx_long() -> bool {
+    std::env::var("REFIT_APPROX_LONG")
+        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
 }
 
 pub struct HygieneScorer {
@@ -276,62 +251,60 @@ pub struct HygieneScorer {
     in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     disk_path: Option<PathBuf>,
     override_weights: Option<Arc<weights::ResolvedWeights>>,
+    default_opts: EvalOptions,
     dirty: AtomicBool,
     last_warm_us: AtomicU64,
 }
 
 impl HygieneScorer {
     #[cfg(test)]
-    pub fn new() -> Self {
-        Self::with_path(None, None)
-    }
+    pub fn new() -> Self { Self::with_path(None, None, EvalOptions::default()) }
 
     fn with_path(
         disk_path: Option<PathBuf>,
         override_weights: Option<Arc<weights::ResolvedWeights>>,
+        default_opts: EvalOptions,
     ) -> Self {
         Self {
             cache: SieveCache::new(16_384, 32 * 1024 * 1024),
             in_flight: Mutex::new(HashMap::new()),
-            disk_path,
-            override_weights,
+            disk_path, override_weights, default_opts,
             dirty: AtomicBool::new(false),
             last_warm_us: AtomicU64::new(0),
         }
     }
 
+    pub fn set_approx_long(&mut self, enabled: bool) {
+        if enabled { self.default_opts.approx_long = true; }
+    }
+
     fn active_weights(&self) -> &weights::ResolvedWeights {
-        if let Some(ref w) = self.override_weights {
-            w.as_ref()
-        } else {
-            weights::v07_weights()
+        match self.override_weights.as_deref() {
+            Some(w) => w,
+            None => weights::v07_weights(),
         }
     }
 
     /// Expose the active weights' 16-hex BLAKE3 prefix without inflating embedded `WEIGHTS_NPZ`.
     pub fn weights_blake3_prefix(&self) -> &str {
-        match &self.override_weights {
-            Some(w) => &w.hash_prefix,
+        match self.override_weights.as_deref() {
+            Some(w) => w.hash_prefix.as_str(),
             None => weights::default_weights_hash_prefix(),
         }
     }
 
     pub fn open_persistent(repo_root: &Path) -> Self {
-        let override_weights = match weights::load_verified_override(repo_root) {
-            Ok(w) => w,
-            Err(err) => {
-                tracing::warn!("rejecting unverified local hygiene weights override: {err}");
-                None
-            }
-        };
-        Self::open_with_weights(repo_root, override_weights)
+        let ov = weights::load_verified_override(repo_root).unwrap_or_else(|err| {
+            tracing::warn!("rejecting unverified local hygiene weights override: {err}");
+            None
+        });
+        Self::open_with_weights(repo_root, ov)
     }
 
     /// Open a persistent scorer while propagating errors from any invalid `.refit/weights/` override.
     #[cfg(test)]
     pub fn open_persistent_checked(repo_root: &Path) -> anyhow::Result<Self> {
-        let override_weights = weights::load_verified_override(repo_root)?;
-        Ok(Self::open_with_weights(repo_root, override_weights))
+        Ok(Self::open_with_weights(repo_root, weights::load_verified_override(repo_root)?))
     }
 
     fn open_with_weights(
@@ -339,29 +312,24 @@ impl HygieneScorer {
         override_weights: Option<Arc<weights::ResolvedWeights>>,
     ) -> Self {
         let disk_path = repo_root.join(".refit/cache/hygiene_v07_cache.zst");
-        let scorer = Self::with_path(Some(disk_path.clone()), override_weights);
+        let opts = EvalOptions { approx_long: env_approx_long(), ..EvalOptions::default() };
+        let scorer = Self::with_path(Some(disk_path.clone()), override_weights, opts);
         let prefix = scorer.weights_blake3_prefix().to_string();
         if let Some(saved) = read_hygiene_cache(&disk_path, &prefix) {
-            for (key, val) in saved {
-                let weight = hygiene_entry_weight(&key, &val);
-                scorer.cache.insert(key, val, weight);
+            for (k, v) in saved {
+                let w = hygiene_entry_weight(&k, &v);
+                scorer.cache.insert(k, v, w);
             }
         }
         scorer
     }
 
-    pub fn warm_us(&self) -> u64 {
-        self.last_warm_us.load(Ordering::Relaxed)
-    }
+    pub fn warm_us(&self) -> u64 { self.last_warm_us.load(Ordering::Relaxed) }
 
     pub fn flush_cache(&self) {
-        if !self.dirty.swap(false, Ordering::AcqRel) {
-            return;
-        }
+        if !self.dirty.swap(false, Ordering::AcqRel) { return; }
         let Some(ref path) = self.disk_path else { return };
-        if let Some(parent) = path.parent() {
-            ensure_cachedir_tag(parent);
-        }
+        if let Some(parent) = path.parent() { ensure_cachedir_tag(parent); }
         let map: HashMap<String, HygieneResult> = self.cache.snapshot().into_iter().collect();
         let _ = write_compact_cache_zstd(path, &map);
     }
@@ -382,15 +350,27 @@ impl HygieneScorer {
         }
     }
 
-    pub fn score_content(&self, _path: &str, content: &str) -> HygieneResult {
+    pub fn score_content(&self, path: &str, content: &str) -> HygieneResult {
+        self.score_content_with_opts(path, content, self.default_opts).0
+    }
+
+    pub fn score_content_with_opts(
+        &self,
+        _path: &str,
+        content: &str,
+        opts: EvalOptions,
+    ) -> (HygieneResult, Option<SparseAttnTelemetry>) {
+        let line_count = content.as_bytes().iter().filter(|&&b| b == b'\n').count() + 1;
+        let approx_active = opts.approx_long && line_count > opts.approx_threshold;
+        let namespace = if approx_active { "v07-approx" } else { "v07" };
         let key = format!(
-            "v07:{}:{}",
+            "{namespace}:{}:{}",
             self.weights_blake3_prefix(),
             MvccStore::hash_bytes(content.as_bytes())
         );
         let t0 = Instant::now();
         if let Some(res) = self.cache_hit(&key, t0) {
-            return res;
+            return (res, None);
         }
 
         let lock = {
@@ -404,7 +384,7 @@ impl HygieneScorer {
         if let Some(res) = self.cache_hit(&key, t0) {
             drop(guard);
             self.release_in_flight(&key, &lock);
-            return res;
+            return (res, None);
         }
 
         let est = estimate_neural_bytes(content);
@@ -412,7 +392,7 @@ impl HygieneScorer {
         let req = est.min(gate.capacity());
         let permit = gate.reserve_or_wait(req, Duration::from_secs(5)).ok();
         let started = Instant::now();
-        let mut res = model::score_v07_with_weights(content, self.active_weights());
+        let (mut res, telemetry) = model::score_v07_with_opts(content, self.active_weights(), opts);
         res.latency_us = started.elapsed().as_micros().max(1) as u64;
         let weight = hygiene_entry_weight(&key, &res);
         self.cache.insert(key.clone(), res.clone(), weight);
@@ -421,36 +401,25 @@ impl HygieneScorer {
         drop(permit);
         drop(guard);
         self.release_in_flight(&key, &lock);
-        res
+        (res, telemetry)
     }
 
-    /// Score content with exact `v0.7.0` `score` plus additive `CH-V4` `strict_score` & anti-gaming vetoes.
-    /// When built with `--features neural-v6`, also populates `CH-V5..V7` `multiscale_score` & `calibration_log`.
+    /// Score content with exact `v0.7.0` `score` plus additive `CH-V4..V7` strict/calibration track.
+    #[cfg(test)]
     pub fn score_content_strict(&self, path: &str, content: &str) -> HygieneResult {
-        #[cfg(feature = "neural-v6")]
-        {
-            self.score_content_multiscale(path, content, None)
-        }
-        #[cfg(not(feature = "neural-v6"))]
-        {
-            let base = self.score_content(path, content);
-            strict::score_strict(path, content, &base)
-        }
+        self.score_content_strict_with_ego(path, content, None)
     }
 
-    /// Score content on the `CH-V5..V7` multiscale track while preserving canonical `v0.7.0` `score`.
-    #[cfg(any(feature = "neural-v6", test))]
-    pub fn score_content_multiscale(
+    /// Score content with exact `v0.7.0` `score` plus live `FileEgoContext` & truthful `CalibrationAudit`.
+    pub fn score_content_strict_with_ego(
         &self,
         path: &str,
         content: &str,
-        ego: Option<&multiscale::EgoContext>,
+        ego: Option<&FileEgoContext>,
     ) -> HygieneResult {
-        let base = self.score_content(path, content);
-        let mut out = strict::score_strict(path, content, &base);
+        let (base, telemetry) = self.score_content_with_opts(path, content, self.default_opts);
         let zero_ratio = model::weight_zero_ratio(self.active_weights());
-        let _audit = multiscale::score_multiscale(path, content, &mut out, ego, zero_ratio);
-        out
+        strict::score_strict_calibrated(path, content, &base, ego, telemetry.as_ref(), zero_ratio)
     }
 
     pub fn score_files(
@@ -518,77 +487,23 @@ impl HygieneScorer {
 mod tests {
     use super::*;
     use crate::platform::write_zstd;
-    use crate::testutil::TempRepo;
+    use crate::testutil::{TempRepo, build_single_entry_zip, map_conds, nest_src, repeat_fn, walk_rs_files};
     use flate2::Compression;
     use flate2::write::DeflateEncoder;
     use std::collections::{BTreeSet, HashSet};
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
-    fn nest_src(head: &str, step: &str, open: &[String], body: &str, close: Option<&str>) -> String {
-        let mut out = format!("{head}\n");
-        for (i, line) in open.iter().enumerate() {
-            out.push_str(&format!("{}{line}\n", step.repeat(i + 1)));
-        }
-        out.push_str(&format!("{}{body}\n", step.repeat(open.len() + 1)));
-        if let Some(ch) = close {
-            for i in (0..open.len()).rev() {
-                out.push_str(&format!("{}{ch}\n", step.repeat(i + 1)));
-            }
-            out.push_str("  return 0;\n}\n");
-        }
-        out
-    }
-
-    fn repeat_fn(
-        head: &str,
-        range: std::ops::RangeInclusive<usize>,
-        mut line: impl FnMut(usize) -> String,
-        tail: &str,
-    ) -> String {
-        let mut out = format!("{head}\n");
-        for i in range {
-            out.push_str(&line(i));
-        }
-        out.push_str(tail);
-        out
-    }
-
-    fn map_conds(vars: &[&str], fmt: impl Fn(&str) -> String) -> Vec<String> {
-        vars.iter().map(|v| fmt(v)).collect()
-    }
-
-    fn walk_rs_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let p = entry.unwrap().path();
-            if p.is_dir() {
-                walk_rs_files(base, &p, out);
-            } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
-                let rel = p
-                    .strip_prefix(base)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                out.push((rel, p));
-            }
-        }
-    }
-
     fn sq_tuples(list: &[Squiggle]) -> Vec<(usize, String, i64)> {
-        list.iter()
-            .map(|s| (s.line, s.kind.clone(), (s.probability * 10000.0).round() as i64))
-            .collect()
+        list.iter().map(|s| (s.line, s.kind.clone(), (s.probability * 10000.0).round() as i64)).collect()
     }
 
     fn js_sq_tuples(list: &[serde_json::Value]) -> Vec<(usize, String, i64)> {
-        list.iter()
-            .map(|s| {
-                let ln = s["line"].as_u64().unwrap() as usize;
-                let kind = s["kind"].as_str().unwrap().to_string();
-                let p = (s["probability"].as_f64().unwrap() * 10000.0).round() as i64;
-                (ln, kind, p)
-            })
-            .collect()
+        list.iter().map(|s| (
+            s["line"].as_u64().unwrap() as usize,
+            s["kind"].as_str().unwrap().to_string(),
+            (s["probability"].as_f64().unwrap() * 10000.0).round() as i64,
+        )).collect()
     }
 
     #[test]
@@ -919,124 +834,191 @@ mod tests {
         );
     }
 
-    fn build_single_entry_zip(name: &str, method: u16, comp_bytes: &[u8], uncomp_len: u32) -> Vec<u8> {
-        let mut out = Vec::new();
-        let name_b = name.as_bytes();
-        // Local file header
-        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&method.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(comp_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&uncomp_len.to_le_bytes());
-        out.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(name_b);
-        out.extend_from_slice(comp_bytes);
-
-        let cd_off = out.len() as u32;
-        // Central directory header
-        out.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&20u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&method.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&(comp_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&uncomp_len.to_le_bytes());
-        out.extend_from_slice(&(name_b.len() as u16).to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(name_b);
-
-        let cd_size = (out.len() as u32) - cd_off;
-        // EOCD
-        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&cd_size.to_le_bytes());
-        out.extend_from_slice(&cd_off.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out
-    }
-
     #[test]
     fn weights_override_zip_bomb_and_digest_guard() {
         let real_npz = fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/codehygiene/weights.npz")).unwrap();
         let real_digest = blake3::hash(&real_npz).to_hex().to_string();
-
-        // 1. Valid verified local override succeeds
         let ok_repo = TempRepo::new("weights_ok");
         let wdir = ok_repo.path().join(".refit/weights");
         fs::create_dir_all(&wdir).unwrap();
         fs::write(wdir.join("hygiene.npz"), &real_npz).unwrap();
-        fs::write(
-            wdir.join("hygiene.json"),
-            format!(r#"{{"version":"0.7.0","arch":"v07","file":"hygiene.npz","blake3":"{real_digest}"}}"#),
-        )
-        .unwrap();
+        let write_manifest = |v: &str, a: &str, f: &str, d: &str| {
+            let body = format!(r#"{{"version":"{v}","arch":"{a}","file":"{f}","blake3":"{d}"}}"#);
+            fs::write(wdir.join("hygiene.json"), body).unwrap();
+        };
+        write_manifest("0.7.0", "v07", "hygiene.npz", &real_digest);
         let scorer = HygieneScorer::open_persistent_checked(ok_repo.path()).unwrap();
         assert_eq!(scorer.weights_blake3_prefix(), &real_digest[..16]);
         assert_eq!(scorer.score_content("a.rs", "pub const X: usize = 1;\n").score, 0.8808);
 
-        // 2. Digest mismatch fails closed
         let bad_digest = "0".repeat(64);
-        fs::write(
-            wdir.join("hygiene.json"),
-            format!(r#"{{"version":"0.7.0","arch":"v07","file":"hygiene.npz","blake3":"{bad_digest}"}}"#),
-        )
-        .unwrap();
-        let err = HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap();
-        assert!(err.to_string().contains("digest mismatch"), "got {err}");
-
-        // 3. Unsupported arch fails closed
-        fs::write(
-            wdir.join("hygiene.json"),
-            format!(r#"{{"version":"0.8.0","arch":"v08","file":"hygiene.npz","blake3":"{real_digest}"}}"#),
-        )
-        .unwrap();
-        let err = HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap();
-        assert!(err.to_string().contains("unsupported weights arch"), "got {err}");
-
-        // 4. Path traversal filename fails closed
-        fs::write(
-            wdir.join("hygiene.json"),
-            format!(r#"{{"version":"0.7.0","arch":"v07","file":"../hygiene.npz","blake3":"{real_digest}"}}"#),
-        )
-        .unwrap();
-        let err = HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap();
-        assert!(err.to_string().contains("unsafe weights filename"), "got {err}");
-
-        // 5. Unpinned hygiene.npz without hygiene.json fails closed
+        for (v, a, f, d, want) in [
+            ("0.7.0", "v07", "hygiene.npz", bad_digest.as_str(), "digest mismatch"),
+            ("0.8.0", "v08", "hygiene.npz", real_digest.as_str(), "unsupported weights arch"),
+            ("0.7.0", "v07", "../hygiene.npz", real_digest.as_str(), "unsafe weights filename"),
+        ] {
+            write_manifest(v, a, f, d);
+            let err = HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap();
+            assert!(err.to_string().contains(want), "got {err}");
+        }
         fs::remove_file(wdir.join("hygiene.json")).unwrap();
-        let err = HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap();
-        assert!(err.to_string().contains("unpinned"), "got {err}");
-
-        // 6. Archive size cap (> 512 KiB) fails closed
+        assert!(HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap().to_string().contains("unpinned"));
         let oversized = vec![0u8; weights::MAX_NPZ_ARCHIVE_BYTES + 1];
-        let err = weights::load_weights_from_npz(&oversized).err().unwrap();
-        assert!(err.to_string().contains("exceeds"), "got {err}");
+        assert!(weights::load_weights_from_npz(&oversized).err().unwrap().to_string().contains("exceeds"));
 
-        // 7. Zip-bomb cap (deflated entry > 2 MiB from tiny compressed payload) fails closed
         let bomb_raw = vec![0u8; weights::MAX_NPY_ENTRY_BYTES + 4096];
         let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
         enc.write_all(&bomb_raw).unwrap();
         let comp = enc.finish().unwrap();
-        assert!(comp.len() < 16 * 1024, "compressed bomb should be tiny, got {}", comp.len());
+        assert!(comp.len() < 16 * 1024);
         let bomb_zip = build_single_entry_zip("trits.npy", 8, &comp, bomb_raw.len() as u32);
-        let err = weights::load_weights_from_npz(&bomb_zip).err().unwrap();
-        assert!(err.to_string().contains("zip-bomb"), "got {err}");
-
-        // 8. Truncated / malformed archive fails cleanly without panicking
+        assert!(weights::load_weights_from_npz(&bomb_zip).err().unwrap().to_string().contains("zip-bomb"));
         assert!(weights::load_weights_from_npz(&real_npz[..40]).is_err());
+    }
+
+    #[test]
+    fn test_ego_graph_wired_into_strict_with_v07_parity() {
+        let scorer = HygieneScorer::new();
+        let src = "pub struct Order {\n    pub total_cents: u64,\n}\n\
+            pub fn compute_tax(amount: u64, rate_bps: u64) -> u64 {\n    (amount * rate_bps) / 10_000\n}\n";
+        let base = scorer.score_content("src/order.rs", src);
+
+        let clean_ego = FileEgoContext { fan_in: 2, fan_out: 1, ..FileEgoContext::default() };
+        let clean_res = scorer.score_content_strict_with_ego("src/order.rs", src, Some(&clean_ego));
+        assert_eq!((clean_res.score, clean_res.strict_score, clean_res.multiscale_score), (base.score, Some(base.score), Some(base.score)));
+        assert!(clean_res.triggered_vetoes.is_empty());
+        let ca: strict::CalibrationAudit = serde_json::from_str(clean_res.calibration_log.as_deref().unwrap()).unwrap();
+        assert_eq!((ca.raw_v07, ca.delta_cross, ca.use_5trit_lut), (base.score, 0.0, false));
+
+        let bad_ego = FileEgoContext {
+            fan_in: 9, fan_out: 8, neighbor_dirs: 3, has_module_cycle: true, tangle: true,
+            external_field_readers: 4, clone_cluster_hits: 2, churn_commits: 25,
+        };
+        let bad_res = scorer.score_content_strict_with_ego("src/order.rs", src, Some(&bad_ego));
+        assert_eq!(bad_res.score, base.score);
+        assert!(bad_res.strict_score.unwrap() <= 0.48 && bad_res.multiscale_score.unwrap() <= 0.48 && bad_res.veto_cap.unwrap() <= 0.48);
+        for rule in ["module-cycle", "tangle", "field-leak"] {
+            assert!(bad_res.triggered_vetoes.iter().any(|r| r == rule), "missing `{rule}`");
+        }
+        let ba: strict::CalibrationAudit = serde_json::from_str(bad_res.calibration_log.as_deref().unwrap()).unwrap();
+        assert!(ba.delta_cross > 0.0 && ba.delta_block > 0.0);
+    }
+
+    #[test]
+    fn default_v07_zero_delta_parity() {
+        let mut long_src = String::with_capacity(48 * 1024);
+        for i in 0..1400 {
+            long_src.push_str(&format!("pub const ITEM_{i}: usize = {};\n", i * 3 + 1));
+        }
+        let w = weights::v07_weights();
+        let (res, sparse_alloc) = model::reset_and_check_sparse_alloc_on_default(&long_src, w);
+        let scalar = model::score_v07_scalar_only(&long_src, w);
+        assert!(!sparse_alloc, "default path must keep SparseScratch unallocated (None)");
+        assert_eq!(res.score, scalar.score, "default path must maintain 0.000000000 scalar parity");
+    }
+
+    const CLONE_FN_BLOCK: &str = concat!(
+        "pub fn process_order_alpha(raw_input: &[u64], limit: u64, fee_bps: u64) -> u64 {\n",
+        "    let mut total = raw_input.iter().copied().sum::<u64>();\n",
+        "    let normalized = total.saturating_mul(17).saturating_add(limit);\n",
+        "    let clamped = normalized.clamp(100, 100_000);\n",
+        "    let weighted = (clamped * 3) / 2 + raw_input.len() as u64;\n",
+        "    let fee_deduct = (weighted * fee_bps) / 10_000;\n",
+        "    let adjusted = weighted.saturating_sub(fee_deduct + limit / 4);\n",
+        "    let checksum = adjusted.rotate_left(5) ^ 0x5A5A_1234;\n",
+        "    let bucket = (checksum % 997).saturating_add(adjusted);\n",
+        "    let reserve = (bucket / 3).clamp(16, 4096);\n",
+        "    let net_delta = bucket.saturating_sub(reserve).wrapping_add(clamped);\n",
+        "    let audited = (net_delta ^ checksum).rotate_right(3);\n",
+        "    total = total.wrapping_add(audited).saturating_sub(clamped);\n",
+        "    total ^ checksum\n}\n\n",
+    );
+
+    fn build_far_clone_fixture(renamed: bool) -> String {
+        let block_b = if renamed {
+            CLONE_FN_BLOCK
+                .replace("process_order_alpha", "process_order_omega")
+                .replace("raw_input", "src_slice")
+                .replace("limit", "bound")
+                .replace("fee_bps", "tax_bps")
+                .replace("total", "accum")
+        } else {
+            CLONE_FN_BLOCK.to_string()
+        };
+        let mut out = String::with_capacity(48 * 1024);
+        for i in 0..30 {
+            out.push_str(&format!("pub fn preamble_fn_{i}(v: u64) -> u64 {{\n    v.wrapping_add({})\n}}\n", i * 7 + 3));
+        }
+        out.push_str(CLONE_FN_BLOCK);
+        for i in 0..260 {
+            out.push_str(&format!(
+                "pub fn mid_worker_{i}(arg_{i}: u64) -> u64 {{\n    let res_{i} = arg_{i}.wrapping_mul({}) ^ {};\n    res_{i}\n}}\n",
+                i * 11 + 5, i * 13 + 9
+            ));
+        }
+        out.push_str(&block_b);
+        for i in 0..80 {
+            out.push_str(&format!("pub fn epilogue_fn_{i}(z: u64) -> u64 {{\n    z.saturating_sub({})\n}}\n", i * 5 + 2));
+        }
+        out
+    }
+
+    #[test]
+    fn wired_cobs2_engram_lsa_mli_far_clone_recall() {
+        let scorer = HygieneScorer::new();
+        let approx_opts = EvalOptions { approx_long: true, approx_threshold: 1024 };
+        for (label, renamed, min_hits) in [("exact", false, 12usize), ("renamed", true, 7usize)] {
+            let src = build_far_clone_fixture(renamed);
+            let default_res = scorer.score_content(&format!("far_{label}.rs"), &src);
+            let (approx_res, tel_opt) = scorer.score_content_with_opts(&format!("far_{label}.rs"), &src, approx_opts);
+            let tel = tel_opt.expect("cold approx_long run must return SparseAttnTelemetry");
+            let dup_hits = approx_res.squiggles.iter().filter(|s| s.kind == "duplicate_block" && s.probability >= 0.80).count();
+            assert!(dup_hits >= min_hits, "{label}: expected >= {min_hits} duplicate_block hits >= 0.80, got {dup_hits} (def={}, app={})", default_res.score, approx_res.score);
+            assert!(default_res.score - approx_res.score >= 0.08, "{label}: score drop < 0.08 (def={}, app={})", default_res.score, approx_res.score);
+            assert!(tel.mli_reused && tel.engram_bytes > 0 && tel.engram_bytes <= 128 * 1024 && tel.cobs_blocks > 0);
+            assert_eq!(tel.attn_mode, "v07_cobs2_engram_lsa_mli");
+            assert_eq!(scorer.score_content(&format!("far_{label}.rs"), &src).score, default_res.score);
+        }
+    }
+
+    #[test]
+    fn wired_cobs2_real_strict_preserves_local_squiggles() {
+        let scorer = HygieneScorer::new();
+        let strict_src = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hygiene/strict.rs")).unwrap();
+        let def_strict = scorer.score_content("src/hygiene/strict.rs", &strict_src);
+        let (app_strict, tel_opt) = scorer.score_content_with_opts("src/hygiene/strict.rs", &strict_src, EvalOptions { approx_long: true, approx_threshold: 256 });
+        assert!(tel_opt.is_some() && app_strict.score <= def_strict.score + 0.005);
+        for sq in def_strict.squiggles.iter().filter(|s| s.kind == "duplicate_block") {
+            assert!(app_strict.squiggles.iter().any(|a| a.kind == "duplicate_block" && a.line == sq.line), "lost strict.rs:L{}", sq.line);
+        }
+
+        let mut long_local = String::with_capacity(48 * 1024);
+        for i in 0..380 {
+            long_local.push_str(&format!("pub fn pad_top_{i}(x: u64) -> u64 {{\n    x.wrapping_add({})\n}}\n", i * 3 + 1));
+        }
+        long_local.push_str(CLONE_FN_BLOCK);
+        long_local.push_str(&CLONE_FN_BLOCK.replace("process_order_alpha", "process_order_beta"));
+        for i in 0..120 {
+            long_local.push_str(&format!("pub fn pad_bot_{i}(y: u64) -> u64 {{\n    y.wrapping_mul({})\n}}\n", i * 5 + 2));
+        }
+        let def_loc = scorer.score_content("long_local.rs", &long_local);
+        let (app_loc, _) = scorer.score_content_with_opts("long_local.rs", &long_local, EvalOptions { approx_long: true, approx_threshold: 1024 });
+        let def_dups: Vec<usize> = def_loc.squiggles.iter().filter(|s| s.kind == "duplicate_block").map(|s| s.line).collect();
+        assert!(!def_dups.is_empty(), "fixture must have local duplicate_block squiggles");
+        for ln in def_dups {
+            assert!(app_loc.squiggles.iter().any(|s| s.kind == "duplicate_block" && s.line == ln), "lost local dup at L{ln}");
+        }
+        assert!(app_loc.score <= def_loc.score + 0.005);
+    }
+
+    #[test]
+    fn wired_dense_qk_partition_unified_and_cross_layer_mli() {
+        let (mae_2048, tel_2048) = ops::bench_dense_qk_two_layer(2048);
+        let (_mae_4096, tel_4096) = ops::bench_dense_qk_two_layer(4096);
+        let ratio = (tel_4096.pairs_evaluated as f64) / (tel_2048.pairs_evaluated as f64);
+        assert!(mae_2048 <= 0.01, "DenseQk MAE {mae_2048:.5} > 0.01");
+        assert!(ratio <= 2.15, "DenseQk scaling ratio {ratio:.3} > 2.15");
+        assert!(tel_2048.mli_reused && tel_2048.mli_reuse_hits >= 1);
+        assert!(tel_4096.mli_reused && tel_4096.mli_reuse_hits >= 1);
     }
 }
