@@ -406,9 +406,16 @@ const COMMON_GENERIC_FIELDS: &[&str] = &[
     "value", "score", "count", "index", "key", "msg", "code", "len", "pos",
 ];
 
+fn index_source_rels(source_rels: &[String]) -> FxHashMap<&str, usize> {
+    let mut map = FxHashMap::with_capacity_and_hasher(source_rels.len(), Default::default());
+    for (idx, rel) in source_rels.iter().enumerate() {
+        map.insert(rel.as_str(), idx);
+    }
+    map
+}
+
 fn build_importers_of(source_rels: &[String], edges: &[(String, String)]) -> Vec<FxHashSet<usize>> {
-    let id_of: FxHashMap<&str, usize> =
-        source_rels.iter().enumerate().map(|(i, r)| (r.as_str(), i)).collect();
+    let id_of = index_source_rels(source_rels);
     let mut importers = vec![FxHashSet::default(); source_rels.len()];
     for (src, dst) in edges {
         if let (Some(&s), Some(&d)) = (id_of.get(src.as_str()), id_of.get(dst.as_str())) && s != d {
@@ -436,9 +443,13 @@ fn reader_refs_definer_type(
 ) -> bool {
     let (Some(defs_map), Some(refs_map)) = (defs_by_file, refs_by_file) else { return false };
     let (Some(defs), Some(refs)) = (defs_map.get(definer_rel), refs_map.get(reader_rel)) else { return false };
-    defs.iter()
-        .filter(|sym| sym.as_bytes().first().is_some_and(u8::is_ascii_uppercase))
-        .any(|ty| refs.iter().any(|r| r == ty))
+    for sym in defs {
+        let is_type = sym.as_bytes().first().is_some_and(u8::is_ascii_uppercase);
+        if is_type && refs.iter().any(|r| r == sym) {
+            return true;
+        }
+    }
+    false
 }
 
 fn max_scoped_field_leak_for_file(
@@ -474,8 +485,7 @@ pub fn build_ego_contexts(
     file_churn: &BTreeMap<String, u32>, clone_clusters: &[CloneCluster],
 ) -> FxHashMap<String, FileEgoContext> {
     let n = source_rels.len();
-    let id_of: FxHashMap<&str, usize> =
-        source_rels.iter().enumerate().map(|(i, r)| (r.as_str(), i)).collect();
+    let id_of = index_source_rels(source_rels);
     let (mut fan_in, mut fan_out) = (vec![0usize; n], vec![0usize; n]);
     let mut neighbor_dirs: Vec<FxHashSet<String>> = vec![FxHashSet::default(); n];
     for (src, dst) in arch.runtime_edges {
@@ -528,14 +538,19 @@ pub fn deep_module_findings_with_csr(
     ego: &FxHashMap<String, FileEgoContext>,
 ) -> Vec<String> {
     let mut findings = Vec::new();
-    let mut cycles: Vec<Vec<&str>> = sccs.iter().filter(|c| c.len() >= 2).map(|comp| {
-        let mut files: Vec<&str> = comp.iter().map(|&id| source_rels[id as usize].as_str()).collect();
+    let mut cycles: Vec<Vec<&str>> = Vec::new();
+    for comp in sccs.iter().filter(|c| c.len() >= 2) {
+        let mut files: Vec<&str> = Vec::with_capacity(comp.len());
+        for &id in comp {
+            files.push(source_rels[id as usize].as_str());
+        }
         files.sort_unstable();
-        files
-    }).collect();
+        cycles.push(files);
+    }
     cycles.sort();
     for cyc in cycles.into_iter().take(12) {
-        let preview = cyc.iter().take(4).copied().collect::<Vec<_>>().join(" <-> ");
+        let head = &cyc[..cyc.len().min(4)];
+        let preview = head.join(" <-> ");
         findings.push(format!("[module-cycle] {preview} ({} files)", cyc.len()));
     }
     for rel in source_rels {
@@ -772,9 +787,17 @@ pub fn match_tests_inverted(
             (tidx, scan_test_body_hits(&txt, &needed_stems, &needed_pymods))
         };
         let postings: Vec<(usize, Vec<usize>)> = if crate::platform::budget().is_constrained() {
-            test_files.iter().enumerate().map(scan_one).collect()
+            let mut out = Vec::with_capacity(test_files.len());
+            for item in test_files.iter().enumerate() {
+                out.push(scan_one(item));
+            }
+            out
         } else {
-            test_files.par_iter().enumerate().map(scan_one).collect()
+            test_files
+                .par_iter()
+                .enumerate()
+                .map(scan_one)
+                .collect()
         };
         for (tidx, hits) in postings {
             for sidx in hits {
@@ -857,11 +880,18 @@ fn read_hex_oid(path: &Path) -> Option<String> {
 
 fn find_packed_ref_oid(common_dir: &Path, ref_name: &str) -> Option<String> {
     let raw = std::fs::read_to_string(common_dir.join("packed-refs")).ok()?;
-    raw.lines().map(str::trim).filter(|t| !t.is_empty() && !t.starts_with(['#', '^'])).find_map(|t| {
-        let mut parts = t.split_whitespace();
-        let (oid, name) = (parts.next()?, parts.next()?);
-        (name == ref_name && is_valid_oid(oid)).then(|| oid.to_string())
-    })
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(['#', '^']) {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let (Some(oid), Some(name)) = (parts.next(), parts.next()) else { continue };
+        if name == ref_name && is_valid_oid(oid) {
+            return Some(oid.to_string());
+        }
+    }
+    None
 }
 
 /// Pure-Rust zero-subprocess git `HEAD` OID resolver (dirs, worktrees, detached HEAD, `packed-refs`).
@@ -953,7 +983,12 @@ impl NpmiCounts {
                 .then_with(|| a.file_b.cmp(&b.file_b))
         });
         let pairs = ranked.into_iter().map(|(_, p)| p).collect();
-        let file_commits = self.id_to_path.into_iter().zip(self.churn_commits).filter(|(_, c)| *c > 0).collect();
+        let mut file_commits = BTreeMap::new();
+        for (path, cnt) in self.id_to_path.into_iter().zip(self.churn_commits) {
+            if cnt > 0 {
+                file_commits.insert(path, cnt);
+            }
+        }
         GenomeSummary { pairs, file_commits }
     }
 }
@@ -967,7 +1002,8 @@ fn score_npmi_pair(
         (c_xy as f64) / n_f, (counts.file_commits[idx_a] as f64) / n_f, (counts.file_commits[idx_b] as f64) / n_f,
     );
     if p_x <= 0.0 || p_y <= 0.0 || p_xy <= 0.0 { return None; }
-    let npmi = ((p_xy / (p_x * p_y)).ln() / (-p_xy.ln()).max(1e-9)).clamp(-1.0, 1.0);
+    let pmi = (p_xy / (p_x * p_y)).ln();
+    let npmi = (pmi / (-p_xy.ln()).max(1e-9)).clamp(-1.0, 1.0);
     if npmi <= 0.05 { return None; }
     let (pa, pb) = (&counts.id_to_path[idx_a], &counts.id_to_path[idx_b]);
     let (file_a, file_b) = if pa <= pb { (pa.clone(), pb.clone()) } else { (pb.clone(), pa.clone()) };
@@ -1022,11 +1058,23 @@ pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeS
 
     let Ok(mut child) = Command::new("git")
         .args(["log", "--no-merges", "--name-status", "-M", "-n", "2500", "--format=COMMIT %ct"])
-        .current_dir(repo_root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
-    else { return GenomeSummary::default() };
-    let Some(stdout) = child.stdout.take() else { let _ = child.wait(); return GenomeSummary::default() };
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return GenomeSummary::default();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.wait();
+        return GenomeSummary::default();
+    };
 
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let (started, mut reader) = (Instant::now(), BufReader::with_capacity(64 * 1024, stdout));
     let (mut line, mut current) = (String::new(), Vec::with_capacity(BULK_COMMIT_LIMIT));
     let (mut commit_ids, mut rename_map) = (Vec::with_capacity(BULK_COMMIT_LIMIT), FxHashMap::default());
@@ -1058,9 +1106,11 @@ pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeS
     }
 
     let summary = counts.finalize(MIN_COCHANGE_SUPPORT);
+    let top_pairs: Vec<CochangePair> = summary.pairs[..summary.pairs.len().min(200)].to_vec();
     let entry = GenomeCache {
-        version: GENOME_CACHE_VERSION, head_oid,
-        pairs: summary.pairs.iter().take(200).cloned().collect(),
+        version: GENOME_CACHE_VERSION,
+        head_oid,
+        pairs: top_pairs,
         file_commits: summary.file_commits.clone(),
     };
     let _ = write_zstd(&cache_path, &entry);
@@ -1115,27 +1165,37 @@ mod tests {
             self.comps.push(comp);
         }
 
+        fn step_edges(&mut self, v: u32, mut ei: u32) -> bool {
+            let vu = v as usize;
+            let end = self.graph.offsets[vu + 1];
+            while ei < end {
+                let w = self.graph.targets[ei as usize] as usize;
+                ei += 1;
+                if self.index[w] == 0 {
+                    self.call_stack.push((v, ei));
+                    self.push_node(w);
+                    return true;
+                }
+                if self.on_stack[w] && self.index[w] < self.lowlink[vu] {
+                    self.lowlink[vu] = self.index[w];
+                }
+            }
+            false
+        }
+
         fn visit(&mut self, start: usize) {
             self.push_node(start);
-            while let Some((v, mut ei)) = self.call_stack.pop() {
-                let (vu, end, mut descended) = (v as usize, self.graph.offsets[v as usize + 1], false);
-                while ei < end {
-                    let w = self.graph.targets[ei as usize] as usize;
-                    ei += 1;
-                    if self.index[w] == 0 {
-                        self.call_stack.push((v, ei));
-                        self.push_node(w);
-                        descended = true;
-                        break;
-                    }
-                    if self.on_stack[w] && self.index[w] < self.lowlink[vu] {
-                        self.lowlink[vu] = self.index[w];
-                    }
+            while let Some((v, ei)) = self.call_stack.pop() {
+                if self.step_edges(v, ei) {
+                    continue;
                 }
-                if descended { continue; }
-                if self.lowlink[vu] == self.index[vu] { self.pop_scc(v); }
+                let vu = v as usize;
+                if self.lowlink[vu] == self.index[vu] {
+                    self.pop_scc(v);
+                }
                 if let Some(&(parent, _)) = self.call_stack.last() {
-                    self.lowlink[parent as usize] = self.lowlink[parent as usize].min(self.lowlink[vu]);
+                    let pu = parent as usize;
+                    self.lowlink[pu] = self.lowlink[pu].min(self.lowlink[vu]);
                 }
             }
         }
@@ -1147,13 +1207,20 @@ mod tests {
         comps
     }
 
+    fn to_string_vec(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
     fn mk_metric(
         loc: usize, exp: usize, fns: usize, pass: usize, pubs: &[&str], reads: &[&str],
     ) -> ModuleMetrics {
         ModuleMetrics {
-            loc, exported_symbols: exp, total_fns: fns, passthrough_fns: pass,
-            pub_fields: pubs.iter().map(|s| (*s).into()).collect(),
-            field_reads: reads.iter().map(|s| (*s).into()).collect(),
+            loc,
+            exported_symbols: exp,
+            total_fns: fns,
+            passthrough_fns: pass,
+            pub_fields: to_string_vec(pubs),
+            field_reads: to_string_vec(reads),
         }
     }
 

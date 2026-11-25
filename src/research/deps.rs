@@ -316,7 +316,8 @@ pub fn extract_pnpm_lock_v9(mut reader: impl BufRead) -> Vec<LockedDep> {
 
 fn split_pnpm_pkg_key(raw_key: &str) -> Option<(String, String)> {
     let unq = raw_key.trim().trim_matches(['\'', '"']);
-    let base = unq.split('(').next().unwrap_or(unq).trim_start_matches('/');
+    let head = unq.split('(').next().unwrap_or(unq);
+    let base = head.trim_start_matches('/');
     let at = base.rfind('@').filter(|&p| p > 0)?;
     let (name, ver) = (&base[..at], &base[at + 1..]);
     (!name.is_empty() && !ver.is_empty()).then(|| (name.to_string(), ver.to_string()))
@@ -348,7 +349,8 @@ pub fn extract_go_mod_and_sum(mut go_mod: impl BufRead, go_sum: Option<impl BufR
             .filter(|s| !s.is_empty() && !s.starts_with("//"))
         {
             let direct = !b.contains("// indirect");
-            let mut toks = b.split("//").next().unwrap_or(b).split_whitespace();
+            let code = b.split("//").next().unwrap_or(b);
+            let mut toks = code.split_whitespace();
             if let (Some(m), Some(v)) = (toks.next(), toks.next()) {
                 let verified = sum_hashes.is_empty() || sum_hashes.contains(&(m.to_string(), v.to_string()));
                 out.push(LockedDep {
@@ -378,18 +380,26 @@ pub fn project_msrv_minor(repo_root: &Path) -> u32 {
 pub fn extract_repo_lockfiles(repo_root: &Path) -> Vec<LockedDep> {
     let mut deps = Vec::new();
     if let Ok(f) = File::open(repo_root.join("Cargo.lock")) {
-        let direct: FxHashSet<String> = fs::read_to_string(repo_root.join("Cargo.toml"))
-            .map(|t| parse_deps("Cargo.toml", &t).into_iter().filter(|d| !d.is_local).map(|d| d.package).collect())
-            .unwrap_or_default();
+        let mut direct = FxHashSet::default();
+        if let Ok(txt) = fs::read_to_string(repo_root.join("Cargo.toml")) {
+            for dep in parse_deps("Cargo.toml", &txt) {
+                if !dep.is_local {
+                    direct.insert(dep.package);
+                }
+            }
+        }
         deps.extend(extract_cargo_lock(f, &direct));
     }
     if let Ok(f) = File::open(repo_root.join("pnpm-lock.yaml")) {
         deps.extend(extract_pnpm_lock_v9(BufReader::with_capacity(LOCKFILE_BUF_BYTES, f)));
     }
     if let Ok(f) = File::open(repo_root.join("uv.lock")) {
-        let direct: FxHashSet<String> = fs::read_to_string(repo_root.join("pyproject.toml"))
-            .map(|t| parse_deps("pyproject.toml", &t).into_iter().map(|d| d.package).collect())
-            .unwrap_or_default();
+        let mut direct = FxHashSet::default();
+        if let Ok(txt) = fs::read_to_string(repo_root.join("pyproject.toml")) {
+            for dep in parse_deps("pyproject.toml", &txt) {
+                direct.insert(dep.package);
+            }
+        }
         deps.extend(extract_uv_lock(f, &direct));
     }
     if let Ok(mod_f) = File::open(repo_root.join("go.mod")) {
@@ -423,8 +433,12 @@ fn parse_sparse_index_versions(body: &str) -> Vec<String> {
 }
 
 fn versions_to_release_refs(versions: &[String]) -> Vec<ReleaseNoteRef> {
-    let mut parsed: Vec<(Version, &str)> = versions.iter()
-        .filter_map(|s| Version::parse(s).ok().map(|v| (v, s.as_str()))).collect();
+    let mut parsed: Vec<(Version, &str)> = Vec::with_capacity(versions.len());
+    for s in versions {
+        if let Ok(v) = Version::parse(s) {
+            parsed.push((v, s.as_str()));
+        }
+    }
     parsed.sort_by(|a, b| a.0.cmp(&b.0));
     parsed.dedup_by(|a, b| a.0 == b.0);
     let (mut out, mut prev) = (Vec::with_capacity(parsed.len()), None::<&Version>);
@@ -450,7 +464,11 @@ async fn fetch_single_crate_index(
     let mut req = client.get(format!("{}/{rel}", base_url.trim_end_matches('/'))).timeout(Duration::from_secs(5));
     if let Some(tag) = prev_etag { req = req.header(reqwest::header::IF_NONE_MATCH, tag); }
     let Ok(resp) = req.send().await else { return IndexFetchOutcome::Failed };
-    let etag = resp.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     match resp.status().as_u16() {
         304 => IndexFetchOutcome::NotModified(etag),
         200 => {
@@ -465,7 +483,9 @@ async fn fetch_single_crate_index(
 pub async fn fetch_crates_io_releases(
     client: &reqwest::Client, base_url: &str, cache_path: &Path, crate_names: &[&str],
 ) -> FxHashMap<String, Vec<ReleaseNoteRef>> {
-    let (mut cache, now, mut seen) = (read_zstd::<CratesIndexCache>(cache_path).unwrap_or_default(), now_ms(), FxHashSet::default());
+    let mut cache = read_zstd::<CratesIndexCache>(cache_path).unwrap_or_default();
+    let now = now_ms();
+    let mut seen = FxHashSet::default();
     let targets: Vec<String> = crate_names.iter().map(|s| s.trim().to_ascii_lowercase())
         .filter(|k| !k.is_empty() && seen.insert(k.clone())).take(MAX_CRATES_INDEX_CRATES).collect();
     let to_fetch: Vec<(String, Option<String>)> = targets.iter()
@@ -475,23 +495,15 @@ pub async fn fetch_crates_io_releases(
     let mut dirty = false;
     if !to_fetch.is_empty() {
         let fetched: Vec<(String, IndexFetchOutcome)> = stream::iter(to_fetch)
-            .map(|(n, etag)| async move { (n.clone(), fetch_single_crate_index(client, base_url, &n, etag.as_deref()).await) })
-            .buffer_unordered(MAX_CRATES_INDEX_CONCURRENCY).collect().await;
+            .map(|(n, etag)| async move {
+                let res = fetch_single_crate_index(client, base_url, &n, etag.as_deref()).await;
+                (n, res)
+            })
+            .buffer_unordered(MAX_CRATES_INDEX_CONCURRENCY)
+            .collect()
+            .await;
         for (name, outcome) in fetched {
-            match outcome {
-                IndexFetchOutcome::NotModified(new_etag) => {
-                    if let Some(entry) = cache.entries.get_mut(&name) {
-                        entry.fetched_ms = now;
-                        if new_etag.is_some() { entry.etag = new_etag; }
-                        dirty = true;
-                    }
-                }
-                IndexFetchOutcome::Fresh { etag, versions } => {
-                    cache.entries.insert(name, CachedCrateVersions { etag, fetched_ms: now, versions });
-                    dirty = true;
-                }
-                IndexFetchOutcome::Failed => {}
-            }
+            dirty |= apply_index_outcome(&mut cache, name, outcome, now);
         }
     }
     if dirty {
@@ -500,6 +512,31 @@ pub async fn fetch_crates_io_releases(
     }
     targets.into_iter()
         .filter_map(|n| cache.entries.get(&n).map(|e| (n, versions_to_release_refs(&e.versions)))).collect()
+}
+
+fn apply_index_outcome(
+    cache: &mut CratesIndexCache,
+    name: String,
+    outcome: IndexFetchOutcome,
+    now: u64,
+) -> bool {
+    match outcome {
+        IndexFetchOutcome::NotModified(new_etag) => {
+            let Some(entry) = cache.entries.get_mut(&name) else {
+                return false;
+            };
+            entry.fetched_ms = now;
+            if new_etag.is_some() {
+                entry.etag = new_etag;
+            }
+            true
+        }
+        IndexFetchOutcome::Fresh { etag, versions } => {
+            cache.entries.insert(name, CachedCrateVersions { etag, fetched_ms: now, versions });
+            true
+        }
+        IndexFetchOutcome::Failed => false,
+    }
 }
 
 fn format_changelog_query(dep: &LockedDep, plan: &HopPlan) -> String {
@@ -524,7 +561,8 @@ fn plan_manifest_fallback_queries(repo_root: &Path) -> Vec<String> {
     let (mut queries, mut seen) = (Vec::new(), BTreeSet::new());
     for &(file, tpl) in SPECS {
         let Ok(txt) = fs::read_to_string(repo_root.join(file)) else { continue };
-        for dep in parse_deps(file, &txt).into_iter().filter(|d| !d.is_local).take(4) {
+        let external = parse_deps(file, &txt).into_iter().filter(|d| !d.is_local);
+        for dep in external.take(4) {
             let q = tpl.replace("{p}", &dep.package);
             if seen.insert(q.clone()) {
                 queries.push(q);
@@ -622,7 +660,9 @@ mod tests {
 
         let pnpm = "importers:\n  .:\n    dependencies:\n      react:\n        specifier: ^19\npackages:\n  react@19.1.0(peer@1.0.0):\n    resolution: {}\nsnapshots:\n  ghost@0.0.1: {}\n";
         let pdeps = extract_pnpm_lock_v9(Cursor::new(pnpm));
-        assert!(pdeps.len() == 1 && pdeps[0].direct && pdeps[0].name == "react" && pdeps[0].version == "19.1.0");
+        assert_eq!(pdeps.len(), 1);
+        assert!(pdeps[0].direct);
+        assert_eq!((pdeps[0].name.as_str(), pdeps[0].version.as_str()), ("react", "19.1.0"));
 
         let uv = "[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [{ name = \"colorama\", marker = \"sys_platform == 'win32'\" }]\n[[package]]\nname = \"colorama\"\nversion = \"0.4.6\"\n";
         let udeps = extract_uv_lock(Cursor::new(uv), &["colorama".into()].into_iter().collect());
@@ -630,7 +670,9 @@ mod tests {
 
         let go_mod = "module demo\nrequire (\n\tgithub.com/gin-gonic/gin v1.10.0\n\tgolang.org/x/sys v0.25.0 // indirect\n)\n";
         let gdeps = extract_go_mod_and_sum(Cursor::new(go_mod), Some(Cursor::new("github.com/gin-gonic/gin v1.10.0 h1:abc=\n")));
-        assert!(gdeps.len() == 2 && gdeps[0].direct && gdeps[0].integrity_verified && !gdeps[1].direct && !gdeps[1].integrity_verified);
+        assert_eq!(gdeps.len(), 2);
+        assert!(gdeps[0].direct && gdeps[0].integrity_verified);
+        assert!(!gdeps[1].direct && !gdeps[1].integrity_verified);
     }
 
     #[tokio::test]
@@ -675,7 +717,9 @@ mod tests {
         let find = |n: &str| advisories.iter().find(|a| a.name == n).unwrap();
         assert!(find("lazy_static").kind == "std_replacement" && find("lazy_static").recommendation.contains("std::sync::LazyLock"));
         assert!(find("serde_yaml").kind == "rustsec_unmaintained" && find("serde_yaml").recommendation.contains("RUSTSEC-2024-0320"));
-        assert_eq!((find("reqwest").kind.as_str(), &find("reqwest").hops, find("reqwest").breaking_hops), ("major_upgrade_hops", &vec!["2.0.0".into(), "3.1.0".into()], 2));
+        let reqw = find("reqwest");
+        assert_eq!(reqw.kind, "major_upgrade_hops");
+        assert_eq!((&reqw.hops, reqw.breaking_hops), (&vec!["2.0.0".into(), "3.1.0".into()], 2));
 
         // Fresh TTL hit (0 HTTP calls), then stale cache -> If-None-Match 304 revalidation.
         let _ = fetch_crates_io_releases(&client, &base_url, &cache_path, &["reqwest"]).await;

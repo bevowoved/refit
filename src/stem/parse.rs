@@ -184,17 +184,7 @@ impl<'a> SymbolParser<'a> {
             .feed(self.ext, trimmed, &mut self.typed_imports, &mut self.glob_reexports);
 
         let indent = line.bytes().take_while(|&byte| matches!(byte, b' ' | b'\t')).count();
-        if self.ext == "py"
-            && indent == 0
-            && !trimmed.starts_with('@')
-            && self.active_fn.take().is_some()
-        {
-            if self.active_fn_lines <= 3 && self.active_fn_calls <= 2 {
-                self.passthrough_fns += 1;
-            }
-            self.active_fn_lines = 0;
-            self.active_fn_calls = 0;
-        }
+        self.close_py_top_fn(indent, trimmed);
 
         let defined_here = self.record_definition(trimmed, indent == 0);
         if !trimmed.starts_with("#[") && !trimmed.starts_with('@') {
@@ -206,6 +196,60 @@ impl<'a> SymbolParser<'a> {
         self.update_fn_scope(trimmed, brace_delta, call_opens);
     }
 
+    fn close_py_top_fn(&mut self, indent: usize, trimmed: &str) {
+        if self.ext != "py" || indent != 0 || trimmed.starts_with('@') {
+            return;
+        }
+        if self.active_fn.take().is_some() {
+            if self.active_fn_lines <= 3 && self.active_fn_calls <= 2 {
+                self.passthrough_fns += 1;
+            }
+            self.active_fn_lines = 0;
+            self.active_fn_calls = 0;
+        }
+    }
+
+    fn record_ident_ref(&mut self, ident: &str) {
+        if self.active_fn.as_ref().is_some_and(|(name, _)| name == ident) {
+            return;
+        }
+        if !self.refs.contains(ident) {
+            self.refs.insert(ident.to_string());
+        }
+        let hits = self.intra_hits.entry(ident.to_string()).or_insert(0);
+        *hits = hits.saturating_add(1);
+    }
+
+    fn maybe_record_field_read(&mut self, field: Option<&str>) {
+        if let Some(name) = field
+            && name.len() >= 3
+            && !is_noise(name)
+        {
+            self.field_reads.insert(name.to_string());
+        }
+    }
+
+    fn handle_scanned_ident<'b>(
+        &mut self,
+        ident: &'b str,
+        prev_was_dot: bool,
+        defined_here: Option<&str>,
+        skipped_decl: &mut bool,
+        pending_field: &mut Option<&'b str>,
+    ) {
+        if prev_was_dot {
+            *pending_field = Some(ident);
+        }
+        if is_noise(ident) {
+            return;
+        }
+        if !*skipped_decl && defined_here == Some(ident) {
+            *skipped_decl = true;
+            return;
+        }
+        self.record_ident_ref(ident);
+    }
+
     /// Single-pass `LexCursor<'a>` scan over a cleaned line collecting brace delta,
     /// call parens, `.field` reads, and non-def/non-self-call identifier references.
     fn scan_line_tokens(&mut self, trimmed: &str, defined_here: Option<&str>) -> (i32, usize) {
@@ -215,15 +259,12 @@ impl<'a> SymbolParser<'a> {
         let mut skipped_decl = false;
         let mut prev_was_dot = false;
         let mut pending_field: Option<&str> = None;
-        let active_name = self.active_fn.as_ref().map(|(name, _)| name.as_str());
 
         while let Some(tok) = cursor.next_token() {
-            if let Some(field) = pending_field.take()
-                && tok.kind != LexKind::LParen
-                && field.len() >= 3
-                && !is_noise(field)
-            {
-                self.field_reads.insert(field.to_string());
+            if tok.kind != LexKind::LParen {
+                self.maybe_record_field_read(pending_field.take());
+            } else {
+                pending_field = None;
             }
             match tok.kind {
                 LexKind::LBrace => brace_delta += 1,
@@ -233,33 +274,14 @@ impl<'a> SymbolParser<'a> {
                     prev_was_dot = true;
                     continue;
                 }
-                LexKind::Ident => {
-                    let ident = tok.as_str();
-                    if prev_was_dot {
-                        pending_field = Some(ident);
-                    }
-                    if !is_noise(ident) {
-                        if !skipped_decl && defined_here == Some(ident) {
-                            skipped_decl = true;
-                        } else if active_name != Some(ident) {
-                            if !self.refs.contains(ident) {
-                                self.refs.insert(ident.to_string());
-                            }
-                            let hits = self.intra_hits.entry(ident.to_string()).or_insert(0);
-                            *hits = hits.saturating_add(1);
-                        }
-                    }
-                }
+                LexKind::Ident => self.handle_scanned_ident(
+                    tok.as_str(), prev_was_dot, defined_here, &mut skipped_decl, &mut pending_field,
+                ),
                 _ => {}
             }
             prev_was_dot = false;
         }
-        if let Some(field) = pending_field
-            && field.len() >= 3
-            && !is_noise(field)
-        {
-            self.field_reads.insert(field.to_string());
-        }
+        self.maybe_record_field_read(pending_field);
         (brace_delta, call_opens)
     }
 
@@ -292,6 +314,15 @@ impl<'a> SymbolParser<'a> {
         Some(sym)
     }
 
+    fn record_pub_field(&mut self, rest: &str) {
+        if let Some(field) = first_ident(rest)
+            && field.len() >= 3
+            && !is_noise(field)
+        {
+            self.pub_fields.insert(field.to_string());
+        }
+    }
+
     fn track_public_fields(&mut self, trimmed: &str, brace_delta: i32) {
         if self.ext == "rs" {
             if trimmed.starts_with("pub struct ") || trimmed.starts_with("pub(crate) struct ") {
@@ -310,22 +341,14 @@ impl<'a> SymbolParser<'a> {
             else {
                 return;
             };
-            if !rest.starts_with("fn ")
-                && !rest.starts_with("async ")
-                && let Some(field) = first_ident(rest)
-                && field.len() >= 3
-                && !is_noise(field)
-            {
-                self.pub_fields.insert(field.to_string());
+            if !rest.starts_with("fn ") && !rest.starts_with("async ") {
+                self.record_pub_field(rest);
             }
         } else if is_js(self.ext)
             && let Some(rest) = trimmed.strip_prefix("public ")
             && !rest.contains('(')
-            && let Some(field) = first_ident(rest)
-            && field.len() >= 3
-            && !is_noise(field)
         {
-            self.pub_fields.insert(field.to_string());
+            self.record_pub_field(rest);
         }
     }
 
@@ -368,7 +391,8 @@ impl<'a> SymbolParser<'a> {
             if start >= end || end > content.len() {
                 continue;
             }
-            for test_line in content[start..end].lines().map(str::trim).filter(|s| !s.is_empty()) {
+            let lines = content[start..end].lines().map(str::trim);
+            for test_line in lines.filter(|s| !s.is_empty()) {
                 collect_token_set(self.lang, test_line, &mut test_refs);
                 if self.ext == "rs" {
                     let (mut dummy_globs, mut test_imps) = (FxHashSet::default(), FxHashSet::default());
@@ -726,7 +750,11 @@ fn expand_rs_use_tree(
         }
         return;
     }
-    let before_as = trimmed.split(" as ").next().unwrap_or(trimmed).trim();
+    let before_as = trimmed
+        .split(" as ")
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
     if let Some(brace_pos) = before_as.find("::{") {
         let head = &before_as[..brace_pos];
         let mod_path = join_use_prefix(prefix, &head.replace("::", "/"));
@@ -750,7 +778,11 @@ fn expand_rs_use_tree(
         return;
     }
 
-    let segs: Vec<&str> = before_as.split("::").map(str::trim).filter(|s| !s.is_empty()).collect();
+    let segs: Vec<&str> = before_as
+        .split("::")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if segs.is_empty() {
         return;
     }

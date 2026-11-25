@@ -327,34 +327,13 @@ pub fn critical_depths(units: &[ModuleUnit]) -> HashMap<String, usize> {
         state[start] = 1;
         stack.push((start, 0));
 
-        while let Some((u, mut ei)) = stack.pop() {
-            let deps = &units[u].dependents;
-            let mut pushed = false;
-            while ei < deps.len() {
-                let dep_name = deps[ei].as_str();
-                ei += 1;
-                if let Some(&v) = idx_of.get(dep_name) {
-                    if state[v] == 0 {
-                        stack.push((u, ei));
-                        state[v] = 1;
-                        stack.push((v, 0));
-                        pushed = true;
-                        break;
-                    } else if state[v] == 2 {
-                        depth[u] = depth[u].max(1 + depth[v]);
-                    } else {
-                        // Back-edge guard (matches recursive visiting -> 0).
-                        depth[u] = depth[u].max(1);
-                    }
-                } else {
-                    depth[u] = depth[u].max(1);
-                }
+        while let Some((u, ei)) = stack.pop() {
+            if step_depth_edges(u, ei, units, &idx_of, &mut state, &mut depth, &mut stack) {
+                continue;
             }
-            if !pushed {
-                state[u] = 2;
-                if let Some(&(parent, _)) = stack.last() {
-                    depth[parent] = depth[parent].max(1 + depth[u]);
-                }
+            state[u] = 2;
+            if let Some(&(parent, _)) = stack.last() {
+                depth[parent] = depth[parent].max(1 + depth[u]);
             }
         }
     }
@@ -364,6 +343,37 @@ pub fn critical_depths(units: &[ModuleUnit]) -> HashMap<String, usize> {
         memo.insert(u.id.clone(), depth[i]);
     }
     memo
+}
+
+fn step_depth_edges(
+    u: usize,
+    mut ei: usize,
+    units: &[ModuleUnit],
+    idx_of: &FxHashMap<&str, usize>,
+    state: &mut [u8],
+    depth: &mut [usize],
+    stack: &mut Vec<(usize, usize)>,
+) -> bool {
+    let deps = &units[u].dependents;
+    while ei < deps.len() {
+        let dep_name = deps[ei].as_str();
+        ei += 1;
+        let Some(&v) = idx_of.get(dep_name) else {
+            depth[u] = depth[u].max(1);
+            continue;
+        };
+        match state[v] {
+            0 => {
+                stack.push((u, ei));
+                state[v] = 1;
+                stack.push((v, 0));
+                return true;
+            }
+            2 => depth[u] = depth[u].max(1 + depth[v]),
+            _ => depth[u] = depth[u].max(1),
+        }
+    }
+    false
 }
 
 pub fn units_interfere(a: &ModuleUnit, b: &ModuleUnit) -> bool {

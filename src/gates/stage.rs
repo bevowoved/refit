@@ -52,10 +52,10 @@ fn is_copy_fallback_err(err: &io::Error, include_emlink: bool) -> bool {
         return true;
     }
     let Some(raw) = err.raw_os_error() else { return false };
-    if matches!(raw, 1 | 18 | 22 | 38 | 45 | 78 | 95) || (include_emlink && raw == 31) { return true; }
-    #[cfg(windows)]
-    if matches!(raw, 5 | 17 | 50 | 87) || (include_emlink && raw == 1142) { return true; }
-    false
+    let unix_match = matches!(raw, 1 | 18 | 22 | 38 | 45 | 78 | 95) || (include_emlink && raw == 31);
+    let win_match = cfg!(windows)
+        && (matches!(raw, 5 | 17 | 50 | 87) || (include_emlink && raw == 1142));
+    unix_match || win_match
 }
 
 /// Same-FS copy cascade: `reflink` (when `build-cache` enabled) -> `hard_link` -> verified `copy`.

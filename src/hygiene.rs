@@ -29,7 +29,7 @@ const CACHE_MAGIC: &[u8; 8] = b"RFHG0002";
 const CACHE_ZSTD_WINDOW_LOG: u32 = 18;
 
 fn estimate_neural_bytes(content: &str) -> usize {
-    let lines = content.as_bytes().iter().filter(|&&b| b == b'\n').count() + 1;
+    let lines = crate::source::count_lines(content.as_bytes());
     (lines.saturating_mul(2048)).clamp(64 * 1024, 16 * 1024 * 1024)
 }
 
@@ -74,7 +74,10 @@ fn toml_style(path: &Path, w_key: &str, i_key: &str, cfg: &mut StyleConfig) -> b
 }
 
 fn json_num(v: &serde_json::Value, top: &str, nested: &str) -> Option<usize> {
-    v[top].as_u64().or_else(|| v["formatter"][nested].as_u64()).map(|n| n as usize)
+    let raw = v[top]
+        .as_u64()
+        .or_else(|| v["formatter"][nested].as_u64())?;
+    Some(raw as usize)
 }
 
 fn json_style(repo_root: &Path, cfg: &mut StyleConfig) -> bool {
@@ -111,12 +114,20 @@ fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
         write_str_u16(&mut out, key);
         let _ = out.write_f64::<LittleEndian>(r.score);
         let _ = out.write_u64::<LittleEndian>(r.latency_us);
-        let flags = u8::from(r.strict_score.is_some())
-            | (u8::from(r.veto_cap.is_some()) << 1)
-            | (u8::from(r.total_squiggles.is_some()) << 2)
-            | (u8::from(r.event_load.is_some()) << 3)
-            | (u8::from(r.multiscale_score.is_some()) << 4)
-            | (u8::from(r.calibration_log.is_some()) << 5);
+        let bits = [
+            r.strict_score.is_some(),
+            r.veto_cap.is_some(),
+            r.total_squiggles.is_some(),
+            r.event_load.is_some(),
+            r.multiscale_score.is_some(),
+            r.calibration_log.is_some(),
+        ];
+        let mut flags = 0u8;
+        for (idx, present) in bits.into_iter().enumerate() {
+            if present {
+                flags |= 1u8 << idx;
+            }
+        }
         out.push(flags);
         write_opt_f64(&mut out, r.strict_score);
         write_opt_f64(&mut out, r.veto_cap);
@@ -125,7 +136,9 @@ fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
         }
         write_opt_f64(&mut out, r.event_load);
         write_opt_f64(&mut out, r.multiscale_score);
-        if let Some(ref s) = r.calibration_log { write_str_u16(&mut out, s); }
+        if let Some(ref s) = r.calibration_log {
+            write_str_u16(&mut out, s);
+        }
 
         let sq_cnt = r.squiggles.len().min(u16::MAX as usize);
         let _ = out.write_u16::<LittleEndian>(sq_cnt as u16);
@@ -145,51 +158,72 @@ fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
         }
         let veto_cnt = r.triggered_vetoes.len().min(u16::MAX as usize);
         let _ = out.write_u16::<LittleEndian>(veto_cnt as u16);
-        for veto in r.triggered_vetoes.iter().take(veto_cnt) { write_str_u16(&mut out, veto); }
+        for veto in r.triggered_vetoes.iter().take(veto_cnt) {
+            write_str_u16(&mut out, veto);
+        }
     }
     out
 }
 
+fn decode_cache_entry(rd: &mut Cursor<&[u8]>) -> Option<(String, HygieneResult)> {
+    let key = read_str_u16(rd)?;
+    let (score, latency_us, flags) = (
+        rd.read_f64::<LittleEndian>().ok()?,
+        rd.read_u64::<LittleEndian>().ok()?,
+        rd.read_u8().ok()?,
+    );
+    let strict_score = read_opt_f64(rd, flags, 1)?;
+    let veto_cap = read_opt_f64(rd, flags, 2)?;
+    let total_squiggles = if (flags & 4) != 0 {
+        Some(rd.read_u32::<LittleEndian>().ok()? as usize)
+    } else {
+        None
+    };
+    let event_load = read_opt_f64(rd, flags, 8)?;
+    let multiscale_score = read_opt_f64(rd, flags, 16)?;
+    let calibration_log = if (flags & 32) != 0 {
+        Some(read_str_u16(rd)?)
+    } else {
+        None
+    };
+
+    let sq_cnt = rd.read_u16::<LittleEndian>().ok()? as usize;
+    let mut squiggles = Vec::with_capacity(sq_cnt.min(64));
+    for _ in 0..sq_cnt {
+        let line = rd.read_u32::<LittleEndian>().ok()? as usize;
+        let kind_id = rd.read_u8().ok()?;
+        let (kind, message) = match model::SQUIGGLE_SPEC.get(kind_id as usize) {
+            Some(&(sk, sm, _)) => (sk.to_string(), sm.to_string()),
+            None if kind_id == 255 => (read_str_u16(rd)?, read_str_u16(rd)?),
+            None => return None,
+        };
+        let probability = rd.read_f64::<LittleEndian>().ok()?;
+        squiggles.push(Squiggle { line, kind, probability, message });
+    }
+    let veto_cnt = rd.read_u16::<LittleEndian>().ok()? as usize;
+    let mut triggered_vetoes = Vec::with_capacity(veto_cnt.min(32));
+    for _ in 0..veto_cnt {
+        triggered_vetoes.push(read_str_u16(rd)?);
+    }
+    Some((key, HygieneResult {
+        score, squiggles, cached: false, latency_us, strict_score, veto_cap,
+        total_squiggles, event_load, triggered_vetoes, multiscale_score, calibration_log,
+    }))
+}
+
 fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> {
-    if !bytes.starts_with(CACHE_MAGIC) { return None; }
+    if !bytes.starts_with(CACHE_MAGIC) {
+        return None;
+    }
     let mut rd = Cursor::new(&bytes[8..]);
     let count = rd.read_u32::<LittleEndian>().ok()? as usize;
-    if count > 1_000_000 { return None; }
+    if count > 1_000_000 {
+        return None;
+    }
     let mut map = HashMap::with_capacity(count.min(4096));
     for _ in 0..count {
-        let key = read_str_u16(&mut rd)?;
-        let score = rd.read_f64::<LittleEndian>().ok()?;
-        let latency_us = rd.read_u64::<LittleEndian>().ok()?;
-        let flags = rd.read_u8().ok()?;
-        let strict_score = read_opt_f64(&mut rd, flags, 1)?;
-        let veto_cap = read_opt_f64(&mut rd, flags, 2)?;
-        let total_squiggles = if (flags & 4) != 0 {
-            Some(rd.read_u32::<LittleEndian>().ok()? as usize)
-        } else { None };
-        let event_load = read_opt_f64(&mut rd, flags, 8)?;
-        let multiscale_score = read_opt_f64(&mut rd, flags, 16)?;
-        let calibration_log = if (flags & 32) != 0 { Some(read_str_u16(&mut rd)?) } else { None };
-
-        let sq_cnt = rd.read_u16::<LittleEndian>().ok()? as usize;
-        let mut squiggles = Vec::with_capacity(sq_cnt.min(64));
-        for _ in 0..sq_cnt {
-            let line = rd.read_u32::<LittleEndian>().ok()? as usize;
-            let kind_id = rd.read_u8().ok()?;
-            let (kind, message) = match model::SQUIGGLE_SPEC.get(kind_id as usize) {
-                Some(&(sk, sm, _)) => (sk.to_string(), sm.to_string()),
-                None if kind_id == 255 => (read_str_u16(&mut rd)?, read_str_u16(&mut rd)?),
-                None => return None,
-            };
-            let probability = rd.read_f64::<LittleEndian>().ok()?;
-            squiggles.push(Squiggle { line, kind, probability, message });
-        }
-        let veto_cnt = rd.read_u16::<LittleEndian>().ok()? as usize;
-        let mut triggered_vetoes = Vec::with_capacity(veto_cnt.min(32));
-        for _ in 0..veto_cnt { triggered_vetoes.push(read_str_u16(&mut rd)?); }
-        map.insert(key, HygieneResult {
-            score, squiggles, cached: false, latency_us, strict_score, veto_cap,
-            total_squiggles, event_load, triggered_vetoes, multiscale_score, calibration_log,
-        });
+        let (key, val) = decode_cache_entry(&mut rd)?;
+        map.insert(key, val);
     }
     Some(map)
 }
@@ -484,15 +518,21 @@ mod tests {
     use std::process::{Command, Stdio};
 
     fn sq_tuples(list: &[Squiggle]) -> Vec<(usize, String, i64)> {
-        list.iter().map(|s| (s.line, s.kind.clone(), (s.probability * 10000.0).round() as i64)).collect()
+        list.iter()
+            .map(|s| (s.line, s.kind.clone(), (s.probability * 10_000.0).round() as i64))
+            .collect()
     }
 
     fn js_sq_tuples(list: &[serde_json::Value]) -> Vec<(usize, String, i64)> {
-        list.iter().map(|s| (
-            s["line"].as_u64().unwrap() as usize,
-            s["kind"].as_str().unwrap().to_string(),
-            (s["probability"].as_f64().unwrap() * 10000.0).round() as i64,
-        )).collect()
+        let mut out = Vec::with_capacity(list.len());
+        for s in list {
+            let ln = s["line"].as_u64().unwrap() as usize;
+            let raw_kind = s["kind"].as_str().unwrap();
+            let raw_prob = s["probability"].as_f64().unwrap();
+            let prob = (raw_prob * 10_000.0).round() as i64;
+            out.push((ln, raw_kind.to_string(), prob));
+        }
+        out
     }
 
     #[test]
@@ -851,9 +891,11 @@ mod tests {
             assert!(err.to_string().contains(want), "got {err}");
         }
         fs::remove_file(wdir.join("hygiene.json")).unwrap();
-        assert!(HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap().to_string().contains("unpinned"));
+        let unpinned_err = HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap();
+        assert!(unpinned_err.to_string().contains("unpinned"));
         let oversized = vec![0u8; weights::MAX_NPZ_ARCHIVE_BYTES + 1];
-        assert!(weights::load_weights_from_npz(&oversized).err().unwrap().to_string().contains("exceeds"));
+        let over_err = weights::load_weights_from_npz(&oversized).err().unwrap();
+        assert!(over_err.to_string().contains("exceeds"));
 
         let bomb_raw = vec![0u8; weights::MAX_NPY_ENTRY_BYTES + 4096];
         let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
@@ -861,7 +903,8 @@ mod tests {
         let comp = enc.finish().unwrap();
         assert!(comp.len() < 16 * 1024);
         let bomb_zip = build_single_entry_zip("trits.npy", 8, &comp, bomb_raw.len() as u32);
-        assert!(weights::load_weights_from_npz(&bomb_zip).err().unwrap().to_string().contains("zip-bomb"));
+        let bomb_err = weights::load_weights_from_npz(&bomb_zip).err().unwrap();
+        assert!(bomb_err.to_string().contains("zip-bomb"));
         assert!(weights::load_weights_from_npz(&real_npz[..40]).is_err());
     }
 
@@ -876,7 +919,8 @@ mod tests {
         let clean_res = scorer.score_content_strict_with_ego("src/order.rs", src, Some(&clean_ego));
         assert_eq!((clean_res.score, clean_res.strict_score, clean_res.multiscale_score), (base.score, Some(base.score), Some(base.score)));
         assert!(clean_res.triggered_vetoes.is_empty());
-        let ca: strict::CalibrationAudit = serde_json::from_str(clean_res.calibration_log.as_deref().unwrap()).unwrap();
+        let cal_json = clean_res.calibration_log.as_deref().unwrap();
+        let ca: strict::CalibrationAudit = serde_json::from_str(cal_json).unwrap();
         assert_eq!((ca.raw_v07, ca.delta_cross, ca.use_5trit_lut), (base.score, 0.0, false));
 
         let bad_ego = FileEgoContext {
@@ -961,7 +1005,11 @@ mod tests {
             let default_res = scorer.score_content(&format!("far_{label}.rs"), &src);
             let (approx_res, tel_opt) = scorer.score_content_with_opts(&format!("far_{label}.rs"), &src, approx_opts);
             let tel = tel_opt.expect("cold approx_long run must return SparseAttnTelemetry");
-            let dup_hits = approx_res.squiggles.iter().filter(|s| s.kind == "duplicate_block" && s.probability >= 0.80).count();
+            let dup_hits = approx_res
+                .squiggles
+                .iter()
+                .filter(|s| s.kind == "duplicate_block" && s.probability >= 0.80)
+                .count();
             assert!(dup_hits >= min_hits, "{label}: expected >= {min_hits} duplicate_block hits >= 0.80, got {dup_hits} (def={}, app={})", default_res.score, approx_res.score);
             assert!(default_res.score - approx_res.score >= 0.08, "{label}: score drop < 0.08 (def={}, app={})", default_res.score, approx_res.score);
             assert!(tel.mli_reused && tel.engram_bytes > 0 && tel.engram_bytes <= 128 * 1024 && tel.cobs_blocks > 0);
@@ -992,7 +1040,12 @@ mod tests {
         }
         let def_loc = scorer.score_content("long_local.rs", &long_local);
         let (app_loc, _) = scorer.score_content_with_opts("long_local.rs", &long_local, EvalOptions { approx_long: true, approx_threshold: 1024 });
-        let def_dups: Vec<usize> = def_loc.squiggles.iter().filter(|s| s.kind == "duplicate_block").map(|s| s.line).collect();
+        let def_dups: Vec<usize> = def_loc
+            .squiggles
+            .iter()
+            .filter(|s| s.kind == "duplicate_block")
+            .map(|s| s.line)
+            .collect();
         assert!(!def_dups.is_empty(), "fixture must have local duplicate_block squiggles");
         for ln in def_dups {
             assert!(app_loc.squiggles.iter().any(|s| s.kind == "duplicate_block" && s.line == ln), "lost local dup at L{ln}");

@@ -77,7 +77,11 @@ fn encode_front_coded_block(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
             restarts.push(data.len() as u16);
             0
         } else {
-            prev.iter().zip(key).take_while(|(a, b)| a == b).count()
+            let mut n = 0usize;
+            while n < prev.len() && n < key.len() && prev[n] == key[n] {
+                n += 1;
+            }
+            n
         };
         let suffix = &key[shared..];
         write_varint(&mut data, shared as u32);
@@ -247,9 +251,9 @@ impl SstIndex {
             write_varint(&mut raw, a.first_key.len() as u32);
             raw.extend_from_slice(&a.first_key);
             raw.extend_from_slice(&a.offset.to_le_bytes());
-            raw.extend_from_slice(&a.comp_len.to_le_bytes());
-            raw.extend_from_slice(&a.raw_len.to_le_bytes());
-            raw.extend_from_slice(&a.tag.to_le_bytes());
+            for word in [a.comp_len, a.raw_len, a.tag] {
+                raw.extend_from_slice(&word.to_le_bytes());
+            }
         }
         raw[0..8].copy_from_slice(SST_MAGIC);
         raw[8] = 1;
@@ -277,10 +281,13 @@ impl SstIndex {
         if &hdr[0..8] != SST_MAGIC || hdr[8] != 1 {
             return None;
         }
-        let block_count = u32::from_le_bytes(hdr[10..14].try_into().ok()?) as usize;
-        let entry_count = u32::from_le_bytes(hdr[14..18].try_into().ok()?) as usize;
+        let read_u32 = |off: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(hdr[off..off + 4].try_into().ok()?))
+        };
+        let block_count = read_u32(10)? as usize;
+        let entry_count = read_u32(14)? as usize;
         let index_offset = u64::from_le_bytes(hdr[18..26].try_into().ok()?);
-        let expected_tag = u32::from_le_bytes(hdr[26..30].try_into().ok()?);
+        let expected_tag = read_u32(26)?;
         if index_offset < SST_HEADER_LEN as u64 || index_offset > file_len {
             return None;
         }
@@ -412,19 +419,31 @@ mod tests {
         let (h1, h2) = ([1u8; 32], [2u8; 32]);
         assert!(package_abi_changed(None, &h1) && !package_abi_changed(Some(&h1), &h1) && package_abi_changed(Some(&h1), &h2));
 
-        let small: Vec<_> = (0..20).map(|i| (format!("src/s_{i:02}.rs"), format!("pub fn small_fn_{i}() -> i32 {{ {i} }}\n"))).collect();
-        let srefs: Vec<_> = small.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut small = Vec::new();
+        for i in 0..20 {
+            let path = format!("src/s_{i:02}.rs");
+            let body = format!("pub fn small_fn_{i}() -> i32 {{ {i} }}\n");
+            small.push((path, body));
+        }
+        fn as_pairs(entries: &[(String, String)]) -> Vec<(&str, &str)> {
+            entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        }
+        let srefs = as_pairs(&small);
         let small_repo = TempRepo::with_files("sst_small", &srefs);
         let _ = index_repo(small_repo.path(), None);
-        assert!(small_repo.join(".refit/cache/symbol_index.zst").is_file() && !small_repo.join(".refit/cache/sym.sst").exists());
+        assert!(small_repo.join(".refit/cache/symbol_index.zst").is_file());
+        assert!(!small_repo.join(".refit/cache/sym.sst").exists());
         assert!(!should_use_sst(20, 4096));
 
         let mut big = vec![("src/m_000.rs".to_string(), "pub fn sym_000() -> i32 { 0 }\n".to_string())];
         for i in 1..520 {
             let p = i - 1;
-            big.push((format!("src/m_{i:03}.rs"), format!("use crate::m_{p:03}::sym_{p:03};\npub fn sym_{i:03}() -> i32 {{ sym_{p:03}() + {i} }}\n")));
+            let body = format!(
+                "use crate::m_{p:03}::sym_{p:03};\npub fn sym_{i:03}() -> i32 {{ sym_{p:03}() + {i} }}\n"
+            );
+            big.push((format!("src/m_{i:03}.rs"), body));
         }
-        let brefs: Vec<_> = big.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let brefs = as_pairs(&big);
         let big_repo = TempRepo::with_files("sst_big", &brefs);
         let (disc, snap) = index_repo(big_repo.path(), None);
         let (sst_path, zst_path) = (big_repo.join(".refit/cache/sym.sst"), big_repo.join(".refit/cache/symbol_index.zst"));
@@ -439,7 +458,9 @@ mod tests {
 
         let sst_bytes = fs::read(&sst_path).unwrap();
         assert_eq!(&sst_bytes[0..8], SST_MAGIC);
-        let raw_json: usize = SstIndex::open(&sst_path).unwrap().decode_all().unwrap().iter().map(|(k, v)| k.len() + v.len()).sum();
+        let mut idx = SstIndex::open(&sst_path).unwrap();
+        let decoded = idx.decode_all().unwrap();
+        let raw_json: usize = decoded.iter().map(|(k, v)| k.len() + v.len()).sum();
         assert!((sst_bytes.len() as f64) < (raw_json as f64) * 0.35, "sst={}B raw={}B", sst_bytes.len(), raw_json);
 
         let mut lazy = SstIndex::open(&sst_path).unwrap();

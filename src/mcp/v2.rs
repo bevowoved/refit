@@ -274,7 +274,11 @@ impl TaskStore {
         if rec.status.is_terminal() { return; }
         rec.updated_ms = now_ms();
         match outcome {
-            Ok(val) => { rec.status = TaskState::Completed; rec.progress = Some(1.0); rec.result = Some(val); }
+            Ok(val) => {
+                rec.status = TaskState::Completed;
+                rec.progress = Some(1.0);
+                rec.result = Some(val);
+            }
             Err(err) => { rec.status = TaskState::Failed; rec.error = Some(err); }
         }
         let _ = self.save(&rec);
@@ -313,7 +317,11 @@ impl McpV2State {
 
 pub fn is_v2_request(req: &Value) -> bool {
     let top_v = req.get("_meta").and_then(|m| m.get("protocolVersion")).and_then(Value::as_str);
-    let par_v = req.get("params").and_then(|p| p.get("_meta")).and_then(|m| m.get("protocolVersion")).and_then(Value::as_str);
+    let par_v = req
+        .get("params")
+        .and_then(|p| p.get("_meta"))
+        .and_then(|m| m.get("protocolVersion"))
+        .and_then(Value::as_str);
     let init_v = req.get("params").and_then(|p| p.get("protocolVersion")).and_then(Value::as_str);
     let method = req["method"].as_str().unwrap_or("");
     top_v == Some(PROTOCOL_V2)
@@ -345,7 +353,10 @@ pub fn discover_result() -> Value {
 }
 
 pub fn validate_sep2243_headers(headers: &HeaderMap, body: &Value) -> std::result::Result<(), String> {
-    let hdr = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::trim);
+    let hdr = |k: &str| {
+        let val = headers.get(k)?.to_str().ok()?;
+        Some(val.trim())
+    };
     let body_method = body.get("method").and_then(Value::as_str).ok_or_else(|| "missing JSON-RPC `method` field".to_string())?;
     let hdr_method = hdr("mcp-method").ok_or_else(|| "missing required `Mcp-Method` header".to_string())?;
     if hdr_method != body_method {
@@ -446,7 +457,12 @@ pub async fn handle_v2_request(state: &Arc<McpV2State>, req: &Value) -> (StatusC
 }
 
 async fn handle_v2_tool_call(state: &Arc<McpV2State>, id: Option<Value>, params: &Value) -> (StatusCode, Option<Value>) {
-    if let Some(tok) = params.get("continuationToken").or_else(|| params.get("requestState")).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+    let raw_tok = params
+        .get("continuationToken")
+        .or_else(|| params.get("requestState"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if let Some(tok) = raw_tok {
         return handle_mrtr_resume(state, id, params, tok).await;
     }
     let name = json_str(params, "name");
@@ -507,7 +523,10 @@ async fn handle_mrtr_resume(state: &Arc<McpV2State>, id: Option<Value>, params: 
     }
     let resp = &params["inputResponses"];
     let confirmed = resp.get("confirm").and_then(Value::as_bool).or_else(|| {
-        resp.as_array()?.iter().find(|it| it["name"].as_str() == Some("confirm")).and_then(|it| it["value"].as_bool())
+        resp.as_array()?
+            .iter()
+            .find(|it| it["name"].as_str() == Some("confirm"))
+            .and_then(|it| it["value"].as_bool())
     });
     let Some(confirmed) = confirmed else {
         return (StatusCode::BAD_REQUEST, Some(rpc_err(id.unwrap_or(Value::Null), ERR_INVALID_PARAMS, "missing boolean `confirm` inside `inputResponses`")));
@@ -535,8 +554,9 @@ async fn dispatch_tool(
     cancel: Option<&AtomicBool>,
 ) -> std::result::Result<Value, String> {
     if name == "refit_search" {
-        let lang = args["language"].as_str().unwrap_or("Rust").to_string();
-        let cap = args["capability"].as_str().unwrap_or("rate limiter").to_string();
+        let lang = args["language"].as_str().unwrap_or("Rust");
+        let cap = args["capability"].as_str().unwrap_or("rate limiter");
+        let (lang, cap) = (lang.to_string(), cap.to_string());
         return Ok(backend.dispatch_search(lang, cap).await);
     }
     if name == "refit_audit"
@@ -627,7 +647,10 @@ fn spawn_durable_task(
 }
 
 fn task_id_param(params: &Value) -> &str {
-    params["taskId"].as_str().or_else(|| params["task_id"].as_str()).unwrap_or("")
+    params["taskId"]
+        .as_str()
+        .or_else(|| params["task_id"].as_str())
+        .unwrap_or("")
 }
 
 fn task_reply(id: Option<Value>, res: std::result::Result<TaskRecord, String>) -> Value {
@@ -785,25 +808,40 @@ mod tests {
         let (url, client) = (format!("http://{addr}/mcp"), reqwest::Client::new());
 
         let disc_req = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "_meta": {"protocolVersion": "2026-07-28"}});
-        let resp = client.post(&url).header("Mcp-Method", "server/discover").json(&disc_req).send().await.unwrap();
+        let resp = client
+            .post(&url)
+            .header("Mcp-Method", "server/discover")
+            .json(&disc_req)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
         assert!(resp.headers().get("mcp-session-id").is_none());
         let body: Value = resp.json().await.unwrap();
         assert_eq!((&body["result"]["protocolVersion"], &body["result"]["_meta"]["ttlMs"], &body["result"]["_meta"]["cacheScope"]), (&json!("2026-07-28"), &json!(3_600_000), &json!("server")));
-        assert_eq!((&body["result"]["_meta"]["catalogDigest"], body["result"]["tools"].as_array().unwrap().len()), (&json!(catalog_digest()), 17));
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert_eq!((&body["result"]["_meta"]["catalogDigest"], tools.len()), (&json!(catalog_digest()), 17));
 
         let list_resp: Value = client.post(&url).header("Mcp-Method", "tools/list").json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).send().await.unwrap().json().await.unwrap();
         assert_eq!((&list_resp["result"]["_meta"]["ttlMs"], &list_resp["result"]["_meta"]["cacheScope"]), (&json!(3_600_000), &json!("server")));
 
         assert!(is_v2_request(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2026-07-28"}})));
         let call_req = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "refit_read", "arguments": {"path": "src/demo.rs", "start_line": 1, "end_line": 3}}});
-        let call_val: Value = client.post(&url)
-            .header("Mcp-Method", "tools/call").header("Mcp-Name", "refit_read")
-            .header("Mcp-Param-Path", "src/demo.rs").header("Mcp-Param-Start-Line", "1")
+        let call_resp = client
+            .post(&url)
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "refit_read")
+            .header("Mcp-Param-Path", "src/demo.rs")
+            .header("Mcp-Param-Start-Line", "1")
             .header("Mcp-Param-EndLine", "3")
-            .json(&call_req).send().await.unwrap().json().await.unwrap();
+            .json(&call_req)
+            .send()
+            .await
+            .unwrap();
+        let call_val: Value = call_resp.json().await.unwrap();
         assert_eq!(call_val["result"]["resultType"], json!("complete"));
-        assert!(call_val["result"]["content"][0]["text"].as_str().unwrap().contains("pub fn demo"));
+        let demo_txt = call_val["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(demo_txt.contains("pub fn demo"));
 
         type HeaderCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, Value);
         let bad_cases: Vec<HeaderCase<'_>> = vec![
@@ -821,10 +859,17 @@ mod tests {
             assert_eq!(r.status().as_u16(), 400, "case `{label}`");
             let v: Value = r.json().await.unwrap();
             assert_eq!(v["error"]["code"], json!(-32020), "case `{label}`: {v}");
-            assert!(v["error"]["message"].as_str().unwrap().contains("HeaderMismatchError"));
+            let err_msg = v["error"]["message"].as_str().unwrap();
+            assert!(err_msg.contains("HeaderMismatchError"));
         }
 
-        let batch = client.post(&url).header("Mcp-Method", "server/discover").json(&json!([disc_req])).send().await.unwrap();
+        let batch = client
+            .post(&url)
+            .header("Mcp-Method", "server/discover")
+            .json(&json!([disc_req]))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(batch.status().as_u16(), 400);
         assert_eq!(batch.json::<Value>().await.unwrap()["error"]["code"], json!(-32600));
 
@@ -843,7 +888,8 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         let body = resp.unwrap();
         assert_eq!(body["result"]["resultType"], json!("input_required"));
-        let token = body["result"]["continuationToken"].as_str().unwrap().to_string();
+        let raw_token = body["result"]["continuationToken"].as_str().unwrap();
+        let token = raw_token.to_string();
         assert!(token.starts_with(MRTR_TOKEN_PREFIX));
 
         let mut tampered = token.clone();
@@ -858,7 +904,8 @@ mod tests {
         let (st2, resp2) = handle_v2_request(&state, &resume).await;
         let b2 = resp2.unwrap();
         assert_eq!((st2, &b2["result"]["resultType"]), (StatusCode::OK, &json!("complete")));
-        assert!(b2["result"]["content"][0]["text"].as_str().unwrap().contains("pub fn ok"));
+        let ok_txt = b2["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(ok_txt.contains("pub fn ok"));
     }
 
     #[tokio::test]
@@ -868,7 +915,8 @@ mod tests {
         let (st, resp) = handle_v2_request(&state, &start).await;
         let val = resp.unwrap();
         assert_eq!((st, &val["result"]["resultType"]), (StatusCode::OK, &json!("task")));
-        let task_id = val["result"]["taskId"].as_str().unwrap().to_string();
+        let raw_task_id = val["result"]["taskId"].as_str().unwrap();
+        let task_id = raw_task_id.to_owned();
         assert!(repo.join(&format!(".refit/tasks/{task_id}.json")).exists());
 
         let mut completed = false;
@@ -881,7 +929,9 @@ mod tests {
 
         backend.delay_ms.store(250, Ordering::Release);
         let slow = json!({"jsonrpc": "2.0", "id": 22, "method": "tools/call", "params": {"name": "refit_read", "mode": "task", "arguments": {"path": "src/lib.rs"}}});
-        let slow_id = handle_v2_request(&state, &slow).await.1.unwrap()["result"]["taskId"].as_str().unwrap().to_string();
+        let slow_resp = handle_v2_request(&state, &slow).await.1.unwrap();
+        let raw_slow_id = slow_resp["result"]["taskId"].as_str().unwrap();
+        let slow_id = raw_slow_id.to_owned();
         let (_, cancel_resp) = handle_v2_request(&state, &json!({"jsonrpc": "2.0", "id": 23, "method": "tasks/cancel", "params": {"taskId": slow_id}})).await;
         assert_eq!(cancel_resp.unwrap()["result"]["status"], json!("cancelled"));
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;

@@ -118,11 +118,18 @@ pub struct StrictReport {
 
 impl StrictReport {
     pub fn veto_rules(&self) -> Vec<&'static str> {
-        self.findings.iter().filter(|f| f.severity == Severity::Veto).map(|f| f.rule).collect()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Veto)
+            .map(|f| f.rule)
+            .collect()
     }
     pub fn formatted_vetoes(&self) -> Vec<String> {
-        self.findings.iter().filter(|f| f.severity == Severity::Veto)
-            .map(|f| format!("{} (L{}): {}", f.rule, f.line, f.detail)).collect()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Veto)
+            .map(|f| format!("{} (L{}): {}", f.rule, f.line, f.detail))
+            .collect()
     }
 }
 
@@ -533,24 +540,51 @@ fn finalize_block_metrics(m: &mut BlockModuleMetrics, pub_fields: usize, ego: Op
         m.structural_rules.push("shallow-module".into());
     }
     if let Some(ctx) = ego {
-        if ctx.has_module_cycle { m.module_cycle = true; m.structural_rules.push("module-cycle".into()); }
+        if ctx.has_module_cycle {
+            m.module_cycle = true;
+            m.structural_rules.push("module-cycle".into());
+        }
         let deg = ctx.fan_in + ctx.fan_out;
-        let tangle = ctx.tangle || (ctx.fan_in >= 6 && ctx.fan_out >= 6 && ctx.neighbor_dirs >= 2 && deg > 0
-            && (0.35..=0.65).contains(&((ctx.fan_out as f64) / (deg as f64))));
-        if tangle { m.tangle = true; m.structural_rules.push("tangle".into()); }
+        let balanced = deg > 0 && (0.35..=0.65).contains(&((ctx.fan_out as f64) / (deg as f64)));
+        let high_fan = ctx.fan_in >= 6 && ctx.fan_out >= 6 && ctx.neighbor_dirs >= 2;
+        if ctx.tangle || (high_fan && balanced) {
+            m.tangle = true;
+            m.structural_rules.push("tangle".into());
+        }
     }
-    let mut delta = 0.0f64;
-    if m.max_fn_loc > 60 { delta += 0.015 * ((m.max_fn_loc - 60) as f64); }
-    if m.max_cognitive > 15 { delta += 0.10 * ((m.max_cognitive - 15) as f64); }
-    if m.max_params > 5 { delta += 0.25 * ((m.max_params - 5) as f64); }
-    if m.max_bool_params >= 2 { delta += 0.35 * ((m.max_bool_params - 1) as f64); }
-    if m.field_leaks > 0 { delta += 0.75; }
-    if m.shallow_module { delta += 0.65 + 0.15 * (m.pub_items.saturating_sub(7) as f64); }
-    if m.module_cycle { delta += 1.20; }
-    if m.tangle { delta += 0.80; }
+    let delta = compute_block_delta(m);
     m.delta_block = (delta * 10_000.0).round() / 10_000.0;
     let bscore = (sigmoid_f64(2.0 - delta) / sigmoid_f64(2.0)).clamp(0.0, 1.0);
     m.block_score = (bscore * 10_000.0).round() / 10_000.0;
+}
+
+fn compute_block_delta(m: &BlockModuleMetrics) -> f64 {
+    let mut delta = 0.0f64;
+    if m.max_fn_loc > 60 {
+        delta += 0.015 * ((m.max_fn_loc - 60) as f64);
+    }
+    if m.max_cognitive > 15 {
+        delta += 0.10 * ((m.max_cognitive - 15) as f64);
+    }
+    if m.max_params > 5 {
+        delta += 0.25 * ((m.max_params - 5) as f64);
+    }
+    if m.max_bool_params >= 2 {
+        delta += 0.35 * ((m.max_bool_params - 1) as f64);
+    }
+    if m.field_leaks > 0 {
+        delta += 0.75;
+    }
+    if m.shallow_module {
+        delta += 0.65 + 0.15 * (m.pub_items.saturating_sub(7) as f64);
+    }
+    if m.module_cycle {
+        delta += 1.20;
+    }
+    if m.tangle {
+        delta += 0.80;
+    }
+    delta
 }
 
 fn check_bidi_and_invisibles(src: &str, findings: &mut Vec<StrictFinding>) {
@@ -584,7 +618,7 @@ fn check_bidi_and_invisibles(src: &str, findings: &mut Vec<StrictFinding>) {
 #[inline]
 fn is_cyrillic_or_greek(ch: char) -> bool {
     let cp = ch as u32;
-    (0x0370..=0x03FF).contains(&cp) || (0x1F00..=0x1FFF).contains(&cp) || (0x0400..=0x052F).contains(&cp)
+    matches!(cp, 0x0370..=0x03FF | 0x1F00..=0x1FFF | 0x0400..=0x052F)
 }
 
 fn check_uts39_homoglyphs(tokens: &[StrictTok<'_>], lines: &[LineScan<'_>], findings: &mut Vec<StrictFinding>) {
@@ -674,7 +708,8 @@ fn inspect_attr(tokens: &[StrictTok<'_>], idx: usize, findings: &mut Vec<StrictF
     if let Some(first) = inner.first().filter(|t| t.kind == LexKind::Ident) {
         let ln = tokens[idx].line;
         let has_reason = inner.windows(2).any(|w| {
-            w[0].kind == LexKind::Ident && w[0].text == "reason" && w[1].kind == LexKind::Eq
+            let is_reason = w[0].kind == LexKind::Ident && w[0].text == "reason";
+            is_reason && w[1].kind == LexKind::Eq
         });
         match first.text {
             "allow" => push_finding(
@@ -883,11 +918,14 @@ fn check_line_tails_blanks_and_comments(
         } else {
             acc.consec_blank = 0;
             acc.nonblank_run += 1;
-            if acc.nonblank_run >= 2 { acc.alt_blank_run = 0; }
+            if acc.nonblank_run >= 2 {
+                acc.alt_blank_run = 0;
+            }
             acc.nonblank_prod += 1;
         }
         if ls.has_nondoc_comment && !ls.has_code && !ls.has_doc_comment && !ls.has_safety_comment {
-            acc.record_pure_nondoc(lines, ln, ls.comment_slices.first().copied().unwrap_or("").trim());
+            let first = ls.comment_slices.first().copied().unwrap_or("");
+            acc.record_pure_nondoc(lines, ln, first.trim());
         }
     }
     metrics.nondoc_comment_lines = acc.nondoc_pure;
@@ -1201,17 +1239,21 @@ impl<'a> FnAnalyzer<'a> {
 
     fn handle_fn_ident(&mut self, tokens: &[StrictTok<'a>], idx: usize, prev: Option<&StrictTok<'a>>, is_go: bool) {
         let tok = &tokens[idx];
-        let nest = self.brace_stack.iter().rev().take_while(|f| f.kind != BraceKind::FnBody)
-            .filter(|f| matches!(f.kind, BraceKind::ControlFlow | BraceKind::Closure)).count();
+        let nest = self
+            .brace_stack
+            .iter()
+            .rev()
+            .take_while(|f| f.kind != BraceKind::FnBody)
+            .filter(|f| matches!(f.kind, BraceKind::ControlFlow | BraceKind::Closure))
+            .count();
         match tok.text {
-            "if" => {
-                if !is_go && is_match_guard_if(tokens, idx) {
-                    if let Some(cur) = self.fn_stack.last_mut() {
-                        cur.cognitive += 1;
-                        cur.last_bool_op = None;
-                    }
-                    return;
+            "if" if !is_go && is_match_guard_if(tokens, idx) => {
+                if let Some(cur) = self.fn_stack.last_mut() {
+                    cur.cognitive += 1;
+                    cur.last_bool_op = None;
                 }
+            }
+            "if" => {
                 let else_if = prev.is_some_and(|p| p.kind == LexKind::Ident && p.text == "else");
                 self.add_cf(tok, if else_if { 1 } else { 1 + nest });
             }
@@ -1225,6 +1267,21 @@ impl<'a> FnAnalyzer<'a> {
             "while" | "loop" | "match" | "switch" => self.add_cf(tok, 1 + nest),
             "let" if !is_go => self.handle_let(tokens, idx, prev),
             _ => {}
+        }
+    }
+
+    fn handle_rbrace(
+        &mut self, idx: usize, line: usize, tokens: &[StrictTok<'a>],
+        metrics: &mut StrictMetrics, block: &mut BlockModuleMetrics, findings: &mut Vec<StrictFinding>,
+    ) {
+        let Some(popped) = self.brace_stack.pop() else { return };
+        if popped.kind != BraceKind::FnBody {
+            self.clear_bool_op();
+            return;
+        }
+        if let Some(acc) = self.fn_stack.pop() {
+            let body = &tokens[(acc.open_tok_idx + 1).min(idx)..idx];
+            finalize_fn(&acc, line, body, metrics, block, findings);
         }
     }
 
@@ -1276,16 +1333,7 @@ fn analyze_functions_and_blocks(
             LexKind::RBracket => state.bracket_depth = state.bracket_depth.saturating_sub(1),
             LexKind::Semi | LexKind::Comma | LexKind::FatArrow => state.clear_bool_op(),
             LexKind::LBrace => state.handle_lbrace(idx, tokens, lines),
-            LexKind::RBrace => {
-                if let Some(popped) = state.brace_stack.pop() {
-                    if popped.kind == BraceKind::FnBody {
-                        if let Some(acc) = state.fn_stack.pop() {
-                            let body = &tokens[(acc.open_tok_idx + 1).min(idx)..idx];
-                            finalize_fn(&acc, tok.line, body, metrics, block, findings);
-                        }
-                    } else { state.clear_bool_op(); }
-                }
-            }
+            LexKind::RBrace => state.handle_rbrace(idx, tok.line, tokens, metrics, block, findings),
             _ => step_fn_body_token(&mut state, tokens, idx, prev, is_go),
         }
     }

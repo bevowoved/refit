@@ -43,7 +43,10 @@ struct LineFeat { norm_hash: u64, valid: bool }
 
 fn build_log2_lut() -> [f32; 256] {
     let mut lut = [0.0f32; 256];
-    for (i, slot) in lut.iter_mut().enumerate().skip(1) { *slot = (i as f32) * (i as f32).log2(); }
+    for (i, slot) in lut.iter_mut().enumerate().skip(1) {
+        let f = i as f32;
+        *slot = f * f.log2();
+    }
     lut
 }
 
@@ -59,15 +62,29 @@ fn is_clone_keyword(tok: &[u8]) -> bool {
 
 #[inline]
 fn is_ignored_line_prefix(t: &[u8]) -> bool {
-    t.len() < 12 || [
+    if t.len() < 12 {
+        return true;
+    }
+    let prefixes = [
         b"//".as_slice(), b"#", b"/*", b"* ", b"import ", b"from ", b"use ", b"package ",
-    ].iter().any(|p| t.starts_with(p))
+        b"pub const ", b"pub(crate) const ", b"pub(super) const ",
+    ];
+    if prefixes.iter().any(|p| t.starts_with(p)) {
+        return true;
+    }
+    t.starts_with(b"pub ") && t.ends_with(b",") && !t.contains(&b'=') && !t.contains(&b'(')
 }
 
 fn shannon_entropy(bytes: &[u8], lut: &[f32; 256]) -> f32 {
     let mut counts = [0u16; 128];
-    for &b in bytes { counts[(b & 0x7f) as usize] += 1; }
-    let sum_c: f32 = counts.iter().filter(|&&c| c > 0).map(|&c| lut[(c as usize).min(255)]).sum();
+    for &b in bytes {
+        counts[(b & 0x7f) as usize] += 1;
+    }
+    let sum_c: f32 = counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| lut[(c as usize).min(255)])
+        .sum();
     let (n, nf) = (bytes.len(), bytes.len() as f32);
     let n_log_n = if n < 256 { lut[n] } else { nf * nf.log2() };
     (n_log_n - sum_c) / nf
@@ -156,21 +173,38 @@ fn mark_boiler_window(mask: &mut [bool], pos: usize) { mask[pos..pos + 4].fill(t
 
 fn filter_boiler_kgrams(raw: &[(u64, u32)], mask: &[bool], out: &mut Vec<(u64, u32)>) {
     out.clear();
-    out.extend(raw.iter().copied().filter(|&(_, p)| !mask[p as usize..p as usize + 4].iter().any(|&b| b)));
+    for &(hash, pos) in raw {
+        let p = pos as usize;
+        if !mask[p..p + 4].iter().any(|&b| b) {
+            out.push((hash, pos));
+        }
+    }
 }
 
 fn winnow_run(run: &[(u64, u32)], on_pick: &mut impl FnMut(u64, u32)) {
     if run.len() < 3 {
-        let best = run[1..].iter().copied().fold(run[0], |b, x| if x.0 <= b.0 { x } else { b });
+        let mut best = run[0];
+        for &item in &run[1..] {
+            if item.0 <= best.0 {
+                best = item;
+            }
+        }
         on_pick(best.0, best.1);
         return;
     }
     let mut last_picked = u32::MAX;
     for w in run.windows(3) {
         let mut best = w[0];
-        if w[1].0 <= best.0 { best = w[1]; }
-        if w[2].0 <= best.0 { best = w[2]; }
-        if best.1 != last_picked { last_picked = best.1; on_pick(best.0, best.1); }
+        if w[1].0 <= best.0 {
+            best = w[1];
+        }
+        if w[2].0 <= best.0 {
+            best = w[2];
+        }
+        if best.1 != last_picked {
+            last_picked = best.1;
+            on_pick(best.0, best.1);
+        }
     }
 }
 
@@ -178,7 +212,9 @@ fn winnow_contiguous(win_slice: &[(u64, u32)], mut on_pick: impl FnMut(u64, u32)
     let (n, mut run_start) = (win_slice.len(), 0usize);
     while run_start < n {
         let mut run_end = run_start + 1;
-        while run_end < n && win_slice[run_end].1 == win_slice[run_end - 1].1 + 1 { run_end += 1; }
+        while run_end < n && win_slice[run_end].1 == win_slice[run_end - 1].1 + 1 {
+            run_end += 1;
+        }
         winnow_run(&win_slice[run_start..run_end], &mut on_pick);
         run_start = run_end;
     }
@@ -186,15 +222,18 @@ fn winnow_contiguous(win_slice: &[(u64, u32)], mut on_pick: impl FnMut(u64, u32)
 
 fn scan_bytes_feats(bytes: &[u8], lut: &[f32; 256], out: &mut Vec<LineFeat>) {
     out.clear();
-    out.extend(bytes.split(|&b| b == b'\n').map(|l| scan_line_type2(l.strip_suffix(b"\r").unwrap_or(l), lut)));
+    for line in bytes.split(|&b| b == b'\n') {
+        let clean = line.strip_suffix(b"\r").unwrap_or(line);
+        out.push(scan_line_type2(clean, lut));
+    }
 }
 
 fn extract_line(bytes: &[u8], line_idx: usize) -> String {
-    bytes
-        .split(|&b| b == b'\n')
-        .nth(line_idx)
-        .map(|l| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)).trim().to_string())
-        .unwrap_or_default()
+    let Some(raw) = bytes.split(|&b| b == b'\n').nth(line_idx) else {
+        return String::new();
+    };
+    let clean = raw.strip_suffix(b"\r").unwrap_or(raw);
+    String::from_utf8_lossy(clean).trim().to_string()
 }
 
 type ExactKgrams = Vec<(usize, Vec<(u64, u32)>)>;
@@ -252,7 +291,8 @@ fn find_clones_exact(files: &[(&str, &[u8])], log2_lut: &[f32; 256]) -> Vec<Clon
             &raw_kgrams
         };
         winnow_contiguous(win_slice, |hash, pos| {
-            if (2..cap).contains(&df_counts.get(&hash).copied().unwrap_or(0)) {
+            let df = df_counts.get(&hash).copied().unwrap_or(0);
+            if (2..cap).contains(&df) {
                 buckets.entry(hash).or_default().push((fid as u32, pos));
             }
         });
@@ -700,23 +740,37 @@ fn weighted_jaccard(a: &[(u64, f32)], b: &[(u64, f32)]) -> f64 {
             std::cmp::Ordering::Equal => {
                 inter += a[i].1.min(b[j].1) as f64;
                 uni += a[i].1.max(b[j].1) as f64;
-                i += 1; j += 1;
+                i += 1;
+                j += 1;
             }
-            std::cmp::Ordering::Less => { uni += a[i].1 as f64; i += 1; }
-            std::cmp::Ordering::Greater => { uni += b[j].1 as f64; j += 1; }
+            std::cmp::Ordering::Less => {
+                uni += a[i].1 as f64;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                uni += b[j].1 as f64;
+                j += 1;
+            }
         }
     }
-    uni += a[i..].iter().map(|x| x.1 as f64).sum::<f64>() + b[j..].iter().map(|x| x.1 as f64).sum::<f64>();
+    let tail_a: f64 = a[i..].iter().map(|x| x.1 as f64).sum();
+    let tail_b: f64 = b[j..].iter().map(|x| x.1 as f64).sum();
+    uni += tail_a + tail_b;
     if uni > 0.0 { inter / uni } else { 0.0 }
 }
 
 fn extract_domain_token_hashes(body: &[u8], filter_syntax: bool) -> Vec<u64> {
-    let (mut toks, mut stack_buf) = (Vec::with_capacity(24), [0u8; 64]);
+    let mut toks = Vec::with_capacity(24);
+    let mut stack_buf = [0u8; 64];
     for raw in iter_idents(body).filter(|r| r.len() >= 2) {
         let hash = if raw.len() <= stack_buf.len() {
-            for (dst, &src) in stack_buf[..raw.len()].iter_mut().zip(raw) { *dst = src.to_ascii_lowercase(); }
+            for (dst, &src) in stack_buf[..raw.len()].iter_mut().zip(raw) {
+                *dst = src.to_ascii_lowercase();
+            }
             let lower = &stack_buf[..raw.len()];
-            if filter_syntax && SYNTAX_STOP.contains(&lower) { continue; }
+            if filter_syntax && SYNTAX_STOP.contains(&lower) {
+                continue;
+            }
             rapid_hash64(lower, 0x333)
         } else {
             let owned: Vec<u8> = raw.iter().map(u8::to_ascii_lowercase).collect();

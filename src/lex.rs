@@ -1034,6 +1034,16 @@ impl<'a> LexCursor<'a> {
         Ok(None)
     }
 
+    fn finish_quoted_lit(
+        &mut self, start: usize, start_line: u32, quote: u8, escape: bool, multiline: bool, checked: bool,
+    ) -> Result<LexTok<'a>, String> {
+        let (end, _, closed) = quoted_lit(self.bytes, start, escape, multiline);
+        if checked && !closed {
+            return Err(format!("unterminated string literal at L{start_line}"));
+        }
+        Ok(self.emit_lit(LexKind::StrLit, start, end, start_line, quote, 0))
+    }
+
     fn try_step_script_lit(
         &mut self, start: usize, start_line: u32, checked: bool,
     ) -> Result<Option<LexTok<'a>>, String> {
@@ -1041,11 +1051,13 @@ impl<'a> LexCursor<'a> {
         if self.spec.hash_line_comments {
             if let Some((after_open, quote, triple)) = detect_py_fstring(self.bytes, start) {
                 self.modes.push(LexMode::PyFString { quote, triple, brace_depth: 0 });
-                return Ok(Some(self.emit_lit(LexKind::StrLit, start, after_open, start_line, quote, 0)));
+                let tok = self.emit_lit(LexKind::StrLit, start, after_open, start_line, quote, 0);
+                return Ok(Some(tok));
             }
             if matches!(byte, b'"' | b'\'') && self.bytes.get(start..start + 3) == Some(&[byte, byte, byte]) {
                 let end = skip_py_triple(self.bytes, start + 3, byte);
-                return Ok(Some(self.emit_lit(LexKind::StrLit, start, end, start_line, byte, TokFlags::DOC_COMMENT)));
+                let tok = self.emit_lit(LexKind::StrLit, start, end, start_line, byte, TokFlags::DOC_COMMENT);
+                return Ok(Some(tok));
             }
         }
         if self.spec.js_templates_regex {
@@ -1060,9 +1072,7 @@ impl<'a> LexCursor<'a> {
             }
         }
         if self.spec.backtick_raw_str && byte == b'`' {
-            let (end, _, closed) = quoted_lit(self.bytes, start, false, true);
-            if checked && !closed { return Err(format!("unterminated string literal at L{start_line}")); }
-            return Ok(Some(self.emit_lit(LexKind::StrLit, start, end, start_line, b'`', 0)));
+            return self.finish_quoted_lit(start, start_line, b'`', false, true, checked).map(Some);
         }
         Ok(None)
     }
@@ -1075,13 +1085,13 @@ impl<'a> LexCursor<'a> {
         {
             return Ok(Some(tok));
         }
-        if let Some(tok) = self.try_step_script_lit(start, start_line, checked)? { return Ok(Some(tok)); }
+        if let Some(tok) = self.try_step_script_lit(start, start_line, checked)? {
+            return Ok(Some(tok));
+        }
         let byte = self.bytes[start];
         if byte == b'"' || (!self.spec.rust_raw_and_cfg && byte == b'\'') {
             let multiline = self.spec.rust_raw_and_cfg || (!checked && !self.spec.hash_line_comments);
-            let (end, _, closed) = quoted_lit(self.bytes, start, true, multiline);
-            if checked && !closed { return Err(format!("unterminated string literal at L{start_line}")); }
-            return Ok(Some(self.emit_lit(LexKind::StrLit, start, end, start_line, byte, 0)));
+            return self.finish_quoted_lit(start, start_line, byte, true, multiline, checked).map(Some);
         }
         Ok(None)
     }
@@ -1208,9 +1218,14 @@ pub fn blank_noise_sentinel(ext: &str, content: &str) -> SentinelLex {
 
 /// Unified pushdown stateful brace & literal balance checker across Rust, TS, JS, JSX, and Go.
 pub fn check_balanced_syntax(rel_path: &str, source: &str) -> Result<(), String> {
-    let ext = Path::new(rel_path).extension().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = Path::new(rel_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     let lang = LangKind::from_ext(ext);
-    if !matches!(lang, LangKind::Rust | LangKind::Go | LangKind::Js | LangKind::Jsx) { return Ok(()); }
+    if !matches!(lang, LangKind::Rust | LangKind::Go | LangKind::Js | LangKind::Jsx) {
+        return Ok(());
+    }
     let (mut cursor, mut delims) = (LexCursor::new(lang, source.as_bytes()), Vec::new());
     while let Some(tok) = cursor.next_checked()? {
         match tok.kind {
@@ -1265,10 +1280,9 @@ mod tests {
         );
         let lexed = blank_noise_sentinel("rs", src);
         assert_eq!(lexed.bytes.len(), src.len());
-        assert_eq!(
-            lexed.bytes.iter().filter(|&&b| b == b'\n').count(),
-            src.as_bytes().iter().filter(|&&b| b == b'\n').count()
-        );
+        let lex_nl = lexed.bytes.iter().filter(|&&b| b == b'\n').count();
+        let src_nl = src.as_bytes().iter().filter(|&&b| b == b'\n').count();
+        assert_eq!(lex_nl, src_nl);
         let cleaned = lexed.to_clean_string(src);
         assert!(cleaned.contains("pub fn live_fn"));
         assert!(cleaned.contains("pub fn after_test"));

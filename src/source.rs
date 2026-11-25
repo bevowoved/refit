@@ -8,12 +8,18 @@ pub fn ext_of(p: impl AsRef<Path>) -> String { ext_str(p.as_ref()).to_ascii_lowe
 #[inline] pub fn stem_of(p: &Path) -> &str { p.file_stem().and_then(|s| s.to_str()).unwrap_or("") }
 
 pub fn dir_of(p: impl AsRef<Path>) -> String {
-    p.as_ref().parent().map_or_else(String::new, |d| d.to_string_lossy().replace('\\', "/"))
+    match p.as_ref().parent() {
+        Some(d) => d.to_string_lossy().replace('\\', "/"),
+        None => String::new(),
+    }
 }
 
 pub fn rel_norm(root: &Path, abs: &Path) -> Option<String> {
     let rel = abs.strip_prefix(root).ok()?;
-    (!rel.as_os_str().is_empty()).then(|| rel.to_string_lossy().replace('\\', "/"))
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
 pub fn work_dir(repo_root: &Path, dot_name: &str, tmp_name: &str) -> PathBuf {
@@ -77,8 +83,14 @@ pub fn scan_files(root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8>>>) ->
     let mut out = RepoScan { sources: Vec::new(), tests: Vec::new(), all: Vec::new() };
     let mut push = |rel: String, ext: String, abs: Option<PathBuf>| {
         out.all.push((rel.clone(), ext.clone(), abs.clone()));
-        if rel.ends_with("__init__.py") { return; }
-        if test_path(&rel) { out.tests.push((rel, ext, abs)); } else { out.sources.push((rel, ext, abs)); }
+        if rel.ends_with("__init__.py") {
+            return;
+        }
+        if test_path(&rel) {
+            out.tests.push((rel, ext, abs));
+        } else {
+            out.sources.push((rel, ext, abs));
+        }
     };
     if let Some(map) = preloaded {
         for rel in map.keys() {
@@ -126,10 +138,11 @@ pub struct RepoSnapshot {
     pub total_preloaded_bytes: usize,
 }
 
+const MAX_SINGLE_PRELOAD: u64 = 1024 * 1024;
+
 impl RepoSnapshot {
     pub fn capture(repo_root: &Path, include_hidden_configs: bool) -> Self {
         const MIB: usize = 1024 * 1024;
-        const MAX_SINGLE_PRELOAD: u64 = 1024 * 1024;
         let b = crate::platform::budget();
         let max_preload = if b.is_constrained() {
             (b.mem_gate_bytes / 4).min(4 * MIB)
@@ -150,23 +163,21 @@ impl RepoSnapshot {
                 manifest_rels.push((rel.clone(), fname.to_string(), abs.clone()));
             }
             if supported_ext(ext) {
-                if source_rel(&rel) { source_rels.push(rel.clone()); }
-                if total_preloaded_bytes < max_preload {
-                    let len = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(u64::MAX);
-                    if len <= MAX_SINGLE_PRELOAD && total_preloaded_bytes.saturating_add(len as usize) <= max_preload
-                        && let Ok(bytes) = std::fs::read(&abs)
-                    {
-                        total_preloaded_bytes += bytes.len();
-                        preloaded.insert(rel.clone(), bytes);
-                    }
+                if source_rel(&rel) {
+                    source_rels.push(rel.clone());
                 }
+                try_preload_source(&abs, &rel, max_preload, &mut total_preloaded_bytes, &mut preloaded);
             } else {
                 let lower = rel.to_ascii_lowercase();
                 let fname_lo = lower.rsplit('/').next().unwrap_or(&lower);
                 let is_doc = SNAP_DOC_FILENAMES.contains(&fname_lo)
                     || (lower.starts_with("docs/") && lower.ends_with(".md"));
-                if is_doc && seen_docs.insert(rel.clone()) { doc_rels.push((rel.clone(), abs.clone())); }
-                if is_snap_infra_file(&rel, fname, &ext.to_ascii_lowercase()) { infra_rels.push((rel, abs)); }
+                if is_doc && seen_docs.insert(rel.clone()) {
+                    doc_rels.push((rel.clone(), abs.clone()));
+                }
+                if is_snap_infra_file(&rel, fname, &ext.to_ascii_lowercase()) {
+                    infra_rels.push((rel, abs));
+                }
             }
         }
         let cursor_rules = repo_root.join(".cursorrules");
@@ -182,15 +193,43 @@ impl RepoSnapshot {
         let mut out = RepoScan { sources: Vec::new(), tests: Vec::new(), all: Vec::new() };
         for rel in &self.all_rels {
             let ext = ext_of(rel);
-            if !supported_ext(&ext) { continue; }
+            if !supported_ext(&ext) {
+                continue;
+            }
             out.all.push((rel.clone(), ext.clone(), None));
-            if rel.ends_with("__init__.py") { continue; }
-            if test_path(rel) { out.tests.push((rel.clone(), ext, None)); } else { out.sources.push((rel.clone(), ext, None)); }
+            if rel.ends_with("__init__.py") {
+                continue;
+            }
+            if test_path(rel) {
+                out.tests.push((rel.clone(), ext, None));
+            } else {
+                out.sources.push((rel.clone(), ext, None));
+            }
         }
         out.sources.sort_by(|a, b| a.0.cmp(&b.0));
         out.tests.sort_by(|a, b| a.0.cmp(&b.0));
         out.all.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+}
+
+fn try_preload_source(
+    abs: &Path,
+    rel: &str,
+    max_preload: usize,
+    total_bytes: &mut usize,
+    preloaded: &mut BTreeMap<String, Vec<u8>>,
+) {
+    if *total_bytes >= max_preload {
+        return;
+    }
+    let len = std::fs::metadata(abs).map(|m| m.len()).unwrap_or(u64::MAX);
+    if len > MAX_SINGLE_PRELOAD || total_bytes.saturating_add(len as usize) > max_preload {
+        return;
+    }
+    if let Ok(bytes) = std::fs::read(abs) {
+        *total_bytes += bytes.len();
+        preloaded.insert(rel.to_string(), bytes);
     }
 }
 

@@ -108,7 +108,8 @@ fn with_tx(
     let _g = lock.lock();
     let tx_dir = txs_dir(repo_root).join(handle);
     let meta_path = tx_dir.join("meta.json");
-    let Some(mut meta) = fs::read_to_string(&meta_path).ok().and_then(|s| serde_json::from_str::<TxMeta>(&s).ok()) else {
+    let raw_meta = fs::read_to_string(&meta_path).ok();
+    let Some(mut meta) = raw_meta.and_then(|s| serde_json::from_str::<TxMeta>(&s).ok()) else {
         return json!({ err_key: false, "error": format!("unknown tx_handle `{handle}`") });
     };
     match f(&tx_dir, &mut meta) {
@@ -123,7 +124,9 @@ fn with_tx(
 }
 
 pub fn tx_begin(repo_root: &Path, args: &Value) -> Value {
-    let (now, ttl_ms) = (now_ms(), args["ttl_secs"].as_u64().unwrap_or(1800).clamp(1, 86_400) * 1000);
+    let now = now_ms();
+    let ttl_secs = args["ttl_secs"].as_u64().unwrap_or(1800).clamp(1, 86_400);
+    let ttl_ms = ttl_secs * 1000;
     let root = txs_dir(repo_root);
     let swept = sweep_txs(&root, now);
     let handle = format!("tx-{now}-{}", MCP_TX_SEQ.fetch_add(1, Ordering::Relaxed));
@@ -172,14 +175,19 @@ pub fn tx_move(repo_root: &Path, args: &Value) -> Value {
             return Err(json!({"ok": false, "error": format!("destination exists: `{to}`")}));
         }
         let (content, created, orig, hash) = read_source(repo_root, meta, &from)?;
-        if created { meta.staged.remove(&from); } else { meta.staged.insert(from.clone(), StagedFile::deleted(hash, orig)); }
+        if created {
+            meta.staged.remove(&from);
+        } else {
+            meta.staged.insert(from.clone(), StagedFile::deleted(hash, orig));
+        }
         upsert_created(meta, &to, content);
         Ok(json!({ "ok": true, "tx_handle": handle, "moved": [from, to], "staged_files_count": meta.staged.len() }))
     })
 }
 
 pub fn tx_stage(repo_root: &Path, args: &Value) -> Value {
-    let (handle, patch_text) = (args["tx_handle"].as_str().unwrap_or(""), args["patch_text"].as_str().unwrap_or(""));
+    let handle = args["tx_handle"].as_str().unwrap_or("");
+    let patch_text = args["patch_text"].as_str().unwrap_or("");
     with_tx(repo_root, handle, "ok", true, |_, meta| {
         let hunks = parse_patches(patch_text);
         if hunks.is_empty() { return Err(json!({"ok": false, "error": "no <<<REFIT_PATCH>>> hunks found"})); }
@@ -195,7 +203,8 @@ pub fn tx_stage(repo_root: &Path, args: &Value) -> Value {
 
 pub fn tx_commit(ctx: &ToolCtx<'_>, args: &Value) -> Value {
     let handle = args["tx_handle"].as_str().unwrap_or("");
-    let (dry_run, allow_abi) = (args["dry_run"].as_bool().unwrap_or(false), args["allow_abi_change"].as_bool().unwrap_or(false));
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    let allow_abi = args["allow_abi_change"].as_bool().unwrap_or(false);
     let mut committed = false;
     let res = with_tx(ctx.repo_root, handle, "passed", false, |tx_dir, meta| {
         if meta.staged.is_empty() {
@@ -312,7 +321,9 @@ fn load_working(repo_root: &Path, meta: &TxMeta, hunks: &[crate::types::AsrfHunk
     for h in hunks {
         if working.contains_key(&h.path) { continue; }
         if let Some(prev) = meta.staged.get(&h.path) {
-            if !prev.deleted { working.insert(h.path.clone(), prev.staged_content.clone()); }
+            if !prev.deleted {
+                working.insert(h.path.clone(), prev.staged_content.clone());
+            }
         } else if h.op != PatchOp::Create {
             let Ok(disk) = fs::read_to_string(repo_root.join(&h.path)) else {
                 return Err(json!({"ok": false, "error": format!("not found: `{}`", h.path)}));
@@ -330,7 +341,10 @@ fn hash_working(working: &BTreeMap<String, String>, key: &str) -> (String, Strin
 
 fn record_applied(meta: &mut TxMeta, working: &BTreeMap<String, String>, applied: crate::graph::AppliedPatch) {
     for del in &applied.deleted {
-        if meta.staged.get(del).is_some_and(|s| s.created) { meta.staged.remove(del); continue; }
+        if meta.staged.get(del).is_some_and(|s| s.created) {
+            meta.staged.remove(del);
+            continue;
+        }
         let (h, orig) = match meta.staged.get(del) {
             Some(prev) => (prev.base_blake3.clone(), prev.original_content.clone()),
             None => hash_working(working, del),

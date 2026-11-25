@@ -394,8 +394,10 @@ fn push_drift(out: &mut Vec<DocDriftFinding>, file: &str, line: usize, kind: &st
 
 /// Zero-LLM ReCite / DOCER scanner reusing `RepoSnapshot` and `LexCursor` (`!in_test`).
 fn scan_doc_drift(repo_root: &Path, repo_snap: &RepoSnapshot, snap: &SymbolGraph) -> Vec<DocDriftFinding> {
-    let known_symbols: BTreeSet<String> = snap.defs_by_file.values()
-        .chain(snap.refs_by_file.values()).flat_map(|s| s.iter().cloned()).collect();
+    let mut known_symbols = BTreeSet::new();
+    for syms in snap.defs_by_file.values().chain(snap.refs_by_file.values()) {
+        known_symbols.extend(syms.iter().cloned());
+    }
     let (mut repo_files, mut repo_dirs) = (BTreeSet::new(), BTreeSet::new());
     for rel in &repo_snap.all_rels {
         repo_files.insert(rel.clone());
@@ -550,14 +552,23 @@ fn scan_source_comments(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut 
 fn scan_comment_call_refs(ctx: &DriftCtx<'_>, rel: &str, ln: usize, comment: &str, out: &mut Vec<DocDriftFinding>) {
     let (bytes, mut pos) = (comment.as_bytes(), 0usize);
     while pos + 2 < bytes.len() {
-        if !(bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'_') { pos += 1; continue; }
+        if !(bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'_') {
+            pos += 1;
+            continue;
+        }
         let start = pos;
         pos += 1;
-        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') { pos += 1; }
+        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+            pos += 1;
+        }
         let is_call = pos + 1 < bytes.len() && bytes[pos] == b'(' && bytes[pos + 1] == b')';
-        if !is_call || (start > 0 && bytes[start - 1] == b'.') { continue; }
+        let after_dot = start > 0 && bytes[start - 1] == b'.';
+        if !is_call || after_dot {
+            continue;
+        }
         let sym = &comment[start..pos];
-        if sym.len() >= 5 && !is_ignored_symbol(sym) && !is_placeholder_text(sym) && !ctx.known_symbols.contains(sym) {
+        let trackable = sym.len() >= 5 && !is_ignored_symbol(sym) && !is_placeholder_text(sym);
+        if trackable && !ctx.known_symbols.contains(sym) {
             let msg = format!("Stale comment reference `{sym}()` not found in live codebase");
             push_drift(out, rel, ln, "doc_stale_symbol", format!("{sym}()"), msg);
         }
@@ -627,12 +638,11 @@ mod tests {
         assert!(!f2.iter().any(|f| f.rule_id == "docker_runs_as_root"));
 
         let (ste_md, ste_lint) = render_audit_ste100(&rep, None).unwrap();
-        assert!(ste_md.contains("STE100 Issue 9 Audit Report"));
-        assert!(ste_lint.compliant, "compiled STE100 audit had violations: {:?}", ste_lint.issues);
+        assert!(ste_md.contains("STE100 Issue 9 Audit Report") && ste_lint.compliant);
 
         let (sus_ste, sus_lint) = write_sustain_ste100(dir.path(), &rep, true, None).unwrap();
         assert_eq!(sus_ste.files_written.len(), 4);
-        assert!(sus_lint.compliant, "compiled STE100 sustain had violations: {:?}", sus_lint.issues);
+        assert!(sus_lint.compliant);
     }
 
     #[test]

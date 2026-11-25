@@ -171,24 +171,61 @@ impl SparseScratch {
 
 #[derive(Default)]
 pub(super) struct EvalScratch {
-    pub(super) grid: Vec<u8>, pub(super) row_lens: Vec<u16>,
-    pub(super) rib_emb: Vec<f32>, pub(super) lex: Vec<f32>, pub(super) proj1: Vec<f32>,
-    pub(super) pref1: Vec<f32>, pub(super) gates: Vec<f32>, pub(super) proj2: Vec<f32>,
-    pub(super) pref2: Vec<f32>, pub(super) fused: Vec<f32>, pub(super) cells_soa: Vec<f32>,
-    pub(super) acc_soa: Vec<f32>, pub(super) csum_p1: Vec<f32>, pub(super) base_p1: Vec<f32>,
-    pub(super) csum_p2: Vec<f32>, pub(super) base_p2: Vec<f32>, pub(super) line_sum0: Vec<f32>,
-    pub(super) line_sum1: Vec<f32>, pub(super) tile: TileScratch,
-    pub(super) excl_tile: Vec<f32>, pub(super) saw_tile: Vec<f32>, pub(super) paren_tile: Vec<f32>,
-    pub(super) hidden_tile: Vec<f32>, pub(super) stats_tile: Vec<f32>, pub(super) ctx_h_tile: Vec<f32>,
-    pub(super) ctx_o_tile: Vec<f32>, pub(super) running_delta: Vec<f32>,
-    pub(super) ring_w: Vec<f32>, pub(super) ring_g: RingGate, pub(super) prev1_raw: Vec<f32>,
-    pub(super) prev2_raw: Vec<f32>, pub(super) mean_acc: Vec<f64>, pub(super) peak: Vec<f32>,
-    pub(super) col_sums: Vec<f32>, pub(super) conv3: Vec<f32>, pub(super) conv7: Vec<f32>,
-    pub(super) sketch: Vec<f32>, pub(super) deltas: Vec<f32>, pub(super) state: Vec<f32>,
-    pub(super) q_buf: Vec<f32>, pub(super) k_buf: Vec<f32>, pub(super) v_buf: Vec<f32>,
-    pub(super) merged: Vec<f32>, pub(super) attn_out: Vec<f32>, pub(super) gate: Vec<f32>,
-    pub(super) logits: Vec<f64>, pub(super) keys: Vec<usize>, pub(super) k_tile: Vec<f64>,
-    pub(super) logits_4: Vec<f64>, pub(super) q_nz: Vec<bool>, pub(super) k_nz: Vec<bool>,
+    pub(super) grid: Vec<u8>,
+    pub(super) row_lens: Vec<u16>,
+    pub(super) rib_emb: Vec<f32>,
+    pub(super) lex: Vec<f32>,
+    pub(super) proj1: Vec<f32>,
+    pub(super) pref1: Vec<f32>,
+    pub(super) gates: Vec<f32>,
+    pub(super) proj2: Vec<f32>,
+    pub(super) pref2: Vec<f32>,
+    pub(super) fused: Vec<f32>,
+    pub(super) cells_soa: Vec<f32>,
+    pub(super) acc_soa: Vec<f32>,
+
+    pub(super) csum_p1: Vec<f32>,
+    pub(super) base_p1: Vec<f32>,
+    pub(super) csum_p2: Vec<f32>,
+    pub(super) base_p2: Vec<f32>,
+    pub(super) line_sum0: Vec<f32>,
+    pub(super) line_sum1: Vec<f32>,
+    pub(super) tile: TileScratch,
+    pub(super) excl_tile: Vec<f32>,
+    pub(super) saw_tile: Vec<f32>,
+    pub(super) paren_tile: Vec<f32>,
+    pub(super) hidden_tile: Vec<f32>,
+    pub(super) stats_tile: Vec<f32>,
+
+    pub(super) ctx_h_tile: Vec<f32>,
+    pub(super) ctx_o_tile: Vec<f32>,
+    pub(super) running_delta: Vec<f32>,
+    pub(super) ring_w: Vec<f32>,
+    pub(super) ring_g: RingGate,
+    pub(super) prev1_raw: Vec<f32>,
+    pub(super) prev2_raw: Vec<f32>,
+    pub(super) mean_acc: Vec<f64>,
+    pub(super) peak: Vec<f32>,
+
+    pub(super) col_sums: Vec<f32>,
+    pub(super) conv3: Vec<f32>,
+    pub(super) conv7: Vec<f32>,
+    pub(super) sketch: Vec<f32>,
+    pub(super) deltas: Vec<f32>,
+    pub(super) state: Vec<f32>,
+    pub(super) q_buf: Vec<f32>,
+    pub(super) k_buf: Vec<f32>,
+    pub(super) v_buf: Vec<f32>,
+    pub(super) merged: Vec<f32>,
+    pub(super) attn_out: Vec<f32>,
+    pub(super) gate: Vec<f32>,
+
+    pub(super) logits: Vec<f64>,
+    pub(super) keys: Vec<usize>,
+    pub(super) k_tile: Vec<f64>,
+    pub(super) logits_4: Vec<f64>,
+    pub(super) q_nz: Vec<bool>,
+    pub(super) k_nz: Vec<bool>,
     pub(super) sparse: Option<Box<SparseScratch>>,
 }
 
@@ -197,49 +234,66 @@ impl EvalScratch {
 
     pub(super) fn ensure_span_buffers(&mut self, w: &ResolvedWeights) {
         let (emb_dim, pre_cols, hc_dim) = (w.tok_emb.cols, w.pre_conv3_w.cols, w.hc_dim);
-        let (p1, g1, p2) = (w.pref1_proj.cols as usize, w.gate1_w.cols as usize, w.pref2_proj.cols as usize);
+        let p1 = w.pref1_proj.cols as usize;
+        let g1 = w.gate1_w.cols as usize;
+        let p2 = w.pref2_proj.cols as usize;
         let max_conv = w.conv3_w.cols.max(w.conv7_w.cols).max(w.sketch_w.cols);
         let ml_cols = w.ml_proj.cols as usize;
-        let max_ctx_h = (w.ctx_layers[0].cmlp_w.cols as usize).max(w.ctx_layers[1].cmlp_w.cols as usize);
+        let c0_h = w.ctx_layers[0].cmlp_w.cols as usize;
+        let c1_h = w.ctx_layers[1].cmlp_w.cols as usize;
+        let max_ctx_h = c0_h.max(c1_h);
 
-        ensure_len(&mut self.rib_emb, (MAX_SPAN_LEN + 2) * emb_dim);
-        ensure_len(&mut self.lex, MAX_SPAN_LEN * pre_cols);
-        ensure_len(&mut self.proj1, MAX_SPAN_LEN * p1);
-        ensure_len(&mut self.pref1, MAX_SPAN_LEN * p1);
-        ensure_len(&mut self.gates, MAX_SPAN_LEN * g1);
-        ensure_len(&mut self.proj2, MAX_SPAN_LEN * p2);
-        ensure_len(&mut self.pref2, MAX_SPAN_LEN * p2);
-        ensure_len(&mut self.fused, MAX_SPAN_LEN * hc_dim);
-        ensure_len(&mut self.cells_soa, hc_dim * MAX_SPAN_LEN);
-        ensure_len(&mut self.acc_soa, max_conv * MAX_SPAN_LEN);
-        ensure_len(&mut self.csum_p1, p1); ensure_len(&mut self.base_p1, p1);
-        ensure_len(&mut self.csum_p2, p2); ensure_len(&mut self.base_p2, p2);
-        ensure_len(&mut self.line_sum0, hc_dim); ensure_len(&mut self.line_sum1, hc_dim);
-        ensure_len(&mut self.excl_tile, 8 * ml_cols);
-        ensure_len(&mut self.saw_tile, 8 * w.ml_gate_w.cols as usize);
-        ensure_len(&mut self.paren_tile, 8 * w.ml_paren_w.cols);
-        ensure_len(&mut self.hidden_tile, 8 * w.lmlp1_w.cols as usize);
-        ensure_len(&mut self.stats_tile, 8 * w.lmlp2_w.cols as usize);
-        ensure_len(&mut self.ctx_h_tile, 8 * max_ctx_h);
-        ensure_len(&mut self.ctx_o_tile, 8 * w.state_dim);
-        ensure_len(&mut self.running_delta, ml_cols);
-        ensure_len(&mut self.ring_w, (PEAK_WINDOW + 1) * w.state_dim);
-        ensure_len(&mut self.prev1_raw, w.state_dim);
-        ensure_len(&mut self.prev2_raw, w.state_dim);
-        if self.mean_acc.len() < w.state_dim { self.mean_acc.resize(w.state_dim, 0.0); }
+        let sized: [(&mut Vec<f32>, usize); 27] = [
+            (&mut self.rib_emb, (MAX_SPAN_LEN + 2) * emb_dim),
+            (&mut self.lex, MAX_SPAN_LEN * pre_cols),
+            (&mut self.proj1, MAX_SPAN_LEN * p1),
+            (&mut self.pref1, MAX_SPAN_LEN * p1),
+            (&mut self.gates, MAX_SPAN_LEN * g1),
+            (&mut self.proj2, MAX_SPAN_LEN * p2),
+            (&mut self.pref2, MAX_SPAN_LEN * p2),
+            (&mut self.fused, MAX_SPAN_LEN * hc_dim),
+            (&mut self.cells_soa, hc_dim * MAX_SPAN_LEN),
+            (&mut self.acc_soa, max_conv * MAX_SPAN_LEN),
+            (&mut self.csum_p1, p1),
+            (&mut self.base_p1, p1),
+            (&mut self.csum_p2, p2),
+            (&mut self.base_p2, p2),
+            (&mut self.line_sum0, hc_dim),
+            (&mut self.line_sum1, hc_dim),
+            (&mut self.excl_tile, 8 * ml_cols),
+            (&mut self.saw_tile, 8 * w.ml_gate_w.cols as usize),
+            (&mut self.paren_tile, 8 * w.ml_paren_w.cols),
+            (&mut self.hidden_tile, 8 * w.lmlp1_w.cols as usize),
+            (&mut self.stats_tile, 8 * w.lmlp2_w.cols as usize),
+            (&mut self.ctx_h_tile, 8 * max_ctx_h),
+            (&mut self.ctx_o_tile, 8 * w.state_dim),
+            (&mut self.running_delta, ml_cols),
+            (&mut self.ring_w, (PEAK_WINDOW + 1) * w.state_dim),
+            (&mut self.prev1_raw, w.state_dim),
+            (&mut self.prev2_raw, w.state_dim),
+        ];
+        for (buf, needed) in sized {
+            ensure_len(buf, needed);
+        }
         ensure_len(&mut self.peak, w.state_dim);
+        if self.mean_acc.len() < w.state_dim {
+            self.mean_acc.resize(w.state_dim, 0.0);
+        }
     }
 
     pub(super) fn shrink_if_oversized(&mut self, num_lines: usize, max_lines: usize) {
         if num_lines <= max_lines { return; }
-        drop_vec(&mut self.grid); drop_vec(&mut self.row_lens);
+        drop_vec(&mut self.grid);
+        drop_vec(&mut self.row_lens);
         for buf in [
             &mut self.col_sums, &mut self.conv3, &mut self.conv7, &mut self.sketch,
             &mut self.deltas, &mut self.state, &mut self.q_buf, &mut self.k_buf,
             &mut self.v_buf, &mut self.merged, &mut self.attn_out, &mut self.gate,
         ] { drop_vec(buf); }
         for buf in [&mut self.logits, &mut self.k_tile, &mut self.logits_4] { drop_vec(buf); }
-        drop_vec(&mut self.keys); drop_vec(&mut self.q_nz); drop_vec(&mut self.k_nz);
+        drop_vec(&mut self.keys);
+        drop_vec(&mut self.q_nz);
+        drop_vec(&mut self.k_nz);
         self.sparse = None;
     }
 }
@@ -256,8 +310,14 @@ fn swar_all_printable_ascii(chunk: [u8; 8]) -> bool {
 pub(super) fn encode_grid_into(code: &str, grid: &mut Vec<u8>, row_lens: &mut Vec<u16>) -> usize {
     grid.clear();
     row_lens.clear();
-    if code.is_empty() { grid.resize(MAX_COLS, 0); row_lens.push(0); return 1; }
-    if let Some(n) = encode_grid_swar_ascii(code.as_bytes(), grid, row_lens) { return n; }
+    if code.is_empty() {
+        grid.resize(MAX_COLS, 0);
+        row_lens.push(0);
+        return 1;
+    }
+    if let Some(n) = encode_grid_swar_ascii(code.as_bytes(), grid, row_lens) {
+        return n;
+    }
     encode_grid_general(code, grid, row_lens)
 }
 
@@ -294,7 +354,11 @@ fn encode_grid_swar_ascii(bytes: &[u8], grid: &mut Vec<u8>, row_lens: &mut Vec<u
             return None;
         }
     }
-    if col > 0 || row_lens.is_empty() { row_lens.push(col as u16); } else { grid.truncate(row_base); }
+    if col > 0 || row_lens.is_empty() {
+        row_lens.push(col as u16);
+    } else {
+        grid.truncate(row_base);
+    }
     Some(row_lens.len())
 }
 
@@ -323,7 +387,10 @@ fn split_slices(text: &str) -> Vec<&str> {
         }
         parts.push(&text[start..idx]);
         let mut next = idx + ch.len_utf8();
-        if ch == '\r' && it.peek().is_some_and(|&(_, c)| c == '\n') { it.next(); next += 1; }
+        if ch == '\r' && it.peek().is_some_and(|&(_, c)| c == '\n') {
+            it.next();
+            next += 1;
+        }
         start = next;
     }
     parts.push(&text[start..]);
@@ -550,8 +617,14 @@ pub(super) fn norm_sketch(sketch: &mut [f32], num_lines: usize, total_sketch: us
     let mut base = 0usize;
     while base < total {
         let end = (base + SKETCH_DIM).min(total);
-        let norm = (sketch[base..end].iter().map(|&v| v * v).sum::<f32>() + 1e-6f32).sqrt();
-        for val in &mut sketch[base..end] { *val /= norm; }
+        let mut sq_sum = 0.0f32;
+        for &v in &sketch[base..end] {
+            sq_sum += v * v;
+        }
+        let norm = (sq_sum + 1e-6f32).sqrt();
+        for val in &mut sketch[base..end] {
+            *val /= norm;
+        }
         base += SKETCH_DIM;
     }
 }
@@ -581,6 +654,34 @@ struct SoftmaxBuf<'a> {
     max_l: f64,
 }
 
+impl SoftmaxBuf<'_> {
+    #[inline]
+    fn push(&mut self, key: usize, logit: f64) {
+        self.keys[self.count] = key;
+        self.logits[self.count] = logit;
+        self.max_l = self.max_l.max(logit);
+        self.count += 1;
+    }
+}
+
+#[inline]
+fn exp_sum_in_place(logits: &mut [f64], max_l: f64, init: f64) -> f64 {
+    let mut sum = init;
+    for lv in logits {
+        let e = (*lv - max_l).exp();
+        *lv = e;
+        sum += e;
+    }
+    sum
+}
+
+#[inline]
+fn accum_weighted_v(dst: &mut [f32], src: &[f32], aw: f64) {
+    for (out, &val) in dst.iter_mut().zip(src.iter()) {
+        *out += (aw * (val as f64)) as f32;
+    }
+}
+
 #[inline]
 fn accum_exact_v(
     hr: HeadRef<'_>,
@@ -592,9 +693,10 @@ fn accum_exact_v(
     merged: &mut [f32],
 ) {
     let dst = q * hr.layer.v_tot + hr.head.v_off;
+    let v_dim = hr.layer.v_dim;
     for (&k, &ew) in keys.iter().zip(weights.iter()) {
-        let (aw, vb) = (ew / exp_sum, k * hr.layer.v_tot + hr.head.v_off);
-        for d in 0..hr.layer.v_dim { merged[dst + d] += (aw * (v_buf[vb + d] as f64)) as f32; }
+        let vb = k * hr.layer.v_tot + hr.head.v_off;
+        accum_weighted_v(&mut merged[dst..dst + v_dim], &v_buf[vb..vb + v_dim], ew / exp_sum);
     }
 }
 
@@ -603,43 +705,46 @@ fn attend_uniform_global(hr: HeadRef<'_>, n: usize, sc: &mut EvalScratch) {
     let mut sum = vec![0.0f64; v_dim];
     for row in 0..n {
         let base = row * hr.layer.v_tot + hr.head.v_off;
-        for (d, s) in sum.iter_mut().enumerate() { *s += sc.v_buf[base + d] as f64; }
+        for (d, s) in sum.iter_mut().enumerate() {
+            *s += sc.v_buf[base + d] as f64;
+        }
     }
     for row in 0..n {
         let base = row * hr.layer.v_tot + hr.head.v_off;
-        for (d, &s) in sum.iter().enumerate() { sc.merged[base + d] = (s * wf) as f32; }
+        for (d, &s) in sum.iter().enumerate() {
+            sc.merged[base + d] = (s * wf) as f32;
+        }
     }
 }
 
 struct StaticBand<'a> { offsets: &'a [i8], rel_vals: &'a [f64], interior: &'a [f64], min_neg: usize, max_pos: usize }
 
 fn attend_static_banded(hr: HeadRef<'_>, band: StaticBand<'_>, n: usize, sc: &mut EvalScratch) {
+    let v_dim = hr.layer.v_dim;
     for q in 0..n {
         let dst = q * hr.layer.v_tot + hr.head.v_off;
         if q >= band.min_neg && q + band.max_pos < n {
             for (&off, &aw) in band.offsets.iter().zip(band.interior.iter()) {
                 let vb = (q as isize + off as isize) as usize * hr.layer.v_tot + hr.head.v_off;
-                for d in 0..hr.layer.v_dim { sc.merged[dst + d] += (aw * (sc.v_buf[vb + d] as f64)) as f32; }
+                accum_weighted_v(&mut sc.merged[dst..dst + v_dim], &sc.v_buf[vb..vb + v_dim], aw);
             }
             continue;
         }
-        let (mut count, mut max_l) = (0usize, hr.head.sink);
+        let mut sm = SoftmaxBuf { keys: &mut sc.keys, logits: &mut sc.logits, count: 0, max_l: hr.head.sink };
         for (&off, &rv) in band.offsets.iter().zip(band.rel_vals.iter()) {
             let k = q as isize + off as isize;
             if k >= 0 && k < n as isize {
-                sc.keys[count] = k as usize;
-                sc.logits[count] = rv;
-                max_l = max_l.max(rv);
-                count += 1;
+                sm.push(k as usize, rv);
             }
         }
-        let mut exp_sum = (hr.head.sink - max_l).exp();
-        for lv in &mut sc.logits[..count] { *lv = (*lv - max_l).exp(); exp_sum += *lv; }
+        let (count, max_l) = (sm.count, sm.max_l);
+        let exp_sum = exp_sum_in_place(&mut sc.logits[..count], max_l, (hr.head.sink - max_l).exp());
         accum_exact_v(hr, q, &sc.keys[..count], &sc.logits[..count], exp_sum, &sc.v_buf, &mut sc.merged);
     }
 }
 
 fn attend_general_static_exact(hr: HeadRef<'_>, rel: &[f64; 65], n: usize, sc: &mut EvalScratch) {
+    let v_dim = hr.layer.v_dim;
     for q in 0..n {
         let mut max_l = hr.head.sink;
         for (k, slot) in sc.logits.iter_mut().enumerate().take(n) {
@@ -647,12 +752,11 @@ fn attend_general_static_exact(hr: HeadRef<'_>, rel: &[f64; 65], n: usize, sc: &
             *slot = rv;
             max_l = max_l.max(rv);
         }
-        let mut exp_sum = (hr.head.sink - max_l).exp();
-        for lv in &mut sc.logits[..n] { *lv = (*lv - max_l).exp(); exp_sum += *lv; }
+        let exp_sum = exp_sum_in_place(&mut sc.logits[..n], max_l, (hr.head.sink - max_l).exp());
         let dst = q * hr.layer.v_tot + hr.head.v_off;
         for (k, &ew) in sc.logits.iter().enumerate().take(n) {
-            let (aw, vb) = (ew / exp_sum, k * hr.layer.v_tot + hr.head.v_off);
-            for d in 0..hr.layer.v_dim { sc.merged[dst + d] += (aw * (sc.v_buf[vb + d] as f64)) as f32; }
+            let vb = k * hr.layer.v_tot + hr.head.v_off;
+            accum_weighted_v(&mut sc.merged[dst..dst + v_dim], &sc.v_buf[vb..vb + v_dim], ew / exp_sum);
         }
     }
 }
@@ -683,8 +787,8 @@ fn attend_general_static_prefix(
         }
         let le = if left_cnt > 0 { (rel[0] - max_l).exp() } else { 0.0 };
         let re = if right_cnt > 0 { (rel[64] - max_l).exp() } else { 0.0 };
-        let mut exp_sum = (hr.head.sink - max_l).exp() + (left_cnt as f64) * le + (right_cnt as f64) * re;
-        for lv in &mut sc.logits[..band_len] { *lv = (*lv - max_l).exp(); exp_sum += *lv; }
+        let base_sum = (hr.head.sink - max_l).exp() + (left_cnt as f64) * le + (right_cnt as f64) * re;
+        let exp_sum = exp_sum_in_place(&mut sc.logits[..band_len], max_l, base_sum);
         let dst = q * hr.layer.v_tot + hr.head.v_off;
         if left_cnt > 0 {
             let (aw, loff) = (le / exp_sum, left_cnt * v_dim);
@@ -698,8 +802,9 @@ fn attend_general_static_prefix(
             }
         }
         for (i, k) in (left_cnt..right_start).enumerate() {
-            let (aw, vb) = (sc.logits[i] / exp_sum, k * hr.layer.v_tot + hr.head.v_off);
-            for d in 0..v_dim { sc.merged[dst + d] += (aw * (sc.v_buf[vb + d] as f64)) as f32; }
+            let vb = k * hr.layer.v_tot + hr.head.v_off;
+            let aw = sc.logits[i] / exp_sum;
+            accum_weighted_v(&mut sc.merged[dst..dst + v_dim], &sc.v_buf[vb..vb + v_dim], aw);
         }
         tel.pairs_evaluated += band_len + usize::from(left_cnt > 0) + usize::from(right_cnt > 0);
     }
@@ -802,7 +907,10 @@ fn build_cobs_blocks_into(
         for row in lo..hi {
             if active_only && !(sc.k_nz[row] && sp.v_pos[row]) { continue; }
             let kb = row * hr.layer.qk_tot + hr.head.qk_off;
-            for d in 0..h_dim { let diff = sc.k_buf[kb + d] - mk[d]; vk[d] += diff * diff * inv_cnt; }
+            for d in 0..h_dim {
+                let diff = sc.k_buf[kb + d] - mk[d];
+                vk[d] += diff * diff * inv_cnt;
+            }
         }
     }
     num_blocks
@@ -823,7 +931,10 @@ fn select_top_blocks(scores: &[(f64, u16)], k_sel: usize, out: &mut [u16; LSA_TO
     for _ in 0..lim {
         let (mut best_blk, mut best_sc) = (u16::MAX, f64::NEG_INFINITY);
         for &(sc, blk) in scores {
-            if sc > best_sc && !out[..picked].contains(&blk) { best_sc = sc; best_blk = blk; }
+            if sc > best_sc && !out[..picked].contains(&blk) {
+                best_sc = sc;
+                best_blk = blk;
+            }
         }
         if best_blk == u16::MAX { break; }
         out[picked] = best_blk;
@@ -1014,14 +1125,11 @@ fn select_dense_far_blocks(
         if take > 0 { tel.mli_reused = true; tel.mli_reuse_hits += 1; }
         return take;
     }
-    let (k_lo, k_hi, h_dim, mut valid) = (q.saturating_sub(32), (q + 33).min(ctx.n), layer.h_dim, 0usize);
+    let (k_lo, k_hi, mut valid) = (q.saturating_sub(32), (q + 33).min(ctx.n), 0usize);
     for blk in 0..ctx.num_blocks {
-        let (b_lo, b_hi) = (blk * ctx.blk_span, ((blk + 1) * ctx.blk_span).min(ctx.n));
-        let rem = (b_hi - b_lo).saturating_sub(b_hi.min(k_hi).saturating_sub(b_lo.max(k_lo)));
-        if rem == 0 { continue; }
-        let (mu, var) = (&sp.mu_k[blk * h_dim..(blk + 1) * h_dim], &sp.var_k[blk * h_dim..(blk + 1) * h_dim]);
-        let rb = dense_far_rel_bias(ctx.rel, ctx.all_zero, b_lo, b_hi, k_lo);
-        let score = (rem as f64).ln() + cobs_cumulant_score(q_slice, mu, var, layer.inv_s) + rb;
+        let Some(score) = cobs_block_far_logit(q_slice, blk, (k_lo, k_hi), layer, ctx, sp) else {
+            continue;
+        };
         sp.blk_scores[valid] = (score, blk as u16);
         valid += 1;
     }
@@ -1035,23 +1143,36 @@ fn select_dense_far_blocks(
     merged_n
 }
 
+fn cobs_block_far_logit(
+    q_slice: &[f32], blk: usize, local: (usize, usize),
+    layer: &AttnLayerWeights, ctx: &DenseBlockCtx<'_>, sp: &SparseScratch,
+) -> Option<f64> {
+    let (b_lo, b_hi) = (blk * ctx.blk_span, ((blk + 1) * ctx.blk_span).min(ctx.n));
+    let overlap = b_hi.min(local.1).saturating_sub(b_lo.max(local.0));
+    let rem = (b_hi - b_lo).saturating_sub(overlap);
+    if rem == 0 {
+        return None;
+    }
+    let h_dim = layer.h_dim;
+    let mu = &sp.mu_k[blk * h_dim..(blk + 1) * h_dim];
+    let var = &sp.var_k[blk * h_dim..(blk + 1) * h_dim];
+    let rb = dense_far_rel_bias(ctx.rel, ctx.all_zero, b_lo, b_hi, local.0);
+    Some((rem as f64).ln() + cobs_cumulant_score(q_slice, mu, var, layer.inv_s) + rb)
+}
+
 fn append_unselected_cobs_coarse(
     q_slice: &[f32], q: usize, layer: &AttnLayerWeights, ctx: &DenseBlockCtx<'_>,
     sel: &[u16], sp: &SparseScratch, sm: &mut SoftmaxBuf<'_>,
 ) -> usize {
-    let (k_lo, k_hi, h_dim, mut added) = (q.saturating_sub(32), (q + 33).min(ctx.n), layer.h_dim, 0usize);
+    let (k_lo, k_hi, mut added) = (q.saturating_sub(32), (q + 33).min(ctx.n), 0usize);
     for blk in 0..ctx.num_blocks {
-        if sel.contains(&(blk as u16)) { continue; }
-        let (b_lo, b_hi) = (blk * ctx.blk_span, ((blk + 1) * ctx.blk_span).min(ctx.n));
-        let rem = (b_hi - b_lo).saturating_sub(b_hi.min(k_hi).saturating_sub(b_lo.max(k_lo)));
-        if rem == 0 || sm.count >= sm.keys.len() { continue; }
-        let (mu, var) = (&sp.mu_k[blk * h_dim..(blk + 1) * h_dim], &sp.var_k[blk * h_dim..(blk + 1) * h_dim]);
-        let rb = dense_far_rel_bias(ctx.rel, ctx.all_zero, b_lo, b_hi, k_lo);
-        let logit = (rem as f64).ln() + cobs_cumulant_score(q_slice, mu, var, layer.inv_s) + rb;
-        sm.keys[sm.count] = blk;
-        sm.logits[sm.count] = logit;
-        sm.max_l = sm.max_l.max(logit);
-        sm.count += 1;
+        if sel.contains(&(blk as u16)) || sm.count >= sm.keys.len() {
+            continue;
+        }
+        let Some(logit) = cobs_block_far_logit(q_slice, blk, (k_lo, k_hi), layer, ctx, sp) else {
+            continue;
+        };
+        sm.push(blk, logit);
         added += 1;
     }
     added
@@ -1096,7 +1217,7 @@ unsafe fn attend_dense_qk_cobs<K: HygieneKernel>(
             // SAFETY: Enclosing caller guarantees `K` invariants.
             let dot = unsafe { K::dot_f32_as_f64(q_slice, &sc.k_buf[kb..kb + h_dim]) };
             let logit = dense_rel_bias(rel_cfg.0, rel_cfg.1, q, k) + dot * hr.layer.inv_s;
-            sm.keys[sm.count] = k; sm.logits[sm.count] = logit; sm.max_l = sm.max_l.max(logit); sm.count += 1;
+            sm.push(k, logit);
         }
         tel.pairs_evaluated += k_hi - k_lo;
         if sel_cnt > 0 {
@@ -1104,10 +1225,11 @@ unsafe fn attend_dense_qk_cobs<K: HygieneKernel>(
             for s_idx in 0..sp.lsa_len {
                 let k = sp.lsa_rows[s_idx] as usize;
                 if k >= k_lo && k < k_hi { continue; }
+                let key_vec = &sp.lsa_k[s_idx * h_dim..(s_idx + 1) * h_dim];
                 // SAFETY: Enclosing caller guarantees `K` invariants.
-                let dot = unsafe { K::dot_f32_as_f64(q_slice, &sp.lsa_k[s_idx * h_dim..(s_idx + 1) * h_dim]) };
+                let dot = unsafe { K::dot_f32_as_f64(q_slice, key_vec) };
                 let logit = dense_rel_bias(rel_cfg.0, rel_cfg.1, q, k) + dot * hr.layer.inv_s;
-                sm.keys[sm.count] = k; sm.logits[sm.count] = logit; sm.max_l = sm.max_l.max(logit); sm.count += 1;
+                sm.push(k, logit);
                 tel.pairs_evaluated += 1;
             }
         }
@@ -1175,59 +1297,11 @@ pub(super) unsafe fn sink_attention_with<K: HygieneKernel>(
     let mut banded_mli_ready = false;
     for (head_idx, head) in layer.heads.iter().enumerate() {
         let hr = HeadRef { layer, head };
-        match &head.kind {
-            HeadKind::UniformGlobal => attend_uniform_global(hr, n, sc),
-            HeadKind::StaticBanded { offsets, rel_vals, interior_weights, min_neg, max_pos } => {
-                let sb = StaticBand {
-                    offsets, rel_vals, interior: interior_weights,
-                    min_neg: *min_neg, max_pos: *max_pos,
-                };
-                attend_static_banded(hr, sb, n, sc);
-            }
-            HeadKind::BandedQk { offsets, rel_vals } => {
-                let is_far_banded = offsets.iter().any(|&o| o.unsigned_abs() >= 31);
-                if is_far_banded && let Some(tel) = telemetry.as_deref_mut() {
-                    tel.attn_mode = "v07_cobs2_engram_lsa_mli";
-                    // SAFETY: Enclosing caller guarantees `K` invariants.
-                    unsafe {
-                        attend_banded_far_cobs::<K>(
-                            hr, (offsets, rel_vals), n, banded_mli_ready, sc, tel,
-                        );
-                    }
-                    banded_mli_ready = true;
-                } else {
-                    // SAFETY: Enclosing caller guarantees `K` invariants.
-                    unsafe { attend_banded_qk_with::<K>(hr, (offsets, rel_vals), n, sc); }
-                }
-            }
-            HeadKind::DenseQk { rel, all_zero_rel } => {
-                if let Some(tel) = telemetry.as_deref_mut() {
-                    tel.attn_mode = "v07_cobs2_engram_lsa_mli";
-                    // SAFETY: Enclosing caller guarantees `K` invariants.
-                    unsafe {
-                        attend_dense_qk_cobs::<K>(
-                            hr, (rel, *all_zero_rel), (layer_idx, head_idx), n, sc, tel,
-                        );
-                    }
-                } else {
-                    let args = DenseQkArgs {
-                        q_proj: &sc.q_buf, k_proj: &sc.k_buf, v_proj: &sc.v_buf, num_lines: n,
-                        qk_tot: layer.qk_tot, qk_off: head.qk_off, h_dim: layer.h_dim,
-                        v_tot: layer.v_tot, v_off: head.v_off, v_dim: layer.v_dim,
-                        inv_s: layer.inv_s, sink: head.sink, rel, all_zero_rel: *all_zero_rel,
-                    };
-                    // SAFETY: Enclosing caller guarantees `K` invariants.
-                    unsafe { K::dense_qk_head(&args, &mut sc.k_tile, &mut sc.logits_4, &mut sc.merged); }
-                }
-            }
-            HeadKind::GeneralStatic { rel } => {
-                if let Some(tel) = telemetry.as_deref_mut() {
-                    if tel.attn_mode.is_empty() { tel.attn_mode = "v07_static_prefix"; }
-                    attend_general_static_prefix(hr, rel, n, sc, tel);
-                } else {
-                    attend_general_static_exact(hr, rel, n, sc);
-                }
-            }
+        // SAFETY: Enclosing caller guarantees `K` invariants.
+        unsafe {
+            dispatch_attn_head::<K>(
+                hr, (layer_idx, head_idx), n, &mut banded_mli_ready, sc, telemetry.as_deref_mut(),
+            );
         }
     }
 
@@ -1237,6 +1311,72 @@ pub(super) unsafe fn sink_attention_with<K: HygieneKernel>(
             &sc.merged[..n * layer.v_tot], n, layer.v_tot,
             CsOp::new(&layer.wo, None, false), &mut sc.attn_out[..n * state_dim], &mut sc.tile,
         );
+    }
+}
+
+// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+#[inline(always)]
+unsafe fn dispatch_attn_head<K: HygieneKernel>(
+    hr: HeadRef<'_>,
+    ids: (usize, usize),
+    n: usize,
+    banded_mli_ready: &mut bool,
+    sc: &mut EvalScratch,
+    telemetry: Option<&mut SparseAttnTelemetry>,
+) {
+    match &hr.head.kind {
+        HeadKind::UniformGlobal => attend_uniform_global(hr, n, sc),
+        HeadKind::StaticBanded { offsets, rel_vals, interior_weights, min_neg, max_pos } => {
+            let sb = StaticBand {
+                offsets, rel_vals, interior: interior_weights,
+                min_neg: *min_neg, max_pos: *max_pos,
+            };
+            attend_static_banded(hr, sb, n, sc);
+        }
+        HeadKind::BandedQk { offsets, rel_vals } => {
+            let is_far_banded = offsets.iter().any(|&o| o.unsigned_abs() >= 31);
+            if is_far_banded && let Some(tel) = telemetry {
+                tel.attn_mode = "v07_cobs2_engram_lsa_mli";
+                // SAFETY: Enclosing caller guarantees `K` invariants.
+                unsafe {
+                    attend_banded_far_cobs::<K>(
+                        hr, (offsets, rel_vals), n, *banded_mli_ready, sc, tel,
+                    );
+                }
+                *banded_mli_ready = true;
+            } else {
+                // SAFETY: Enclosing caller guarantees `K` invariants.
+                unsafe { attend_banded_qk_with::<K>(hr, (offsets, rel_vals), n, sc); }
+            }
+        }
+        HeadKind::DenseQk { rel, all_zero_rel } => {
+            if let Some(tel) = telemetry {
+                tel.attn_mode = "v07_cobs2_engram_lsa_mli";
+                // SAFETY: Enclosing caller guarantees `K` invariants.
+                unsafe {
+                    attend_dense_qk_cobs::<K>(hr, (rel, *all_zero_rel), ids, n, sc, tel);
+                }
+                return;
+            }
+            let args = DenseQkArgs {
+                q_proj: &sc.q_buf, k_proj: &sc.k_buf, v_proj: &sc.v_buf, num_lines: n,
+                qk_tot: hr.layer.qk_tot, qk_off: hr.head.qk_off, h_dim: hr.layer.h_dim,
+                v_tot: hr.layer.v_tot, v_off: hr.head.v_off, v_dim: hr.layer.v_dim,
+                inv_s: hr.layer.inv_s, sink: hr.head.sink, rel, all_zero_rel: *all_zero_rel,
+            };
+            // SAFETY: Enclosing caller guarantees `K` invariants.
+            unsafe { K::dense_qk_head(&args, &mut sc.k_tile, &mut sc.logits_4, &mut sc.merged); }
+        }
+        HeadKind::GeneralStatic { rel } => {
+            if let Some(tel) = telemetry {
+                if tel.attn_mode.is_empty() {
+                    tel.attn_mode = "v07_static_prefix";
+                }
+                attend_general_static_prefix(hr, rel, n, sc, tel);
+            } else {
+                attend_general_static_exact(hr, rel, n, sc);
+            }
+        }
     }
 }
 
@@ -1289,7 +1429,14 @@ pub(super) fn bench_dense_qk_two_layer(n: usize) -> (f64, SparseAttnTelemetry) {
     let approx = run_2l(base.clone(), Some(&mut tel));
     let mae = if n <= 2048 {
         let exact = run_2l(base, None);
-        approx.iter().zip(exact.iter()).map(|(&a, &b)| ((a - b) as f64).abs()).sum::<f64>() / ((n * dim) as f64)
-    } else { 0.0 };
+        let diff_sum: f64 = approx
+            .iter()
+            .zip(exact.iter())
+            .map(|(&a, &b)| ((a - b) as f64).abs())
+            .sum();
+        diff_sum / ((n * dim) as f64)
+    } else {
+        0.0
+    };
     (mae, tel)
 }
