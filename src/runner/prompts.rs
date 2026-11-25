@@ -62,6 +62,16 @@ pub(super) fn guess_lang(unit: &ModuleUnit) -> &'static str {
     }
 }
 
+pub(super) fn cold_verifier_hint(lang: &str) -> &'static str {
+    match lang {
+        "py" => "ruff-cli+ty",
+        "rs" => "cargo-check/rust-glancer",
+        "ts" => "oxlint/tsrs->biome/tsc",
+        "go" => "gofmt+go-vet",
+        _ => "polyglot-gates",
+    }
+}
+
 pub(super) fn pick_effort(unit: &ModuleUnit, attempt: u32, diags: &[String]) -> &'static str {
     let hard = diags.iter().any(|d| {
         let l = d.to_ascii_lowercase();

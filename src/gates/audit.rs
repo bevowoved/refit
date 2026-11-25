@@ -1,4 +1,7 @@
-use super::runners::{CmdSpec, first_lines, parse_pytest, parse_ty, ruff_map};
+use super::runners::{
+    CmdSpec, detect_cold_js_linter, detect_cold_rust_checker, detect_cold_ts_checker, first_lines,
+    parse_pytest, parse_ty, ruff_map, rust_cargo_env,
+};
 use super::stage::CargoSlot;
 use crate::graph::build_dag;
 use crate::hygiene::HygieneScorer;
@@ -34,6 +37,9 @@ pub struct ToolchainInfo {
 }
 
 pub fn detect_tools(langs: &[String]) -> Vec<ToolchainInfo> {
+    let (_, _, ts_tc) = detect_cold_ts_checker();
+    let (_, _, js_lint) = detect_cold_js_linter(false);
+    let (_, _, rs_tc) = detect_cold_rust_checker();
     langs
         .iter()
         .map(|l| {
@@ -42,10 +48,19 @@ pub fn detect_tools(langs: &[String]) -> Vec<ToolchainInfo> {
                 .find(|&&(k, _, _, _)| k == l)
                 .copied()
                 .unwrap_or(("", "refit-untangle", "host-lsp", "repo-test"));
+            let resolved_lint = match l.as_str() {
+                "typescript" | "javascript" if js_lint.starts_with("oxlint") => js_lint,
+                _ => lint,
+            };
+            let resolved_tc = match l.as_str() {
+                "typescript" => ts_tc,
+                "rust" => rs_tc,
+                _ => tc,
+            };
             ToolchainInfo {
                 language: l.clone(),
-                canonical_linter: lint.into(),
-                canonical_typecheck_lsp: tc.into(),
+                canonical_linter: resolved_lint.into(),
+                canonical_typecheck_lsp: resolved_tc.into(),
                 canonical_test_runner: test.into(),
             }
         })
@@ -579,9 +594,9 @@ fn audit_polyglot(
             .then(|| s.spawn(|| probe_cargo(&cfg.repo_root)));
         let h_ts = (has_ts && cfg.repo_root.join("tsconfig.json").exists()).then(|| {
             s.spawn(|| {
-                let args = ["--noEmit".into()];
-                let cmd = CmdSpec::new("tsc", &args, &cfg.repo_root, base_env, 20_000);
-                poly_probe(&cmd, "tsconfig.json", "tsc", true)
+                let (prog, args, label) = detect_cold_ts_checker();
+                let cmd = CmdSpec::new(prog, &args, &cfg.repo_root, base_env, 20_000);
+                poly_probe(&cmd, "tsconfig.json", label, true)
             })
         });
         let h_go = (has_go && cfg.repo_root.join("go.mod").exists()).then(|| {
@@ -603,9 +618,17 @@ fn audit_polyglot(
 
 fn probe_cargo(root: &Path) -> Option<(String, String)> {
     let slot = CargoSlot::acquire(root);
-    let env = sandbox_env(&[("CARGO_TARGET_DIR".into(), slot.dir.display().to_string())]);
-    let args = ["check".into(), "--quiet".into()];
-    let cmd = CmdSpec::new("cargo", &args, root, &env, 30_000);
+    let env = rust_cargo_env(&slot.dir);
+    let (prog, args, label) = detect_cold_rust_checker();
+    if prog == "rust-glancer" {
+        let probe = CmdSpec::new(prog, &args, root, &env, 20_000);
+        if let Some(hit) = poly_probe(&probe, "Cargo.toml", label, false) {
+            return Some(hit);
+        }
+        return None;
+    }
+    let cargo_args = ["check".into(), "--quiet".into()];
+    let cmd = CmdSpec::new("cargo", &cargo_args, root, &env, 30_000);
     poly_probe(&cmd, "Cargo.toml", "cargo check", false)
 }
 

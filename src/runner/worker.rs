@@ -1,11 +1,14 @@
-use super::prompts::{guess_lang, pick_effort};
-use crate::gates::{GateConfig, run_gates, stage_hardlinks};
+use super::prompts::{cold_verifier_hint, guess_lang, pick_effort};
+use crate::gates::{GateConfig, net_new_diagnostics, run_gates, stage_hardlinks};
 use crate::graph::{apply_patches, build_packet, parse_patches};
 use crate::hygiene::HygieneScorer;
 use crate::learn::LearnStore;
 use crate::mvcc::{CommitOutcome, MvccStore};
 use crate::net::drain_sse;
-use crate::platform::{backoff_ms, char_prefix, now_ms};
+use crate::platform::{
+    InvertedRewindIndex, MIN_KERNEL_COST_US, RewindEvent, backoff_ms, char_prefix, now_ms,
+    should_use_index,
+};
 use crate::proxy::ProxyState;
 use crate::research::WebClient;
 use crate::source::{count_lines, dir_of};
@@ -34,6 +37,8 @@ pub(super) struct WorkerCtx {
     pub(super) gate_cfg: Arc<GateConfig>,
     pub(super) mvcc: Arc<MvccStore>,
     pub(super) learn: Arc<LearnStore>,
+    pub(super) rewind_index: Arc<InvertedRewindIndex>,
+    pub(super) file_to_unit: Arc<HashMap<String, String>>,
     pub(super) proxy: Arc<ProxyState>,
     pub(super) shared_state: Arc<RunState>,
     pub(super) research: Arc<WebClient>,
@@ -249,7 +254,12 @@ async fn call_llm(
         "wave_dispatch",
         EventSpec {
             uncached_tpm: Some(ctx.proxy.snapshot().uncached_tpm_rolling),
-            data: Some(json!({"attempt": attempt, "k": r.k, "lang": r.lang})),
+            data: Some(json!({
+                "attempt": attempt,
+                "k": r.k,
+                "lang": r.lang,
+                "verifier_hint": cold_verifier_hint(r.lang)
+            })),
             ..EventSpec::unit(&r.unit)
         },
     );
@@ -378,7 +388,17 @@ async fn gate_fail(ctx: &WorkerCtx, r: &mut UnitRun, attempt: u32, verdict: Gate
 
     let summary = verdict.diagnostics.join(" | ");
     let _ = ctx.mvcc.record_rollback(&r.unit.id, &fg, &summary);
-    ctx.learn.record_failure(&fg, &r.dir, &summary);
+    let unit_baseline: Vec<String> = r
+        .unit
+        .files
+        .iter()
+        .flat_map(|rel| ctx.baseline_diags.get(rel).cloned().unwrap_or_default())
+        .collect();
+    let net_new = net_new_diagnostics(&unit_baseline, &verdict.diagnostics);
+    let learn_diag = if net_new.is_empty() { summary.clone() } else { net_new.join(" | ") };
+    if let Some(event) = ctx.learn.record_failure(&fg, &r.dir, &learn_diag) {
+        dispatch_rewind(ctx, &r.unit, event);
+    }
     let snip = char_prefix(&summary, 140);
     r.prior_fails.push(format!("Attempt {attempt} failed at {fg}: {snip}"));
 
@@ -396,6 +416,30 @@ async fn gate_fail(ctx: &WorkerCtx, r: &mut UnitRun, attempt: u32, verdict: Gate
     let data = json!({"gate": fg, "attempt": attempt, "diagnostics": verdict.diagnostics});
     ctx.telemetry.emit_unit("mvcc_rollback", &r.unit, data);
     r.diags = verdict.diagnostics;
+}
+
+fn dispatch_rewind(ctx: &WorkerCtx, unit: &ModuleUnit, event: RewindEvent) {
+    if !should_use_index(MIN_KERNEL_COST_US) {
+        return;
+    }
+    let affected_paths = ctx.rewind_index.query_event_paths(&event, MIN_KERNEL_COST_US);
+    let mut flagged_units: Vec<String> = affected_paths
+        .iter()
+        .filter_map(|rel| ctx.file_to_unit.get(rel))
+        .filter(|uid| uid.as_str() != unit.id.as_str())
+        .cloned()
+        .collect();
+    flagged_units.sort();
+    flagged_units.dedup();
+    ctx.shared_state.record_rewind(event.clone(), &flagged_units);
+    let data = json!({
+        "trigger": event.trigger.as_str(),
+        "rule_key": event.rule_key,
+        "token": event.token,
+        "affected_files": affected_paths.len(),
+        "flagged_units": flagged_units
+    });
+    ctx.telemetry.emit_unit("live_rewind", unit, data);
 }
 
 fn commit_unit(

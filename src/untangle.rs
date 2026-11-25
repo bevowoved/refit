@@ -1,4 +1,5 @@
 mod clones;
+mod drift;
 mod infra;
 mod simiflow;
 
@@ -39,6 +40,9 @@ pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditR
     let genome_twins = genome::format_genome_twins(&genome_summary, 25);
     let deep_module_findings =
         csr::deep_module_findings(&source_rels, &snap.runtime_edges, &snap.metrics_by_file);
+    let known_symbols = drift::collect_known_symbols(&snap, &preloaded);
+    let doc_drift_findings =
+        drift::scan_doc_drift(repo_root, &source_rels, &preloaded, &known_symbols);
 
     let triage_plan = build_triage(
         &infra_findings,
@@ -65,6 +69,7 @@ pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditR
         triage_plan,
         genome_twins,
         deep_module_findings,
+        doc_drift_findings,
     })
 }
 
@@ -243,6 +248,17 @@ pub fn render_audit(report: &AuditReport) -> String {
         }
         md.push('\n');
     }
+
+    if !report.doc_drift_findings.is_empty() {
+        md.push_str("## Documentation & Comment Drift (ReCite / DOCER)\n\n");
+        for df in report.doc_drift_findings.iter().take(20) {
+            md.push_str(&format!(
+                "- `{}` L{} [{}]: `{}` — {}\n",
+                df.file, df.line, df.kind, df.reference, df.message
+            ));
+        }
+        md.push('\n');
+    }
     md
 }
 
@@ -267,7 +283,11 @@ pub fn write_sustain(
             "2. Never introduce circular imports (`scc_count` baseline: `{}`).\n",
             "3. Consolidate shared capabilities instead of duplicating helpers.\n",
             "4. Never commit credentials, `*:*` IAM wildcards, or root Dockerfiles.\n",
-            "5. Run `refit scan . --fast` and `refit audit .` before opening a PR.\n"
+            "5. Run `refit scan . --fast` and `refit audit .` before opening a PR.\n\n",
+            "## Code-Precedence Guardrail\n",
+            "- When docs (`README.md`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, or comments) ",
+            "and code disagree, trust live code & tests first and update stale markdown immediately.\n",
+            "- Keep all backticked file paths and `ident()` symbol references verified against live code.\n"
         ),
         report.scc_count
     );

@@ -11,7 +11,9 @@ use crate::graph::{critical_depths, deps_context, units_interfere};
 use crate::hygiene::HygieneScorer;
 use crate::learn::LearnStore;
 use crate::mvcc::MvccStore;
-use crate::platform::{now_ms, os_tag, self_metrics, stream_http, walk_files};
+use crate::platform::{
+    Durability, InvertedRewindIndex, now_ms, os_tag, self_metrics, stream_http, walk_files,
+};
 use crate::proxy::{CacheMode, ProxyConfig, start_proxy};
 use crate::research::WebClient;
 use crate::source::{count_lines, ext_str, quantile, rel_norm, source_rel, supported_ext};
@@ -79,6 +81,7 @@ struct RunTotals {
 struct SchedState {
     pending: Vec<ModuleUnit>,
     completed: HashSet<String>,
+    rewound_once: HashSet<String>,
     in_flight: HashMap<String, ModuleUnit>,
     task_map: HashMap<tokio::task::Id, ModuleUnit>,
     join_set: JoinSet<WorkerOutcome>,
@@ -153,6 +156,8 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
     let (chat_url, chat_bearer, chat_model, via_oc) =
         chat_endpoint(&client, &opts, &client_tok).await;
 
+    let (rewind_index, file_to_unit) = build_rewind_index(&active_repo, &bundle, &gate_cfg);
+
     let ctx = Arc::new(WorkerCtx {
         run_id,
         repo_root: active_repo.clone(),
@@ -166,6 +171,8 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
         gate_cfg: gate_cfg.clone(),
         mvcc,
         learn,
+        rewind_index: Arc::new(rewind_index),
+        file_to_unit: Arc::new(file_to_unit),
         proxy: proxy_state,
         shared_state,
         research,
@@ -226,6 +233,7 @@ fn emit_start(
         "provider_label": opts.provider_label, "via_openclaw": via_oc,
         "resume": opts.resume, "rolled_back_on_resume": rolled_back,
         "stem_used": plan.stem_used, "stem_index_ms": plan.stem_index_ms,
+        "rewind_indexed_files": ctx.rewind_index.file_count(),
         "total_files": plan.total_files, "total_loc": plan.total_loc,
         "scc_count": plan.scc_count, "wave_count": plan.wave_count,
         "research_online": ctx.research.is_online(),
@@ -322,6 +330,7 @@ async fn run_sched(
     let mut s = SchedState {
         pending,
         completed,
+        rewound_once: HashSet::new(),
         in_flight: HashMap::new(),
         task_map: HashMap::new(),
         join_set: JoinSet::new(),
@@ -339,6 +348,7 @@ async fn run_sched(
         }
 
         drain_skipped(&ctx, &mut s);
+        apply_rewind_events(&ctx, all_units, &mut s);
         spawn_ready(&ctx, all_units, &mut s);
         if s.in_flight.is_empty() {
             mark_blocked(&ctx, &mut s);
@@ -358,6 +368,73 @@ async fn run_sched(
         }
     }
     s.tot
+}
+
+fn build_rewind_index(
+    repo_root: &Path,
+    bundle: &ScanCache,
+    gate_cfg: &GateConfig,
+) -> (InvertedRewindIndex, HashMap<String, String>) {
+    let total_files: usize = bundle.plan.units.iter().map(|u| u.files.len()).sum();
+    let mut index = InvertedRewindIndex::with_capacity(total_files);
+    let mut file_to_unit = HashMap::with_capacity(total_files);
+    let mut unit_files: HashMap<&str, &[String]> = HashMap::with_capacity(bundle.plan.units.len());
+
+    for unit in &bundle.plan.units {
+        unit_files.insert(unit.id.as_str(), unit.files.as_slice());
+        let has_diags = unit
+            .files
+            .iter()
+            .any(|rel| bundle.audit.per_file_diagnostics.get(rel).is_some_and(|v| !v.is_empty()));
+        let durability = if !has_diags && unit.baseline_hygiene >= gate_cfg.min_hygiene_target {
+            Durability::High
+        } else {
+            Durability::Low
+        };
+        for rel in &unit.files {
+            file_to_unit.insert(rel.clone(), unit.id.clone());
+            if let Ok(bytes) = fs::read(repo_root.join(rel)) {
+                index.index_file_bytes(rel, &bytes, durability);
+            } else {
+                index.register_file(rel, durability);
+            }
+        }
+    }
+
+    for unit in &bundle.plan.units {
+        let Some(src_file) = unit.files.first() else { continue };
+        for dep_id in &unit.deps {
+            if let Some(dep_files) = unit_files.get(dep_id.as_str()) {
+                for dep_file in *dep_files {
+                    index.add_dep_by_path(src_file, dep_file);
+                }
+            }
+        }
+    }
+    (index, file_to_unit)
+}
+
+fn apply_rewind_events(ctx: &WorkerCtx, all_units: &[ModuleUnit], s: &mut SchedState) {
+    let events = ctx.shared_state.drain_rewind_events();
+    if events.is_empty() {
+        return;
+    }
+    for (_, flagged_units) in events {
+        for uid in flagged_units {
+            if s.rewound_once.contains(&uid)
+                || ctx.shared_state.is_skipped(&uid)
+                || s.in_flight.contains_key(&uid)
+                || s.pending.iter().any(|u| u.id == uid)
+            {
+                continue;
+            }
+            if let Some(unit) = all_units.iter().find(|u| u.id == uid) {
+                s.completed.remove(&uid);
+                s.rewound_once.insert(uid);
+                s.pending.push(unit.clone());
+            }
+        }
+    }
 }
 
 fn drain_skipped(ctx: &WorkerCtx, s: &mut SchedState) {
@@ -608,6 +685,7 @@ fn build_summary(ctx: &WorkerCtx, mut inp: SummaryInput<'_>) -> RunSummary {
         "via_openclaw": inp.via_oc, "learn_rules": rules, "learn_helpful": helpful,
         "tracked_units": digest.tracked_units,
         "blocked_units": ctx.shared_state.blocked_count(),
+        "rewind_triggers": ctx.shared_state.rewind_count(),
         "telemetry_dedup_skipped": ctx.telemetry.dedup_skipped(),
         "worktree": wt_meta
     });
