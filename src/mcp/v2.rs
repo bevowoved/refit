@@ -331,8 +331,13 @@ impl McpV2State {
 pub fn is_v2_request(req: &Value) -> bool {
     let top_v = req.get("_meta").and_then(|m| m.get("protocolVersion")).and_then(Value::as_str);
     let par_v = req.get("params").and_then(|p| p.get("_meta")).and_then(|m| m.get("protocolVersion")).and_then(Value::as_str);
+    let init_v = req.get("params").and_then(|p| p.get("protocolVersion")).and_then(Value::as_str);
     let method = req["method"].as_str().unwrap_or("");
-    top_v == Some(PROTOCOL_V2) || par_v == Some(PROTOCOL_V2) || method == "server/discover" || method.starts_with("tasks/")
+    top_v == Some(PROTOCOL_V2)
+        || par_v == Some(PROTOCOL_V2)
+        || init_v == Some(PROTOCOL_V2)
+        || method == "server/discover"
+        || method.starts_with("tasks/")
 }
 
 pub fn batch_rejection_error() -> Value {
@@ -386,7 +391,15 @@ pub fn validate_sep2243_headers(headers: &HeaderMap, body: &Value) -> std::resul
         let actual = [args_obj, params_obj]
             .into_iter()
             .flatten()
-            .find_map(|m| m.iter().find(|(k, _)| k.as_str() == suffix || k.to_snake_case() == snake).map(|(_, v)| v))
+            .find_map(|m| {
+                m.iter()
+                    .find(|(k, _)| {
+                        k.as_str() == suffix
+                            || k.to_snake_case() == snake
+                            || eq_param_key(k.as_str(), suffix)
+                    })
+                    .map(|(_, v)| v)
+            })
             .ok_or_else(|| format!("header `{lower}` has no matching body parameter"))?;
         let actual_str = match actual {
             Value::String(t) => t.clone(),
@@ -399,6 +412,12 @@ pub fn validate_sep2243_headers(headers: &HeaderMap, body: &Value) -> std::resul
         }
     }
     Ok(())
+}
+
+fn eq_param_key(a: &str, b: &str) -> bool {
+    let ia = a.bytes().filter(|&c| c != b'_' && c != b'-').map(|c| c.to_ascii_lowercase());
+    let ib = b.bytes().filter(|&c| c != b'_' && c != b'-').map(|c| c.to_ascii_lowercase());
+    ia.eq(ib)
 }
 
 fn estimate_tool_bytes(name: &str) -> usize {
@@ -527,11 +546,12 @@ fn snapshot_epoch_sync(tool: &str, args: &Value) -> (u64, u64) {
 }
 
 async fn run_complete_tool_call(state: &Arc<McpV2State>, id: Option<Value>, name: String, args: Value) -> (StatusCode, Option<Value>) {
-    let (epoch, slot_epoch) = snapshot_epoch_sync(&name, &args);
     let gate = MemGate::global();
     let Ok(mem_permit) = gate.try_admit(estimate_tool_bytes(&name).min(gate.capacity())) else {
         return (StatusCode::SERVICE_UNAVAILABLE, Some(rpc_err(id.unwrap_or(Value::Null), ERR_OVERLOADED, "server busy: MemGate admission limit reached")));
     };
+    let tool_for_ep = name.clone();
+    let args_for_ep = args.clone();
     let payload = if name == "refit_search" {
         let res = state.backend.dispatch_search(
             args["language"].as_str().unwrap_or("Rust").to_string(),
@@ -553,6 +573,7 @@ async fn run_complete_tool_call(state: &Arc<McpV2State>, id: Option<Value>, name
             .await
             .unwrap_or_else(|e| json!({"error": format!("mcp worker join error: {e}")}))
     };
+    let (epoch, slot_epoch) = snapshot_epoch_sync(&tool_for_ep, &args_for_ep);
     (StatusCode::OK, Some(wrap_complete_result(id, &payload, epoch, slot_epoch)))
 }
 
@@ -782,10 +803,12 @@ mod tests {
         let list_resp: Value = client.post(&url).header("Mcp-Method", "tools/list").json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).send().await.unwrap().json().await.unwrap();
         assert_eq!((&list_resp["result"]["_meta"]["ttlMs"], &list_resp["result"]["_meta"]["cacheScope"]), (&json!(3_600_000), &json!("server")));
 
+        assert!(is_v2_request(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2026-07-28"}})));
         let call_req = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "refit_read", "arguments": {"path": "src/demo.rs", "start_line": 1, "end_line": 3}}});
         let call_val: Value = client.post(&url)
             .header("Mcp-Method", "tools/call").header("Mcp-Name", "refit_read")
             .header("Mcp-Param-Path", "src/demo.rs").header("Mcp-Param-Start-Line", "1")
+            .header("Mcp-Param-EndLine", "3")
             .json(&call_req).send().await.unwrap().json().await.unwrap();
         assert_eq!(call_val["result"]["resultType"], json!("complete"));
         assert!(call_val["result"]["content"][0]["text"].as_str().unwrap().contains("pub fn demo"));

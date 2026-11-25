@@ -231,6 +231,10 @@ impl SstIndex {
                 end += 1;
             }
             let block = encode_front_coded_block(&entries[idx..end]);
+            if block.len() > MAX_DECOMP_BLOCK_BYTES {
+                tracing::warn!(block_len = block.len(), "SST block exceeds MAX_DECOMP_BLOCK_BYTES; skipping SST write");
+                return Ok(false);
+            }
             let comp = zstd::bulk::compress(&block, 1)?;
             let (offset, comp_len, raw_len) = (raw.len() as u64, u32::try_from(comp.len())?, u32::try_from(block.len())?);
             let tag = blake3_tag(&[&offset.to_le_bytes(), &comp_len.to_le_bytes(), &raw_len.to_le_bytes(), &comp]);
@@ -280,7 +284,11 @@ impl SstIndex {
         if index_offset < SST_HEADER_LEN as u64 || index_offset > file_len {
             return None;
         }
-        let mut footer = vec![0u8; usize::try_from(file_len - index_offset).ok()?];
+        let footer_len = file_len.saturating_sub(index_offset);
+        if footer_len > MAX_DECOMP_BLOCK_BYTES as u64 {
+            return None;
+        }
+        let mut footer = vec![0u8; usize::try_from(footer_len).ok()?];
         file.seek(SeekFrom::Start(index_offset)).ok()?;
         file.read_exact(&mut footer).ok()?;
         if blake3_tag(&[&hdr[0..26], &footer]) != expected_tag {

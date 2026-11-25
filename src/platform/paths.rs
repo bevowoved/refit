@@ -351,7 +351,10 @@ fn strip_root_str<'a>(path_norm: &'a str, root_norm: &str) -> Option<&'a str> {
     let win_drive = root_norm.len() >= 2
         && root_norm.as_bytes()[0].is_ascii_alphabetic()
         && root_norm.as_bytes()[1] == b':';
-    if (cfg!(windows) || win_drive) && path_norm.len() > root_norm.len() {
+    if (cfg!(windows) || win_drive)
+        && path_norm.len() > root_norm.len()
+        && path_norm.is_char_boundary(root_norm.len())
+    {
         let (head, tail) = path_norm.split_at(root_norm.len());
         if head.eq_ignore_ascii_case(root_norm)
             && let Some(rel) = tail.strip_prefix('/')
@@ -494,6 +497,8 @@ mod tests {
 
         assert_eq!(rel_to_root(Path::new(r"D:\cerebras\refit"), Path::new(r"\\?\d:\cerebras\refit\src\app.py")).as_deref(), Some("src/app.py"));
         assert_eq!(rel_to_root(Path::new("/mnt/d/cerebras/refit"), Path::new(r"D:\cerebras\refit\src\mod.py")).as_deref(), Some("src/mod.py"));
+        // Sibling path with multi-byte UTF-8 char straddling root_norm.len() must not panic.
+        assert_eq!(rel_to_root(Path::new(r"D:\repo\ab"), Path::new("D:\\repo\\a\u{00E9}\\x.rs")), None);
         assert_eq!((strip_utf8_bom("\u{FEFF}hello"), trim_crlf("line\r\n")), ("hello", "line"));
         assert!(pwsh_utf8_preamble().contains("UTF8Encoding"));
     }

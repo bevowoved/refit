@@ -174,7 +174,7 @@ fn parse_proc_kb_field(raw: &str, prefix: &str) -> Option<u64> {
     raw.lines()
         .find_map(|line| line.strip_prefix(prefix))
         .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
-        .map(|kb| kb * 1024)
+        .map(|kb| kb.saturating_mul(1024))
 }
 
 fn detect_budget() -> ResourceBudget {
@@ -405,6 +405,9 @@ impl MemGate {
     }
 
     pub fn try_admit(&self, bytes: usize) -> Result<MemPermit<'_>, GateErr> {
+        if bytes > self.capacity {
+            return Err(GateErr::TooBig { requested: bytes, capacity: self.capacity });
+        }
         if under_memory_pressure() {
             return Err(GateErr::Busy);
         }

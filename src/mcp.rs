@@ -28,9 +28,12 @@ use tx::{
     tx_delete, tx_move, tx_stage, verify_commit,
 };
 
+const EPOCH_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
 struct EpochMemo<T> {
     epoch: u64,
     stat_sig: u64,
+    stored_at: std::time::Instant,
     value: T,
 }
 
@@ -38,6 +41,7 @@ fn quick_repo_stat_sig(repo_root: &Path) -> u64 {
     let mut h = FxHasher::default();
     for p in [
         repo_root.to_path_buf(),
+        repo_root.join(".git/HEAD"),
         repo_root.join(".git/index"),
         repo_root.join(".refit/wal.jsonl"),
     ] {
@@ -318,6 +322,7 @@ fn run_scan(ctx: &McpCtx, args: &Value) -> Value {
         && cached_fast == fast
         && memo.epoch == ep
         && memo.stat_sig == sig
+        && memo.stored_at.elapsed() < EPOCH_MEMO_TTL
     {
         let mut v = memo.value.clone();
         if let Some(obj) = v.as_object_mut() {
@@ -331,18 +336,27 @@ fn run_scan(ctx: &McpCtx, args: &Value) -> Value {
     match scan_cached(&ctx.repo_root, true, fast, &ctx.hygiene) {
         Ok((bundle, hit)) => {
             let ep_after = ctx.epoch.global_epoch();
-            let sig_after = quick_repo_stat_sig(&ctx.repo_root);
             let mut v = serde_json::to_value(&bundle.plan).unwrap_or_else(|_| json!({"ok": true}));
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("scan_cache_hit".into(), json!(hit));
                 obj.insert("epoch_cache_hit".into(), json!(false));
-                obj.insert("epoch".into(), json!(ep_after));
+                obj.insert("epoch".into(), json!(ep));
                 obj.insert("fast_mode".into(), json!(fast));
                 obj.insert("detected_languages".into(), json!(bundle.detected_languages));
                 obj.insert("polyglot_toolchains".into(), json!(bundle.polyglot_toolchains));
             }
-            *ctx.scan_memo.lock() =
-                Some((fast, EpochMemo { epoch: ep_after, stat_sig: sig_after, value: v.clone() }));
+            if ep_after == ep {
+                let sig_after = quick_repo_stat_sig(&ctx.repo_root);
+                *ctx.scan_memo.lock() = Some((
+                    fast,
+                    EpochMemo {
+                        epoch: ep,
+                        stat_sig: sig_after,
+                        stored_at: std::time::Instant::now(),
+                        value: v.clone(),
+                    },
+                ));
+            }
             v
         }
         Err(e) => json!({"error": e.to_string()}),
@@ -359,7 +373,7 @@ fn run_symbols(ctx: &McpCtx, args: &Value) -> Value {
         .symbols_memo
         .lock()
         .as_ref()
-        .filter(|m| m.epoch == ep && m.stat_sig == sig)
+        .filter(|m| m.epoch == ep && m.stat_sig == sig && m.stored_at.elapsed() < EPOCH_MEMO_TTL)
         .map(|m| m.value.clone());
     if let Some(snap) = cached_snap {
         let mut v = query_symbol_graph(&snap, sym, file);
@@ -370,22 +384,27 @@ fn run_symbols(ctx: &McpCtx, args: &Value) -> Value {
         return v;
     }
 
-    let (mut v, ep_after) = if sym.is_none()
+    let mut v = if sym.is_none()
         && file.is_some()
         && ctx.repo_root.join(".refit/cache/sym.sst").is_file()
     {
-        (query_symbols(&ctx.repo_root, None, file), ep)
+        query_symbols(&ctx.repo_root, None, file)
     } else {
         let snap = Arc::new(load_symbols(&ctx.repo_root, None));
-        let ep_now = ctx.epoch.global_epoch();
-        let sig_now = quick_repo_stat_sig(&ctx.repo_root);
-        *ctx.symbols_memo.lock() =
-            Some(EpochMemo { epoch: ep_now, stat_sig: sig_now, value: snap.clone() });
-        (query_symbol_graph(&snap, sym, file), ep_now)
+        if ctx.epoch.global_epoch() == ep {
+            let sig_now = quick_repo_stat_sig(&ctx.repo_root);
+            *ctx.symbols_memo.lock() = Some(EpochMemo {
+                epoch: ep,
+                stat_sig: sig_now,
+                stored_at: std::time::Instant::now(),
+                value: snap.clone(),
+            });
+        }
+        query_symbol_graph(&snap, sym, file)
     };
     if let Some(obj) = v.as_object_mut() {
         obj.insert("epoch_cache_hit".into(), json!(false));
-        obj.insert("epoch".into(), json!(ep_after));
+        obj.insert("epoch".into(), json!(ep));
     }
     v
 }
@@ -399,17 +418,22 @@ fn run_rewind(ctx: &McpCtx, args: &Value) -> Value {
         .symbols_memo
         .lock()
         .as_ref()
-        .filter(|m| m.epoch == ep && m.stat_sig == sig)
+        .filter(|m| m.epoch == ep && m.stat_sig == sig && m.stored_at.elapsed() < EPOCH_MEMO_TTL)
         .map(|m| m.value.clone());
-    let (snap, hit, ep_out) = match cached {
-        Some(g) => (g, true, ep),
+    let (snap, hit) = match cached {
+        Some(g) => (g, true),
         None => {
             let g = Arc::new(load_symbols(&ctx.repo_root, None));
-            let ep_now = ctx.epoch.global_epoch();
-            let sig_now = quick_repo_stat_sig(&ctx.repo_root);
-            *ctx.symbols_memo.lock() =
-                Some(EpochMemo { epoch: ep_now, stat_sig: sig_now, value: g.clone() });
-            (g, false, ep_now)
+            if ctx.epoch.global_epoch() == ep {
+                let sig_now = quick_repo_stat_sig(&ctx.repo_root);
+                *ctx.symbols_memo.lock() = Some(EpochMemo {
+                    epoch: ep,
+                    stat_sig: sig_now,
+                    stored_at: std::time::Instant::now(),
+                    value: g.clone(),
+                });
+            }
+            (g, false)
         }
     };
     let mut val = ok_json(crate::learn::query_learn_and_rewind_with_graph(
@@ -420,7 +444,7 @@ fn run_rewind(ctx: &McpCtx, args: &Value) -> Value {
     ));
     if let Some(obj) = val.as_object_mut() {
         obj.insert("epoch_cache_hit".into(), json!(hit));
-        obj.insert("epoch".into(), json!(ep_out));
+        obj.insert("epoch".into(), json!(ep));
     }
     val
 }
@@ -489,11 +513,11 @@ fn run_read(ctx: &McpCtx, args: &Value) -> Value {
     if !check_target(repo_root, rel) {
         return json!({"error": format!("unsafe path `{rel}`")});
     }
+    let epoch = ctx.epoch.global_epoch();
+    let file_epoch = ctx.epoch.slot_epoch(rel);
     let Ok(file) = fs::File::open(repo_root.join(rel)) else {
         return json!({"error": format!("file not found `{rel}`")});
     };
-    let epoch = ctx.epoch.global_epoch();
-    let file_epoch = ctx.epoch.slot_epoch(rel);
 
     let start = args["start_line"].as_u64().unwrap_or(1).max(1) as usize;
     let req_end = args["end_line"]
@@ -614,7 +638,11 @@ mod tests {
         fn new(tag: &str, files: &[(&str, &str)]) -> Self {
             let repo = TempRepo::nested_with(tag, "repo", files);
             let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
-            let ctx = build_mcp_ctx(repo.path().to_path_buf(), tx);
+            let ctx = build_mcp_ctx_with_epoch(
+                repo.path().to_path_buf(),
+                tx,
+                Arc::new(EpochRegistry::new()),
+            );
             Self { repo, ctx }
         }
 

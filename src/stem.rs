@@ -640,9 +640,13 @@ fn build_tables(
 }
 
 pub(crate) fn should_use_sst(file_count: usize, est_json_bytes: u64) -> bool {
-    (cfg!(feature = "sst-storage")
-        && (file_count >= sst::SST_MIN_FILES || est_json_bytes >= sst::SST_MIN_INDEX_BYTES))
-        || std::env::var_os("REFIT_FORCE_SST").is_some()
+    let forced = std::env::var("REFIT_FORCE_SST").ok().is_some_and(|v| {
+        let t = v.trim();
+        !t.is_empty() && !matches!(t.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    });
+    forced
+        || (cfg!(feature = "sst-storage")
+            && (file_count >= sst::SST_MIN_FILES || est_json_bytes >= sst::SST_MIN_INDEX_BYTES))
 }
 
 fn estimate_symbol_json_bytes(files: &BTreeMap<String, FileSymbols>) -> u64 {
@@ -757,7 +761,11 @@ fn discover_internal(
     }
 
     let (edges, runtime_edges, glob_reexport_targets) = collect_edges(&new_files, &tables);
-    if parsed_n > 0 || prev.files.len() != new_files.len() {
+    let want_sst = should_use_sst(new_files.len(), estimate_symbol_json_bytes(&new_files));
+    let cache_exists = repo_root.join(".refit/cache/symbol_index.zst").is_file();
+    let sst_exists = repo_root.join(".refit/cache/sym.sst").is_file();
+    let format_mismatch = if want_sst { !sst_exists || cache_exists } else { !cache_exists || sst_exists };
+    if parsed_n > 0 || prev.files.len() != new_files.len() || format_mismatch {
         persist_symbol_caches(repo_root, &new_files, &edges, &runtime_edges, prev.files.len());
     }
     let snap = build_graph(

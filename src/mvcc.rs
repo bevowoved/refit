@@ -166,11 +166,13 @@ impl MvccStore {
         *self.wal_cursor.lock() = (stats.valid_pos as u64, stats.next_seq.max(1));
 
         let mut rolled_back_txs = 0usize;
+        let mut recovered_paths = Vec::new();
         for (tx_id, module_id, files) in prepared {
             if closed.contains(&tx_id) {
                 continue;
             }
             restore_prepared(self, &files)?;
+            recovered_paths.extend(files.into_iter().map(|f| f.path));
             self.append_wal(&WalRecord::Rollback {
                 tx_id,
                 module_id,
@@ -181,6 +183,9 @@ impl MvccStore {
             rolled_back_txs += 1;
         }
 
+        if rolled_back_txs > 0 {
+            self.epoch.publish_batch("wal_recovery", &recovered_paths, max_rev);
+        }
         *head_rev = max_rev;
         Ok(WalRecovery { rolled_back_txs, committed_modules, head_rev: max_rev })
     }

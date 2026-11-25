@@ -632,20 +632,26 @@ struct SieveState<K, V> {
 }
 
 impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
-    fn evict_one(&mut self) -> bool {
+    fn evict_one_except(&mut self, protected: Option<&K>) -> bool {
         let len = self.map.len();
-        if len == 0 {
+        if len == 0 || (len == 1 && protected.is_some()) {
             return false;
         }
         let mut idx = self.hand % len;
-        loop {
+        let max_steps = len.saturating_mul(2).saturating_add(2);
+        for _ in 0..max_steps {
+            let is_protected = self.map.get_index(idx).is_some_and(|(k, _)| protected == Some(k));
+            if is_protected {
+                idx = (idx + 1) % len;
+                continue;
+            }
             let visited = self.map.get_index_mut(idx).is_some_and(|(_, (_, _, v))| {
                 let was = *v;
                 *v = false;
                 was
             });
             if !visited {
-                if let Some((_, (_, w, _))) = self.map.swap_remove_index(idx) {
+                if let Some((_, (_, w, _))) = self.map.shift_remove_index(idx) {
                     self.total_weight = self.total_weight.saturating_sub(w);
                 }
                 self.hand = if self.map.is_empty() { 0 } else { idx % self.map.len() };
@@ -653,21 +659,41 @@ impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
             }
             idx = (idx + 1) % len;
         }
+        false
     }
 
     fn insert(&mut self, key: K, val: V, weight: usize) -> Option<V> {
         let w = weight.max(1);
+        if w > self.max_bytes {
+            if let Some((_, (prev, old_w, _))) = self.map.shift_remove_full(&key).map(|(i, k, v)| {
+                if i < self.hand {
+                    self.hand = self.hand.saturating_sub(1);
+                } else if !self.map.is_empty() {
+                    self.hand %= self.map.len();
+                } else {
+                    self.hand = 0;
+                }
+                (k, v)
+            }) {
+                self.total_weight = self.total_weight.saturating_sub(old_w);
+                return Some(prev);
+            }
+            return None;
+        }
         if let Some((slot_val, slot_w, visited)) = self.map.get_mut(&key) {
             self.total_weight = self.total_weight.saturating_sub(*slot_w).saturating_add(w);
             *slot_w = w;
             *visited = true;
             let prev = std::mem::replace(slot_val, val);
-            while self.total_weight > self.max_bytes && self.map.len() > 1 && self.evict_one() {}
+            while self.total_weight > self.max_bytes
+                && self.map.len() > 1
+                && self.evict_one_except(Some(&key))
+            {}
             return Some(prev);
         }
         while (self.map.len() >= self.max_entries
             || (self.total_weight.saturating_add(w) > self.max_bytes && !self.map.is_empty()))
-            && self.evict_one()
+            && self.evict_one_except(None)
         {}
         self.map.insert(key, (val, w, false));
         self.total_weight = self.total_weight.saturating_add(w);
@@ -994,7 +1020,14 @@ mod tests {
         tiny.insert(2, 20, 100);
         tiny.insert(3, 30, 100);
         assert!(tiny.len() <= 2);
-        assert_eq!(tiny.remove(&3), Some(30));
+        // Oversized entry (> max_bytes) must not wipe the existing cache.
+        assert_eq!(tiny.insert(99, 999, 500), None);
+        assert_eq!(tiny.get(&99), None);
+        assert_eq!(tiny.get(&3), Some(30));
+        // Weight-increasing update on an existing visited key must never self-evict.
+        assert_eq!(tiny.insert(3, 33, 200), Some(30));
+        assert_eq!(tiny.get(&3), Some(33));
+        assert_eq!(tiny.remove(&3), Some(33));
     }
 
     #[test]
