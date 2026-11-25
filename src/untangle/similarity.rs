@@ -72,7 +72,13 @@ fn is_ignored_line_prefix(t: &[u8]) -> bool {
     if prefixes.iter().any(|p| t.starts_with(p)) {
         return true;
     }
-    t.starts_with(b"pub ") && t.ends_with(b",") && !t.contains(&b'=') && !t.contains(&b'(')
+    let field_rest = t
+        .strip_prefix(b"pub(crate) ")
+        .or_else(|| t.strip_prefix(b"pub(super) "))
+        .or_else(|| t.strip_prefix(b"pub "));
+    field_rest.is_some_and(|r| {
+        r.ends_with(b",") && r.contains(&b':') && !r.contains(&b'=') && !r.contains(&b'(')
+    })
 }
 
 fn shannon_entropy(bytes: &[u8], lut: &[f32; 256]) -> f32 {
