@@ -4,6 +4,7 @@
 use crate::types::{SandboxResult, SelfMetrics};
 use anyhow::{Context, Result};
 use parking_lot::{Condvar, Mutex};
+use rayon::prelude::*;
 use std::fmt;
 use std::io::Read;
 use std::path::Path;
@@ -147,13 +148,53 @@ fn detect_budget() -> ResourceBudget {
     let (os_cpus, os_mem): (Option<usize>, Option<u64>) = (None, None);
     if let Some(c) = os_cpus { vcpus = vcpus.min(c.max(1)); }
     if let Some(m) = os_mem { mem_bytes = mem_bytes.min(m); }
-    if let Ok(raw) = std::env::var("REFIT_BUDGET_MB") && let Ok(mb) = raw.trim().parse::<u64>() && mb >= 64 {
+    if let Some(mb) = crate::platform::env_parse::<u64>("REFIT_BUDGET_MB").filter(|&m| m >= 64) {
         mem_bytes = mem_bytes.min(mb * MIB);
     }
-    if let Ok(raw) = std::env::var("REFIT_MAX_CPUS") && let Ok(c) = raw.trim().parse::<usize>() && c >= 1 {
+    if let Some(c) = crate::platform::env_parse::<usize>("REFIT_MAX_CPUS").filter(|&c| c >= 1) {
         vcpus = vcpus.min(c);
     }
     ResourceBudget::from_limits(vcpus, mem_bytes)
+}
+
+/// Map `items` serially when constrained (`1-vCPU` / low-RAM), else in parallel via Rayon.
+pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
+    if budget().is_constrained() {
+        items.iter().map(f).collect()
+    } else {
+        items.par_iter().map(f).collect()
+    }
+}
+
+/// Execute two closures serially when constrained, else concurrently on scoped OS threads.
+pub fn par_join2<A: Send, B: Send>(fa: impl FnOnce() -> A + Send, fb: impl FnOnce() -> B + Send) -> (A, B) {
+    if budget().is_constrained() {
+        (fa(), fb())
+    } else {
+        std::thread::scope(|s| {
+            let hb = s.spawn(fb);
+            let a = fa();
+            (a, hb.join().expect("par_join2"))
+        })
+    }
+}
+
+/// Execute three closures serially when constrained, else concurrently on scoped OS threads.
+pub fn par_join3<A: Send, B: Send, C: Send>(
+    fa: impl FnOnce() -> A + Send,
+    fb: impl FnOnce() -> B + Send,
+    fc: impl FnOnce() -> C + Send,
+) -> (A, B, C) {
+    if budget().is_constrained() {
+        (fa(), fb(), fc())
+    } else {
+        std::thread::scope(|s| {
+            let hb = s.spawn(fb);
+            let hc = s.spawn(fc);
+            let a = fa();
+            (a, hb.join().expect("par_join3 b"), hc.join().expect("par_join3 c"))
+        })
+    }
 }
 
 fn host_memory_bytes() -> Option<u64> {
@@ -180,28 +221,38 @@ fn host_memory_bytes() -> Option<u64> {
 }
 
 #[cfg(windows)]
-fn detect_windows_job_limits(host_cpus: usize) -> (Option<usize>, Option<u64>) {
+// SAFETY: Caller guarantees `T` is the exact Win32 POD struct matching `class` for `job`.
+unsafe fn query_job_info<T>(
+    job: windows_sys::Win32::Foundation::HANDLE,
+    class: windows_sys::Win32::System::JobObjects::JOBOBJECTINFOCLASS,
+) -> Option<T> {
     use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
+    // SAFETY: Caller guarantees `T` is POD matching `class`.
+    unsafe {
+        let mut info: T = zeroed();
+        let ok = QueryInformationJobObject(
+            job, class, (&mut info as *mut T).cast(), size_of::<T>() as u32, std::ptr::null_mut(),
+        );
+        (ok != 0).then_some(info)
+    }
+}
+
+#[cfg(windows)]
+fn detect_windows_job_limits(host_cpus: usize) -> (Option<usize>, Option<u64>) {
     use windows_sys::Win32::System::JobObjects::{
         JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
         JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
-        QueryInformationJobObject,
     };
 
     let (mut cpu_limit, mut mem_limit) = (None, None);
-    // SAFETY: Null job handle queries the current process's active job object into zeroed POD structs.
+    // SAFETY: Null job handle queries the current process's active job object into matching POD structs.
     unsafe {
-        let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-        if QueryInformationJobObject(
-            std::ptr::null_mut(),
-            JobObjectExtendedLimitInformation,
-            (&mut ext as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            std::ptr::null_mut(),
-        ) != 0
-        {
+        if let Some(ext) = query_job_info::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(
+            std::ptr::null_mut(), JobObjectExtendedLimitInformation,
+        ) {
             let flags = ext.BasicLimitInformation.LimitFlags;
             if (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) != 0 && ext.ProcessMemoryLimit > 0 {
                 mem_limit = Some(ext.ProcessMemoryLimit as u64);
@@ -211,19 +262,14 @@ fn detect_windows_job_limits(host_cpus: usize) -> (Option<usize>, Option<u64>) {
                 mem_limit = Some(mem_limit.map_or(j, |p| p.min(j)));
             }
         }
-        let mut rate: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = zeroed();
         let mask = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-        if QueryInformationJobObject(
-            std::ptr::null_mut(),
-            JobObjectCpuRateControlInformation,
-            (&mut rate as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
-            size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-            std::ptr::null_mut(),
-        ) != 0
-            && (rate.ControlFlags & mask) == mask
+        if let Some(rate) = query_job_info::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>(
+            std::ptr::null_mut(), JobObjectCpuRateControlInformation,
+        ) && (rate.ControlFlags & mask) == mask
             && rate.Anonymous.CpuRate > 0
         {
-            cpu_limit = Some(((host_cpus as u64 * rate.Anonymous.CpuRate as u64).div_ceil(10_000)).max(1) as usize);
+            let cap = (host_cpus as u64 * rate.Anonymous.CpuRate as u64).div_ceil(10_000).max(1);
+            cpu_limit = Some(cap as usize);
         }
     }
     (cpu_limit, mem_limit)
@@ -542,27 +588,22 @@ fn attach_job(child: &Child) -> Option<windows_sys::Win32::Foundation::HANDLE> {
 
 #[cfg(windows)]
 fn close_job(job_handle: Option<windows_sys::Win32::Foundation::HANDLE>) -> (u64, u64) {
-    use std::mem::{size_of, zeroed};
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     };
     let Some(job) = job_handle else { return (0, 0) };
-    // SAFETY: `job` is an owned Job Object handle queried with exact POD buffer sizes and closed.
+    // SAFETY: `job` is an owned Job Object handle queried with matching POD structs and closed.
     unsafe {
-        let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
-        let cpu_ms = if QueryInformationJobObject(
+        let cpu_ms = query_job_info::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>(
             job, JobObjectBasicAccountingInformation,
-            (&mut acct as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32, std::ptr::null_mut(),
-        ) != 0 { ((acct.TotalUserTime + acct.TotalKernelTime).max(0) as u64) / 10_000 } else { 0 };
-        let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-        let peak_rss = if QueryInformationJobObject(
+        )
+        .map_or(0, |a| ((a.TotalUserTime + a.TotalKernelTime).max(0) as u64) / 10_000);
+        let peak_rss = query_job_info::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(
             job, JobObjectExtendedLimitInformation,
-            (&mut ext as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32, std::ptr::null_mut(),
-        ) != 0 { ext.PeakJobMemoryUsed as u64 } else { 0 };
+        )
+        .map_or(0, |e| e.PeakJobMemoryUsed as u64);
         CloseHandle(job);
         (cpu_ms, peak_rss)
     }

@@ -274,6 +274,33 @@ impl Drop for MockHttp {
     fn drop(&mut self) { self.handle.abort(); }
 }
 
+/// Ephemeral local Axum HTTP server for integration tests (auto-aborts on drop).
+pub struct TestAxum {
+    pub base_url: String,
+    handle: JoinHandle<()>,
+}
+
+impl TestAxum {
+    pub async fn spawn(app: axum::Router) -> Self {
+        let listener = bind_ephemeral().await;
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self { base_url, handle }
+    }
+}
+
+impl Drop for TestAxum {
+    fn drop(&mut self) { self.handle.abort(); }
+}
+
+pub fn assert_contains_all(haystack: &str, needles: &[&str]) {
+    for &needle in needles {
+        assert!(haystack.contains(needle), "missing expected `{needle}` in:\n{haystack}");
+    }
+}
+
 pub async fn mock_sse(chunks: Vec<Vec<u8>>, delay_ms: u64, hold_secs: u64) -> String {
     let listener = bind_ephemeral().await;
     let addr = listener.local_addr().unwrap().to_string();

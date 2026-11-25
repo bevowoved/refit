@@ -198,16 +198,10 @@ pub fn scan_cached(
         Ok::<AuditStats, anyhow::Error>(fresh)
     };
     // Pre-warm hygiene once before `build_dag` so `dag_from` hits warm cache with zero contention.
-    let (plan_res, audit_res) = if budget().is_constrained() {
-        let audit_res = run_audit();
-        (build_dag(repo_root, None, scorer, preloaded), audit_res)
-    } else {
-        std::thread::scope(|s| {
-            let h_plan = s.spawn(|| build_dag(repo_root, None, scorer, preloaded));
-            let h_audit = s.spawn(run_audit);
-            (h_plan.join().expect("dag"), h_audit.join().expect("audit"))
-        })
-    };
+    let (audit_res, plan_res) = crate::platform::par_join2(
+        run_audit,
+        || build_dag(repo_root, None, scorer, preloaded),
+    );
     drop(preloaded_owned);
     scorer.flush_cache();
     collect_os_memory();
@@ -258,7 +252,7 @@ pub fn read_gates(repo_root: &Path) -> GateConfig {
     let user_local = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
         .map(|h| PathBuf::from(h).join(".local/bin")).unwrap_or_default();
     let mut venvs = vec![repo_root.join(".venv"), repo_root.join("venv")];
-    if let Ok(v) = std::env::var("VIRTUAL_ENV") && !v.trim().is_empty() { venvs.push(PathBuf::from(v)); }
+    if let Some(v) = crate::platform::env_trimmed("VIRTUAL_ENV") { venvs.push(PathBuf::from(v)); }
     if let Ok(exe) = std::env::current_exe() { venvs.extend(exe.ancestors().take(4).map(|a| a.join(".venv"))); }
     venvs.push(PathBuf::from(".venv"));
     let (py_rel, pt_rel) = if cfg!(windows) { ("Scripts/python.exe", "Scripts/pytest.exe") } else { ("bin/python", "bin/pytest") };
@@ -268,7 +262,7 @@ pub fn read_gates(repo_root: &Path) -> GateConfig {
         if py.exists() { python_bin = py.display().to_string(); }
         if pt.exists() { pytest_bin = pt.display().to_string(); break; }
     }
-    let strict = std::env::var("REFIT_STRICT_TOOLS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let strict = crate::platform::env_truthy("REFIT_STRICT_TOOLS");
     GateConfig {
         repo_root: repo_root.to_path_buf(), python_bin, pytest_bin,
         ruff_bin: resolve_tool("ruff", &user_local), ty_bin: resolve_tool("ty", &user_local),
@@ -298,24 +292,11 @@ pub fn audit_files(
     ensure_cache_dirs_tagged(&cfg.repo_root);
     let base_env = sandbox_env(&polyglot_cache_env(&cfg.repo_root));
 
-    let ((med, p10, per_h), py_audit, poly_diags) = if budget().is_constrained() {
-        let h = hygiene.score_files(&cfg.repo_root, rel_files, preloaded);
-        let py = (!py_files.is_empty()).then(|| audit_python(cfg, &py_files, &base_env, skip_tests));
-        let poly = audit_polyglot(cfg, rel_files, &base_env, skip_tests);
-        (h, py, poly)
-    } else {
-        std::thread::scope(|s| {
-            let h_hyg = s.spawn(|| hygiene.score_files(&cfg.repo_root, rel_files, preloaded));
-            let h_py = (!py_files.is_empty())
-                .then(|| s.spawn(|| audit_python(cfg, &py_files, &base_env, skip_tests)));
-            let h_poly = s.spawn(|| audit_polyglot(cfg, rel_files, &base_env, skip_tests));
-            (
-                h_hyg.join().expect("hygiene"),
-                h_py.map(|h| h.join().expect("python")),
-                h_poly.join().expect("polyglot"),
-            )
-        })
-    };
+    let ((med, p10, per_h), py_audit, poly_diags) = crate::platform::par_join3(
+        || hygiene.score_files(&cfg.repo_root, rel_files, preloaded),
+        || (!py_files.is_empty()).then(|| audit_python(cfg, &py_files, &base_env, skip_tests)),
+        || audit_polyglot(cfg, rel_files, &base_env, skip_tests),
+    );
 
     let mut stats = AuditStats { hygiene_median: med, hygiene_p10: p10, ..AuditStats::default() };
     for (file_k, msg) in poly_diags {

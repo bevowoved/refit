@@ -89,23 +89,28 @@ pub fn normalize_os_path(raw: &str, check_shell_safe: bool) -> Result<Normalized
             }
             continue;
         }
-        if seg.contains(':') {
-            return Err(PathReject::AlternateDataStream);
-        }
-        if seg.ends_with('.') || seg.ends_with(' ') {
-            return Err(PathReject::TrailingDotOrSpace);
-        }
-        if is_windows_reserved(seg) {
-            return Err(PathReject::ReservedDeviceName);
-        }
-        if is_protected_repo_dir(seg) {
-            return Err(PathReject::ProtectedDir);
-        }
+        validate_path_segment(seg)?;
         stack.push(seg);
     }
     let joined = stack.join("/");
     let normalized = if prefix.is_empty() { joined } else { format!("{prefix}{joined}") };
     Ok(NormalizedPath { normalized, wsl_9p_warning, nfd_normalized })
+}
+
+fn validate_path_segment(seg: &str) -> Result<(), PathReject> {
+    if seg.contains(':') {
+        return Err(PathReject::AlternateDataStream);
+    }
+    if seg.ends_with('.') || seg.ends_with(' ') {
+        return Err(PathReject::TrailingDotOrSpace);
+    }
+    if is_windows_reserved(seg) {
+        return Err(PathReject::ReservedDeviceName);
+    }
+    if is_protected_repo_dir(seg) {
+        return Err(PathReject::ProtectedDir);
+    }
+    Ok(())
 }
 
 fn format_drive_prefix(drive_byte: u8) -> String {
@@ -231,12 +236,7 @@ pub fn normalize_rel(rel: &str) -> Option<String> {
         if seg.is_empty() || seg == "." {
             continue;
         }
-        if seg == ".."
-            || seg.ends_with('.')
-            || seg.ends_with(' ')
-            || is_windows_reserved(seg)
-            || is_protected_repo_dir(seg)
-        {
+        if seg == ".." || validate_path_segment(seg).is_err() {
             return None;
         }
         stack.push(seg);

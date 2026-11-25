@@ -176,10 +176,8 @@ fn print_json<T: Serialize>(val: &T) -> Result<()> {
 }
 
 fn read_key(file_opt: Option<&PathBuf>) -> Result<String> {
-    if let Ok(env_k) = std::env::var("CEREBRAS_API_KEY")
-        && !env_k.trim().is_empty()
-    {
-        return Ok(env_k.trim().to_string());
+    if let Some(env_k) = platform::env_trimmed("CEREBRAS_API_KEY") {
+        return Ok(env_k);
     }
 
     if let Some(p) = file_opt {
@@ -194,7 +192,7 @@ fn read_key(file_opt: Option<&PathBuf>) -> Result<String> {
 
 fn run_opts(a: RunCliArgs, api_key: String, resume: bool) -> runner::RunOptions {
     let retention = proxy::CacheMode::parse_mode(a.cache_retention.as_deref());
-    let kw = a.keep_warm || std::env::var("REFIT_KEEP_WARM").is_ok_and(|v| v == "1" || v == "true");
+    let kw = a.keep_warm || platform::env_truthy("REFIT_KEEP_WARM");
     runner::RunOptions {
         repo_root: a.repo, api_key, upstream_base_url: a.upstream, openclaw_base_url: a.openclaw_url,
         openclaw_token: a.openclaw_token, openclaw_model: a.openclaw_model, model: a.model,

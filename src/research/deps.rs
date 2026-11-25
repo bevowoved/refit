@@ -636,7 +636,7 @@ pub fn evaluate_repo_deps_from(
 mod tests {
     use super::*;
     use crate::hygiene::HygieneScorer;
-    use crate::testutil::TempRepo;
+    use crate::testutil::{TempRepo, TestAxum, assert_contains_all};
     use crate::untangle::untangle_repo;
     use axum::Router;
     use axum::http::{HeaderMap, StatusCode};
@@ -645,7 +645,6 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::net::TcpListener;
 
     #[test]
     fn lockfile_extractors_and_rfc2789_paths() {
@@ -694,11 +693,8 @@ mod tests {
                 }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let srv = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let srv = TestAxum::spawn(app).await;
+        let base_url = &srv.base_url;
 
         let repo = TempRepo::with_files(
             "deps_etag_304",
@@ -710,30 +706,31 @@ mod tests {
         );
 
         let (cache_path, client) = (repo.join(".refit/cache/crates_index.zst"), reqwest::Client::new());
-        let rels1 = fetch_crates_io_releases(&client, &base_url, &cache_path, &["reqwest"]).await;
+        let rels1 = fetch_crates_io_releases(&client, base_url, &cache_path, &["reqwest"]).await;
         assert_eq!((hits.load(Ordering::Relaxed), hits_304.load(Ordering::Relaxed)), (1, 0));
 
         let (advisories, _) = evaluate_repo_deps(repo.path(), &rels1);
         let find = |n: &str| advisories.iter().find(|a| a.name == n).unwrap();
-        assert!(find("lazy_static").kind == "std_replacement" && find("lazy_static").recommendation.contains("std::sync::LazyLock"));
-        assert!(find("serde_yaml").kind == "rustsec_unmaintained" && find("serde_yaml").recommendation.contains("RUSTSEC-2024-0320"));
+        assert_eq!(find("lazy_static").kind, "std_replacement");
+        assert_contains_all(&find("lazy_static").recommendation, &["std::sync::LazyLock"]);
+        assert_eq!(find("serde_yaml").kind, "rustsec_unmaintained");
+        assert_contains_all(&find("serde_yaml").recommendation, &["RUSTSEC-2024-0320"]);
         let reqw = find("reqwest");
         assert_eq!(reqw.kind, "major_upgrade_hops");
         assert_eq!((&reqw.hops, reqw.breaking_hops), (&vec!["2.0.0".into(), "3.1.0".into()], 2));
 
         // Fresh TTL hit (0 HTTP calls), then stale cache -> If-None-Match 304 revalidation.
-        let _ = fetch_crates_io_releases(&client, &base_url, &cache_path, &["reqwest"]).await;
+        let _ = fetch_crates_io_releases(&client, base_url, &cache_path, &["reqwest"]).await;
         assert_eq!(hits.load(Ordering::Relaxed), 1);
         let mut stale: CratesIndexCache = read_zstd(&cache_path).unwrap();
         stale.entries.get_mut("reqwest").unwrap().fetched_ms = 1;
         write_zstd(&cache_path, &stale).unwrap();
-        let rels2 = fetch_crates_io_releases(&client, &base_url, &cache_path, &["reqwest"]).await;
+        let rels2 = fetch_crates_io_releases(&client, base_url, &cache_path, &["reqwest"]).await;
         assert_eq!((hits.load(Ordering::Relaxed), hits_304.load(Ordering::Relaxed), rels2["reqwest"].len()), (2, 1, 3));
 
         // Offline untangle_repo makes 0 HTTP calls and omits empty dep_advisories from JSON.
         let report = untangle_repo(repo.path(), &HygieneScorer::open_persistent(repo.path())).unwrap();
         assert!(report.dep_advisories.is_empty() && hits.load(Ordering::Relaxed) == 2);
         assert!(!serde_json::to_string(&report).unwrap().contains("dep_advisories"));
-        srv.abort();
     }
 }

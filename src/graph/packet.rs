@@ -1,8 +1,7 @@
 use crate::lex::{first_ident, ident_byte};
-use crate::platform::char_prefix;
+use crate::platform::{char_prefix, par_map};
 use crate::types::ModuleUnit;
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -379,11 +378,7 @@ fn abi_summary_enriched(
         }
         (!sigs.is_empty()).then(|| format!("- {rel}: {}", sigs.join(" | ")))
     };
-    let lines: Vec<String> = if crate::platform::budget().is_constrained() {
-        rels.iter().filter_map(extract).collect()
-    } else {
-        rels.par_iter().filter_map(extract).collect()
-    };
+    let lines: Vec<String> = par_map(&rels, extract).into_iter().flatten().collect();
     if lines.is_empty() {
         return String::new();
     }

@@ -372,20 +372,18 @@ fn cargo_deps(txt: &str, out: &mut Vec<ManifestDep>) {
     }
 }
 
-#[derive(serde::Deserialize, Default)]
-struct PyProjectManifest { project: Option<PyProjectSection>, tool: Option<PyToolSection> }
-#[derive(serde::Deserialize, Default)]
-struct PyProjectSection { #[serde(default)] dependencies: Vec<String> }
-#[derive(serde::Deserialize, Default)]
-struct PyToolSection { poetry: Option<PyPoetrySection> }
-#[derive(serde::Deserialize, Default)]
-struct PyPoetrySection { #[serde(default)] dependencies: BTreeMap<String, toml::Value> }
-
 fn py_deps(txt: &str, out: &mut Vec<ManifestDep>) {
-    let Ok(doc) = toml::from_str::<PyProjectManifest>(txt) else { return };
-    if let Some(proj) = doc.project { for item in &proj.dependencies { push_py(item, out); } }
-    if let Some(poetry) = doc.tool.and_then(|t| t.poetry) {
-        for name in poetry.dependencies.keys() { push_py(name, out); }
+    let Ok(doc) = toml::from_str::<toml::Value>(txt) else { return };
+    if let Some(arr) = doc.get("project").and_then(|p| p.get("dependencies")).and_then(toml::Value::as_array) {
+        for item in arr.iter().filter_map(toml::Value::as_str) {
+            push_py(item, out);
+        }
+    }
+    let poetry = doc.get("tool").and_then(|t| t.get("poetry")).and_then(|p| p.get("dependencies"));
+    if let Some(tbl) = poetry.and_then(toml::Value::as_table) {
+        for name in tbl.keys() {
+            push_py(name, out);
+        }
     }
 }
 
@@ -398,13 +396,13 @@ fn push_py(raw: &str, out: &mut Vec<ManifestDep>) {
 }
 
 fn go_deps(txt: &str, out: &mut Vec<ManifestDep>) {
-    let mut in_req = false;
-    for line in txt.lines().map(str::trim) {
-        if line.starts_with("require (") { in_req = true; continue; }
-        if in_req && line.starts_with(')') { in_req = false; continue; }
-        let body = if in_req { Some(line) } else { line.strip_prefix("require ") };
-        let Some(b) = body.filter(|s| !s.contains("// indirect") && !s.starts_with("//")) else { continue };
-        if let Some(m) = b.split_whitespace().next().filter(|s| !s.is_empty()) { push_dep(out, "go", m, false); }
+    for line in crate::platform::parse_go_block_lines(txt, "require") {
+        if line.contains("// indirect") {
+            continue;
+        }
+        if let Some(m) = line.split_whitespace().next().filter(|s| !s.is_empty()) {
+            push_dep(out, "go", m, false);
+        }
     }
 }
 
