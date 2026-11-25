@@ -220,6 +220,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "bytes"
 version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1339,7 +1345,9 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "axum",
+ "base64",
  "blake3",
+ "byteorder",
  "bytes",
  "clap",
  "constant_time_eq",
@@ -1350,8 +1358,10 @@ dependencies = [
  "getrandom 0.4.3",
  "globset",
  "governor",
+ "heck",
  "httpdate",
  "ignore",
+ "indexmap",
  "memchr",
  "mimalloc",
  "nix",
@@ -1360,11 +1370,13 @@ dependencies = [
  "reflink-copy",
  "reqwest",
  "rustc-hash",
+ "same-file",
  "semver",
  "serde",
  "serde_json",
  "shlex",
  "similar",
+ "smallvec",
  "strsim",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",

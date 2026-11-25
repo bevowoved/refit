@@ -9,19 +9,20 @@ mod weights;
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
 use crate::platform::{
-    MemGate, SieveCache, TangoCreditRing, budget, collect_os_memory, ensure_cachedir_tag,
-    under_memory_pressure, write_atomic,
+    MemGate, SieveCache, budget, collect_os_memory, ensure_cachedir_tag, under_memory_pressure,
+    write_atomic,
 };
 use crate::source::{quantile, read_text};
 use crate::types::{HygieneResult, Squiggle};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Write;
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const CACHE_MAGIC: &[u8; 8] = b"RFHG0002";
@@ -61,23 +62,25 @@ pub fn repo_style(repo_root: &Path) -> StyleConfig {
     cfg
 }
 
+fn find_toml_usize(val: &toml::Value, key: &str) -> Option<usize> {
+    let tbl = val.as_table()?;
+    if let Some(n) = tbl.get(key).and_then(toml::Value::as_integer).and_then(|v| usize::try_from(v).ok()) {
+        return Some(n);
+    }
+    tbl.values().find_map(|child| find_toml_usize(child, key))
+}
+
 fn toml_style(path: &Path, w_key: &str, i_key: &str, cfg: &mut StyleConfig) -> bool {
     let Ok(raw) = fs::read_to_string(path) else { return false };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&raw) else { return false };
     let mut found = false;
-
-    for line in raw.lines() {
-        let head = line.split('#').next().unwrap_or("");
-        let Some((k, val)) = head.trim().split_once('=') else { continue };
-        let Ok(n) = val.trim().parse::<usize>() else { continue };
-        let key = k.trim();
-
-        if key == w_key {
-            cfg.max_line_width = n.clamp(60, 160);
-            found = true;
-        } else if key == i_key {
-            cfg.indent_width = n.clamp(2, 8);
-            found = true;
-        }
+    if let Some(n) = find_toml_usize(&parsed, w_key) {
+        cfg.max_line_width = n.clamp(60, 160);
+        found = true;
+    }
+    if let Some(n) = find_toml_usize(&parsed, i_key) {
+        cfg.indent_width = n.clamp(2, 8);
+        found = true;
     }
     found
 }
@@ -104,67 +107,58 @@ fn json_style(repo_root: &Path, cfg: &mut StyleConfig) -> bool {
     false
 }
 
-fn encode_optional_fields(out: &mut Vec<u8>, res: &HygieneResult) {
-    let mut flags = 0u8;
-    if res.strict_score.is_some() {
-        flags |= 1 << 0;
-    }
-    if res.veto_cap.is_some() {
-        flags |= 1 << 1;
-    }
-    if res.total_squiggles.is_some() {
-        flags |= 1 << 2;
-    }
-    if res.event_load.is_some() {
-        flags |= 1 << 3;
-    }
-    if res.multiscale_score.is_some() {
-        flags |= 1 << 4;
-    }
-    if res.calibration_log.is_some() {
-        flags |= 1 << 5;
-    }
-    out.push(flags);
-    if let Some(strict_val) = res.strict_score {
-        out.extend_from_slice(&strict_val.to_le_bytes());
-    }
-    if let Some(cap_val) = res.veto_cap {
-        out.extend_from_slice(&cap_val.to_le_bytes());
-    }
-    if let Some(total_sq) = res.total_squiggles {
-        out.extend_from_slice(&(total_sq.min(u32::MAX as usize) as u32).to_le_bytes());
-    }
-    if let Some(load_val) = res.event_load {
-        out.extend_from_slice(&load_val.to_le_bytes());
-    }
-    if let Some(ms_val) = res.multiscale_score {
-        out.extend_from_slice(&ms_val.to_le_bytes());
-    }
-    if let Some(ref cal_log) = res.calibration_log {
-        write_str_u16(out, cal_log);
-    }
+fn write_str_u16(out: &mut Vec<u8>, text: &str) {
+    let bytes = text.as_bytes();
+    let len = bytes.len().min(u16::MAX as usize);
+    let _ = out.write_u16::<LittleEndian>(len as u16);
+    out.extend_from_slice(&bytes[..len]);
 }
 
-/// Safe explicit little-endian binary codec for `HygieneResult` caches (zero `#[repr(C)]` UB).
+fn read_str_u16(rd: &mut Cursor<&[u8]>) -> Option<String> {
+    let len = rd.read_u16::<LittleEndian>().ok()? as usize;
+    let mut buf = vec![0u8; len];
+    rd.read_exact(&mut buf).ok()?;
+    String::from_utf8(buf).ok()
+}
+
+/// Safe explicit little-endian binary codec for `HygieneResult` caches (`RFHG0002`, zero `#[repr(C)]` UB).
 fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + map.len() * 96);
     out.extend_from_slice(CACHE_MAGIC);
-    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
-
+    let _ = out.write_u32::<LittleEndian>(map.len() as u32);
     for (key, res) in map {
         write_str_u16(&mut out, key);
-        out.extend_from_slice(&res.score.to_le_bytes());
-        out.extend_from_slice(&res.latency_us.to_le_bytes());
-        encode_optional_fields(&mut out, res);
+        let _ = out.write_f64::<LittleEndian>(res.score);
+        let _ = out.write_u64::<LittleEndian>(res.latency_us);
+        let flags = (u8::from(res.strict_score.is_some()))
+            | (u8::from(res.veto_cap.is_some()) << 1)
+            | (u8::from(res.total_squiggles.is_some()) << 2)
+            | (u8::from(res.event_load.is_some()) << 3)
+            | (u8::from(res.multiscale_score.is_some()) << 4)
+            | (u8::from(res.calibration_log.is_some()) << 5);
+        out.push(flags);
+        if let Some(v) = res.strict_score { let _ = out.write_f64::<LittleEndian>(v); }
+        if let Some(v) = res.veto_cap { let _ = out.write_f64::<LittleEndian>(v); }
+        if let Some(v) = res.total_squiggles { let _ = out.write_u32::<LittleEndian>(v.min(u32::MAX as usize) as u32); }
+        if let Some(v) = res.event_load { let _ = out.write_f64::<LittleEndian>(v); }
+        if let Some(v) = res.multiscale_score { let _ = out.write_f64::<LittleEndian>(v); }
+        if let Some(ref s) = res.calibration_log { write_str_u16(&mut out, s); }
 
         let sq_cnt = res.squiggles.len().min(u16::MAX as usize);
-        out.extend_from_slice(&(sq_cnt as u16).to_le_bytes());
+        let _ = out.write_u16::<LittleEndian>(sq_cnt as u16);
         for sq in res.squiggles.iter().take(sq_cnt) {
-            encode_squiggle(&mut out, sq);
+            let _ = out.write_u32::<LittleEndian>(sq.line.min(u32::MAX as usize) as u32);
+            if let Some(idx) = model::SQUIGGLE_SPEC.iter().position(|(k, m, _)| *k == sq.kind && *m == sq.message) {
+                out.push(idx as u8);
+            } else {
+                out.push(255);
+                write_str_u16(&mut out, &sq.kind);
+                write_str_u16(&mut out, &sq.message);
+            }
+            let _ = out.write_f64::<LittleEndian>(sq.probability);
         }
-
         let veto_cnt = res.triggered_vetoes.len().min(u16::MAX as usize);
-        out.extend_from_slice(&(veto_cnt as u16).to_le_bytes());
+        let _ = out.write_u16::<LittleEndian>(veto_cnt as u16);
         for veto in res.triggered_vetoes.iter().take(veto_cnt) {
             write_str_u16(&mut out, veto);
         }
@@ -172,141 +166,48 @@ fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
     out
 }
 
-fn encode_squiggle(out: &mut Vec<u8>, sq: &Squiggle) {
-    out.extend_from_slice(&(sq.line.min(u32::MAX as usize) as u32).to_le_bytes());
-    let kind_idx = model::SQUIGGLE_SPEC
-        .iter()
-        .position(|(k, msg, _)| *k == sq.kind && *msg == sq.message);
-    if let Some(idx) = kind_idx {
-        out.push(idx as u8);
-    } else {
-        out.push(255u8);
-        write_str_u16(out, &sq.kind);
-        write_str_u16(out, &sq.message);
-    }
-    out.extend_from_slice(&sq.probability.to_le_bytes());
-}
-
-fn write_str_u16(out: &mut Vec<u8>, text: &str) {
-    let bytes = text.as_bytes();
-    let len = bytes.len().min(u16::MAX as usize);
-    out.extend_from_slice(&(len as u16).to_le_bytes());
-    out.extend_from_slice(&bytes[..len]);
-}
-
-struct LeReader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> LeReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(len)?;
-        let slice = self.buf.get(self.pos..end)?;
-        self.pos = end;
-        Some(slice)
-    }
-
-    fn read_u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-
-    fn read_u16(&mut self) -> Option<u16> {
-        let b = self.take(2)?;
-        Some(u16::from_le_bytes([b[0], b[1]]))
-    }
-
-    fn read_u32(&mut self) -> Option<u32> {
-        let b = self.take(4)?;
-        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn read_u64(&mut self) -> Option<u64> {
-        let b = self.take(8)?;
-        Some(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-    }
-
-    fn read_f64(&mut self) -> Option<f64> {
-        Some(f64::from_le_bytes(self.read_u64()?.to_le_bytes()))
-    }
-
-    fn read_str_u16(&mut self) -> Option<String> {
-        let len = self.read_u16()? as usize;
-        let bytes = self.take(len)?;
-        std::str::from_utf8(bytes).ok().map(str::to_string)
-    }
-}
-
-struct DecodedOptFields {
-    strict_score: Option<f64>,
-    veto_cap: Option<f64>,
-    total_squiggles: Option<usize>,
-    event_load: Option<f64>,
-    multiscale_score: Option<f64>,
-    calibration_log: Option<String>,
-}
-
-fn decode_optional_fields(rd: &mut LeReader<'_>) -> Option<DecodedOptFields> {
-    let flags = rd.read_u8()?;
-    let strict_score = if (flags & (1 << 0)) != 0 { Some(rd.read_f64()?) } else { None };
-    let veto_cap = if (flags & (1 << 1)) != 0 { Some(rd.read_f64()?) } else { None };
-    let total_squiggles = if (flags & (1 << 2)) != 0 { Some(rd.read_u32()? as usize) } else { None };
-    let event_load = if (flags & (1 << 3)) != 0 { Some(rd.read_f64()?) } else { None };
-    let multiscale_score = if (flags & (1 << 4)) != 0 { Some(rd.read_f64()?) } else { None };
-    let calibration_log = if (flags & (1 << 5)) != 0 { Some(rd.read_str_u16()?) } else { None };
-    Some(DecodedOptFields {
-        strict_score,
-        veto_cap,
-        total_squiggles,
-        event_load,
-        multiscale_score,
-        calibration_log,
-    })
-}
-
 fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> {
-    let mut rd = LeReader::new(bytes);
-    if rd.take(8)? != CACHE_MAGIC {
+    if !bytes.starts_with(CACHE_MAGIC) {
         return None;
     }
-    let count = rd.read_u32()? as usize;
+    let mut rd = Cursor::new(&bytes[8..]);
+    let count = rd.read_u32::<LittleEndian>().ok()? as usize;
     if count > 1_000_000 {
         return None;
     }
     let mut map = HashMap::with_capacity(count.min(4096));
     for _ in 0..count {
-        let key = rd.read_str_u16()?;
-        let score = rd.read_f64()?;
-        let latency_us = rd.read_u64()?;
-        let opt = decode_optional_fields(&mut rd)?;
+        let key = read_str_u16(&mut rd)?;
+        let score = rd.read_f64::<LittleEndian>().ok()?;
+        let latency_us = rd.read_u64::<LittleEndian>().ok()?;
+        let flags = rd.read_u8().ok()?;
+        let strict_score = if (flags & 1) != 0 { Some(rd.read_f64::<LittleEndian>().ok()?) } else { None };
+        let veto_cap = if (flags & 2) != 0 { Some(rd.read_f64::<LittleEndian>().ok()?) } else { None };
+        let total_squiggles = if (flags & 4) != 0 { Some(rd.read_u32::<LittleEndian>().ok()? as usize) } else { None };
+        let event_load = if (flags & 8) != 0 { Some(rd.read_f64::<LittleEndian>().ok()?) } else { None };
+        let multiscale_score = if (flags & 16) != 0 { Some(rd.read_f64::<LittleEndian>().ok()?) } else { None };
+        let calibration_log = if (flags & 32) != 0 { Some(read_str_u16(&mut rd)?) } else { None };
 
-        let sq_cnt = rd.read_u16()? as usize;
+        let sq_cnt = rd.read_u16::<LittleEndian>().ok()? as usize;
         let mut squiggles = Vec::with_capacity(sq_cnt.min(64));
         for _ in 0..sq_cnt {
-            let line = rd.read_u32()? as usize;
-            let kind_id = rd.read_u8()?;
-            let (kind, message) = if (kind_id as usize) < model::SQUIGGLE_SPEC.len() {
-                let (spec_k, spec_m, _) = model::SQUIGGLE_SPEC[kind_id as usize];
-                (spec_k.to_string(), spec_m.to_string())
+            let line = rd.read_u32::<LittleEndian>().ok()? as usize;
+            let kind_id = rd.read_u8().ok()?;
+            let (kind, message) = if let Some(&(sk, sm, _)) = model::SQUIGGLE_SPEC.get(kind_id as usize) {
+                (sk.to_string(), sm.to_string())
             } else if kind_id == 255 {
-                (rd.read_str_u16()?, rd.read_str_u16()?)
+                (read_str_u16(&mut rd)?, read_str_u16(&mut rd)?)
             } else {
                 return None;
             };
-            let probability = rd.read_f64()?;
+            let probability = rd.read_f64::<LittleEndian>().ok()?;
             squiggles.push(Squiggle { line, kind, probability, message });
         }
-
-        let veto_cnt = rd.read_u16()? as usize;
+        let veto_cnt = rd.read_u16::<LittleEndian>().ok()? as usize;
         let mut triggered_vetoes = Vec::with_capacity(veto_cnt.min(32));
         for _ in 0..veto_cnt {
-            triggered_vetoes.push(rd.read_str_u16()?);
+            triggered_vetoes.push(read_str_u16(&mut rd)?);
         }
-
         map.insert(
             key,
             HygieneResult {
@@ -314,13 +215,13 @@ fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> 
                 squiggles,
                 cached: false,
                 latency_us,
-                strict_score: opt.strict_score,
-                veto_cap: opt.veto_cap,
-                total_squiggles: opt.total_squiggles,
-                event_load: opt.event_load,
+                strict_score,
+                veto_cap,
+                total_squiggles,
+                event_load,
                 triggered_vetoes,
-                multiscale_score: opt.multiscale_score,
-                calibration_log: opt.calibration_log,
+                multiscale_score,
+                calibration_log,
             },
         );
     }
@@ -569,7 +470,19 @@ impl HygieneScorer {
                 })
                 .collect()
         } else if b.rayon_threads <= 2 && rel_paths.len() > 8 {
-            score_files_credit_ring(self, repo_root, rel_paths, preloaded)
+            let next = AtomicUsize::new(0);
+            let out = Mutex::new(Vec::with_capacity(rel_paths.len()));
+            std::thread::scope(|s| {
+                let run = || {
+                    while let Some(rel) = rel_paths.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let text = read_text(repo_root, rel, preloaded).unwrap_or_default();
+                        out.lock().push((rel.clone(), self.score_content(rel, &text)));
+                    }
+                };
+                s.spawn(run);
+                run();
+            });
+            out.into_inner()
         } else {
             rel_paths
                 .par_iter()
@@ -599,46 +512,6 @@ impl HygieneScorer {
         }
         (median, p10, per_file)
     }
-}
-
-fn score_files_credit_ring(
-    scorer: &HygieneScorer,
-    repo_root: &Path,
-    rel_paths: &[String],
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
-) -> Vec<(String, HygieneResult)> {
-    let ring = TangoCreditRing::<usize, 64>::new();
-    let out = Mutex::new(Vec::with_capacity(rel_paths.len()));
-    let done = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        let r_ref = &ring;
-        let o_ref = &out;
-        let d_ref = &done;
-        let worker = scope.spawn(move || {
-            loop {
-                if let Some(idx) = r_ref.try_pop() {
-                    let rel = &rel_paths[idx];
-                    let text = read_text(repo_root, rel, preloaded).unwrap_or_default();
-                    let res = scorer.score_content(rel, &text);
-                    o_ref.lock().push((rel.clone(), res));
-                } else if d_ref.load(Ordering::Acquire) {
-                    break;
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-        });
-        for (idx, rel) in rel_paths.iter().enumerate() {
-            if r_ref.try_push(idx).is_err() {
-                let text = read_text(repo_root, rel, preloaded).unwrap_or_default();
-                let res = scorer.score_content(rel, &text);
-                o_ref.lock().push((rel.clone(), res));
-            }
-        }
-        d_ref.store(true, Ordering::Release);
-        let _ = worker.join();
-    });
-    out.into_inner()
 }
 
 #[cfg(test)]
@@ -835,9 +708,9 @@ mod tests {
 
             for step in 0..2500 {
                 let mut xs = [0.0f64; 4];
-                for j in 0..4 {
+                for (j, slot) in xs.iter_mut().enumerate() {
                     let t = ((step * 4 + j) as f64) / 9999.0;
-                    xs[j] = -708.0 + t * 1417.0;
+                    *slot = -708.0 + t * 1417.0;
                 }
                 // SAFETY: AVX2 support verified above.
                 unsafe {

@@ -251,6 +251,10 @@ pub fn query_symbols(repo_root: &Path, symbol: Option<&str>, file: Option<&str>)
     }
 
     let snap = load_symbols(repo_root, None);
+    query_symbol_graph(&snap, symbol, file)
+}
+
+pub fn query_symbol_graph(snap: &SymbolGraph, symbol: Option<&str>, file: Option<&str>) -> Value {
     if let Some(sym) = symbol {
         let definers: Vec<String> = snap
             .defs_by_file

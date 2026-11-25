@@ -1,42 +1,44 @@
-pub mod budget;
-pub mod epoch;
-pub mod memgate;
 pub mod paths;
 mod proc;
 mod redact;
 pub mod rewind;
-pub mod sieve;
 
 pub use crate::net::backoff_ms;
 #[cfg(test)]
 use crate::net::{is_quota_exhausted, is_retryable, retry_ms};
-pub use budget::{allocator_name, budget, collect_os_memory, init_allocator, under_memory_pressure};
-pub use epoch::EpochRegistry;
-pub use memgate::{MemGate, TangoCreditRing};
 pub use paths::{
     check_rel, check_target_in_repo, normalize_rel, pwsh_utf8_preamble, rel_to_root,
     strip_utf8_bom, trim_crlf,
 };
-pub use proc::{run_cmd, self_metrics};
+pub use proc::{
+    MemGate, allocator_name, budget, collect_os_memory, init_allocator, run_cmd, self_metrics,
+    under_memory_pressure,
+};
 pub use redact::{find_secret, redact_secrets};
 pub use rewind::{
     Durability, InvertedRewindIndex, MIN_KERNEL_COST_US, RewindEvent, RewindTrigger,
     should_use_index,
 };
-pub use sieve::SieveCache;
 
 use crate::net::build_http;
 use anyhow::{Context, Result};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ignore::WalkBuilder;
+use indexmap::IndexMap;
+use parking_lot::Mutex;
+use rustc_hash::{FxBuildHasher, FxHasher};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const EPOCH_SLOTS: usize = 64;
 
 const FILE_BUF_SIZE: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
@@ -432,17 +434,17 @@ pub fn save_stat_cache(path: &Path, map: &BTreeMap<String, StatEntry>) -> Result
 fn encode_stat_map(map: &BTreeMap<String, StatEntry>) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + map.len() * 112);
     out.extend_from_slice(STAT_MAGIC);
-    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    let _ = out.write_u32::<LittleEndian>(map.len() as u32);
     for (rel, e) in map {
         let rb = rel.as_bytes();
         let rlen = rb.len().min(u16::MAX as usize);
         let hb = e.blake3.as_bytes();
         let hlen = hb.len().min(u16::MAX as usize);
-        out.extend_from_slice(&(rlen as u16).to_le_bytes());
+        let _ = out.write_u16::<LittleEndian>(rlen as u16);
         out.extend_from_slice(&rb[..rlen]);
-        out.extend_from_slice(&e.mtime_ns.to_le_bytes());
-        out.extend_from_slice(&e.size.to_le_bytes());
-        out.extend_from_slice(&(hlen as u16).to_le_bytes());
+        let _ = out.write_u64::<LittleEndian>(e.mtime_ns);
+        let _ = out.write_u64::<LittleEndian>(e.size);
+        let _ = out.write_u16::<LittleEndian>(hlen as u16);
         out.extend_from_slice(&hb[..hlen]);
     }
     out
@@ -452,22 +454,20 @@ fn decode_stat_map(buf: &[u8]) -> Option<BTreeMap<String, StatEntry>> {
     if buf.len() < 12 || &buf[..8] != STAT_MAGIC {
         return None;
     }
-    let count = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
-    let mut pos = 12usize;
+    let mut rd = Cursor::new(&buf[8..]);
+    let count = rd.read_u32::<LittleEndian>().ok()? as usize;
     let mut map = BTreeMap::new();
     for _ in 0..count {
-        let rlen = u16::from_le_bytes(buf.get(pos..pos + 2)?.try_into().ok()?) as usize;
-        pos += 2;
-        let rel = std::str::from_utf8(buf.get(pos..pos + rlen)?).ok()?.to_string();
-        pos += rlen;
-        let mtime_ns = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
-        pos += 8;
-        let size = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
-        pos += 8;
-        let hlen = u16::from_le_bytes(buf.get(pos..pos + 2)?.try_into().ok()?) as usize;
-        pos += 2;
-        let blake3 = std::str::from_utf8(buf.get(pos..pos + hlen)?).ok()?.to_string();
-        pos += hlen;
+        let rlen = rd.read_u16::<LittleEndian>().ok()? as usize;
+        let mut rbuf = vec![0u8; rlen];
+        rd.read_exact(&mut rbuf).ok()?;
+        let rel = String::from_utf8(rbuf).ok()?;
+        let mtime_ns = rd.read_u64::<LittleEndian>().ok()?;
+        let size = rd.read_u64::<LittleEndian>().ok()?;
+        let hlen = rd.read_u16::<LittleEndian>().ok()? as usize;
+        let mut hbuf = vec![0u8; hlen];
+        rd.read_exact(&mut hbuf).ok()?;
+        let blake3 = String::from_utf8(hbuf).ok()?;
         map.insert(rel, StatEntry { mtime_ns, size, blake3 });
     }
     Some(map)
@@ -526,16 +526,15 @@ fn open_lock_file(lock_path: &Path) -> Result<File> {
 
 fn is_lock_unsupported(err: &io::Error) -> bool {
     #[cfg(unix)]
-    if let Some(code) = err.raw_os_error()
-        && matches!(
-            nix::errno::Errno::from_raw(code),
-            nix::errno::Errno::EOPNOTSUPP
-                | nix::errno::Errno::ENOTSUP
-                | nix::errno::Errno::ENOLCK
-                | nix::errno::Errno::ENOSYS
-        )
-    {
-        return true;
+    if let Some(code) = err.raw_os_error() {
+        let e = nix::errno::Errno::from_raw(code);
+        if e == nix::errno::Errno::EOPNOTSUPP
+            || e == nix::errno::Errno::ENOTSUP
+            || e == nix::errno::Errno::ENOLCK
+            || e == nix::errno::Errno::ENOSYS
+        {
+            return true;
+        }
     }
     err.kind() == io::ErrorKind::Unsupported
 }
@@ -626,6 +625,190 @@ fn replace_file(src_path: &Path, dst_path: &Path, parent: &Path) -> Result<()> {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// Thread-safe byte- and entry-bounded SIEVE cache over `IndexMap` + `FxBuildHasher`.
+struct SieveState<K, V> {
+    map: IndexMap<K, (V, usize, bool), FxBuildHasher>,
+    hand: usize,
+    total_weight: usize,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
+    fn evict_one(&mut self) -> bool {
+        let len = self.map.len();
+        if len == 0 {
+            return false;
+        }
+        let mut idx = self.hand % len;
+        loop {
+            let visited = self.map.get_index_mut(idx).is_some_and(|(_, (_, _, v))| {
+                let was = *v;
+                *v = false;
+                was
+            });
+            if !visited {
+                if let Some((_, (_, w, _))) = self.map.swap_remove_index(idx) {
+                    self.total_weight = self.total_weight.saturating_sub(w);
+                }
+                self.hand = if self.map.is_empty() { 0 } else { idx % self.map.len() };
+                return true;
+            }
+            idx = (idx + 1) % len;
+        }
+    }
+
+    fn insert(&mut self, key: K, val: V, weight: usize) -> Option<V> {
+        let w = weight.max(1);
+        if let Some((slot_val, slot_w, visited)) = self.map.get_mut(&key) {
+            self.total_weight = self.total_weight.saturating_sub(*slot_w).saturating_add(w);
+            *slot_w = w;
+            *visited = true;
+            let prev = std::mem::replace(slot_val, val);
+            while self.total_weight > self.max_bytes && self.map.len() > 1 && self.evict_one() {}
+            return Some(prev);
+        }
+        while (self.map.len() >= self.max_entries
+            || (self.total_weight.saturating_add(w) > self.max_bytes && !self.map.is_empty()))
+            && self.evict_one()
+        {}
+        self.map.insert(key, (val, w, false));
+        self.total_weight = self.total_weight.saturating_add(w);
+        None
+    }
+}
+
+pub struct SieveCache<K, V> {
+    inner: Mutex<SieveState<K, V>>,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> SieveCache<K, V> {
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            inner: Mutex::new(SieveState {
+                map: IndexMap::with_hasher(FxBuildHasher),
+                hand: 0,
+                total_weight: 0,
+                max_entries: max_entries.max(1),
+                max_bytes: max_bytes.max(1),
+            }),
+        }
+    }
+
+    pub fn get(&self, key: &K) -> Option<V> {
+        let mut g = self.inner.lock();
+        let (v, _, visited) = g.map.get_mut(key)?;
+        *visited = true;
+        Some(v.clone())
+    }
+
+    pub fn insert(&self, key: K, val: V, weight_bytes: usize) -> Option<V> {
+        self.inner.lock().insert(key, val, weight_bytes)
+    }
+
+    pub fn get_or_insert_with(&self, key: K, weight_bytes: usize, make: impl FnOnce() -> V) -> V {
+        let mut g = self.inner.lock();
+        if let Some((v, _, visited)) = g.map.get_mut(&key) {
+            *visited = true;
+            return v.clone();
+        }
+        let val = make();
+        g.insert(key, val.clone(), weight_bytes);
+        val
+    }
+
+    pub fn remove(&self, key: &K) -> Option<V> {
+        let mut g = self.inner.lock();
+        let (v, w, _) = g.map.swap_remove(key)?;
+        g.total_weight = g.total_weight.saturating_sub(w);
+        if !g.map.is_empty() {
+            g.hand %= g.map.len();
+        } else {
+            g.hand = 0;
+        }
+        Some(v)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().map.len()
+    }
+
+    pub fn snapshot(&self) -> Vec<(K, V)> {
+        self.inner.lock().map.iter().map(|(k, (v, _, _))| (k.clone(), v.clone())).collect()
+    }
+}
+
+/// Lock-free monotonic epoch registry (`global_epoch` + 64 atomic key slots).
+pub struct EpochRegistry {
+    global_epoch: AtomicU64,
+    slots: [AtomicU64; EPOCH_SLOTS],
+}
+
+impl EpochRegistry {
+    pub fn new() -> Self {
+        Self {
+            global_epoch: AtomicU64::new(1),
+            slots: std::array::from_fn(|_| AtomicU64::new(1)),
+        }
+    }
+
+    #[cfg(any(feature = "mcp-v2", test))]
+    pub fn global() -> &'static Self {
+        Self::global_arc_slot().as_ref()
+    }
+
+    pub fn global_arc() -> std::sync::Arc<Self> {
+        Self::global_arc_slot().clone()
+    }
+
+    fn global_arc_slot() -> &'static std::sync::Arc<Self> {
+        static GLOBAL: OnceLock<std::sync::Arc<EpochRegistry>> = OnceLock::new();
+        GLOBAL.get_or_init(|| std::sync::Arc::new(Self::new()))
+    }
+
+    #[inline]
+    pub fn global_epoch(&self) -> u64 {
+        self.global_epoch.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn slot_idx(key: &str) -> usize {
+        let mut h = FxHasher::default();
+        key.hash(&mut h);
+        (h.finish() as usize) & (EPOCH_SLOTS - 1)
+    }
+
+    #[inline]
+    pub fn slot_epoch(&self, key: &str) -> u64 {
+        self.slots[Self::slot_idx(key)].load(Ordering::Acquire)
+    }
+
+    /// Single-authority monotonic publish (`+1` exact) for ABI cutoff or single-key updates.
+    #[inline]
+    #[cfg(test)]
+    pub fn publish(&self, key: &str, _head_rev: u64) -> u64 {
+        let next = self.global_epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        self.slots[Self::slot_idx(key)].fetch_max(next, Ordering::Release);
+        next
+    }
+
+    /// Single-authority monotonic batch publish called by `MvccStore::commit_tx` (`+1` exact).
+    pub fn publish_batch(&self, module_id: &str, files: &[String], _head_rev: u64) -> u64 {
+        let next = self.global_epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        self.slots[Self::slot_idx(module_id)].fetch_max(next, Ordering::Release);
+        for f in files {
+            self.slots[Self::slot_idx(f)].fetch_max(next, Ordering::Release);
+        }
+        next
+    }
+}
+
+impl Default for EpochRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -797,5 +980,51 @@ mod tests {
         assert!(SidecarLock::try_acquire(&lp).unwrap().is_none());
         drop(lk);
         assert!(SidecarLock::try_acquire(&lp).unwrap().is_some());
+    }
+
+    #[test]
+    fn sieve_evicts_unvisited_and_bounds_bytes() {
+        let cache = SieveCache::<String, u32>::new(3, 1024);
+        cache.insert("hot".into(), 1, 100);
+        cache.insert("cold1".into(), 2, 100);
+        cache.insert("cold2".into(), 3, 100);
+        assert_eq!(cache.get(&"hot".into()), Some(1));
+        cache.insert("fresh".into(), 4, 100);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(&"hot".into()), Some(1));
+        assert_eq!(cache.get(&"fresh".into()), Some(4));
+
+        let tiny = SieveCache::<u32, u32>::new(16, 250);
+        tiny.insert(1, 10, 100);
+        tiny.insert(2, 20, 100);
+        tiny.insert(3, 30, 100);
+        assert!(tiny.len() <= 2);
+        assert_eq!(tiny.remove(&3), Some(30));
+    }
+
+    #[test]
+    fn epoch_single_publish_on_mvcc_commit() {
+        let tmp = TempRepo::with_files("epoch_mvcc", &[("src/a.rs", "pub fn a() -> i32 { 1 }\n")]);
+        let reg = std::sync::Arc::new(EpochRegistry::new());
+        let store = crate::mvcc::MvccStore::open_with_epoch(tmp.path(), "ep-run", reg.clone()).unwrap();
+        let ep_before = reg.global_epoch();
+        let slot_before = reg.slot_epoch("src/a.rs");
+
+        let mut exp = BTreeMap::new();
+        exp.insert("src/a.rs".into(), tmp.hash("src/a.rs"));
+        let mut new_files = BTreeMap::new();
+        new_files.insert("src/a.rs".into(), b"pub fn a() -> i32 { 2 }\n".to_vec());
+        let outcome = store.commit_tx("mod_a", &exp, &new_files, &[]).unwrap();
+        assert!(matches!(outcome, crate::mvcc::CommitOutcome::Committed { head_rev: 1, .. }));
+
+        let ep_after = reg.global_epoch();
+        assert_eq!(ep_after, ep_before + 1, "commit_tx must bump global_epoch by exact +1");
+        assert!(reg.slot_epoch("src/a.rs") > slot_before);
+        assert_eq!(reg.slot_epoch("src/a.rs"), ep_after);
+        assert_eq!(reg.slot_epoch("mod_a"), ep_after);
+
+        // Also confirm default MvccStore::open binds directly to EpochRegistry::global().
+        let default_store = crate::mvcc::MvccStore::open(tmp.path(), "ep-global").unwrap();
+        assert!(std::sync::Arc::ptr_eq(default_store.epoch_registry(), &EpochRegistry::global_arc()));
     }
 }

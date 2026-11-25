@@ -1,9 +1,450 @@
+//! Process execution, OS resource budgeting (cgroup v2 / Win32 Job Objects), allocator tuning,
+//! and Condvar-backed `MemGate` admission control.
+
 use crate::types::{SandboxResult, SelfMetrics};
 use anyhow::{Context, Result};
+use parking_lot::{Condvar, Mutex};
+use std::fmt;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+const MIB: u64 = 1024 * 1024;
+const CONSTRAINED_MEM_BYTES: u64 = 384 * MIB;
+#[cfg(feature = "alloc-mimalloc")]
+const TIGHT_MEM_BYTES: u64 = 256 * MIB;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecMode {
+    InlineConstrained,
+    BoundedBalanced,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceBudget {
+    pub effective_vcpus: usize,
+    pub effective_mem_bytes: u64,
+    pub mode: ExecMode,
+    pub http_pool_max: usize,
+    pub pipe_cap_bytes: usize,
+    pub sse_line_cap_bytes: usize,
+    pub mem_gate_bytes: usize,
+    pub mcp_blocking_permits: usize,
+    pub rayon_threads: usize,
+}
+
+impl ResourceBudget {
+    #[inline]
+    pub fn is_constrained(&self) -> bool {
+        self.mode == ExecMode::InlineConstrained
+    }
+
+    pub fn from_limits(vcpus: usize, mem_bytes: u64) -> Self {
+        let effective_vcpus = vcpus.max(1);
+        let constrained = effective_vcpus <= 1 || mem_bytes <= CONSTRAINED_MEM_BYTES;
+        let mode = if constrained { ExecMode::InlineConstrained } else { ExecMode::BoundedBalanced };
+        let (http_pool_max, pipe_cap_bytes, sse_line_cap_bytes, mem_gate_bytes, mcp_blocking_permits, rayon_threads) =
+            if constrained {
+                (2, 4 * MIB as usize, 2 * MIB as usize, 16 * MIB as usize, 1, 0)
+            } else {
+                let gate_mb = ((mem_bytes / MIB) / 8).clamp(16, 64) as usize;
+                (
+                    effective_vcpus.clamp(4, 16),
+                    32 * MIB as usize,
+                    16 * MIB as usize,
+                    gate_mb * MIB as usize,
+                    effective_vcpus.clamp(2, 4),
+                    effective_vcpus.min(8),
+                )
+            };
+        Self {
+            effective_vcpus,
+            effective_mem_bytes: mem_bytes,
+            mode,
+            http_pool_max,
+            pipe_cap_bytes,
+            sse_line_cap_bytes,
+            mem_gate_bytes,
+            mcp_blocking_permits,
+            rayon_threads,
+        }
+    }
+}
+
+static BUDGET: OnceLock<ResourceBudget> = OnceLock::new();
+
+pub fn budget() -> &'static ResourceBudget {
+    BUDGET.get_or_init(detect_budget)
+}
+
+pub fn allocator_name() -> &'static str {
+    #[cfg(feature = "alloc-mimalloc")]
+    { "mimalloc" }
+    #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+    { "jemalloc" }
+    #[cfg(not(any(feature = "alloc-mimalloc", all(feature = "alloc-jemalloc", not(target_env = "msvc")))))]
+    { "system" }
+}
+
+#[cfg(feature = "alloc-mimalloc")]
+unsafe extern "C" {
+    fn mi_collect(force: bool);
+    fn mi_option_set(option: core::ffi::c_int, value: core::ffi::c_long);
+}
+
+#[cfg(feature = "alloc-mimalloc")]
+const MI_OPT_ARENA_EAGER_COMMIT: core::ffi::c_int = 4;
+#[cfg(feature = "alloc-mimalloc")]
+const MI_OPT_PURGE_DECOMMITS: core::ffi::c_int = 5;
+#[cfg(feature = "alloc-mimalloc")]
+const MI_OPT_PURGE_DELAY: core::ffi::c_int = 15;
+#[cfg(feature = "alloc-mimalloc")]
+const MI_OPT_ALLOW_THP: core::ffi::c_int = 43;
+
+/// Tune the global allocator once at startup before any worker threads spawn.
+pub fn init_allocator(b: &ResourceBudget) {
+    #[cfg(feature = "alloc-mimalloc")]
+    // SAFETY: Called once from sync `fn main()` before spawning worker threads; option indices
+    // match mimalloc v3 (`v3/include/mimalloc.h`).
+    unsafe {
+        mi_option_set(MI_OPT_PURGE_DECOMMITS, 1);
+        mi_option_set(MI_OPT_PURGE_DELAY, 75);
+        if b.effective_mem_bytes <= TIGHT_MEM_BYTES {
+            mi_option_set(MI_OPT_ARENA_EAGER_COMMIT, 0);
+            mi_option_set(MI_OPT_ALLOW_THP, 0);
+        }
+    }
+    #[cfg(not(feature = "alloc-mimalloc"))]
+    let _ = b.effective_mem_bytes;
+}
+
+#[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+unsafe extern "C" {
+    fn _rjem_mallctl(
+        name: *const core::ffi::c_char,
+        oldp: *mut core::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut core::ffi::c_void,
+        newlen: usize,
+    ) -> core::ffi::c_int;
+}
+
+#[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+fn purge_jemalloc_all_arenas() -> core::ffi::c_int {
+    // SAFETY: `arena.4096.purge\0` (`MALLCTL_ARENAS_ALL = 4096`) is a valid NUL-terminated void mallctl.
+    unsafe {
+        _rjem_mallctl(
+            b"arena.4096.purge\0".as_ptr().cast(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            0,
+        )
+    }
+}
+
+/// Release purged allocator pages back to the OS at coarse phase boundaries.
+pub fn collect_os_memory() {
+    #[cfg(feature = "alloc-mimalloc")]
+    // SAFETY: `mi_collect(true)` is thread-safe and purges abandoned segments back to the OS.
+    unsafe {
+        mi_collect(true);
+    }
+    #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+    {
+        let _ = tikv_jemalloc_ctl::epoch::advance();
+        let _ = purge_jemalloc_all_arenas();
+    }
+}
+
+/// Returns `true` if Linux PSI `memory.pressure` indicates direct-reclaim stall pressure.
+pub fn under_memory_pressure() -> bool {
+    #[cfg(target_os = "linux")]
+    if let Ok(raw) = std::fs::read_to_string("/proc/pressure/memory") {
+        return parse_psi_some_avg10(&raw).is_some_and(|v| v > 5.0);
+    }
+    false
+}
+
+/// Unified Linux `/proc/*` `Key: <n> kB` field reader (used for both `/proc/meminfo` and `/proc/self/status`).
+#[cfg(target_os = "linux")]
+fn parse_proc_kb_field(raw: &str, prefix: &str) -> Option<u64> {
+    raw.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+}
+
+fn detect_budget() -> ResourceBudget {
+    let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let mut vcpus = host_cpus;
+    let mut mem_bytes = host_memory_bytes().unwrap_or(4 * 1024 * MIB);
+
+    #[cfg(target_os = "linux")]
+    let (os_cpus, os_mem) = detect_linux_cgroup_limits();
+    #[cfg(windows)]
+    let (os_cpus, os_mem) = detect_windows_job_limits(host_cpus);
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let (os_cpus, os_mem): (Option<usize>, Option<u64>) = (None, None);
+
+    if let Some(c) = os_cpus {
+        vcpus = vcpus.min(c.max(1));
+    }
+    if let Some(m) = os_mem {
+        mem_bytes = mem_bytes.min(m);
+    }
+    if let Ok(raw) = std::env::var("REFIT_BUDGET_MB")
+        && let Ok(mb) = raw.trim().parse::<u64>()
+        && mb >= 64
+    {
+        mem_bytes = mem_bytes.min(mb * MIB);
+    }
+    if let Ok(raw) = std::env::var("REFIT_MAX_CPUS")
+        && let Ok(c) = raw.trim().parse::<usize>()
+        && c >= 1
+    {
+        vcpus = vcpus.min(c);
+    }
+    ResourceBudget::from_limits(vcpus, mem_bytes)
+}
+
+fn host_memory_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: `MEMORYSTATUSEX` is POD with `dwLength` initialized to its exact byte size.
+        unsafe {
+            let mut st: MEMORYSTATUSEX = zeroed();
+            st.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+            (GlobalMemoryStatusEx(&mut st) != 0 && st.ullTotalPhys > 0).then_some(st.ullTotalPhys)
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
+        parse_proc_kb_field(&raw, "MemTotal:")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn detect_windows_job_limits(host_cpus: usize) -> (Option<usize>, Option<u64>) {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject,
+    };
+
+    let (mut cpu_limit, mut mem_limit) = (None, None);
+    // SAFETY: Null job handle queries the current process's active job object into zeroed POD structs.
+    unsafe {
+        let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+        if QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&mut ext as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            let flags = ext.BasicLimitInformation.LimitFlags;
+            if (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) != 0 && ext.ProcessMemoryLimit > 0 {
+                mem_limit = Some(ext.ProcessMemoryLimit as u64);
+            }
+            if (flags & JOB_OBJECT_LIMIT_JOB_MEMORY) != 0 && ext.JobMemoryLimit > 0 {
+                let j = ext.JobMemoryLimit as u64;
+                mem_limit = Some(mem_limit.map_or(j, |p| p.min(j)));
+            }
+        }
+        let mut rate: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = zeroed();
+        let mask = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        if QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectCpuRateControlInformation,
+            (&mut rate as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+            size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        ) != 0
+            && (rate.ControlFlags & mask) == mask
+            && rate.Anonymous.CpuRate > 0
+        {
+            cpu_limit = Some(((host_cpus as u64 * rate.Anonymous.CpuRate as u64).div_ceil(10_000)).max(1) as usize);
+        }
+    }
+    (cpu_limit, mem_limit)
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_cgroup_limits() -> (Option<usize>, Option<u64>) {
+    use std::path::PathBuf;
+    let Ok(cg_file) = std::fs::read_to_string("/proc/self/cgroup") else { return (None, None) };
+    let Some(rel) = parse_cgroup_v2_rel(&cg_file) else { return (None, None) };
+    let root = Path::new("/sys/fs/cgroup");
+    let leaf = if rel.is_empty() || rel == "/" { root.to_path_buf() } else { root.join(rel.trim_start_matches('/')) };
+    let (mut min_cpus, mut min_mem, mut cur): (Option<usize>, Option<u64>, Option<PathBuf>) = (None, None, Some(leaf));
+    while let Some(dir) = cur {
+        if let Ok(raw) = std::fs::read_to_string(dir.join("cpu.max"))
+            && let Some(c) = parse_cgroup_cpu_max(&raw)
+        {
+            min_cpus = Some(min_cpus.map_or(c, |p| p.min(c)));
+        }
+        for name in ["memory.max", "memory.high"] {
+            if let Ok(raw) = std::fs::read_to_string(dir.join(name))
+                && let Some(m) = parse_cgroup_mem_limit(&raw)
+            {
+                min_mem = Some(min_mem.map_or(m, |p| p.min(m)));
+            }
+        }
+        if dir == root {
+            break;
+        }
+        cur = dir.parent().map(Path::to_path_buf).filter(|p| p.starts_with(root));
+    }
+    (min_cpus, min_mem)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_cgroup_v2_rel(raw: &str) -> Option<&str> {
+    raw.lines().find_map(|l| l.strip_prefix("0::").map(str::trim))
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_cgroup_cpu_max(raw: &str) -> Option<usize> {
+    let mut parts = raw.split_whitespace();
+    let quota_str = parts.next()?;
+    if quota_str == "max" {
+        return None;
+    }
+    let (quota, period) = (quota_str.parse::<u64>().ok()?, parts.next()?.parse::<u64>().ok()?);
+    (quota > 0 && period > 0).then(|| quota.div_ceil(period).max(1) as usize)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_cgroup_mem_limit(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    (!s.is_empty() && s != "max").then(|| s.parse::<u64>().ok().filter(|&v| v > 0)).flatten()
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn parse_psi_some_avg10(raw: &str) -> Option<f64> {
+    raw.lines()
+        .find_map(|l| l.strip_prefix("some "))
+        .and_then(|rest| rest.split_whitespace().find_map(|t| t.strip_prefix("avg10=")?.parse().ok()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateErr {
+    Busy,
+    TooBig { requested: usize, capacity: usize },
+}
+
+impl fmt::Display for GateErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Busy => write!(f, "memory gate busy: reservation limit reached"),
+            Self::TooBig { requested, capacity } => {
+                write!(f, "memory gate request {requested}B exceeds capacity {capacity}B")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GateErr {}
+
+/// Condvar-backed byte-budget admission controller (zero 1ms spin-polling).
+#[derive(Debug)]
+pub struct MemGate {
+    capacity: usize,
+    used: Mutex<usize>,
+    released: Condvar,
+}
+
+#[derive(Debug)]
+pub struct MemPermit<'a> {
+    gate: &'a MemGate,
+    bytes: usize,
+}
+
+impl Drop for MemPermit<'_> {
+    fn drop(&mut self) {
+        let mut used = self.gate.used.lock();
+        *used = used.saturating_sub(self.bytes);
+        drop(used);
+        self.gate.released.notify_all();
+    }
+}
+
+impl MemGate {
+    pub const fn new(capacity: usize) -> Self {
+        Self { capacity, used: Mutex::new(0), released: Condvar::new() }
+    }
+
+    pub fn global() -> &'static Self {
+        static GLOBAL_GATE: OnceLock<MemGate> = OnceLock::new();
+        GLOBAL_GATE.get_or_init(|| Self::new(budget().mem_gate_bytes))
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[cfg(test)]
+    #[inline]
+    pub fn used(&self) -> usize {
+        *self.used.lock()
+    }
+
+    pub fn try_admit(&self, bytes: usize) -> Result<MemPermit<'_>, GateErr> {
+        if under_memory_pressure() {
+            return Err(GateErr::Busy);
+        }
+        self.try_reserve(bytes)
+    }
+
+    pub fn try_reserve(&self, bytes: usize) -> Result<MemPermit<'_>, GateErr> {
+        if bytes > self.capacity {
+            return Err(GateErr::TooBig { requested: bytes, capacity: self.capacity });
+        }
+        let mut used = self.used.lock();
+        if used.checked_add(bytes).is_some_and(|next| next <= self.capacity) {
+            *used += bytes;
+            Ok(MemPermit { gate: self, bytes })
+        } else {
+            Err(GateErr::Busy)
+        }
+    }
+
+    pub fn reserve_or_wait(&self, bytes: usize, max_wait: Duration) -> Result<MemPermit<'_>, GateErr> {
+        if bytes > self.capacity {
+            return Err(GateErr::TooBig { requested: bytes, capacity: self.capacity });
+        }
+        let deadline = Instant::now() + max_wait;
+        let mut used = self.used.lock();
+        loop {
+            if used.checked_add(bytes).is_some_and(|next| next <= self.capacity) {
+                *used += bytes;
+                return Ok(MemPermit { gate: self, bytes });
+            }
+            if self.released.wait_until(&mut used, deadline).timed_out() {
+                if used.checked_add(bytes).is_some_and(|next| next <= self.capacity) {
+                    *used += bytes;
+                    return Ok(MemPermit { gate: self, bytes });
+                }
+                return Err(GateErr::Busy);
+            }
+        }
+    }
+}
 
 #[cfg(windows)]
 pub fn self_metrics() -> SelfMetrics {
@@ -14,15 +455,14 @@ pub fn self_metrics() -> SelfMetrics {
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
-    // SAFETY: `GetCurrentProcess` returns the pseudo-handle for this process; both memory
-    // counter structs and `FILETIME` outputs are zeroed POD with exact struct byte sizes.
+    // SAFETY: `GetCurrentProcess` returns the process pseudo-handle; POD outputs carry exact sizes.
     unsafe {
         let proc_h = GetCurrentProcess();
         let mut ex2: PROCESS_MEMORY_COUNTERS_EX2 = zeroed();
         ex2.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
         let rss_bytes = if GetProcessMemoryInfo(
             proc_h,
-            &mut ex2 as *mut PROCESS_MEMORY_COUNTERS_EX2 as *mut PROCESS_MEMORY_COUNTERS,
+            (&mut ex2 as *mut PROCESS_MEMORY_COUNTERS_EX2).cast(),
             ex2.cb,
         ) != 0
             && ex2.PrivateWorkingSetSize > 0
@@ -63,46 +503,25 @@ pub fn self_metrics() -> SelfMetrics {
         .unwrap_or(0);
 
     #[cfg(target_os = "linux")]
-    let rss_bytes = linux_uss_bytes().unwrap_or_else(|| {
-        usage.map(|u| u.max_rss().max(0) as u64 * 1024).unwrap_or(0)
-    });
-
+    let rss_bytes = linux_uss_bytes()
+        .unwrap_or_else(|| usage.map(|u| u.max_rss().max(0) as u64 * 1024).unwrap_or(0));
     #[cfg(not(target_os = "linux"))]
     let rss_bytes = usage.map(|u| u.max_rss().max(0) as u64).unwrap_or(0);
-
     SelfMetrics { rss_bytes, cpu_ms }
 }
 
 #[cfg(target_os = "linux")]
 fn linux_uss_bytes() -> Option<u64> {
     if let Ok(rollup) = std::fs::read_to_string("/proc/self/smaps_rollup") {
-        let mut dirty_kb = 0u64;
-        let mut clean_kb = 0u64;
-        let mut lazy_kb = 0u64;
-        let mut found = false;
-        for line in rollup.lines() {
-            if let Some(rest) = line.strip_prefix("Private_Dirty:") {
-                dirty_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
-                found = true;
-            } else if let Some(rest) = line.strip_prefix("Private_Clean:") {
-                clean_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
-                found = true;
-            } else if let Some(rest) = line.strip_prefix("LazyFree:") {
-                lazy_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            }
-        }
-        if found {
-            return Some(dirty_kb.saturating_add(clean_kb).saturating_sub(lazy_kb) * 1024);
+        let dirty = parse_proc_kb_field(&rollup, "Private_Dirty:");
+        let clean = parse_proc_kb_field(&rollup, "Private_Clean:");
+        if dirty.is_some() || clean.is_some() {
+            let lazy = parse_proc_kb_field(&rollup, "LazyFree:").unwrap_or(0);
+            return Some(dirty.unwrap_or(0).saturating_add(clean.unwrap_or(0)).saturating_sub(lazy));
         }
     }
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
+    parse_proc_kb_field(&status, "VmRSS:")
 }
 
 fn spawn_pipe<R: Read + Send + 'static>(pipe: Option<R>, cap_bytes: usize) -> std::thread::JoinHandle<String> {
@@ -110,15 +529,11 @@ fn spawn_pipe<R: Read + Send + 'static>(pipe: Option<R>, cap_bytes: usize) -> st
         let mut buf = Vec::new();
         if let Some(mut p) = pipe {
             let mut chunk = [0u8; 8192];
-            loop {
-                match p.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if buf.len() < cap_bytes {
-                            let keep = (cap_bytes - buf.len()).min(n);
-                            buf.extend_from_slice(&chunk[..keep]);
-                        }
-                    }
+            while let Ok(n) = p.read(&mut chunk)
+                && n > 0
+            {
+                if buf.len() < cap_bytes {
+                    buf.extend_from_slice(&chunk[..(cap_bytes - buf.len()).min(n)]);
                 }
             }
         }
@@ -140,7 +555,6 @@ pub fn run_cmd(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-
     if clear_env {
         cmd.env_clear();
     }
@@ -154,14 +568,11 @@ pub fn run_cmd(
     let (unix_cpu_before, _) = unix_rusage();
 
     let started = Instant::now();
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn `{program}` in {}", cwd.display()))?;
-
+    let mut child = cmd.spawn().with_context(|| format!("spawn `{program}` in {}", cwd.display()))?;
     #[cfg(windows)]
     let job_handle = attach_job(&child);
 
-    let cap = super::budget::budget().pipe_cap_bytes;
+    let cap = budget().pipe_cap_bytes;
     let out_thread = spawn_pipe(child.stdout.take(), cap);
     let err_thread = spawn_pipe(child.stderr.take(), cap);
 
@@ -203,9 +614,7 @@ pub fn run_cmd(
 fn kill_child(child: &mut Child, job: Option<windows_sys::Win32::Foundation::HANDLE>) {
     if let Some(h) = job {
         // SAFETY: `h` is a valid Job Object handle owned by this `run_cmd` invocation.
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(h, 1);
-        }
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(h, 1); }
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -228,11 +637,7 @@ fn set_pgid(cmd: &mut Command) {
 fn kill_child(child: &mut Child) {
     let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
     let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
-    let gone = wait_timeout::ChildExt::wait_timeout(child, Duration::from_millis(100))
-        .ok()
-        .flatten()
-        .is_some();
-    if !gone {
+    if wait_timeout::ChildExt::wait_timeout(child, Duration::from_millis(100)).ok().flatten().is_none() {
         let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
         let _ = child.kill();
     }
@@ -250,24 +655,22 @@ fn attach_job(child: &Child) -> Option<windows_sys::Win32::Foundation::HANDLE> {
         SetInformationJobObject,
     };
 
-    // SAFETY: Win32 Job Object creation/assignment with zeroed POD struct and valid child handle;
-    // any failure path closes the handle before returning `None`.
+    // SAFETY: Win32 Job Object creation/assignment with zeroed POD struct and valid child handle.
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
             return None;
         }
-
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let ptr = &info as *const _ as *const core::ffi::c_void;
-        let len = size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
-
-        if SetInformationJobObject(job, JobObjectExtendedLimitInformation, ptr, len) == 0 {
-            CloseHandle(job);
-            return None;
-        }
-        if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0
+            && AssignProcessToJobObject(job, child.as_raw_handle()) != 0;
+        if !ok {
             CloseHandle(job);
             return None;
         }
@@ -286,37 +689,34 @@ fn close_job(job_handle: Option<windows_sys::Win32::Foundation::HANDLE>) -> (u64
     };
 
     let Some(job) = job_handle else { return (0, 0) };
-    // SAFETY: `job` is a valid owned Job Object handle queried with exact POD buffer sizes and
-    // unconditionally closed via `CloseHandle` before returning.
+    // SAFETY: `job` is an owned Job Object handle queried with exact POD buffer sizes and closed.
     unsafe {
         let mut acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = zeroed();
-        let a_ptr = &mut acct as *mut _ as *mut core::ffi::c_void;
-        let a_len = size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32;
-        let a_ok = QueryInformationJobObject(
+        let cpu_ms = if QueryInformationJobObject(
             job,
             JobObjectBasicAccountingInformation,
-            a_ptr,
-            a_len,
+            (&mut acct as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
             std::ptr::null_mut(),
-        );
-        let cpu_ms = if a_ok != 0 {
+        ) != 0
+        {
             ((acct.TotalUserTime + acct.TotalKernelTime).max(0) as u64) / 10_000
         } else {
             0
         };
-
         let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-        let e_ptr = &mut ext as *mut _ as *mut core::ffi::c_void;
-        let e_len = size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
-        let e_ok = QueryInformationJobObject(
+        let peak_rss = if QueryInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
-            e_ptr,
-            e_len,
+            (&mut ext as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             std::ptr::null_mut(),
-        );
-        let peak_rss = if e_ok != 0 { ext.PeakJobMemoryUsed as u64 } else { 0 };
-
+        ) != 0
+        {
+            ext.PeakJobMemoryUsed as u64
+        } else {
+            0
+        };
         CloseHandle(job);
         (cpu_ms, peak_rss)
     }
@@ -337,4 +737,54 @@ fn unix_rusage() -> (u64, u64) {
             (cpu, rss)
         })
         .unwrap_or((0, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn cgroup_and_budget_parsing() {
+        assert_eq!(parse_cgroup_v2_rel("0::/kubepods.slice/pod1\n"), Some("/kubepods.slice/pod1"));
+        assert_eq!(parse_cgroup_cpu_max("100000 100000\n"), Some(1));
+        assert_eq!(parse_cgroup_cpu_max("250000 100000\n"), Some(3));
+        assert_eq!(parse_cgroup_cpu_max("max 100000\n"), None);
+        assert_eq!(parse_cgroup_mem_limit("268435456\n"), Some(268_435_456));
+        assert_eq!(parse_cgroup_mem_limit("max\n"), None);
+        assert_eq!(parse_psi_some_avg10("some avg10=12.50 avg60=3.10\n"), Some(12.50));
+
+        let tight = ResourceBudget::from_limits(1, 256 * MIB);
+        assert_eq!((tight.mode, tight.rayon_threads, tight.http_pool_max), (ExecMode::InlineConstrained, 0, 2));
+        assert_eq!(ResourceBudget::from_limits(8, 256 * MIB).mode, ExecMode::InlineConstrained);
+        let bal = ResourceBudget::from_limits(8, 8 * 1024 * MIB);
+        assert!(bal.mode == ExecMode::BoundedBalanced && bal.rayon_threads >= 4);
+    }
+
+    #[test]
+    fn memgate_condvar_and_too_big() {
+        let g = Arc::new(MemGate::new(1024));
+        assert_eq!(g.try_reserve(2048).unwrap_err(), GateErr::TooBig { requested: 2048, capacity: 1024 });
+        let p1 = g.try_reserve(600).unwrap();
+        assert_eq!(g.used(), 600);
+        assert_eq!(g.try_reserve(500).unwrap_err(), GateErr::Busy);
+
+        // Verify Condvar wakes waiter promptly upon permit drop.
+        let g2 = g.clone();
+        let waiter = std::thread::spawn(move || {
+            let p = g2.reserve_or_wait(500, Duration::from_secs(2)).unwrap();
+            assert_eq!(g2.used(), 500);
+            drop(p);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        drop(p1);
+        waiter.join().unwrap();
+        assert_eq!(g.used(), 0);
+    }
+
+    #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+    #[test]
+    fn jemalloc_all_arenas_purge_returns_zero() {
+        assert_eq!(purge_jemalloc_all_arenas(), 0);
+    }
 }

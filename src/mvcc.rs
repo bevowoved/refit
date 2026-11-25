@@ -1,23 +1,22 @@
 mod diff;
-pub(crate) mod framed_wal;
 mod wal;
 
 pub use wal::{CommitOutcome, TxDiffReport, WalEvent, WalRecovery};
 
-use crate::platform::{now_ms, write_atomic};
+use crate::platform::{EpochRegistry, now_ms, write_atomic};
 use crate::source::count_lines;
 use crate::types::{WalFileEntry, WalRecord};
 use anyhow::{Context, Result};
-use framed_wal::{
-    WalHaltError, WalScanStats, append_framed_record, append_jsonl_record, file_uses_frames,
-    truncate_torn_tail, wal_next_seq,
-};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use wal::{visit_wal, visit_wal_stats, wal_head};
+use wal::{
+    WalHaltError, WalScanStats, append_framed_record, append_jsonl_record, file_uses_frames,
+    truncate_torn_tail, visit_wal, visit_wal_stats, wal_head, wal_next_seq,
+};
 
 static TX_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -28,6 +27,7 @@ pub struct MvccStore {
     lock_path: PathBuf,
     commit_lock: Mutex<u64>,
     wal_cursor: Mutex<(u64, u64)>,
+    epoch: Arc<EpochRegistry>,
 }
 
 struct TxBatch<'a> {
@@ -40,6 +40,14 @@ struct TxBatch<'a> {
 
 impl MvccStore {
     pub fn open(repo_root: &Path, run_id: &str) -> Result<Self> {
+        Self::open_with_epoch(repo_root, run_id, EpochRegistry::global_arc())
+    }
+
+    pub fn open_with_epoch(
+        repo_root: &Path,
+        run_id: &str,
+        epoch: Arc<EpochRegistry>,
+    ) -> Result<Self> {
         let refit_dir = repo_root.join(".refit");
         let cas_dir = refit_dir.join("cas");
         fs::create_dir_all(&cas_dir)
@@ -56,6 +64,7 @@ impl MvccStore {
             lock_path,
             commit_lock: Mutex::new(persisted_rev),
             wal_cursor: Mutex::new((0, 0)),
+            epoch,
         };
 
         if !store.wal_path.exists() {
@@ -69,6 +78,11 @@ impl MvccStore {
             }
         }
         Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn epoch_registry(&self) -> &Arc<EpochRegistry> {
+        &self.epoch
     }
 
     fn lock_wal(&self) -> Result<crate::platform::SidecarLock> {
@@ -214,6 +228,7 @@ impl MvccStore {
 
         *rev_guard += 1;
         let head_rev = *rev_guard;
+        let committed_paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
         self.append_wal(&WalRecord::Committed {
             tx_id: tx_id.clone(),
             module_id: module_id.to_string(),
@@ -222,7 +237,7 @@ impl MvccStore {
             loc_delta: Some(loc_delta),
             files: entries,
         })?;
-        let _ = crate::platform::EpochRegistry::global().publish(module_id, head_rev);
+        let _ = self.epoch.publish_batch(module_id, &committed_paths, head_rev);
         Ok(CommitOutcome::Committed { head_rev, tx_id, new_hashes })
     }
 
@@ -694,8 +709,8 @@ mod tests {
     #[test]
     fn wal_crash_points_7_of_7() {
         // 0. RFC 3720 Castagnoli CRC32C verification (slice-by-8 across short and long buffers).
-        assert_eq!(framed_wal::crc32c(b"123456789"), 0xE306_9283);
-        assert_eq!(framed_wal::crc32c(b""), 0x0000_0000);
+        assert_eq!(wal::crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(wal::crc32c(b""), 0x0000_0000);
         let long_buf: Vec<u8> = (0..137u8).collect();
         let expected_long = {
             let mut crc = 0xFFFF_FFFFu32;
@@ -707,7 +722,7 @@ mod tests {
             }
             !crc
         };
-        assert_eq!(framed_wal::crc32c(&long_buf), expected_long);
+        assert_eq!(wal::crc32c(&long_buf), expected_long);
 
         // CP-1: Crash after store_cas writes blobs, before Prepared WAL append.
         {
@@ -730,7 +745,7 @@ mod tests {
                 ts_ms: now_ms(),
                 files: vec![],
             };
-            let raw_frame = framed_wal::encode_wal_frame(2, serde_json::to_string(&prep).unwrap().as_bytes()).unwrap();
+            let raw_frame = wal::encode_wal_frame(2, serde_json::to_string(&prep).unwrap().as_bytes()).unwrap();
             {
                 let mut f = OpenOptions::new().append(true).open(&store.wal_path).unwrap();
                 f.write_all(&raw_frame[..13]).unwrap();
@@ -893,29 +908,29 @@ mod tests {
             let r1 = serde_json::to_vec(&WalRecord::RunStart { run_id: "r".into(), ts_ms: 1, repo_root: ".".into() }).unwrap();
             let r2 = serde_json::to_vec(&WalRecord::Rollback { tx_id: "t1".into(), module_id: "m".into(), gate: "g".into(), reason: "ok".into(), ts_ms: 2 }).unwrap();
             let r3 = serde_json::to_vec(&WalRecord::Rollback { tx_id: "t2".into(), module_id: "m".into(), gate: "g".into(), reason: "ok".into(), ts_ms: 3 }).unwrap();
-            framed_wal::append_framed_record(&wal, 1, &r1).unwrap();
-            framed_wal::append_framed_record(&wal, 2, &r2).unwrap();
-            framed_wal::append_framed_record(&wal, 3, &r3).unwrap();
+            wal::append_framed_record(&wal, 1, &r1).unwrap();
+            wal::append_framed_record(&wal, 2, &r2).unwrap();
+            wal::append_framed_record(&wal, 3, &r3).unwrap();
 
             // Mid-file 1-bit flip -> Clean-Halt MidFileCorruption.
             let mut flipped = fs::read(&wal).unwrap();
             let mid = flipped.len() / 2;
             flipped[mid] ^= 0x01;
             assert!(matches!(
-                framed_wal::scan_wal_bytes(&flipped, &mut |_| {}),
+                wal::scan_wal_bytes(&flipped, &mut |_| {}),
                 Err(WalHaltError::MidFileCorruption(_))
             ));
 
             // Frame line fusion (truncated frame #2 directly glued to valid frame #3) -> Clean-Halt.
-            let f1 = framed_wal::encode_wal_frame(1, &r1).unwrap();
-            let f2 = framed_wal::encode_wal_frame(2, &r2).unwrap();
-            let f3 = framed_wal::encode_wal_frame(3, &r3).unwrap();
+            let f1 = wal::encode_wal_frame(1, &r1).unwrap();
+            let f2 = wal::encode_wal_frame(2, &r2).unwrap();
+            let f3 = wal::encode_wal_frame(3, &r3).unwrap();
             let mut fused = Vec::new();
             fused.extend_from_slice(&f1);
             fused.extend_from_slice(&f2[..f2.len() - 4]);
             fused.extend_from_slice(&f3);
             assert!(matches!(
-                framed_wal::scan_wal_bytes(&fused, &mut |_| {}),
+                wal::scan_wal_bytes(&fused, &mut |_| {}),
                 Err(WalHaltError::MidFileCorruption(_))
             ));
 
@@ -924,7 +939,7 @@ mod tests {
             gapped.extend_from_slice(&f1);
             gapped.extend_from_slice(&f3);
             assert!(matches!(
-                framed_wal::scan_wal_bytes(&gapped, &mut |_| {}),
+                wal::scan_wal_bytes(&gapped, &mut |_| {}),
                 Err(WalHaltError::MidFileCorruption(_))
             ));
 
@@ -935,7 +950,7 @@ mod tests {
             upgraded.extend_from_slice(&f2);
             upgraded.extend_from_slice(&f3);
             let mut count = 0usize;
-            let stats = framed_wal::scan_wal_bytes(&upgraded, &mut |_| count += 1).unwrap();
+            let stats = wal::scan_wal_bytes(&upgraded, &mut |_| count += 1).unwrap();
             assert_eq!((count, stats.valid_records, stats.next_seq, stats.has_framed), (3, 3, 4, true));
         }
 

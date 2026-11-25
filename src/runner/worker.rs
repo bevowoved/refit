@@ -449,7 +449,6 @@ fn commit_unit(
     exp_hashes: &BTreeMap<String, String>,
     verdict: GateVerdict,
 ) -> bool {
-    let lease = crate::platform::EpochRegistry::global().try_lease(&r.unit.id);
     let res = ctx.mvcc.commit_tx(
         &r.unit.id,
         exp_hashes,
@@ -459,9 +458,6 @@ fn commit_unit(
 
     match res {
         Ok(CommitOutcome::Committed { head_rev, tx_id, new_hashes }) => {
-            if let Some(l) = lease {
-                l.commit(head_rev);
-            }
             r.out.committed = true;
             let after_loc: usize = verdict
                 .final_contents

@@ -54,9 +54,7 @@ pub fn check_interface_cutoff_digests(
 ) -> InterfaceCutoff {
     let next_hash = interface_blake3_from_digests(digests);
     if prev_interface_blake3 == Some(next_hash.as_str()) {
-        let epoch = registry
-            .try_read(pkg_id)
-            .map_or_else(|| registry.global_epoch(), |(ep, _)| ep);
+        let epoch = registry.slot_epoch(pkg_id);
         return InterfaceCutoff {
             pkg_id: pkg_id.to_string(),
             interface_blake3: next_hash,

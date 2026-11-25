@@ -8,15 +8,18 @@ use crate::graph::{apply_patches, parse_patches};
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::MvccStore;
 use crate::net::{json_str, rpc_err, rpc_ok, rpc_text};
-use crate::platform::MemGate;
+use crate::platform::{EpochRegistry, MemGate, file_mtime_size};
 use crate::research::WebClient;
-use crate::stem::query_symbols;
+use crate::stem::{SymbolGraph, load_symbols, query_symbol_graph, query_symbols};
 use crate::untangle::{render_audit, untangle_repo, write_sustain};
 use anyhow::Result;
 use catalog::{encode_legacy_tools_list_rpc, sep2549_meta, tool_catalog};
+use parking_lot::Mutex;
+use rustc_hash::FxHasher;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -25,6 +28,24 @@ use tx::{
     tx_delete, tx_move, tx_stage, verify_commit,
 };
 
+struct EpochMemo<T> {
+    epoch: u64,
+    stat_sig: u64,
+    value: T,
+}
+
+fn quick_repo_stat_sig(repo_root: &Path) -> u64 {
+    let mut h = FxHasher::default();
+    for p in [
+        repo_root.to_path_buf(),
+        repo_root.join(".git/index"),
+        repo_root.join(".refit/wal.jsonl"),
+    ] {
+        file_mtime_size(&p).hash(&mut h);
+    }
+    h.finish()
+}
+
 struct McpCtx {
     repo_root: PathBuf,
     hygiene: HygieneScorer,
@@ -32,9 +53,20 @@ struct McpCtx {
     research: Arc<WebClient>,
     out_tx: tokio::sync::mpsc::Sender<String>,
     blocking_sem: Arc<tokio::sync::Semaphore>,
+    epoch: Arc<EpochRegistry>,
+    scan_memo: Mutex<Option<(bool, EpochMemo<Value>)>>,
+    symbols_memo: Mutex<Option<EpochMemo<Arc<SymbolGraph>>>>,
 }
 
 fn build_mcp_ctx(repo_root: PathBuf, out_tx: tokio::sync::mpsc::Sender<String>) -> Arc<McpCtx> {
+    build_mcp_ctx_with_epoch(repo_root, out_tx, EpochRegistry::global_arc())
+}
+
+fn build_mcp_ctx_with_epoch(
+    repo_root: PathBuf,
+    out_tx: tokio::sync::mpsc::Sender<String>,
+    epoch: Arc<EpochRegistry>,
+) -> Arc<McpCtx> {
     let permits = crate::platform::budget().mcp_blocking_permits;
     Arc::new(McpCtx {
         hygiene: HygieneScorer::open_persistent(&repo_root),
@@ -43,6 +75,9 @@ fn build_mcp_ctx(repo_root: PathBuf, out_tx: tokio::sync::mpsc::Sender<String>) 
         repo_root,
         out_tx,
         blocking_sem: Arc::new(tokio::sync::Semaphore::new(permits)),
+        epoch,
+        scan_memo: Mutex::new(None),
+        symbols_memo: Mutex::new(None),
     })
 }
 
@@ -53,7 +88,7 @@ impl v2::McpBackend for McpCtx {
     }
 
     fn dispatch_sync(&self, name: &str, args: &Value) -> Value {
-        dispatch_tool(name, args, &self.repo_root, &self.hygiene, &self.gate_cfg)
+        dispatch_tool(name, args, self)
     }
 
     fn dispatch_search(&self, language: String, capability: String) -> v2::SearchFuture<'_> {
@@ -224,7 +259,7 @@ fn spawn_call(tasks: &mut tokio::task::JoinSet<()>, id: Option<Value>, req: &Val
                 let _held = pre_permit.or_else(|| {
                     gate.reserve_or_wait(reserve, std::time::Duration::from_secs(5)).ok()
                 });
-                dispatch_tool(&name, &args, &cc.repo_root, &cc.hygiene, &cc.gate_cfg)
+                dispatch_tool(&name, &args, &cc)
             })
             .await
             .unwrap_or_else(|e| json!({"error": format!("mcp worker join error: {e}")}))
@@ -243,22 +278,17 @@ fn ok_json<T: serde::Serialize>(res: Result<T>) -> Value {
     }
 }
 
-fn dispatch_tool(
-    name: &str,
-    args: &Value,
-    repo_root: &Path,
-    hygiene: &HygieneScorer,
-    gate_cfg: &GateConfig,
-) -> Value {
-    let tctx = ToolCtx { repo_root, hygiene, gate_cfg };
+fn dispatch_tool(name: &str, args: &Value, ctx: &McpCtx) -> Value {
+    let repo_root = ctx.repo_root.as_path();
+    let tctx = ToolCtx { repo_root, hygiene: &ctx.hygiene, gate_cfg: &ctx.gate_cfg };
     match name {
-        "refit_scan" => run_scan(repo_root, args, hygiene),
-        "refit_audit" => run_audit(repo_root, args, hygiene),
-        "refit_sustain" => run_sustain(repo_root, args, hygiene),
-        "refit_symbols" => query_symbols(repo_root, args["symbol"].as_str(), args["file"].as_str()),
-        "refit_read" => run_read(repo_root, args),
+        "refit_scan" => run_scan(ctx, args),
+        "refit_audit" => run_audit(repo_root, args, &ctx.hygiene),
+        "refit_sustain" => run_sustain(repo_root, args, &ctx.hygiene),
+        "refit_symbols" => run_symbols(ctx, args),
+        "refit_read" => run_read(ctx, args),
         "refit_resume" => run_resume(repo_root),
-        "refit_verify" => run_verify(repo_root, hygiene),
+        "refit_verify" => run_verify(repo_root, &ctx.hygiene),
         "refit_tx_begin" => tx_begin(repo_root, args),
         "refit_tx_create" => tx_create(repo_root, args),
         "refit_tx_delete" => tx_delete(repo_root, args),
@@ -271,21 +301,84 @@ fn dispatch_tool(
     }
 }
 
-fn run_scan(repo_root: &Path, args: &Value, hygiene: &HygieneScorer) -> Value {
+fn run_scan(ctx: &McpCtx, args: &Value) -> Value {
     let fast = args["fast"].as_bool().unwrap_or(true);
-    match scan_cached(repo_root, true, fast, hygiene) {
+    let ep = ctx.epoch.global_epoch();
+    let sig = quick_repo_stat_sig(&ctx.repo_root);
+    if let Some((cached_fast, ref memo)) = *ctx.scan_memo.lock()
+        && cached_fast == fast
+        && memo.epoch == ep
+        && memo.stat_sig == sig
+    {
+        let mut v = memo.value.clone();
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("scan_cache_hit".into(), json!(true));
+            obj.insert("epoch_cache_hit".into(), json!(true));
+            obj.insert("epoch".into(), json!(ep));
+        }
+        return v;
+    }
+
+    match scan_cached(&ctx.repo_root, true, fast, &ctx.hygiene) {
         Ok((bundle, hit)) => {
+            let ep_after = ctx.epoch.global_epoch();
+            let sig_after = quick_repo_stat_sig(&ctx.repo_root);
             let mut v = serde_json::to_value(&bundle.plan).unwrap_or_else(|_| json!({"ok": true}));
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("scan_cache_hit".into(), json!(hit));
+                obj.insert("epoch_cache_hit".into(), json!(false));
+                obj.insert("epoch".into(), json!(ep_after));
                 obj.insert("fast_mode".into(), json!(fast));
                 obj.insert("detected_languages".into(), json!(bundle.detected_languages));
                 obj.insert("polyglot_toolchains".into(), json!(bundle.polyglot_toolchains));
             }
+            *ctx.scan_memo.lock() =
+                Some((fast, EpochMemo { epoch: ep_after, stat_sig: sig_after, value: v.clone() }));
             v
         }
         Err(e) => json!({"error": e.to_string()}),
     }
+}
+
+fn run_symbols(ctx: &McpCtx, args: &Value) -> Value {
+    let sym = args["symbol"].as_str();
+    let file = args["file"].as_str();
+    let ep = ctx.epoch.global_epoch();
+    let sig = quick_repo_stat_sig(&ctx.repo_root);
+
+    let cached_snap = ctx
+        .symbols_memo
+        .lock()
+        .as_ref()
+        .filter(|m| m.epoch == ep && m.stat_sig == sig)
+        .map(|m| m.value.clone());
+    if let Some(snap) = cached_snap {
+        let mut v = query_symbol_graph(&snap, sym, file);
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("epoch_cache_hit".into(), json!(true));
+            obj.insert("epoch".into(), json!(ep));
+        }
+        return v;
+    }
+
+    let (mut v, ep_after) = if sym.is_none()
+        && file.is_some()
+        && ctx.repo_root.join(".refit/cache/sym.sst").is_file()
+    {
+        (query_symbols(&ctx.repo_root, None, file), ep)
+    } else {
+        let snap = Arc::new(load_symbols(&ctx.repo_root, None));
+        let ep_now = ctx.epoch.global_epoch();
+        let sig_now = quick_repo_stat_sig(&ctx.repo_root);
+        *ctx.symbols_memo.lock() =
+            Some(EpochMemo { epoch: ep_now, stat_sig: sig_now, value: snap.clone() });
+        (query_symbol_graph(&snap, sym, file), ep_now)
+    };
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("epoch_cache_hit".into(), json!(false));
+        obj.insert("epoch".into(), json!(ep_after));
+    }
+    v
 }
 
 fn run_audit(repo_root: &Path, args: &Value, hygiene: &HygieneScorer) -> Value {
@@ -310,9 +403,10 @@ fn run_sustain(repo_root: &Path, args: &Value, hygiene: &HygieneScorer) -> Value
     ok_json(untangle_repo(repo_root, hygiene).and_then(|r| write_sustain(repo_root, &r, dry)))
 }
 
-fn run_read(repo_root: &Path, args: &Value) -> Value {
+fn run_read(ctx: &McpCtx, args: &Value) -> Value {
     use std::io::BufRead;
 
+    let repo_root = ctx.repo_root.as_path();
     let rel = args["path"].as_str().unwrap_or("");
     if !check_target(repo_root, rel) {
         return json!({"error": format!("unsafe path `{rel}`")});
@@ -320,8 +414,8 @@ fn run_read(repo_root: &Path, args: &Value) -> Value {
     let Ok(file) = fs::File::open(repo_root.join(rel)) else {
         return json!({"error": format!("file not found `{rel}`")});
     };
-    let _epoch = crate::platform::EpochRegistry::global().global_epoch();
-    let _file_epoch = crate::platform::EpochRegistry::global().try_read(rel);
+    let epoch = ctx.epoch.global_epoch();
+    let file_epoch = ctx.epoch.slot_epoch(rel);
 
     let start = args["start_line"].as_u64().unwrap_or(1).max(1) as usize;
     let req_end = args["end_line"]
@@ -352,7 +446,8 @@ fn run_read(repo_root: &Path, args: &Value) -> Value {
     let slice = if start <= end { kept.join("\n") } else { String::new() };
     json!({
         "path": rel, "start_line": start, "end_line": end,
-        "total_lines": total, "content": slice
+        "total_lines": total, "content": slice,
+        "epoch": epoch, "file_epoch": file_epoch
     })
 }
 
@@ -434,19 +529,19 @@ mod tests {
 
     struct Harness {
         repo: TempRepo,
-        hygiene: HygieneScorer,
-        gates: GateConfig,
+        ctx: Arc<McpCtx>,
     }
 
     impl Harness {
         fn new(tag: &str, files: &[(&str, &str)]) -> Self {
             let repo = TempRepo::nested_with(tag, "repo", files);
-            let gates = read_gates(repo.path());
-            Self { repo, hygiene: HygieneScorer::new(), gates }
+            let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+            let ctx = build_mcp_ctx(repo.path().to_path_buf(), tx);
+            Self { repo, ctx }
         }
 
         fn call(&self, tool: &str, args: Value) -> Value {
-            dispatch_tool(tool, &args, self.repo.path(), &self.hygiene, &self.gates)
+            dispatch_tool(tool, &args, &self.ctx)
         }
 
         fn begin_tx(&self) -> String {
@@ -615,5 +710,56 @@ mod tests {
         dispatch_stdio_value(&batch_req, &ctx, &v2_state, &mut tasks).await.unwrap();
         let batch_res: Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
         assert_eq!(batch_res["error"]["code"], json!(-32600));
+    }
+
+    #[test]
+    fn warm_epoch_short_circuit_and_commit_invalidation() {
+        let repo = TempRepo::nested_with(
+            "mcp_epoch_memo",
+            "repo",
+            &[("src/mod_a.rs", "pub fn initial_sym() -> i32 { 1 }\n")],
+        );
+        let reg = Arc::new(EpochRegistry::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(1);
+        let ctx = build_mcp_ctx_with_epoch(repo.path().to_path_buf(), tx, reg.clone());
+        let h = Harness { repo, ctx };
+
+        // 1. Cold calls populate scan_memo and symbols_memo.
+        let s1 = h.call("refit_scan", json!({}));
+        assert_eq!(s1["epoch_cache_hit"], json!(false));
+        let y1 = h.call("refit_symbols", json!({"symbol": "initial_sym"}));
+        assert_eq!(y1["epoch_cache_hit"], json!(false));
+        assert_eq!(y1["definers"], json!(["src/mod_a.rs"]));
+
+        // 2. Warm calls hit O(1) EpochMemo directly.
+        let s2 = h.call("refit_scan", json!({}));
+        assert_eq!((&s2["epoch_cache_hit"], &s2["scan_cache_hit"]), (&json!(true), &json!(true)));
+        let y2 = h.call("refit_symbols", json!({"symbol": "initial_sym"}));
+        assert_eq!(y2["epoch_cache_hit"], json!(true));
+        assert_eq!(y2["definers"], json!(["src/mod_a.rs"]));
+
+        // Verify `refit_read` surfaces live epoch & file_epoch.
+        let rd = h.call("refit_read", json!({"path": "src/mod_a.rs"}));
+        assert!(rd["epoch"].as_u64().is_some_and(|e| e >= 1));
+        assert!(rd["file_epoch"].as_u64().is_some_and(|e| e >= 1));
+
+        // 3. Commit a new symbol via MvccStore::commit_tx -> invalidates both memos!
+        let store = MvccStore::open_with_epoch(h.repo.path(), "memo-commit", reg).unwrap();
+        let mut exp = BTreeMap::new();
+        exp.insert("src/mod_a.rs".into(), h.repo.hash("src/mod_a.rs"));
+        let mut new_files = BTreeMap::new();
+        new_files.insert(
+            "src/mod_a.rs".into(),
+            b"pub fn initial_sym() -> i32 { 1 }\npub fn freshly_committed_sym() -> i32 { 42 }\n"
+                .to_vec(),
+        );
+        let outcome = store.commit_tx("mod_a", &exp, &new_files, &[]).unwrap();
+        assert!(matches!(outcome, crate::mvcc::CommitOutcome::Committed { .. }));
+
+        let s3 = h.call("refit_scan", json!({}));
+        assert_eq!(s3["epoch_cache_hit"], json!(false));
+        let y3 = h.call("refit_symbols", json!({"symbol": "freshly_committed_sym"}));
+        assert_eq!(y3["epoch_cache_hit"], json!(false));
+        assert_eq!(y3["definers"], json!(["src/mod_a.rs"]));
     }
 }
