@@ -62,6 +62,14 @@ impl MemGate {
         self.used.load(Ordering::Acquire)
     }
 
+    /// Non-blocking W4 -> W3 admission gate checked strictly before spawning async/HTTP work.
+    pub fn try_admit(&self, bytes: usize) -> Result<MemPermit<'_>, GateErr> {
+        if super::budget::under_memory_pressure() {
+            return Err(GateErr::Busy);
+        }
+        self.try_reserve(bytes)
+    }
+
     pub fn try_reserve(&self, bytes: usize) -> Result<MemPermit<'_>, GateErr> {
         if bytes > self.capacity {
             return Err(GateErr::TooBig { requested: bytes, capacity: self.capacity });
