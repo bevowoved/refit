@@ -3,7 +3,7 @@ mod wal;
 
 pub use wal::{CommitOutcome, TxDiffReport, WalEvent, WalRecovery};
 
-use crate::platform::{EpochRegistry, now_ms, write_atomic};
+use crate::platform::{EpochRegistry, SidecarLock, now_ms, write_atomic};
 use crate::source::count_lines;
 use crate::types::{WalFileEntry, WalRecord};
 use anyhow::{Context, Result};
@@ -56,7 +56,6 @@ impl MvccStore {
         let wal_path = refit_dir.join("wal.jsonl");
         let lock_path = refit_dir.join("wal.lock");
         let persisted_rev = wal_head(&wal_path);
-
         let store = Self {
             repo_root: repo_root.to_path_buf(),
             cas_dir,
@@ -85,8 +84,8 @@ impl MvccStore {
         &self.epoch
     }
 
-    fn lock_wal(&self) -> Result<crate::platform::SidecarLock> {
-        crate::platform::SidecarLock::acquire(&self.lock_path)
+    fn lock_wal(&self) -> Result<SidecarLock> {
+        SidecarLock::acquire(&self.lock_path)
             .with_context(|| format!("acquire OS lock {}", self.lock_path.display()))
     }
 
@@ -114,10 +113,8 @@ impl MvccStore {
         })?;
         let actual = Self::hash_bytes(&bytes);
         if actual != hash {
-            return Err(WalHaltError::UnrecoverableRollback(format!(
-                "corrupt CAS blob `{hash}` (actual `{actual}`)"
-            ))
-            .into());
+            let detail = format!("corrupt CAS blob `{hash}` (actual `{actual}`)");
+            return Err(WalHaltError::UnrecoverableRollback(detail).into());
         }
         Ok(bytes)
     }
@@ -127,7 +124,7 @@ impl MvccStore {
         let use_framed = cfg!(feature = "wal-crc32c") || file_uses_frames(&self.wal_path);
         if use_framed {
             let mut cursor = self.wal_cursor.lock();
-            let disk_len = fs::metadata(&self.wal_path).map(|meta| meta.len()).unwrap_or(0);
+            let disk_len = fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0);
             let seq = if disk_len == cursor.0 && cursor.1 > 0 {
                 cursor.1
             } else {
@@ -142,120 +139,21 @@ impl MvccStore {
     }
 
     pub fn recover_wal(&self) -> Result<WalRecovery> {
-        let mut head_rev = self.commit_lock.lock();
-        let _flock = self.lock_wal()?;
-        if !self.wal_path.exists() {
-            return Ok(WalRecovery {
-                rolled_back_txs: 0,
-                committed_modules: HashMap::new(),
-                head_rev: 0,
-            });
-        }
-
-        let (prepared, closed, committed_modules, max_rev, stats) = scan_recovery(&self.wal_path)?;
-        tracing::debug!(
-            valid_records = stats.valid_records,
-            file_len = stats.file_len,
-            truncated = stats.truncated_bytes,
-            has_framed = stats.has_framed,
-            "WAL recovery scan completed"
-        );
-        if stats.truncated_bytes > 0 {
-            truncate_torn_tail(&self.wal_path, stats.valid_pos)?;
-        }
-        *self.wal_cursor.lock() = (stats.valid_pos as u64, stats.next_seq.max(1));
-
-        let mut rolled_back_txs = 0usize;
-        let mut recovered_paths = Vec::new();
-        for (tx_id, module_id, files) in prepared {
-            if closed.contains(&tx_id) {
-                continue;
-            }
-            restore_prepared(self, &files)?;
-            recovered_paths.extend(files.into_iter().map(|f| f.path));
-            self.append_wal(&WalRecord::Rollback {
-                tx_id,
-                module_id,
-                gate: "wal_recovery".into(),
-                reason: "restored PREPARED transaction from CAS after crash".into(),
-                ts_ms: now_ms(),
-            })?;
-            rolled_back_txs += 1;
-        }
-
-        if rolled_back_txs > 0 {
-            self.epoch.publish_batch("wal_recovery", &recovered_paths, max_rev);
-        }
-        *head_rev = max_rev;
-        Ok(WalRecovery { rolled_back_txs, committed_modules, head_rev: max_rev })
+        recover_store(self)
     }
 
     pub fn commit_tx(
-        &self,
-        module_id: &str,
-        expected_hashes: &BTreeMap<String, String>,
-        new_files: &BTreeMap<String, Vec<u8>>,
-        deleted_files: &[String],
+        &self, module_id: &str, expected_hashes: &BTreeMap<String, String>,
+        new_files: &BTreeMap<String, Vec<u8>>, deleted_files: &[String],
     ) -> Result<CommitOutcome> {
-        let mut rev_guard = self.commit_lock.lock();
-        let _flock = self.lock_wal()?;
-        *rev_guard = (*rev_guard).max(wal_head(&self.wal_path));
-
-        let mut old_blobs = BTreeMap::new();
-        if let Some(conflict) = check_cas(&self.repo_root, expected_hashes, &mut old_blobs)? {
-            return Ok(conflict);
-        }
-
-        let mut entries = Vec::with_capacity(new_files.len() + deleted_files.len());
-        let mut new_hashes = BTreeMap::new();
-        let mut loc_delta = 0i64;
-        stage_writes(self, new_files, &mut old_blobs, &mut entries, &mut new_hashes, &mut loc_delta)?;
-
-        let mut del_blobs = BTreeMap::new();
-        stage_deletes(self, new_files, deleted_files, &old_blobs, &mut del_blobs, &mut entries, &mut loc_delta)?;
-
-        let tx_id = format!("tx-{}-{}", now_ms(), TX_SEQ.fetch_add(1, Ordering::Relaxed));
-        self.append_wal(&WalRecord::Prepared {
-            tx_id: tx_id.clone(),
-            module_id: module_id.to_string(),
-            ts_ms: now_ms(),
-            files: entries.clone(),
-        })?;
-
-        let batch = TxBatch {
-            tx_id: &tx_id,
-            module_id,
-            new_files,
-            old_blobs: &old_blobs,
-            del_blobs: &del_blobs,
-        };
-        apply_io(self, &batch)?;
-
-        *rev_guard += 1;
-        let head_rev = *rev_guard;
-        let committed_paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
-        self.append_wal(&WalRecord::Committed {
-            tx_id: tx_id.clone(),
-            module_id: module_id.to_string(),
-            head_rev,
-            ts_ms: now_ms(),
-            loc_delta: Some(loc_delta),
-            files: entries,
-        })?;
-        let _ = self.epoch.publish_batch(module_id, &committed_paths, head_rev);
-        Ok(CommitOutcome::Committed { head_rev, tx_id, new_hashes })
+        execute_commit(self, module_id, expected_hashes, new_files, deleted_files)
     }
 
     pub fn record_rollback(&self, module_id: &str, gate: &str, reason: &str) -> Result<()> {
         let _flock = self.lock_wal()?;
         let tx_id = format!("rb-{}-{}", now_ms(), TX_SEQ.fetch_add(1, Ordering::Relaxed));
-        self.append_wal(&WalRecord::Rollback {
-            tx_id,
-            module_id: module_id.to_string(),
-            gate: gate.to_string(),
-            reason: reason.chars().take(240).collect(),
-            ts_ms: now_ms(),
-        })
+        let clipped: String = reason.chars().take(240).collect();
+        self.append_wal(&rollback_record(tx_id, module_id.into(), gate, clipped))
     }
 
     pub fn head_rev(&self) -> u64 {
@@ -268,7 +166,6 @@ impl MvccStore {
         if !self.wal_path.exists() {
             return Ok(0);
         }
-
         let retained = collect_retained(&self.wal_path, keep_last_revs)?;
         Ok(prune_cas(&self.cas_dir, &retained))
     }
@@ -282,6 +179,101 @@ impl MvccStore {
     }
 }
 
+fn rollback_record(tx_id: String, module_id: String, gate: &str, reason: String) -> WalRecord {
+    WalRecord::Rollback { tx_id, module_id, gate: gate.into(), reason, ts_ms: now_ms() }
+}
+
+fn wal_file_entry(
+    path: String, old_blake3: String, new_blake3: String, created: bool, deleted: bool,
+) -> WalFileEntry {
+    WalFileEntry { path, old_blake3, new_blake3, created, deleted }
+}
+
+fn rollback_unclosed_txs(
+    store: &MvccStore, prepared: Vec<(String, String, Vec<WalFileEntry>)>,
+    closed: &HashSet<String>, max_rev: u64,
+) -> Result<usize> {
+    let (mut rolled_back, mut paths) = (0usize, Vec::new());
+    for (tx_id, module_id, files) in prepared {
+        if closed.contains(&tx_id) {
+            continue;
+        }
+        restore_prepared(store, &files)?;
+        paths.extend(files.into_iter().map(|f| f.path));
+        let reason = "restored PREPARED transaction from CAS after crash".into();
+        store.append_wal(&rollback_record(tx_id, module_id, "wal_recovery", reason))?;
+        rolled_back += 1;
+    }
+    if rolled_back > 0 {
+        store.epoch.publish_batch("wal_recovery", &paths, max_rev);
+    }
+    Ok(rolled_back)
+}
+
+fn recover_store(store: &MvccStore) -> Result<WalRecovery> {
+    let mut head_rev = store.commit_lock.lock();
+    let _flock = store.lock_wal()?;
+    if !store.wal_path.exists() {
+        return Ok(WalRecovery { rolled_back_txs: 0, committed_modules: HashMap::new(), head_rev: 0 });
+    }
+    let (prepared, closed, committed_modules, max_rev, stats) = scan_recovery(&store.wal_path)?;
+    tracing::debug!(
+        valid_records = stats.valid_records, file_len = stats.file_len,
+        truncated = stats.truncated_bytes, has_framed = stats.has_framed,
+        "WAL recovery scan completed"
+    );
+    if stats.truncated_bytes > 0 {
+        truncate_torn_tail(&store.wal_path, stats.valid_pos)?;
+    }
+    *store.wal_cursor.lock() = (stats.valid_pos as u64, stats.next_seq.max(1));
+    let rolled_back_txs = rollback_unclosed_txs(store, prepared, &closed, max_rev)?;
+    *head_rev = max_rev;
+    Ok(WalRecovery { rolled_back_txs, committed_modules, head_rev: max_rev })
+}
+
+fn execute_commit(
+    store: &MvccStore, module_id: &str, expected_hashes: &BTreeMap<String, String>,
+    new_files: &BTreeMap<String, Vec<u8>>, deleted_files: &[String],
+) -> Result<CommitOutcome> {
+    let mut rev_guard = store.commit_lock.lock();
+    let _flock = store.lock_wal()?;
+    *rev_guard = (*rev_guard).max(wal_head(&store.wal_path));
+
+    let mut old_blobs = BTreeMap::new();
+    if let Some(conflict) = check_cas(&store.repo_root, expected_hashes, &mut old_blobs)? {
+        return Ok(conflict);
+    }
+
+    let mut entries = Vec::with_capacity(new_files.len() + deleted_files.len());
+    let (mut new_hashes, mut del_blobs, mut loc_delta) = (BTreeMap::new(), BTreeMap::new(), 0i64);
+    stage_writes(store, new_files, &mut old_blobs, &mut entries, &mut new_hashes, &mut loc_delta)?;
+    stage_deletes(
+        store, new_files, deleted_files, &old_blobs, &mut del_blobs, &mut entries, &mut loc_delta,
+    )?;
+
+    let tx_id = format!("tx-{}-{}", now_ms(), TX_SEQ.fetch_add(1, Ordering::Relaxed));
+    let prep = WalRecord::Prepared {
+        tx_id: tx_id.clone(), module_id: module_id.into(), ts_ms: now_ms(), files: entries.clone(),
+    };
+    store.append_wal(&prep)?;
+
+    let batch = TxBatch {
+        tx_id: &tx_id, module_id, new_files, old_blobs: &old_blobs, del_blobs: &del_blobs,
+    };
+    apply_io(store, &batch)?;
+
+    *rev_guard += 1;
+    let head_rev = *rev_guard;
+    let committed_paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+    let committed = WalRecord::Committed {
+        tx_id: tx_id.clone(), module_id: module_id.into(), head_rev, ts_ms: now_ms(),
+        loc_delta: Some(loc_delta), files: entries,
+    };
+    store.append_wal(&committed)?;
+    let _ = store.epoch.publish_batch(module_id, &committed_paths, head_rev);
+    Ok(CommitOutcome::Committed { head_rev, tx_id, new_hashes })
+}
+
 type RecoveryScan = (
     Vec<(String, String, Vec<WalFileEntry>)>,
     HashSet<String>,
@@ -291,11 +283,8 @@ type RecoveryScan = (
 );
 
 fn scan_recovery(wal_path: &Path) -> Result<RecoveryScan> {
-    let mut prepared = Vec::new();
-    let mut closed = HashSet::new();
-    let mut committed = HashMap::new();
+    let (mut prepared, mut closed, mut committed) = (Vec::new(), HashSet::new(), HashMap::new());
     let mut max_rev = 0u64;
-
     let stats = visit_wal_stats(wal_path, |rec| match rec {
         WalRecord::Prepared { tx_id, module_id, files, .. } => {
             prepared.push((tx_id, module_id, files));
@@ -303,7 +292,7 @@ fn scan_recovery(wal_path: &Path) -> Result<RecoveryScan> {
         WalRecord::Committed { tx_id, module_id, head_rev, files, .. } => {
             closed.insert(tx_id);
             max_rev = max_rev.max(head_rev);
-            let map: BTreeMap<String, String> = files
+            let map = files
                 .into_iter()
                 .filter(|f| !f.deleted)
                 .map(|f| (f.path, f.new_blake3))
@@ -325,11 +314,8 @@ fn restore_prepared(store: &MvccStore, files: &[WalFileEntry]) -> Result<()> {
             if let Err(err) = fs::remove_file(&abs)
                 && err.kind() != std::io::ErrorKind::NotFound
             {
-                return Err(WalHaltError::UnrecoverableRollback(format!(
-                    "remove created `{}`: {err}",
-                    entry.path
-                ))
-                .into());
+                let msg = format!("remove created `{}`: {err}", entry.path);
+                return Err(WalHaltError::UnrecoverableRollback(msg).into());
             }
             continue;
         }
@@ -348,19 +334,18 @@ fn check_cas(
 ) -> Result<Option<CommitOutcome>> {
     for (rel, exp) in expected {
         let abs = repo_root.join(rel);
-        if exp.is_empty() && abs.exists() {
-            let actual = fs::read(&abs)
-                .map_or_else(|_| "exists".into(), |b| MvccStore::hash_bytes(&b));
-            return Ok(Some(CommitOutcome::CasConflict {
-                path: rel.clone(),
-                expected: "<absent>".into(),
-                actual,
-            }));
-        }
         if exp.is_empty() {
+            if abs.exists() {
+                let actual = fs::read(&abs)
+                    .map_or_else(|_| "exists".into(), |b| MvccStore::hash_bytes(&b));
+                return Ok(Some(CommitOutcome::CasConflict {
+                    path: rel.clone(),
+                    expected: "<absent>".into(),
+                    actual,
+                }));
+            }
             continue;
         }
-
         let cur = fs::read(&abs)
             .with_context(|| format!("CAS read failed for {}", abs.display()))?;
         let actual = MvccStore::hash_bytes(&cur);
@@ -377,12 +362,9 @@ fn check_cas(
 }
 
 fn stage_writes(
-    store: &MvccStore,
-    new_files: &BTreeMap<String, Vec<u8>>,
-    old_blobs: &mut BTreeMap<String, Vec<u8>>,
-    entries: &mut Vec<WalFileEntry>,
-    new_hashes: &mut BTreeMap<String, String>,
-    loc_delta: &mut i64,
+    store: &MvccStore, new_files: &BTreeMap<String, Vec<u8>>,
+    old_blobs: &mut BTreeMap<String, Vec<u8>>, entries: &mut Vec<WalFileEntry>,
+    new_hashes: &mut BTreeMap<String, String>, loc_delta: &mut i64,
 ) -> Result<()> {
     for (rel, bytes) in new_files {
         let abs = store.repo_root.join(rel);
@@ -401,49 +383,31 @@ fn stage_writes(
         let new_hash = store.store_cas(bytes)?;
         *loc_delta += count_lines(bytes) as i64 - old_l;
         new_hashes.insert(rel.clone(), new_hash.clone());
-        entries.push(WalFileEntry {
-            path: rel.clone(),
-            old_blake3: old_hash,
-            new_blake3: new_hash,
-            created,
-            deleted: false,
-        });
+        entries.push(wal_file_entry(rel.clone(), old_hash, new_hash, created, false));
     }
     Ok(())
 }
 
 fn stage_deletes(
-    store: &MvccStore,
-    new_files: &BTreeMap<String, Vec<u8>>,
-    deleted: &[String],
-    old_blobs: &BTreeMap<String, Vec<u8>>,
-    del_blobs: &mut BTreeMap<String, Vec<u8>>,
-    entries: &mut Vec<WalFileEntry>,
-    loc_delta: &mut i64,
+    store: &MvccStore, new_files: &BTreeMap<String, Vec<u8>>, deleted: &[String],
+    old_blobs: &BTreeMap<String, Vec<u8>>, del_blobs: &mut BTreeMap<String, Vec<u8>>,
+    entries: &mut Vec<WalFileEntry>, loc_delta: &mut i64,
 ) -> Result<()> {
     for rel in deleted {
         if new_files.contains_key(rel) {
             continue;
         }
-        let Some(old) = old_blobs
-            .get(rel)
-            .cloned()
-            .or_else(|| fs::read(store.repo_root.join(rel)).ok())
-        else {
-            continue;
+        let old = match old_blobs.get(rel) {
+            Some(bytes) => bytes.clone(),
+            None => match fs::read(store.repo_root.join(rel)) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            },
         };
-
-        let old_hash = store.store_cas(&old)?;
-        let empty_hash = store.store_cas(&[])?;
+        let (old_hash, empty_hash) = (store.store_cas(&old)?, store.store_cas(&[])?);
         *loc_delta -= count_lines(&old) as i64;
         del_blobs.insert(rel.clone(), old);
-        entries.push(WalFileEntry {
-            path: rel.clone(),
-            old_blake3: old_hash,
-            new_blake3: empty_hash,
-            created: false,
-            deleted: true,
-        });
+        entries.push(wal_file_entry(rel.clone(), old_hash, empty_hash, false, true));
     }
     Ok(())
 }
@@ -453,8 +417,7 @@ fn apply_io(store: &MvccStore, batch: &TxBatch<'_>) -> Result<()> {
     for (rel, bytes) in batch.new_files {
         let created = !batch.old_blobs.contains_key(rel);
         if let Err(err) = write_atomic(&store.repo_root.join(rel), bytes) {
-            let msg = format!("write failure on `{rel}`: {err}");
-            rollback_io(store, batch, &written, &[], msg)?;
+            rollback_io(store, batch, &written, &[], format!("write failure on `{rel}`: {err}"))?;
             return Err(err);
         }
         written.push((rel.clone(), created));
@@ -476,7 +439,12 @@ fn apply_io(store: &MvccStore, batch: &TxBatch<'_>) -> Result<()> {
     Ok(())
 }
 
-fn rollback_written_file(root: &Path, rel: &str, created: bool, orig: Option<&Vec<u8>>) -> Result<()> {
+fn rollback_written_file(
+    root: &Path,
+    rel: &str,
+    created: bool,
+    orig: Option<&Vec<u8>>,
+) -> Result<()> {
     let abs = root.join(rel);
     if created {
         return match fs::remove_file(&abs) {
@@ -486,10 +454,8 @@ fn rollback_written_file(root: &Path, rel: &str, created: bool, orig: Option<&Ve
         };
     }
     let Some(bytes) = orig else {
-        return Err(WalHaltError::UnrecoverableRollback(format!(
-            "missing pre-image in memory for `{rel}`"
-        ))
-        .into());
+        let msg = format!("missing pre-image in memory for `{rel}`");
+        return Err(WalHaltError::UnrecoverableRollback(msg).into());
     };
     write_atomic(&abs, bytes)
 }
@@ -512,7 +478,6 @@ fn rollback_io(
             first_err = Some(err.context(format!("rollback resurrect `{rel}`")));
         }
     }
-
     for (rel, created) in written.iter().rev() {
         let orig = batch.old_blobs.get(rel);
         if let Err(err) = rollback_written_file(root, rel, *created, orig)
@@ -521,22 +486,13 @@ fn rollback_io(
             first_err = Some(err.context(format!("rollback restore `{rel}`")));
         }
     }
-
     if let Some(rb_err) = first_err {
-        return Err(WalHaltError::UnrecoverableRollback(format!(
-            "rollback I/O failed during `{reason}`: {rb_err}"
-        ))
-        .into());
+        let msg = format!("rollback I/O failed during `{reason}`: {rb_err}");
+        return Err(WalHaltError::UnrecoverableRollback(msg).into());
     }
 
-    store.append_wal(&WalRecord::Rollback {
-        tx_id: batch.tx_id.to_string(),
-        module_id: batch.module_id.to_string(),
-        gate: "mvcc_commit_io".into(),
-        reason,
-        ts_ms: now_ms(),
-    })?;
-    Ok(())
+    let rec = rollback_record(batch.tx_id.into(), batch.module_id.into(), "mvcc_commit_io", reason);
+    store.append_wal(&rec)
 }
 
 fn collect_retained(wal_path: &Path, keep_last_revs: usize) -> Result<HashSet<String>> {
@@ -559,7 +515,6 @@ fn collect_retained(wal_path: &Path, keep_last_revs: usize) -> Result<HashSet<St
             keep_hashes(&files, &mut retained);
         }
     }
-
     committed.sort_by_key(|(rev, _)| *rev);
     let skip = committed.len().saturating_sub(keep_last_revs);
     for (_, files) in committed.into_iter().skip(skip) {
@@ -604,22 +559,50 @@ mod tests {
         (dir, store)
     }
 
-    fn prep_entry(
-        path: &str, old_b3: String, new_b3: String, created: bool, deleted: bool,
-    ) -> WalFileEntry {
-        WalFileEntry { path: path.into(), old_blake3: old_b3, new_blake3: new_b3, created, deleted }
+    fn write_prep(store: &MvccStore, tx_id: &str, module_id: &str, files: Vec<WalFileEntry>) {
+        let rec = WalRecord::Prepared {
+            tx_id: tx_id.into(), module_id: module_id.into(), ts_ms: now_ms(), files,
+        };
+        store.append_wal(&rec).unwrap();
     }
 
-    fn write_prep(store: &MvccStore, tx_id: &str, module_id: &str, files: Vec<WalFileEntry>) {
-        store.append_wal(&WalRecord::Prepared {
-            tx_id: tx_id.into(), module_id: module_id.into(), ts_ms: now_ms(), files,
-        }).unwrap();
+    type PrepSpec<'a> = (&'a str, &'a [u8], &'a [u8], bool, bool);
+
+    fn stage_prep(st: &MvccStore, tx_id: &str, mod_id: &str, specs: &[PrepSpec<'_>]) -> Vec<String> {
+        let mut old_hashes = Vec::with_capacity(specs.len());
+        let mut entries = Vec::with_capacity(specs.len());
+        for &(path, old_b, new_b, created, deleted) in specs {
+            let old_blake3 = st.store_cas(old_b).unwrap();
+            let new_blake3 = st.store_cas(new_b).unwrap();
+            old_hashes.push(old_blake3.clone());
+            entries.push(wal_file_entry(path.into(), old_blake3, new_blake3, created, deleted));
+        }
+        write_prep(st, tx_id, mod_id, entries);
+        old_hashes
     }
 
     fn append_raw_wal(path: &Path, bytes: &[u8]) {
         let mut opts = OpenOptions::new();
-        let mut f = opts.append(true).open(path).unwrap();
+        opts.append(true);
+        let mut f = opts.open(path).unwrap();
         f.write_all(bytes).unwrap();
+    }
+
+    fn corrupt_and_recover(
+        st: &MvccStore,
+        dir: &TempRepo,
+        tail: Option<&[u8]>,
+        rolled: usize,
+        checks: &[(&str, &str)],
+    ) {
+        if let Some(raw) = tail {
+            append_raw_wal(&st.wal_path, raw);
+        }
+        let rec = st.recover_wal().unwrap();
+        assert_eq!((rec.rolled_back_txs, rec.head_rev), (rolled, 0));
+        for &(rel, want) in checks {
+            assert_eq!(dir.hash(rel), want);
+        }
     }
 
     #[test]
@@ -628,13 +611,19 @@ mod tests {
         let real_hash = dir.hash("mod_a.py");
         let next = "def f() -> int:\n    return 2\n";
 
-        let res = store.commit_tx(
-            "mod_a", &map1("mod_a.py", "deadbeef".into()),
-            &map1("mod_a.py", next.as_bytes().to_vec()), &[],
-        ).unwrap();
+        let res = store
+            .commit_tx(
+                "mod_a",
+                &map1("mod_a.py", "deadbeef".into()),
+                &map1("mod_a.py", next.as_bytes().to_vec()),
+                &[],
+            )
+            .unwrap();
         match res {
             CommitOutcome::CasConflict { path, expected, actual } => {
-                assert_eq!((path.as_str(), expected.as_str(), actual), ("mod_a.py", "deadbeef", real_hash));
+                assert_eq!(path.as_str(), "mod_a.py");
+                assert_eq!(expected.as_str(), "deadbeef");
+                assert_eq!(actual, real_hash);
             }
             other => panic!("expected CasConflict, got {other:?}"),
         }
@@ -644,8 +633,8 @@ mod tests {
         assert_eq!(rev, 1);
 
         let torn = b"def f() -> int:\n    return 999_TORN\n";
-        let entry = prep_entry("mod_a.py", h1.clone(), store.store_cas(torn).unwrap(), false, false);
-        write_prep(&store, "tx-crash-sim", "mod_a", vec![entry]);
+        let crash_spec = [("mod_a.py", next.as_bytes(), torn.as_slice(), false, false)];
+        stage_prep(&store, "tx-crash-sim", "mod_a", &crash_spec);
         append_raw_wal(&store.wal_path, b"{\"kind\":\"committed\",\"tx_id\":\"trunca");
         dir.write("mod_a.py", torn);
 
@@ -667,22 +656,27 @@ mod tests {
 
     #[test]
     fn test_mvcc_parallel_commits() {
-        let (dir, raw) = open_repo("mvcc_par", "conc-probe", &[]);
-        let store = Arc::new(raw);
-        for i in 0..8 { dir.write(&format!("m{i}.py"), format!("X = {i}\n")); }
-        std::thread::scope(|s| {
-            for i in 0..8 {
-                let (st, root) = (store.clone(), dir.path().to_path_buf());
-                s.spawn(move || {
-                    let _ = commit_file(
-                        &st, &root, &format!("m{i}"), &format!("m{i}.py"),
-                        format!("X = {}\n", i + 100),
-                    );
+        let (repo, inner) = open_repo("mvcc_par", "conc-probe", &[]);
+        let shared = Arc::new(inner);
+        for idx in 0..8 {
+            repo.write(&format!("m{idx}.py"), format!("X = {idx}\n"));
+        }
+        std::thread::scope(|scope| {
+            for idx in 0..8 {
+                let st = Arc::clone(&shared);
+                let root = repo.path().to_path_buf();
+                scope.spawn(move || {
+                    let mod_name = format!("m{idx}");
+                    let file_name = format!("m{idx}.py");
+                    let body = format!("X = {}\n", idx + 100);
+                    let _ = commit_file(&st, &root, &mod_name, &file_name, body);
                 });
             }
         });
-        assert_eq!(store.head_rev(), 8);
-        for i in 0..8 { assert_eq!(dir.read(&format!("m{i}.py")), format!("X = {}\n", i + 100)); }
+        assert_eq!(shared.head_rev(), 8);
+        for idx in 0..8 {
+            assert_eq!(repo.read(&format!("m{idx}.py")), format!("X = {}\n", idx + 100));
+        }
     }
 
     #[test]
@@ -717,10 +711,14 @@ mod tests {
     #[test]
     fn test_mvcc_create_delete_and_gc() {
         let (dir, s1) = open_repo("mvcc_gc", "r1", &[("old.py", "OLD = 1\n")]);
-        let r1 = s1.commit_tx(
-            "split", &map1("old.py", dir.hash("old.py")),
-            &map1("new_mod.py", b"NEW = 2\n".to_vec()), &["old.py".into()],
-        ).unwrap();
+        let r1 = s1
+            .commit_tx(
+                "split",
+                &map1("old.py", dir.hash("old.py")),
+                &map1("new_mod.py", b"NEW = 2\n".to_vec()),
+                &["old.py".into()],
+            )
+            .unwrap();
         assert!(matches!(r1, CommitOutcome::Committed { head_rev: 1, .. }));
         assert!(!dir.has("old.py") && dir.has("new_mod.py"));
 
@@ -730,172 +728,173 @@ mod tests {
         assert!(s2.gc_cas(1).unwrap() >= 1);
     }
 
-    #[test]
-    fn wal_crash_points_7_of_7() {
-        // 0. RFC 3720 Castagnoli CRC32C verification across short & long buffers.
+    fn wal_rb_bytes(id: &str, ts: u64) -> Vec<u8> {
+        let rec = WalRecord::Rollback {
+            tx_id: id.into(), module_id: "m".into(), gate: "g".into(), reason: "ok".into(), ts_ms: ts,
+        };
+        serde_json::to_vec(&rec).unwrap()
+    }
+
+    fn verify_framed_wal_corruption() {
+        let dir = TempRepo::new("pmv7_halt");
+        let wal = dir.join("framed.wal");
+        let run_start = WalRecord::RunStart { run_id: "r".into(), ts_ms: 1, repo_root: ".".into() };
+        let r1 = serde_json::to_vec(&run_start).unwrap();
+        let (r2, r3) = (wal_rb_bytes("t1", 2), wal_rb_bytes("t2", 3));
+        for (seq, raw) in [(1, &r1), (2, &r2), (3, &r3)] {
+            wal::append_framed_record(&wal, seq, raw).unwrap();
+        }
+
+        let mut flipped = fs::read(&wal).unwrap();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0x01;
+        let f1 = wal::encode_wal_frame(1, &r1).unwrap();
+        let f2 = wal::encode_wal_frame(2, &r2).unwrap();
+        let f3 = wal::encode_wal_frame(3, &r3).unwrap();
+        let fused = [&f1[..], &f2[..f2.len() - 4], &f3[..]].concat();
+        let gapped = [&f1[..], &f3[..]].concat();
+        for bad in [&flipped, &fused, &gapped] {
+            let res = wal::scan_wal_bytes(bad, &mut |_| {});
+            assert!(matches!(res, Err(WalHaltError::MidFileCorruption(_))));
+        }
+
+        let upgraded = [&r1[..], b"\n", &f2[..], &f3[..]].concat();
+        let mut count = 0usize;
+        let stats = wal::scan_wal_bytes(&upgraded, &mut |_| count += 1).unwrap();
+        assert_eq!((count, stats.valid_records, stats.next_seq, stats.has_framed), (3, 3, 4, true));
+    }
+
+    fn verify_cas_rollback_halt() {
+        let (cdir, st) = open_repo("pmv7_cas", "cas", &[("lost.rs", "ORIG\n")]);
+        let missing = "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000";
+        let new_h = st.store_cas(b"NEW\n").unwrap();
+        let entry = wal_file_entry("lost.rs".into(), missing.into(), new_h, false, false);
+        write_prep(&st, "tx-miss", "lost", vec![entry]);
+        let is_unrec = |e: anyhow::Error| {
+            matches!(e.downcast_ref::<WalHaltError>(), Some(WalHaltError::UnrecoverableRollback(_)))
+        };
+        assert!(is_unrec(st.recover_wal().unwrap_err()));
+        assert!(MvccStore::wal_timeline(cdir.path()).unwrap().is_empty());
+        fs::write(st.cas_dir.join(missing), b"CORRUPTED_BYTES").unwrap();
+        assert!(is_unrec(st.recover_wal().unwrap_err()));
+    }
+
+    fn verify_cp1_orphan_cas() {
+        let (repo, store) = open_repo("cp1_cas", "cp1", &[("a.rs", "pub fn v() -> i32 { 1 }\n")]);
+        let pre_hash = repo.hash("a.rs");
+        store.store_cas(b"pub fn v() -> i32 { 2 }\n").unwrap();
+        let rec = store.recover_wal().unwrap();
+        assert_eq!((rec.rolled_back_txs, rec.head_rev), (0, 0));
+        assert_eq!(repo.hash("a.rs"), pre_hash);
+        assert!(store.gc_cas(1).unwrap() >= 1);
+    }
+
+    fn verify_crc32c_reference() {
         assert_eq!((wal::crc32c(b"123456789"), wal::crc32c(b"")), (0xE306_9283, 0));
         let long_buf: Vec<u8> = (0..137u8).collect();
         let ref_crc = !long_buf.iter().fold(0xFFFF_FFFFu32, |mut c, &b| {
             c ^= b as u32;
-            for _ in 0..8 { c = if (c & 1) != 0 { (c >> 1) ^ 0x82F6_3B78 } else { c >> 1 }; }
+            for _ in 0..8 {
+                c = if (c & 1) != 0 { (c >> 1) ^ 0x82F6_3B78 } else { c >> 1 };
+            }
             c
         });
         assert_eq!(wal::crc32c(&long_buf), ref_crc);
+    }
 
-        fn assert_recovered(st: &MvccStore, dir: &TempRepo, rolled: usize, checks: &[(&str, &str)]) {
-            let rec = st.recover_wal().unwrap();
-            assert_eq!((rec.rolled_back_txs, rec.head_rev), (rolled, 0));
-            for &(rel, want) in checks {
-                assert_eq!(dir.hash(rel), want);
-            }
-        }
+    fn verify_cp2_torn_prepared() {
+        let (repo, store) = open_repo("cp2_torn", "cp2", &[("a.rs", "pub fn v() -> i32 { 1 }\n")]);
+        let prep = WalRecord::Prepared {
+            tx_id: "tx-torn".into(),
+            module_id: "a".into(),
+            ts_ms: now_ms(),
+            files: vec![],
+        };
+        let prep_json = serde_json::to_string(&prep).unwrap();
+        let raw = wal::encode_wal_frame(2, prep_json.as_bytes()).unwrap();
+        let torn_pre = repo.hash("a.rs");
+        corrupt_and_recover(&store, &repo, Some(&raw[..13]), 0, &[("a.rs", &torn_pre)]);
+        corrupt_and_recover(&store, &repo, Some(&[0u8; 64]), 0, &[]);
+        let (rev, _, _) =
+            commit_file(&store, repo.path(), "a", "a.rs", "pub fn v() -> i32 { 2 }\n");
+        assert_eq!(rev, 1);
+    }
 
-        fn cas_put(st: &MvccStore, bytes: &[u8]) -> String {
-            st.store_cas(bytes).unwrap()
-        }
-
-        // CP-1: Crash after store_cas writes blobs, before Prepared WAL append.
-        {
-            let (dir, st) = open_repo("cp1_cas", "cp1", &[("a.rs", "pub fn v() -> i32 { 1 }\n")]);
-            let pre = dir.hash("a.rs");
-            let _ = cas_put(&st, b"pub fn v() -> i32 { 2 }\n");
-            assert_recovered(&st, &dir, 0, &[("a.rs", &pre)]);
-            assert!(st.gc_cas(1).unwrap() >= 1);
-        }
-
-        // CP-2: Crash mid-write of Prepared record + all-zero EOF sentinel.
-        {
-            let (dir, st) = open_repo("cp2_torn", "cp2", &[("a.rs", "pub fn v() -> i32 { 1 }\n")]);
-            let pre = dir.hash("a.rs");
-            let prep = WalRecord::Prepared {
-                tx_id: "tx-torn".into(), module_id: "a".into(), ts_ms: now_ms(), files: vec![],
-            };
-            let payload = serde_json::to_string(&prep).unwrap();
-            let raw = wal::encode_wal_frame(2, payload.as_bytes()).unwrap();
-            append_raw_wal(&st.wal_path, &raw[..13]);
-            assert_recovered(&st, &dir, 0, &[("a.rs", &pre)]);
-            append_raw_wal(&st.wal_path, &[0u8; 64]);
-            assert_eq!(st.recover_wal().unwrap().rolled_back_txs, 0);
-            assert_eq!(commit_file(&st, dir.path(), "a", "a.rs", "pub fn v() -> i32 { 2 }\n").0, 1);
-        }
-
+    fn verify_cp3_cp4_cp6() {
         // CP-3 & CP-6: Single-file Prepared crash before write vs torn Committed tail.
-        for (tag, mutate, append_torn) in [
-            ("cp3_prep", false, false),
-            ("cp6_torn", true, true),
-        ] {
+        let torn_tail = &b"{\"kind\":\"committed\",\"tx_id\":\"tx-cp6\""[..];
+        for (tag, mutate, torn) in [("cp3_prep", false, None), ("cp6_torn", true, Some(torn_tail))]
+        {
             let (dir, st) = open_repo(tag, tag, &[("m.rs", "M=1\n")]);
-            let h_old = cas_put(&st, b"M=1\n");
-            let h_new = cas_put(&st, b"M=2\n");
-            let entry = prep_entry("m.rs", h_old.clone(), h_new, false, false);
-            write_prep(&st, &format!("tx-{tag}"), tag, vec![entry]);
+            let tx_name = format!("tx-{tag}");
+            let hs = stage_prep(
+                &st,
+                &tx_name,
+                tag,
+                &[("m.rs", b"M=1\n", b"M=2\n", false, false)],
+            );
             if mutate {
                 dir.write("m.rs", "M=2\n");
             }
-            if append_torn {
-                append_raw_wal(&st.wal_path, b"{\"kind\":\"committed\",\"tx_id\":\"tx-cp6\"");
-            }
-            assert_recovered(&st, &dir, 1, &[("m.rs", &h_old)]);
-            if append_torn {
+            corrupt_and_recover(&st, &dir, torn, 1, &[("m.rs", &hs[0])]);
+            if torn.is_some() {
                 assert_eq!(commit_file(&st, dir.path(), tag, "m.rs", "M=3\n").0, 1);
             }
         }
 
         // CP-4: Crash mid-apply_io in a 4-file batch (2 edits + 1 create + 1 delete).
-        {
-            let seed = &[("e1.rs", "E1 = 1\n"), ("e2.rs", "E2 = 1\n"), ("del.rs", "DEL = 1\n")];
-            let (dir, st) = open_repo("cp4_batch", "cp4", seed);
-            let h1 = cas_put(&st, b"E1 = 1\n");
-            let h2 = cas_put(&st, b"E2 = 1\n");
-            let hd = st.store_cas(b"DEL = 1\n").unwrap();
-            let he = st.store_cas(b"").unwrap();
-            let hn = st.store_cas(b"NEW = 2\n").unwrap();
-            write_prep(&st, "tx-cp4", "batch4", vec![
-                prep_entry("e1.rs", h1.clone(), hn.clone(), false, false),
-                prep_entry("e2.rs", h2.clone(), hn.clone(), false, false),
-                prep_entry("created.rs", he.clone(), hn, true, false),
-                prep_entry("del.rs", hd.clone(), he, false, true),
-            ]);
-            dir.write("e1.rs", "E1 = CORRUPT\n");
-            dir.write("created.rs", "CREATED = 99\n");
-            assert_recovered(&st, &dir, 1, &[("e1.rs", &h1), ("e2.rs", &h2), ("del.rs", &hd)]);
-            assert!(!dir.has("created.rs"));
-        }
+        let seed4 = &[("e1.rs", "E1 = 1\n"), ("e2.rs", "E2 = 1\n"), ("del.rs", "DEL = 1\n")];
+        let (d4, s4) = open_repo("cp4_batch", "cp4", seed4);
+        let h4 = stage_prep(&s4, "tx-cp4", "batch4", &[
+            ("e1.rs", b"E1 = 1\n", b"NEW = 2\n", false, false),
+            ("e2.rs", b"E2 = 1\n", b"NEW = 2\n", false, false),
+            ("created.rs", b"", b"NEW = 2\n", true, false),
+            ("del.rs", b"DEL = 1\n", b"", false, true),
+        ]);
+        d4.write("e1.rs", "E1 = CORRUPT\n");
+        d4.write("created.rs", "CREATED = 99\n");
+        let checks4 = [
+            ("e1.rs", h4[0].as_str()),
+            ("e2.rs", h4[1].as_str()),
+            ("del.rs", h4[3].as_str()),
+        ];
+        corrupt_and_recover(&s4, &d4, None, 1, &checks4);
+        assert!(!d4.has("created.rs"));
+    }
 
+    fn verify_cp5_and_cp7() {
         // CP-5: Crash after ALL apply_io writes and deletes succeed, before Committed WAL append.
-        {
-            let (dir, st) = open_repo("cp5_pre", "cp5", &[("keep.rs", "K=1\n"), ("gone.rs", "G=1\n")]);
-            let hk = st.store_cas(b"K=1\n").unwrap();
-            let hg = st.store_cas(b"G=1\n").unwrap();
-            let he = st.store_cas(b"").unwrap();
-            let hk2 = st.store_cas(b"K=2\n").unwrap();
-            write_prep(&st, "tx-cp5", "m5", vec![
-                prep_entry("keep.rs", hk.clone(), hk2, false, false),
-                prep_entry("gone.rs", hg.clone(), he, false, true),
-            ]);
-            dir.write("keep.rs", "K=2\n");
-            fs::remove_file(dir.join("gone.rs")).unwrap();
-            assert_recovered(&st, &dir, 1, &[("keep.rs", &hk), ("gone.rs", &hg)]);
-        }
+        let (d5, s5) = open_repo("cp5_pre", "cp5", &[("keep.rs", "K=1\n"), ("gone.rs", "G=1\n")]);
+        let h5 = stage_prep(&s5, "tx-cp5", "m5", &[
+            ("keep.rs", b"K=1\n", b"K=2\n", false, false),
+            ("gone.rs", b"G=1\n", b"", false, true),
+        ]);
+        d5.write("keep.rs", "K=2\n");
+        fs::remove_file(d5.join("gone.rs")).unwrap();
+        corrupt_and_recover(&s5, &d5, None, 1, &[("keep.rs", &h5[0]), ("gone.rs", &h5[1])]);
 
         // CP-7: Double-crash during recover_wal + leftover .refit.tmp.* files -> idempotent recovery.
-        {
-            let (dir, st) = open_repo("cp7_dbl", "cp7", &[("a.rs", "A=1\n"), ("b.rs", "B=1\n")]);
-            let ha = st.store_cas(b"A=1\n").unwrap();
-            let hb = st.store_cas(b"B=1\n").unwrap();
-            let ha2 = st.store_cas(b"A=2\n").unwrap();
-            let hb2 = st.store_cas(b"B=2\n").unwrap();
-            write_prep(&st, "tx-cp7", "m7", vec![
-                prep_entry("a.rs", ha.clone(), ha2, false, false),
-                prep_entry("b.rs", hb.clone(), hb2, false, false),
-            ]);
-            dir.write("b.rs", "B=2\n");
-            dir.write(".refit.tmp.99999.1.b.rs", "LEFTOVER");
-            fs::write(st.cas_dir.join(".refit.tmp.99999.2.blob"), b"LEFTOVER").unwrap();
-            assert_recovered(&st, &dir, 1, &[("a.rs", &ha), ("b.rs", &hb)]);
-            assert_eq!(st.recover_wal().unwrap().rolled_back_txs, 0);
-            assert_eq!(commit_file(&st, dir.path(), "m7", "a.rs", "A=3\n").0, 1);
-        }
+        let (d7, s7) = open_repo("cp7_dbl", "cp7", &[("a.rs", "A=1\n"), ("b.rs", "B=1\n")]);
+        let h7 = stage_prep(&s7, "tx-cp7", "m7", &[
+            ("a.rs", b"A=1\n", b"A=2\n", false, false),
+            ("b.rs", b"B=1\n", b"B=2\n", false, false),
+        ]);
+        d7.write("b.rs", "B=2\n");
+        d7.write(".refit.tmp.99999.1.b.rs", "LEFTOVER");
+        fs::write(s7.cas_dir.join(".refit.tmp.99999.2.blob"), b"LEFTOVER").unwrap();
+        corrupt_and_recover(&s7, &d7, None, 1, &[("a.rs", &h7[0]), ("b.rs", &h7[1])]);
+        assert_eq!(s7.recover_wal().unwrap().rolled_back_txs, 0);
+        assert_eq!(commit_file(&s7, d7.path(), "m7", "a.rs", "A=3\n").0, 1);
+    }
 
-        // Strict PM-V7 clean-halt vectors: mid-file flip, line fusion, seq gap, legacy upgrade, bad CAS.
-        {
-            let dir = TempRepo::new("pmv7_halt");
-            let wal = dir.join("framed.wal");
-            let r1 = serde_json::to_vec(&WalRecord::RunStart { run_id: "r".into(), ts_ms: 1, repo_root: ".".into() }).unwrap();
-            let mk_rb = |id: &str, ts: u64| serde_json::to_vec(&WalRecord::Rollback {
-                tx_id: id.into(), module_id: "m".into(), gate: "g".into(), reason: "ok".into(), ts_ms: ts,
-            }).unwrap();
-            let (r2, r3) = (mk_rb("t1", 2), mk_rb("t2", 3));
-            for (seq, raw) in [(1, &r1), (2, &r2), (3, &r3)] {
-                wal::append_framed_record(&wal, seq, raw).unwrap();
-            }
-
-            let mut flipped = fs::read(&wal).unwrap();
-            let mid = flipped.len() / 2;
-            flipped[mid] ^= 0x01;
-            let f1 = wal::encode_wal_frame(1, &r1).unwrap();
-            let f2 = wal::encode_wal_frame(2, &r2).unwrap();
-            let f3 = wal::encode_wal_frame(3, &r3).unwrap();
-            let fused = [&f1[..], &f2[..f2.len() - 4], &f3[..]].concat();
-            let gapped = [&f1[..], &f3[..]].concat();
-            for bad in [&flipped, &fused, &gapped] {
-                assert!(matches!(wal::scan_wal_bytes(bad, &mut |_| {}), Err(WalHaltError::MidFileCorruption(_))));
-            }
-            let upgraded = [&r1[..], b"\n", &f2[..], &f3[..]].concat();
-            let mut count = 0usize;
-            let stats = wal::scan_wal_bytes(&upgraded, &mut |_| count += 1).unwrap();
-            assert_eq!((count, stats.valid_records, stats.next_seq, stats.has_framed), (3, 3, 4, true));
-        }
-        {
-            let (dir, st) = open_repo("pmv7_cas", "cas", &[("lost.rs", "ORIG\n")]);
-            let missing = "deadbeef00000000deadbeef00000000deadbeef00000000deadbeef00000000";
-            let hn = st.store_cas(b"NEW\n").unwrap();
-            write_prep(&st, "tx-miss", "lost", vec![prep_entry("lost.rs", missing.into(), hn, false, false)]);
-            let is_unrec = |e: anyhow::Error| matches!(e.downcast_ref::<WalHaltError>(), Some(WalHaltError::UnrecoverableRollback(_)));
-            assert!(is_unrec(st.recover_wal().unwrap_err()));
-            assert!(MvccStore::wal_timeline(dir.path()).unwrap().is_empty());
-            fs::write(st.cas_dir.join(missing), b"CORRUPTED_BYTES").unwrap();
-            assert!(is_unrec(st.recover_wal().unwrap_err()));
-        }
+    #[test]
+    fn wal_crash_points_7_of_7() {
+        verify_crc32c_reference();
+        verify_cp1_orphan_cas();
+        verify_cp2_torn_prepared();
+        verify_cp3_cp4_cp6();
+        verify_cp5_and_cp7();
+        verify_framed_wal_corruption();
+        verify_cas_rollback_halt();
     }
 }

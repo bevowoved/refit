@@ -9,15 +9,15 @@ use crate::graph::build_dag;
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::MvccStore;
 use crate::platform::{
-    FileBuf, StatEntry, budget, collect_os_memory, ensure_cachedir_tag, file_mtime_size,
-    load_stat_cache, now_unix_ns, read_zstd, run_cmd, sandbox_env, save_stat_cache,
-    stat_cache_fresh, walk_files, write_zstd,
+    FileBuf, StatEntry, budget, collect_os_memory, ensure_cachedir_tag, env_trimmed, env_truthy,
+    file_mtime_size, load_stat_cache, now_unix_ns, par_join2, par_join3, par_map, read_zstd,
+    run_cmd, sandbox_env, save_stat_cache, stat_cache_fresh, walk_files, write_zstd,
 };
 use crate::source::{ext_lang, ext_str, rel_norm, source_rel, stem_of, supported_ext};
-use crate::types::DagPlan;
+use crate::types::{DagPlan, SandboxResult};
 use anyhow::Result;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -119,20 +119,19 @@ fn resolve_file_hash(
 }
 
 fn hash_supported_entries(
-    supported: &[(String, PathBuf)], prev_stats: &BTreeMap<String, StatEntry>, now_ns: u64,
+    supported: &[(String, PathBuf)],
+    prev_stats: &BTreeMap<String, StatEntry>,
+    now_ns: u64,
 ) -> Vec<(String, u64, String, Option<StatEntry>)> {
-    if budget().is_constrained() {
-        let mut fb = FileBuf::new();
-        supported.iter().map(|(rel, abs)| {
-            let (len, h, upd) = resolve_file_hash(rel, abs, prev_stats, now_ns, &mut fb);
-            (rel.clone(), len, h, upd)
-        }).collect()
-    } else {
-        supported.par_iter().map_init(FileBuf::new, |fb, (rel, abs)| {
-            let (len, h, upd) = resolve_file_hash(rel, abs, prev_stats, now_ns, fb);
-            (rel.clone(), len, h, upd)
-        }).collect()
+    thread_local! {
+        static BUF: RefCell<FileBuf> = RefCell::new(FileBuf::new());
     }
+    par_map(supported, |(rel, abs)| {
+        let (len, h, upd) = BUF.with(|cell| {
+            resolve_file_hash(rel, abs, prev_stats, now_ns, &mut cell.borrow_mut())
+        });
+        (rel.clone(), len, h, upd)
+    })
 }
 
 fn read_tree(repo_root: &Path) -> TreeMeta {
@@ -142,13 +141,13 @@ fn read_tree(repo_root: &Path) -> TreeMeta {
     let (mut next_stats, mut stat_dirty, mut hashes) = (BTreeMap::new(), false, BTreeMap::new());
     let mut fp = blake3::Hasher::new();
 
-    for (idx, (rel, len, hash, updated)) in hash_supported_entries(&supported, &prev_stats, now_ns).into_iter().enumerate() {
-        if idx > 0 { fp.update(b"\n"); }
-        fp.update(rel.as_bytes());
-        fp.update(b":");
-        fp.update(len.to_string().as_bytes());
-        fp.update(b":");
-        fp.update(hash.as_bytes());
+    for (idx, (rel, len, hash, updated)) in
+        hash_supported_entries(&supported, &prev_stats, now_ns).into_iter().enumerate()
+    {
+        if idx > 0 {
+            fp.update(b"\n");
+        }
+        fp.update(format!("{rel}:{len}:{hash}").as_bytes());
         if let Some(entry) = updated {
             stat_dirty = true;
             next_stats.insert(rel.clone(), entry);
@@ -157,12 +156,10 @@ fn read_tree(repo_root: &Path) -> TreeMeta {
         }
         hashes.insert(rel, hash);
     }
-    if stat_dirty || next_stats.len() != prev_stats.len() { let _ = save_stat_cache(&stat_path, &next_stats); }
+    if stat_dirty || next_stats.len() != prev_stats.len() {
+        let _ = save_stat_cache(&stat_path, &next_stats);
+    }
     TreeMeta { fingerprint: fp.finalize().to_hex().to_string(), langs, source_rels, supported, hashes }
-}
-
-fn load_preloaded_bytes(supported: &[(String, PathBuf)]) -> BTreeMap<String, Vec<u8>> {
-    supported.par_iter().map(|(rel, abs)| (rel.clone(), fs::read(abs).unwrap_or_default())).collect()
 }
 
 pub fn scan_repo(repo_root: &Path, use_cache: bool, scorer: &HygieneScorer) -> Result<(ScanCache, bool)> {
@@ -170,22 +167,38 @@ pub fn scan_repo(repo_root: &Path, use_cache: bool, scorer: &HygieneScorer) -> R
 }
 
 pub fn scan_cached(
-    repo_root: &Path, use_cache: bool, skip_tests: bool, scorer: &HygieneScorer,
+    repo_root: &Path,
+    use_cache: bool,
+    skip_tests: bool,
+    scorer: &HygieneScorer,
 ) -> Result<(ScanCache, bool)> {
     let cache_dir = repo_root.join(".refit/cache");
     let cache_path = cache_dir.join("scan_cache.zst");
     let snap = read_tree(repo_root);
     let prev = read_zstd::<ScanCache>(&cache_path).filter(|c| c.version == "0.5.0");
-    if use_cache && let Some(ref c) = prev && c.repo_fingerprint == snap.fingerprint && (!c.fast_mode || skip_tests) {
+    if use_cache
+        && let Some(ref c) = prev
+        && c.repo_fingerprint == snap.fingerprint
+        && (!c.fast_mode || skip_tests)
+    {
         return Ok((c.clone(), true));
     }
 
     ensure_cachedir_tag(&cache_dir);
-    let preloaded_owned = (!budget().is_constrained()).then(|| load_preloaded_bytes(&snap.supported));
+    let preloaded_owned: Option<BTreeMap<String, Vec<u8>>> = (!budget().is_constrained()).then(|| {
+        par_map(&snap.supported, |(rel, abs)| (rel.clone(), fs::read(abs).unwrap_or_default()))
+            .into_iter()
+            .collect()
+    });
     let preloaded = preloaded_owned.as_ref();
     let (polyglot_toolchains, gate_cfg) = (detect_tools(&snap.langs), read_gates(repo_root));
     let changed: Vec<String> = match prev {
-        Some(ref p) => snap.source_rels.iter().filter(|r| p.per_file_hashes.get(*r) != snap.hashes.get(*r)).cloned().collect(),
+        Some(ref p) => snap
+            .source_rels
+            .iter()
+            .filter(|r| p.per_file_hashes.get(*r) != snap.hashes.get(*r))
+            .cloned()
+            .collect(),
         None => snap.source_rels.clone(),
     };
     let run_audit = || {
@@ -198,7 +211,7 @@ pub fn scan_cached(
         Ok::<AuditStats, anyhow::Error>(fresh)
     };
     // Pre-warm hygiene once before `build_dag` so `dag_from` hits warm cache with zero contention.
-    let (audit_res, plan_res) = crate::platform::par_join2(
+    let (audit_res, plan_res) = par_join2(
         run_audit,
         || build_dag(repo_root, None, scorer, preloaded),
     );
@@ -226,7 +239,12 @@ fn merge_partial(
     }
     let (med, p10, _) = scorer.score_files(&gate_cfg.repo_root, &snap.source_rels, preloaded);
     (fresh.hygiene_median, fresh.hygiene_p10) = (med, p10);
-    fresh.ruff_errors = fresh.per_file_diagnostics.values().flatten().filter(|d| d.starts_with("ruff ")).count();
+    fresh.ruff_errors = fresh
+        .per_file_diagnostics
+        .values()
+        .flatten()
+        .filter(|d| d.starts_with("ruff "))
+        .count();
     fresh.ty_errors = if changed.iter().any(|r| r.ends_with(".py")) {
         recount_ty(&gate_cfg.repo_root, gate_cfg, &snap.source_rels).unwrap_or(fresh.ty_errors)
     } else {
@@ -236,7 +254,10 @@ fn merge_partial(
 }
 
 fn py_rels(rels: &[String]) -> Vec<String> {
-    rels.iter().filter(|r| r.ends_with(".py")).cloned().collect()
+    rels.iter()
+        .filter(|r| r.ends_with(".py"))
+        .cloned()
+        .collect()
 }
 
 fn recount_ty(repo_root: &Path, cfg: &GateConfig, source_rels: &[String]) -> Option<usize> {
@@ -252,17 +273,30 @@ pub fn read_gates(repo_root: &Path) -> GateConfig {
     let user_local = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME"))
         .map(|h| PathBuf::from(h).join(".local/bin")).unwrap_or_default();
     let mut venvs = vec![repo_root.join(".venv"), repo_root.join("venv")];
-    if let Some(v) = crate::platform::env_trimmed("VIRTUAL_ENV") { venvs.push(PathBuf::from(v)); }
-    if let Ok(exe) = std::env::current_exe() { venvs.extend(exe.ancestors().take(4).map(|a| a.join(".venv"))); }
+    if let Some(v) = env_trimmed("VIRTUAL_ENV") {
+        venvs.push(PathBuf::from(v));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        venvs.extend(exe.ancestors().take(4).map(|a| a.join(".venv")));
+    }
     venvs.push(PathBuf::from(".venv"));
-    let (py_rel, pt_rel) = if cfg!(windows) { ("Scripts/python.exe", "Scripts/pytest.exe") } else { ("bin/python", "bin/pytest") };
+    let (py_rel, pt_rel) = if cfg!(windows) {
+        ("Scripts/python.exe", "Scripts/pytest.exe")
+    } else {
+        ("bin/python", "bin/pytest")
+    };
     let (mut python_bin, mut pytest_bin) = ("python".to_string(), "pytest".to_string());
     for v in &venvs {
         let (py, pt) = (v.join(py_rel), v.join(pt_rel));
-        if py.exists() { python_bin = py.display().to_string(); }
-        if pt.exists() { pytest_bin = pt.display().to_string(); break; }
+        if py.exists() {
+            python_bin = py.display().to_string();
+        }
+        if pt.exists() {
+            pytest_bin = pt.display().to_string();
+            break;
+        }
     }
-    let strict = crate::platform::env_truthy("REFIT_STRICT_TOOLS");
+    let strict = env_truthy("REFIT_STRICT_TOOLS");
     GateConfig {
         repo_root: repo_root.to_path_buf(), python_bin, pytest_bin,
         ruff_bin: resolve_tool("ruff", &user_local), ty_bin: resolve_tool("ty", &user_local),
@@ -292,7 +326,7 @@ pub fn audit_files(
     ensure_cache_dirs_tagged(&cfg.repo_root);
     let base_env = sandbox_env(&polyglot_cache_env(&cfg.repo_root));
 
-    let ((med, p10, per_h), py_audit, poly_diags) = crate::platform::par_join3(
+    let ((med, p10, per_h), py_audit, poly_diags) = par_join3(
         || hygiene.score_files(&cfg.repo_root, rel_files, preloaded),
         || (!py_files.is_empty()).then(|| audit_python(cfg, &py_files, &base_env, skip_tests)),
         || audit_polyglot(cfg, rel_files, &base_env, skip_tests),
@@ -327,6 +361,18 @@ fn is_not_found(err: &anyhow::Error) -> bool {
     })
 }
 
+fn opt_tool<T: Default>(
+    res: Result<SandboxResult>,
+    strict: bool,
+    parse: impl FnOnce(SandboxResult) -> T,
+) -> Result<T> {
+    match res {
+        Ok(out) => Ok(parse(out)),
+        Err(e) if !strict && is_not_found(&e) => Ok(T::default()),
+        Err(e) => Err(e),
+    }
+}
+
 fn audit_python(
     cfg: &GateConfig,
     py_files: &[String],
@@ -337,7 +383,8 @@ fn audit_python(
         let mut py_extra = py_worktree_cache_env(&cfg.repo_root);
         py_extra.push(("PYTHONPATH".into(), cfg.repo_root.display().to_string()));
         let env = sandbox_env(&py_extra);
-        run_cmd(&cfg.pytest_bin, &["-q".into(), "--tb=line".into()], &cfg.repo_root, &env, true, 30_000)
+        let args = ["-q".into(), "--tb=line".into()];
+        run_cmd(&cfg.pytest_bin, &args, &cfg.repo_root, &env, true, 30_000)
     };
     let run_rf = || {
         let mut args = vec!["check".into(), "--output-format=json".into()];
@@ -351,86 +398,65 @@ fn audit_python(
     };
 
     let want_pt = !skip_tests && cfg.repo_root.join("tests").exists();
-    let (pt_res, ruff_res, ty_res) = if budget().is_constrained() {
-        (want_pt.then(run_pt), run_rf(), run_ty_cmd())
-    } else {
-        std::thread::scope(|s| {
-            let t_pt = want_pt.then(|| s.spawn(run_pt));
-            let t_ruff = s.spawn(run_rf);
-            let t_ty = s.spawn(run_ty_cmd);
-            (
-                t_pt.map(|h| h.join().expect("pytest")),
-                t_ruff.join().expect("ruff"),
-                t_ty.join().expect("ty"),
-            )
-        })
-    };
+    let (pt_res, ruff_res, ty_res) = par_join3(|| want_pt.then(run_pt), run_rf, run_ty_cmd);
+    let strict = cfg.strict_polyglot_tools;
 
     let (passed, failed, failed_lines) = match pt_res {
-        Some(Ok(pt)) => {
+        Some(res) => opt_tool(res, strict, |pt| {
             let (p, f) = parse_pytest(&pt.stdout, &pt.stderr, pt.exit_code);
-            let mut fl = Vec::new();
-            for line in pt.stdout.lines() {
-                if line.starts_with("FAILED ") {
-                    fl.push(line.to_string());
-                }
-            }
+            let fl = pt
+                .stdout
+                .lines()
+                .filter(|l| l.starts_with("FAILED "))
+                .map(String::from)
+                .collect();
             (p, f, fl)
-        }
-        Some(Err(e)) if !cfg.strict_polyglot_tools && is_not_found(&e) => (0, 0, Vec::new()),
-        Some(Err(e)) => return Err(e),
-        None => (0, 0, Vec::new()),
+        })?,
+        None => Default::default(),
     };
-
-    let ruff_items = match ruff_res {
-        Ok(out) => ruff_map(&out.stdout, &cfg.repo_root),
-        Err(e) if !cfg.strict_polyglot_tools && is_not_found(&e) => Vec::new(),
-        Err(e) => return Err(e),
-    };
-    let ty_lines = match ty_res {
-        Ok(ty_out) => {
-            if ty_out.exit_code == 0 {
-                Vec::new()
-            } else {
-                parse_ty(&ty_out.stdout, &ty_out.stderr)
-            }
-        }
-        Err(e) if !cfg.strict_polyglot_tools && is_not_found(&e) => Vec::new(),
-        Err(e) => return Err(e),
-    };
+    let ruff_items = opt_tool(ruff_res, strict, |o| ruff_map(&o.stdout, &cfg.repo_root))?;
+    let ty_lines = opt_tool(ty_res, strict, |o| {
+        if o.exit_code == 0 { Vec::new() } else { parse_ty(&o.stdout, &o.stderr) }
+    })?;
     Ok((passed, failed, failed_lines, ruff_items, ty_lines))
 }
 
 fn audit_polyglot(
-    cfg: &GateConfig, rel_files: &[String], base_env: &[(String, String)], skip_tests: bool,
+    cfg: &GateConfig,
+    rel_files: &[String],
+    base_env: &[(String, String)],
+    skip_tests: bool,
 ) -> Vec<(String, String)> {
-    if skip_tests { return Vec::new(); }
-    let run_rs = rel_files.iter().any(|f| f.ends_with(".rs")) && cfg.repo_root.join("Cargo.toml").exists();
-    let run_ts = rel_files.iter().any(|f| f.ends_with(".ts") || f.ends_with(".tsx")) && cfg.repo_root.join("tsconfig.json").exists();
-    let run_go = rel_files.iter().any(|f| f.ends_with(".go")) && cfg.repo_root.join("go.mod").exists();
-    if budget().is_constrained() {
-        return [
-            run_rs.then(|| probe_cargo(&cfg.repo_root)).flatten(),
-            run_ts.then(|| probe_ts(&cfg.repo_root, base_env)).flatten(),
-            run_go.then(|| probe_go(&cfg.repo_root, base_env)).flatten(),
-        ].into_iter().flatten().collect();
+    if skip_tests {
+        return Vec::new();
     }
-    std::thread::scope(|s| {
-        let h_rs = run_rs.then(|| s.spawn(|| probe_cargo(&cfg.repo_root)));
-        let h_ts = run_ts.then(|| s.spawn(|| probe_ts(&cfg.repo_root, base_env)));
-        let h_go = run_go.then(|| s.spawn(|| probe_go(&cfg.repo_root, base_env)));
-        [h_rs, h_ts, h_go].into_iter().flatten().filter_map(|h| h.join().ok().flatten()).collect()
-    })
-}
-
-fn probe_ts(root: &Path, base_env: &[(String, String)]) -> Option<(String, String)> {
-    let (prog, args, label) = detect_cold_ts_checker();
-    poly_probe(&CmdSpec::new(prog, &args, root, base_env, 20_000), "tsconfig.json", label, true)
-}
-
-fn probe_go(root: &Path, base_env: &[(String, String)]) -> Option<(String, String)> {
-    let args = ["vet".into(), "./...".into()];
-    poly_probe(&CmdSpec::new("go", &args, root, base_env, 20_000), "go.mod", "go vet", false)
+    let root = &cfg.repo_root;
+    let has_ext = |exts: &[&str]| rel_files.iter().any(|f| exts.iter().any(|e| f.ends_with(e)));
+    let (run_rs, run_ts, run_go) = (
+        has_ext(&[".rs"]) && root.join("Cargo.toml").exists(),
+        has_ext(&[".ts", ".tsx"]) && root.join("tsconfig.json").exists(),
+        has_ext(&[".go"]) && root.join("go.mod").exists(),
+    );
+    let (rs, ts, go) = par_join3(
+        || run_rs.then(|| probe_cargo(root)).flatten(),
+        || {
+            run_ts.then(|| {
+                let (prog, args, label) = detect_cold_ts_checker();
+                poly_probe(&CmdSpec::new(prog, &args, root, base_env, 20_000), "tsconfig.json", label, true)
+            }).flatten()
+        },
+        || {
+            run_go.then(|| {
+                let args = ["vet".into(), "./...".into()];
+                poly_probe(&CmdSpec::new("go", &args, root, base_env, 20_000), "go.mod", "go vet", false)
+            }).flatten()
+        },
+    );
+    let mut findings = Vec::new();
+    findings.extend(rs);
+    findings.extend(ts);
+    findings.extend(go);
+    findings
 }
 
 fn probe_cargo(root: &Path) -> Option<(String, String)> {

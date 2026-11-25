@@ -70,7 +70,10 @@ pub fn normalize_os_path(raw: &str, check_shell_safe: bool) -> Result<Normalized
     } else {
         trimmed
     };
-    if check_shell_safe && unquoted.chars().any(|c| matches!(c, '&' | '|' | '^' | '%' | ';' | '`' | '$')) {
+    let has_shell_meta = unquoted
+        .chars()
+        .any(|c| matches!(c, '&' | '|' | '^' | '%' | ';' | '`' | '$'));
+    if check_shell_safe && has_shell_meta {
         return Err(PathReject::ShellMetachar);
     }
 
@@ -204,7 +207,8 @@ fn is_combining_mark(c: char) -> bool {
 
 /// Checks Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`).
 fn is_windows_reserved(seg: &str) -> bool {
-    let stem = seg.split('.').next().unwrap_or(seg).trim_end_matches(' ');
+    let base = seg.split('.').next().unwrap_or(seg);
+    let stem = base.trim_end_matches(' ');
     matches!(
         stem.to_ascii_uppercase().as_str(),
         "CON" | "PRN" | "AUX" | "NUL"
@@ -217,7 +221,11 @@ fn is_protected_repo_dir(seg: &str) -> bool {
     if seg.is_ascii() {
         return seg.eq_ignore_ascii_case(".git") || seg.eq_ignore_ascii_case(".refit");
     }
-    let folded: String = seg.chars().filter(|&c| !is_combining_mark(c)).map(|c| c.to_ascii_lowercase()).collect();
+    let folded: String = seg
+        .chars()
+        .filter(|&c| !is_combining_mark(c))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
     folded == ".git" || folded == ".refit"
 }
 
@@ -285,7 +293,10 @@ pub fn canonical_root(repo_root: &Path) -> PathBuf {
     if let Ok(norm) = normalize_os_path(&raw, false) {
         if norm.wsl_9p_warning {
             WSL_9P_WARN_ONCE.call_once(|| {
-                eprintln!("refit warning: path `{raw}` crosses the WSL2 /mnt/* 9P bridge (10x-20x slower than native ext4)");
+                eprintln!(
+                    "refit warning: path `{raw}` crosses the WSL2 /mnt/* 9P bridge \
+                     (10x-20x slower than native ext4)"
+                );
             });
         }
         if norm.nfd_normalized {

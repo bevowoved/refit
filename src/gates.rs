@@ -16,10 +16,9 @@ pub use stage::{prune_repo_caches, stage_hardlinks, sweep_stages};
 
 use crate::graph::hash_abi;
 use crate::hygiene::HygieneScorer;
-use crate::platform::{run_cmd, sandbox_env};
+use crate::platform::{env_truthy, par_join2, par_map, run_cmd, sandbox_env};
 use crate::types::{FileEgoContext, GateVerdict, ModuleUnit};
 use anyhow::Result;
-use rayon::prelude::*;
 use runners::{
     CmdSpec, RunAccum, check_g0, detect_cold_js_linter, detect_cold_rust_checker,
     detect_cold_ts_checker, first_lines, first_pair, merged_rust_cargo_env, parse_pytest,
@@ -52,11 +51,15 @@ fn group_paths(files: &BTreeMap<String, String>) -> LangPaths {
     let mut lp = LangPaths::default();
     for rel in files.keys() {
         lp.all.push(rel.clone());
-        if rel.ends_with(".py") { lp.py.push(rel.clone()); }
-        else if rel.ends_with(".js") || rel.ends_with(".mjs") || rel.ends_with(".cjs") { lp.js.push(rel.clone()); }
-        else if rel.ends_with(".rs") { lp.rs.push(rel.clone()); }
-        else if rel.ends_with(".ts") || rel.ends_with(".tsx") { lp.ts.push(rel.clone()); }
-        else if rel.ends_with(".go") { lp.go.push(rel.clone()); }
+        let bucket = match Path::new(rel).extension().and_then(|e| e.to_str()) {
+            Some("py") => &mut lp.py,
+            Some("js" | "mjs" | "cjs") => &mut lp.js,
+            Some("rs") => &mut lp.rs,
+            Some("ts" | "tsx") => &mut lp.ts,
+            Some("go") => &mut lp.go,
+            _ => continue,
+        };
+        bucket.push(rel.clone());
     }
     lp
 }
@@ -126,15 +129,14 @@ fn check_py0(ctx: &StageCtx<'_>) -> Option<(String, String)> {
 }
 
 fn check_js0(ctx: &StageCtx<'_>, strict: bool) -> Option<(String, String)> {
-    let check_one = |js: &String| {
+    par_map(&ctx.paths.js, |js| {
         let args = ["--check".into(), js.clone()];
-        check_g0("gate0_syntax", &format!("node --check for `{js}`"), &ctx.cmd("node", &args, 5_000), strict, false)
-    };
-    if crate::platform::budget().is_constrained() {
-        ctx.paths.js.iter().find_map(check_one)
-    } else {
-        ctx.paths.js.par_iter().find_map_any(check_one)
-    }
+        let label = format!("node --check for `{js}`");
+        check_g0("gate0_syntax", &label, &ctx.cmd("node", &args, 5_000), strict, false)
+    })
+    .into_iter()
+    .flatten()
+    .next()
 }
 
 fn check_rs0(ctx: &StageCtx<'_>, slot: &CargoSlot, strict: bool) -> Option<(String, String)> {
@@ -144,49 +146,55 @@ fn check_rs0(ctx: &StageCtx<'_>, slot: &CargoSlot, strict: bool) -> Option<(Stri
         && let Ok(out) = CmdSpec::new(prog, &args, ctx.root, &env, 20_000).run()
         && !out.timed_out
     {
-        if out.exit_code == 0 { return None; }
+        if out.exit_code == 0 {
+            return None;
+        }
         let combined = first_pair(&out.stdout, &out.stderr, 6);
         if !combined.to_ascii_lowercase().contains("unrecognized") {
             return Some(("gate0_rust_check".into(), format!("Gate 0 {label} failed: {combined}")));
         }
     }
     let cargo_args = ["check".into(), "--quiet".into()];
-    check_g0("gate0_rust_check", "cargo check", &CmdSpec::new("cargo", &cargo_args, ctx.root, &env, 30_000), strict, false)
+    let spec = CmdSpec::new("cargo", &cargo_args, ctx.root, &env, 30_000);
+    check_g0("gate0_rust_check", "cargo check", &spec, strict, false)
 }
 
 fn run_gate0(ctx: &StageCtx<'_>, candidates: &BTreeMap<String, String>) -> Option<(String, String)> {
     for (rel, content) in candidates {
         if let Err(err) = crate::lex::check_balanced_syntax(rel, content) {
-            return Some(("gate0_syntax".into(), format!("Gate 0 polyglot syntax error in `{rel}`: {err}")));
+            return Some((
+                "gate0_syntax".into(),
+                format!("Gate 0 polyglot syntax error in `{rel}`: {err}"),
+            ));
         }
     }
     let strict = ctx.cfg.strict_polyglot_tools;
-    let check_ts = || {
-        let (prog, args, label) = detect_cold_ts_checker();
-        check_g0("gate0_ts_check", label, &ctx.cmd(prog, &args, 20_000), strict, true)
-    };
-    let check_go = || {
-        let args = ["vet".into(), "./...".into()];
-        check_g0("gate0_go_vet", "go vet", &ctx.cmd("go", &args, 20_000), strict, false)
-    };
-    let want_ts = !ctx.paths.ts.is_empty() && ctx.root.join("tsconfig.json").exists();
-    let want_go = !ctx.paths.go.is_empty() && ctx.root.join("go.mod").exists();
-
-    if crate::platform::budget().is_constrained() {
-        return (!ctx.paths.py.is_empty()).then(|| check_py0(ctx)).flatten()
-            .or_else(|| (!ctx.paths.js.is_empty()).then(|| check_js0(ctx, strict)).flatten())
-            .or_else(|| ctx.slot.and_then(|s| check_rs0(ctx, s, strict)))
-            .or_else(|| want_ts.then(check_ts).flatten())
-            .or_else(|| want_go.then(check_go).flatten());
-    }
-    std::thread::scope(|s| {
-        let h_py = (!ctx.paths.py.is_empty()).then(|| s.spawn(|| check_py0(ctx)));
-        let h_js = (!ctx.paths.js.is_empty()).then(|| s.spawn(|| check_js0(ctx, strict)));
-        let h_rs = ctx.slot.map(|slot| s.spawn(move || check_rs0(ctx, slot, strict)));
-        let h_ts = want_ts.then(|| s.spawn(check_ts));
-        let h_go = want_go.then(|| s.spawn(check_go));
-        [h_py, h_js, h_rs, h_ts, h_go].into_iter().flatten().find_map(|h| h.join().ok().flatten())
+    let active: Vec<&str> = [
+        (!ctx.paths.py.is_empty()).then_some("py"),
+        (!ctx.paths.js.is_empty()).then_some("js"),
+        ctx.slot.is_some().then_some("rs"),
+        (!ctx.paths.ts.is_empty() && ctx.root.join("tsconfig.json").exists()).then_some("ts"),
+        (!ctx.paths.go.is_empty() && ctx.root.join("go.mod").exists()).then_some("go"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    par_map(&active, |&lang| match lang {
+        "py" => check_py0(ctx),
+        "js" => check_js0(ctx, strict),
+        "rs" => ctx.slot.and_then(|s| check_rs0(ctx, s, strict)),
+        "ts" => {
+            let (prog, args, label) = detect_cold_ts_checker();
+            check_g0("gate0_ts_check", label, &ctx.cmd(prog, &args, 20_000), strict, true)
+        }
+        _ => {
+            let args = ["vet".into(), "./...".into()];
+            check_g0("gate0_go_vet", "go vet", &ctx.cmd("go", &args, 20_000), strict, false)
+        }
     })
+    .into_iter()
+    .flatten()
+    .next()
 }
 
 fn check_abi(unit: &ModuleUnit, files: &BTreeMap<String, String>, suffix: &str, v: &mut GateVerdict) -> bool {
@@ -233,12 +241,19 @@ fn run_formatters(ctx: &StageCtx<'_>) -> usize {
 }
 
 fn run_ruff(ctx: &StageCtx<'_>, verdict: &mut GateVerdict, acc: &mut RunAccum) {
-    if ctx.paths.py.is_empty() { return; }
+    if ctx.paths.py.is_empty() {
+        return;
+    }
     let mut args = vec!["check".into(), "--fix".into(), "--output-format=json".into()];
     args.extend(ctx.paths.py.iter().cloned());
     match run_cmd(&ctx.cfg.ruff_bin, &args, ctx.root, ctx.env, true, 8_000) {
-        Ok(out) => { acc.ruff_diags = parse_ruff(&out.stdout); verdict.gate3_ruff_errors = acc.ruff_diags.len(); }
-        Err(e) if ctx.cfg.strict_polyglot_tools => acc.poly_lint.push(format!("ruff unavailable (strict mode): {e}")),
+        Ok(out) => {
+            acc.ruff_diags = parse_ruff(&out.stdout);
+            verdict.gate3_ruff_errors = acc.ruff_diags.len();
+        }
+        Err(e) if ctx.cfg.strict_polyglot_tools => {
+            acc.poly_lint.push(format!("ruff unavailable (strict mode): {e}"));
+        }
         Err(_) => {}
     }
 }
@@ -270,22 +285,11 @@ fn run_py(
         (res, t.elapsed().as_millis() as u64)
     };
 
-    let (ty_res, pt_res, g1_ms) = if crate::platform::budget().is_constrained() {
-        let r_ty = run_ty();
-        let (r_pt, ms) = has_tests.then(run_pt).map_or((None, 0), |(r, m)| (Some(r), m));
-        (r_ty, r_pt, ms)
-    } else {
-        std::thread::scope(|s| {
-            let h_ty = s.spawn(run_ty);
-            let h_pt = has_tests.then(|| s.spawn(run_pt));
-            let r_ty = h_ty.join().expect("ty");
-            let (r_pt, ms) = h_pt.map_or((None, 0), |h| {
-                let (r, m) = h.join().expect("pytest");
-                (Some(r), m)
-            });
-            (r_ty, r_pt, ms)
-        })
-    };
+    let (ty_res, (pt_res, g1_ms)) = par_join2(run_ty, || {
+        has_tests
+            .then(run_pt)
+            .map_or((None, 0), |(r, m)| (Some(r), m))
+    });
 
     apply_py_res(ctx.cfg.strict_polyglot_tools, ty_res, pt_res, g1_ms, verdict, acc);
 }
@@ -418,16 +422,14 @@ fn run_js_tests(
     }
 }
 
-fn strict_hygiene_enabled() -> bool {
-    std::env::var("REFIT_STRICT_HYGIENE")
-        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-}
-
 fn score_gate2(
-    cfg: &GateConfig, unit: &ModuleUnit, working: &BTreeMap<String, String>,
-    hygiene: &HygieneScorer, verdict: &mut GateVerdict,
+    cfg: &GateConfig,
+    unit: &ModuleUnit,
+    working: &BTreeMap<String, String>,
+    hygiene: &HygieneScorer,
+    verdict: &mut GateVerdict,
 ) -> (Vec<String>, bool) {
-    let (t, strict) = (Instant::now(), strict_hygiene_enabled());
+    let (t, strict) = (Instant::now(), env_truthy("REFIT_STRICT_HYGIENE"));
     let (mut sum, mut hints, mut has_veto) = (0.0f64, Vec::new(), false);
     let deg = unit.dependents.len() + unit.deps.len();
     let is_tangle = unit.dependents.len() >= 6 && unit.deps.len() >= 6 && deg > 0
@@ -660,17 +662,37 @@ mod tests {
             "- id: ui_no_db\n  paths: [src/ui/]\n  forbid_import: \"src/db\"\n",
             "  message: \"UI cannot import DB\"\n",
         );
-        let base_rs = "pub fn read_val() -> i32 {\n    1\n}\n";
-        let gc = GateCase::new("inv35", &[(".refit/invariants.yml", inv), ("src/lock.rs", base_rs)]);
-
-        let v1 = gc.verify("src/lock.rs", "pub fn read_val() -> i32 {\n    let _g = m.lock().unwrap();\n    1\n}\n");
-        assert!(!v1.passed && v1.failed_gate.as_deref() == Some("gate3_5_invariants"));
-        assert!(v1.diagnostics.iter().any(|d| d.contains("no_std_mutex_unwrap") && d.contains("L2")));
+        let base = "pub fn read_val() -> i32 {\n    1\n}\n";
+        let gc = GateCase::new("inv35", &[(".refit/invariants.yml", inv), ("src/lock.rs", base)]);
 
         let fake = ["csk", "-", "1234567890abcdef"].concat();
-        let v2 = gc.verify("src/lock.rs", &format!("pub fn read_val() -> i32 {{\n    let _k = \"{fake}\";\n    1\n}}\n"));
-        assert!(!v2.passed && v2.diagnostics.iter().any(|d| d.contains("builtin_no_secrets")));
-        assert!(gc.verify("src/lock.rs", "pub fn read_val() -> i32 {\n    let out = 2;\n    out\n}\n").passed);
+        let cases = [
+            (
+                "pub fn read_val() -> i32 {\n    let _g = m.lock().unwrap();\n    1\n}\n".into(),
+                false,
+                Some("gate3_5_invariants"),
+                Some("no_std_mutex_unwrap"),
+            ),
+            (
+                format!("pub fn read_val() -> i32 {{\n    let _k = \"{fake}\";\n    1\n}}\n"),
+                false,
+                Some("gate3_5_invariants"),
+                Some("builtin_no_secrets"),
+            ),
+            (
+                "pub fn read_val() -> i32 {\n    let out = 2;\n    out\n}\n".into(),
+                true,
+                None,
+                None,
+            ),
+        ];
+        for (body, passed, gate, needle) in cases {
+            let v = gc.verify("src/lock.rs", &body);
+            assert_eq!((v.passed, v.failed_gate.as_deref()), (passed, gate));
+            if let Some(n) = needle {
+                assert!(v.diagnostics.iter().any(|d| d.contains(n)), "{:?}", v.diagnostics);
+            }
+        }
 
         let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
         let cand = BTreeMap::from([

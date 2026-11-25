@@ -174,6 +174,7 @@ pub(super) struct ResolvedWeights {
     pub(super) doc2_b: Vec<f32>,
     pub(super) state_dim: usize,
     pub(super) hc_dim: usize,
+    pub(super) weight_zero_ratio: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -292,8 +293,12 @@ fn parse_npy(bytes: &[u8]) -> Result<NpyData> {
     if descr.ends_with("u1") {
         Ok(NpyData::U8(body.to_vec()))
     } else if descr == "<f4" {
-        if !body.len().is_multiple_of(4) { bail!("misaligned <f4 .npy ({} bytes)", body.len()); }
-        Ok(NpyData::F32(body.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()))
+        if !body.len().is_multiple_of(4) {
+            bail!("misaligned <f4 .npy ({} bytes)", body.len());
+        }
+        let (chunks, _) = body.as_chunks::<4>();
+        let vals = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
+        Ok(NpyData::F32(vals))
     } else if descr.starts_with("<U") {
         if !body.len().is_multiple_of(4) { bail!("misaligned <U .npy ({} bytes)", body.len()); }
         let text = body.as_chunks::<4>().0.iter()
@@ -369,9 +374,9 @@ pub(super) fn load_weights_from_npz(bytes: &[u8]) -> Result<ResolvedWeights> {
         dir = name_end.checked_add(extra).and_then(|v| v.checked_add(comment))
             .ok_or_else(|| anyhow!("ZIP dir advance overflow"))?;
     }
-    let trits = trits.ok_or_else(|| anyhow!("missing `trits.npy` in archive"))?;
-    let vec_buf = vec_buf.ok_or_else(|| anyhow!("missing `vecs.npy` in archive"))?;
-    let meta = meta.ok_or_else(|| anyhow!("missing `meta.npy` in archive"))?;
+    let (Some(trits), Some(vec_buf), Some(meta)) = (trits, vec_buf, meta) else {
+        bail!("missing required `trits.npy`/`vecs.npy`/`meta.npy` in weights archive");
+    };
     unpack_resolved(&trits, &vec_buf, &meta, hash_prefix)
 }
 
@@ -509,31 +514,29 @@ struct RawUnpacked {
     mats: HashMap<String, CompactCsr>,
     convs: HashMap<String, CompactConv>,
     vecs: HashMap<String, Vec<f32>>,
+    total_weights: u64,
+    nnz_weights: u64,
+}
+
+fn take_req<V>(map: &mut HashMap<String, V>, kind: &str, key: &str) -> Result<V> {
+    map.remove(key).ok_or_else(|| anyhow!("missing {kind} `{key}`"))
 }
 
 impl RawUnpacked {
     fn take_emb(&mut self, key: &str) -> Result<Dense2D> {
-        self.dense_embs
-            .remove(key)
-            .ok_or_else(|| anyhow!("missing embedding `{key}`"))
+        take_req(&mut self.dense_embs, "embedding", key)
     }
 
     fn take_mat(&mut self, key: &str) -> Result<CompactCsr> {
-        self.mats
-            .remove(key)
-            .ok_or_else(|| anyhow!("missing matrix `{key}`"))
+        take_req(&mut self.mats, "matrix", key)
     }
 
     fn take_conv(&mut self, key: &str) -> Result<CompactConv> {
-        self.convs
-            .remove(key)
-            .ok_or_else(|| anyhow!("missing conv `{key}`"))
+        take_req(&mut self.convs, "conv", key)
     }
 
     fn take_vec(&mut self, key: &str) -> Result<Vec<f32>> {
-        self.vecs
-            .remove(key)
-            .ok_or_else(|| anyhow!("missing vector `{key}`"))
+        take_req(&mut self.vecs, "vector", key)
     }
 }
 
@@ -557,19 +560,15 @@ fn unpack_raw(trit_buf: &[u8], vec_buf: &[f32], meta_str: &str) -> Result<RawUnp
     }
 
     let flat_trits = decode_trits(trit_buf)?;
-    let mut dense_embs = HashMap::new();
-    let mut mats = HashMap::new();
-    let mut convs = HashMap::new();
-    let mut byte_off = 0usize;
+    let (mut dense_embs, mut mats, mut convs) = (HashMap::new(), HashMap::new(), HashMap::new());
+    let (mut byte_off, mut total_weights, mut nnz_weights) = (0usize, 0u64, 0u64);
 
     for entry in trit_part.split(" ; ") {
         let (name, shape, packed) = parse_meta(entry)?;
-        let mut n_elems = 1usize;
-        for &dim in &shape {
-            n_elems = n_elems
-                .checked_mul(dim)
-                .ok_or_else(|| anyhow!("tensor shape product overflow for `{name}`"))?;
-        }
+        let n_elems = shape.iter().try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(dim)
+                .ok_or_else(|| anyhow!("tensor shape product overflow for `{name}`"))
+        })?;
         let trit_start = byte_off
             .checked_mul(5)
             .ok_or_else(|| anyhow!("trit start overflow for `{name}`"))?;
@@ -582,6 +581,8 @@ fn unpack_raw(trit_buf: &[u8], vec_buf: &[f32], meta_str: &str) -> Result<RawUnp
             .get(trit_start..)
             .ok_or_else(|| anyhow!("trit offset out of bounds for `{name}`"))?;
         let dense = unpack_tensor(trit_slice, n_elems, raw_vecs.get(&skey))?;
+        total_weights += n_elems as u64;
+        nnz_weights += dense.iter().filter(|&&val| val != 0.0).count() as u64;
         byte_off = byte_off
             .checked_add(packed)
             .ok_or_else(|| anyhow!("trit byte offset overflow for `{name}`"))?;
@@ -590,19 +591,18 @@ fn unpack_raw(trit_buf: &[u8], vec_buf: &[f32], meta_str: &str) -> Result<RawUnp
             [k, r, c] => {
                 convs.insert(name, make_compact_conv(&dense, *k, *r, *c)?);
             }
+            [r, c] if name == "tok_emb" || name == "col_emb" => {
+                dense_embs.insert(name, Dense2D { rows: *r, cols: *c, data: dense });
+            }
             [r, c] => {
-                if name == "tok_emb" || name == "col_emb" {
-                    dense_embs.insert(name, Dense2D { rows: *r, cols: *c, data: dense });
-                } else {
-                    mats.insert(name, make_compact_csr(&dense, *r, *c)?);
-                }
+                mats.insert(name, make_compact_csr(&dense, *r, *c)?);
             }
             _ => bail!("unsupported tensor rank {} for `{name}`", shape.len()),
         }
     }
 
     let vecs = raw_vecs.into_iter().filter(|(k, _)| !k.ends_with("_s")).collect();
-    Ok(RawUnpacked { dense_embs, mats, convs, vecs })
+    Ok(RawUnpacked { dense_embs, mats, convs, vecs, total_weights, nnz_weights })
 }
 
 fn precompute_part_ranges(dims: &[usize], active_rows: &[u16]) -> Vec<PartRange> {
@@ -806,35 +806,73 @@ fn build_context_layer(
     state_dim: usize,
 ) -> Result<ContextLayerWeights> {
     let attn = build_attn_layer(raw, layer, state_dim)?;
-    let cmlp_w = raw.take_mat(&format!("cmlp{layer}_w"))?;
-    let cmlp_b = raw.take_vec(&format!("cmlp{layer}_b"))?;
-    let cmlp2_w = raw.take_mat(&format!("cmlp{layer}_2_w"))?;
-    let cmlp2_b = raw.take_vec(&format!("cmlp{layer}_2_b"))?;
-
-    check_len(&format!("cmlp{layer}_w.rows"), cmlp_w.rows as usize, state_dim)?;
-    check_len(&format!("cmlp{layer}_b"), cmlp_b.len(), cmlp_w.cols as usize)?;
-    check_len(&format!("cmlp{layer}_2_w.rows"), cmlp2_w.rows as usize, cmlp_w.cols as usize)?;
-    check_len(&format!("cmlp{layer}_2_w.cols"), cmlp2_w.cols as usize, state_dim)?;
-    check_len(&format!("cmlp{layer}_2_b"), cmlp2_b.len(), state_dim)?;
-
+    let (cmlp_w, cmlp_b) = take_linear(raw, &format!("cmlp{layer}"), state_dim, None)?;
+    let (cmlp2_w, cmlp2_b) =
+        take_linear(raw, &format!("cmlp{layer}_2"), cmlp_w.cols as usize, Some(state_dim))?;
     Ok(ContextLayerWeights { attn, cmlp_w, cmlp_b, cmlp2_w, cmlp2_b })
 }
 
 fn take_linear(
     raw: &mut RawUnpacked,
-    w_key: &str,
-    b_key: &str,
+    prefix: &str,
     expected_rows: usize,
     expected_cols: Option<usize>,
 ) -> Result<(CompactCsr, Vec<f32>)> {
-    let mat = raw.take_mat(w_key)?;
-    let bias = raw.take_vec(b_key)?;
+    let (w_key, b_key) = (format!("{prefix}_w"), format!("{prefix}_b"));
+    let mat = raw.take_mat(&w_key)?;
+    let bias = raw.take_vec(&b_key)?;
     check_len(&format!("{w_key}.rows"), mat.rows as usize, expected_rows)?;
     if let Some(cols) = expected_cols {
         check_len(&format!("{w_key}.cols"), mat.cols as usize, cols)?;
     }
-    check_len(b_key, bias.len(), mat.cols as usize)?;
+    check_len(&b_key, bias.len(), mat.cols as usize)?;
     Ok((mat, bias))
+}
+
+fn take_conv_checked(
+    raw: &mut RawUnpacked,
+    prefix: &str,
+    expected_rows: usize,
+    expected_k: Option<usize>,
+    odd_max_k: bool,
+) -> Result<(CompactConv, Vec<f32>)> {
+    let conv = raw.take_conv(&format!("{prefix}_w"))?;
+    let bias = raw.take_vec(&format!("{prefix}_b"))?;
+    check_len(&format!("{prefix}_w.rows"), conv.rows, expected_rows)?;
+    check_len(&format!("{prefix}_b"), bias.len(), conv.cols)?;
+    if let Some(k) = expected_k {
+        check_len(&format!("{prefix}_w.k_size"), conv.k_size, k)?;
+    }
+    if odd_max_k && (conv.k_size == 0 || conv.k_size.is_multiple_of(2) || conv.k_size > 13) {
+        bail!("{prefix}_w invalid k_size={}", conv.k_size);
+    }
+    Ok((conv, bias))
+}
+
+fn take_proj_checked(raw: &mut RawUnpacked, key: &str, expected_rows: usize) -> Result<CompactCsr> {
+    let mat = raw.take_mat(key)?;
+    check_len(&format!("{key}.rows"), mat.rows as usize, expected_rows)?;
+    Ok(mat)
+}
+
+fn take_part_proj(
+    raw: &mut RawUnpacked,
+    key: &str,
+    dims: &[usize],
+) -> Result<(CompactCsr, Vec<PartRange>)> {
+    let mat = take_proj_checked(raw, key, dims.iter().sum())?;
+    let ranges = precompute_part_ranges(dims, &mat.active_rows);
+    Ok((mat, ranges))
+}
+
+fn take_part_linear(
+    raw: &mut RawUnpacked,
+    prefix: &str,
+    dims: &[usize],
+) -> Result<(CompactCsr, Vec<f32>, Vec<PartRange>)> {
+    let (mat, bias) = take_linear(raw, prefix, dims.iter().sum(), None)?;
+    let ranges = precompute_part_ranges(dims, &mat.active_rows);
+    Ok((mat, bias, ranges))
 }
 
 fn unpack_resolved(
@@ -844,83 +882,51 @@ fn unpack_resolved(
     hash_prefix: String,
 ) -> Result<ResolvedWeights> {
     let mut raw = unpack_raw(trit_buf, vec_buf, meta_str)?;
+    let weight_zero_ratio = if raw.total_weights == 0 {
+        0.0
+    } else {
+        1.0 - (raw.nnz_weights as f64) / (raw.total_weights as f64)
+    };
 
-    let tok_emb = raw.take_emb("tok_emb")?;
-    let col_emb = raw.take_emb("col_emb")?;
+    let (tok_emb, col_emb) = (raw.take_emb("tok_emb")?, raw.take_emb("col_emb")?);
     check_len("tok_emb.rows", tok_emb.rows, 128)?;
     check_len("col_emb.rows", col_emb.rows, 128)?;
     check_len("col_emb.cols", col_emb.cols, tok_emb.cols)?;
     let emb_dim = tok_emb.cols;
 
-    let pre_conv3_w = raw.take_conv("pre_conv3_w")?;
-    let pre_conv3_b = raw.take_vec("pre_conv3_b")?;
-    check_len("pre_conv3_w.k_size", pre_conv3_w.k_size, 3)?;
-    check_len("pre_conv3_w.rows", pre_conv3_w.rows, emb_dim)?;
-    check_len("pre_conv3_b", pre_conv3_b.len(), pre_conv3_w.cols)?;
+    let (pre_conv3_w, pre_conv3_b) =
+        take_conv_checked(&mut raw, "pre_conv3", emb_dim, Some(3), false)?;
+    let (pref1_proj, pref1_ranges) =
+        take_part_proj(&mut raw, "pref1_proj", &[emb_dim, pre_conv3_w.cols])?;
 
-    let pref1_proj = raw.take_mat("pref1_proj")?;
-    check_len("pref1_proj.rows", pref1_proj.rows as usize, emb_dim + pre_conv3_w.cols)?;
-    let pref1_ranges = precompute_part_ranges(&[emb_dim, pre_conv3_w.cols], &pref1_proj.active_rows);
+    let g1_dims = [emb_dim, pre_conv3_w.cols, pref1_proj.cols as usize];
+    let (gate1_w, gate1_b, gate1_ranges) = take_part_linear(&mut raw, "gate1", &g1_dims)?;
 
-    let g1_in = emb_dim + pre_conv3_w.cols + pref1_proj.cols as usize;
-    let (gate1_w, gate1_b) = take_linear(&mut raw, "gate1_w", "gate1_b", g1_in, None)?;
-    let gate1_ranges = precompute_part_ranges(
-        &[emb_dim, pre_conv3_w.cols, pref1_proj.cols as usize],
-        &gate1_w.active_rows,
-    );
-
-    let pref2_proj = raw.take_mat("pref2_proj")?;
-    check_len("pref2_proj.rows", pref2_proj.rows as usize, gate1_w.cols as usize)?;
-
-    let fuse_in = emb_dim + pre_conv3_w.cols + gate1_w.cols as usize + pref2_proj.cols as usize;
-    let (col_fuse_w, col_fuse_b) = take_linear(&mut raw, "col_fuse_w", "col_fuse_b", fuse_in, None)?;
+    let pref2_proj = take_proj_checked(&mut raw, "pref2_proj", gate1_w.cols as usize)?;
+    let fuse_dims = [emb_dim, pre_conv3_w.cols, gate1_w.cols as usize, pref2_proj.cols as usize];
+    let (col_fuse_w, col_fuse_b, col_fuse_ranges) =
+        take_part_linear(&mut raw, "col_fuse", &fuse_dims)?;
     let hc_dim = col_fuse_w.cols as usize;
     if hc_dim == 0 || hc_dim > 128 {
         bail!("unsupported col_fuse_w.cols={hc_dim} (expected 1..=128)");
     }
-    let col_fuse_ranges = precompute_part_ranges(
-        &[emb_dim, pre_conv3_w.cols, gate1_w.cols as usize, pref2_proj.cols as usize],
-        &col_fuse_w.active_rows,
-    );
 
     let pad_fill: Vec<f32> = col_fuse_b.iter().map(|&v| v.max(0.0)).collect();
-    let col_sum_proj = raw.take_mat("col_sum_proj")?;
-    check_len("col_sum_proj.rows", col_sum_proj.rows as usize, hc_dim)?;
+    let col_sum_proj = take_proj_checked(&mut raw, "col_sum_proj", hc_dim)?;
+    let mut padded_conv = |pfx: &str| -> Result<(CompactConv, Vec<f32>, Vec<PadTap>)> {
+        let (conv, bias) = take_conv_checked(&mut raw, pfx, hc_dim, None, true)?;
+        let pads = precompute_pad_taps(&pad_fill, &conv);
+        Ok((conv, bias, pads))
+    };
+    let (conv3_w, conv3_b, conv3_pads) = padded_conv("conv3")?;
+    let (conv7_w, conv7_b, conv7_pads) = padded_conv("conv7")?;
+    let (sketch_w, sketch_b, sketch_pads) = padded_conv("sketch")?;
 
-    let conv3_w = raw.take_conv("conv3_w")?;
-    let conv3_b = raw.take_vec("conv3_b")?;
-    let conv7_w = raw.take_conv("conv7_w")?;
-    let conv7_b = raw.take_vec("conv7_b")?;
-    let sketch_w = raw.take_conv("sketch_w")?;
-    let sketch_b = raw.take_vec("sketch_b")?;
-    for (lbl, conv, bias) in [
-        ("conv3", &conv3_w, &conv3_b),
-        ("conv7", &conv7_w, &conv7_b),
-        ("sketch", &sketch_w, &sketch_b),
-    ] {
-        check_len(&format!("{lbl}_w.rows"), conv.rows, hc_dim)?;
-        check_len(&format!("{lbl}_b"), bias.len(), conv.cols)?;
-        if conv.k_size == 0 || conv.k_size.is_multiple_of(2) || conv.k_size > 13 {
-            bail!("{lbl}_w invalid k_size={}", conv.k_size);
-        }
-    }
-
-    let conv3_pads = precompute_pad_taps(&pad_fill, &conv3_w);
-    let conv7_pads = precompute_pad_taps(&pad_fill, &conv7_w);
-    let sketch_pads = precompute_pad_taps(&pad_fill, &sketch_w);
-
-    let ml_proj = raw.take_mat("ml_proj")?;
     let ml_dims = [col_sum_proj.cols as usize, conv3_w.cols, conv7_w.cols];
-    check_len("ml_proj.rows", ml_proj.rows as usize, ml_dims.iter().sum())?;
-    let ml_proj_ranges = precompute_part_ranges(&ml_dims, &ml_proj.active_rows);
-
-    let (ml_gate_w, ml_gate_b) =
-        take_linear(&mut raw, "ml_gate_w", "ml_gate_b", ml_proj.cols as usize, None)?;
-
-    let ml_paren_w = raw.take_conv("ml_paren_w")?;
-    let ml_paren_b = raw.take_vec("ml_paren_b")?;
-    check_len("ml_paren_w.rows", ml_paren_w.rows, ml_proj.cols as usize)?;
-    check_len("ml_paren_b", ml_paren_b.len(), ml_paren_w.cols)?;
+    let (ml_proj, ml_proj_ranges) = take_part_proj(&mut raw, "ml_proj", &ml_dims)?;
+    let (ml_gate_w, ml_gate_b) = take_linear(&mut raw, "ml_gate", ml_proj.cols as usize, None)?;
+    let (ml_paren_w, ml_paren_b) =
+        take_conv_checked(&mut raw, "ml_paren", ml_proj.cols as usize, None, false)?;
 
     let lmlp1_dims = [
         col_sum_proj.cols as usize,
@@ -929,23 +935,17 @@ fn unpack_resolved(
         ml_gate_w.cols as usize,
         ml_paren_w.cols,
     ];
-    let (lmlp1_w, lmlp1_b) =
-        take_linear(&mut raw, "lmlp1_w", "lmlp1_b", lmlp1_dims.iter().sum(), None)?;
-    let lmlp1_ranges = precompute_part_ranges(&lmlp1_dims, &lmlp1_w.active_rows);
-
-    let (lmlp2_w, lmlp2_b) =
-        take_linear(&mut raw, "lmlp2_w", "lmlp2_b", lmlp1_w.cols as usize, None)?;
+    let (lmlp1_w, lmlp1_b, lmlp1_ranges) = take_part_linear(&mut raw, "lmlp1", &lmlp1_dims)?;
+    let (lmlp2_w, lmlp2_b) = take_linear(&mut raw, "lmlp2", lmlp1_w.cols as usize, None)?;
 
     let state_dim = lmlp2_w.cols as usize + sketch_w.cols;
     let ctx1 = build_context_layer(&mut raw, "1", state_dim)?;
     let ctx2 = build_context_layer(&mut raw, "2", state_dim)?;
 
-    let (sq_w, sq_b) = take_linear(&mut raw, "sq_w", "sq_b", state_dim, Some(6))?;
-    let (pool_gate_w, pool_gate_b) =
-        take_linear(&mut raw, "pool_gate_w", "pool_gate_b", state_dim, Some(1))?;
-    let (doc1_w, doc1_b) = take_linear(&mut raw, "doc1_w", "doc1_b", state_dim * 2, None)?;
-    let (doc2_w, doc2_b) =
-        take_linear(&mut raw, "doc2_w", "doc2_b", doc1_w.cols as usize, Some(1))?;
+    let (sq_w, sq_b) = take_linear(&mut raw, "sq", state_dim, Some(6))?;
+    let (pool_gate_w, pool_gate_b) = take_linear(&mut raw, "pool_gate", state_dim, Some(1))?;
+    let (doc1_w, doc1_b) = take_linear(&mut raw, "doc1", state_dim * 2, None)?;
+    let (doc2_w, doc2_b) = take_linear(&mut raw, "doc2", doc1_w.cols as usize, Some(1))?;
 
     Ok(ResolvedWeights {
         hash_prefix, tok_emb, col_emb, pre_conv3_w, pre_conv3_b, pref1_proj, pref1_ranges,
@@ -954,5 +954,6 @@ fn unpack_resolved(
         sketch_b, sketch_pads, ml_proj, ml_proj_ranges, ml_gate_w, ml_gate_b, ml_paren_w,
         ml_paren_b, lmlp1_w, lmlp1_b, lmlp1_ranges, lmlp2_w, lmlp2_b, ctx_layers: [ctx1, ctx2],
         sq_w, sq_b, pool_gate_w, pool_gate_b, doc1_w, doc1_b, doc2_w, doc2_b, state_dim, hc_dim,
+        weight_zero_ratio,
     })
 }

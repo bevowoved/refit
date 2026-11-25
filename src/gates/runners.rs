@@ -75,29 +75,20 @@ pub(super) fn run_fmt(
     }
 }
 
-#[derive(serde::Deserialize, Default)]
-struct CargoEditionDoc {
-    package: Option<CargoEditionPkg>,
-    workspace: Option<CargoEditionWs>,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct CargoEditionWs {
-    package: Option<CargoEditionPkg>,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct CargoEditionPkg {
-    edition: Option<toml::Value>,
-}
-
 pub(super) fn rust_edition(stage_root: &Path) -> String {
     let Ok(src) = fs::read_to_string(stage_root.join("Cargo.toml")) else {
         return "2021".into();
     };
-    let found = toml::from_str::<CargoEditionDoc>(&src).ok().and_then(|d| {
-        let pkg = d.package.as_ref().and_then(|p| p.edition.as_ref()).and_then(toml::Value::as_str);
-        let ws = d.workspace.as_ref().and_then(|w| w.package.as_ref()).and_then(|p| p.edition.as_ref()).and_then(toml::Value::as_str);
+    let found = toml::from_str::<toml::Value>(&src).ok().and_then(|v| {
+        let pkg = v
+            .get("package")
+            .and_then(|p| p.get("edition"))
+            .and_then(toml::Value::as_str);
+        let ws = v
+            .get("workspace")
+            .and_then(|w| w.get("package"))
+            .and_then(|p| p.get("edition"))
+            .and_then(toml::Value::as_str);
         pkg.or(ws).map(str::to_string)
     });
     found
@@ -174,38 +165,38 @@ fn count_summary(line: &str, passed: &mut usize, failed: &mut usize) {
     }
 }
 
-pub(super) fn parse_ruff(stdout: &str) -> Vec<String> {
+fn map_ruff_json<T>(
+    stdout: &str,
+    mut f: impl FnMut(&str, &str, u64, &str) -> T,
+) -> Vec<T> {
     let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) else {
         return Vec::new();
     };
-    arr.into_iter()
+    arr.iter()
         .map(|v| {
-            let raw = v["filename"].as_str().unwrap_or("");
-            let fname = raw.rsplit(['/', '\\']).next().unwrap_or("");
-            let code = v["code"].as_str().unwrap_or("RUFF");
-            let msg = v["message"].as_str().unwrap_or("");
-            let line = v["location"]["row"].as_u64().unwrap_or(0);
-            format!("ruff {fname} {code} L{line}: {msg}")
+            f(
+                v["filename"].as_str().unwrap_or(""),
+                v["code"].as_str().unwrap_or("RUFF"),
+                v["location"]["row"].as_u64().unwrap_or(0),
+                v["message"].as_str().unwrap_or(""),
+            )
         })
         .collect()
 }
 
-pub(super) fn ruff_map(stdout: &str, repo_root: &Path) -> Vec<(String, String)> {
-    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim()) else {
-        return Vec::new();
-    };
+pub(super) fn parse_ruff(stdout: &str) -> Vec<String> {
+    map_ruff_json(stdout, |raw, code, line, msg| {
+        let fname = raw.rsplit(['/', '\\']).next().unwrap_or("");
+        format!("ruff {fname} {code} L{line}: {msg}")
+    })
+}
 
-    arr.into_iter()
-        .map(|v| {
-            let raw = v["filename"].as_str().unwrap_or("");
-            let rel = crate::platform::rel_to_root(repo_root, Path::new(raw))
-                .unwrap_or_else(|| raw.replace('\\', "/"));
-            let code = v["code"].as_str().unwrap_or("RUFF");
-            let msg = v["message"].as_str().unwrap_or("");
-            let line = v["location"]["row"].as_u64().unwrap_or(0);
-            (rel, format!("ruff {code} L{line}: {msg}"))
-        })
-        .collect()
+pub(super) fn ruff_map(stdout: &str, repo_root: &Path) -> Vec<(String, String)> {
+    map_ruff_json(stdout, |raw, code, line, msg| {
+        let rel = crate::platform::rel_to_root(repo_root, Path::new(raw))
+            .unwrap_or_else(|| raw.replace('\\', "/"));
+        (rel, format!("ruff {code} L{line}: {msg}"))
+    })
 }
 
 pub(super) fn parse_ty(stdout: &str, stderr: &str) -> Vec<String> {
@@ -226,11 +217,7 @@ pub(super) fn parse_ty(stdout: &str, stderr: &str) -> Vec<String> {
 }
 
 pub(super) fn first_lines(s: &str, max: usize) -> String {
-    s.lines()
-        .filter(|l| !l.trim().is_empty())
-        .take(max)
-        .collect::<Vec<_>>()
-        .join(" | ")
+    first_pair(s, "", max)
 }
 
 pub(super) fn first_pair(a: &str, b: &str, max: usize) -> String {
@@ -242,32 +229,18 @@ pub(super) fn first_pair(a: &str, b: &str, max: usize) -> String {
         .join(" | ")
 }
 
-/// Fast zero-spawn `PATH` directory scan returning the resolved executable path.
 pub(super) fn find_tool_in_dirs(dirs: &[PathBuf], bin: &str) -> Option<PathBuf> {
-    let exts: &[&str] = if cfg!(windows) {
-        &[".exe", ".cmd", ".bat", ""]
-    } else {
-        &[""]
-    };
-    for dir in dirs {
-        for ext in exts {
-            let candidate = if ext.is_empty() {
-                dir.join(bin)
-            } else {
-                dir.join(format!("{bin}{ext}"))
-            };
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat", ""] } else { &[""] };
+    dirs.iter().find_map(|dir| {
+        exts.iter().find_map(|ext| {
+            let p = if ext.is_empty() { dir.join(bin) } else { dir.join(format!("{bin}{ext}")) };
+            p.is_file().then_some(p)
+        })
+    })
 }
 
-/// Fast zero-spawn `PATH` lookup returning the first matching binary path.
 pub(super) fn find_tool_on_path(bin: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
     find_tool_in_dirs(&dirs, bin)
 }
 
@@ -278,14 +251,9 @@ pub(super) fn tool_on_path(bin: &str) -> bool {
 pub(super) fn oxlint_supports_type_aware() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
-        if !tool_on_path("oxlint") {
-            return false;
-        }
-        let cwd = std::env::temp_dir();
-        let args = vec!["--help".into()];
-        let env = sandbox_env(&[]);
-        run_cmd("oxlint", &args, &cwd, &env, true, 3_000)
-            .is_ok_and(|out| out.stdout.contains("--type-aware") || out.stderr.contains("--type-aware"))
+        tool_on_path("oxlint")
+            && run_cmd("oxlint", &["--help".into()], &std::env::temp_dir(), &sandbox_env(&[]), true, 3_000)
+                .is_ok_and(|o| o.stdout.contains("--type-aware") || o.stderr.contains("--type-aware"))
     })
 }
 
@@ -296,11 +264,7 @@ pub(super) fn select_ts_checker(
     if has_tsrs {
         ("tsrs", Vec::new(), "tsrs")
     } else if has_oxlint_type_aware {
-        (
-            "oxlint",
-            vec!["--type-aware".into(), "--type-check".into()],
-            "oxlint --type-aware",
-        )
+        ("oxlint", vec!["--type-aware".into(), "--type-check".into()], "oxlint --type-aware")
     } else {
         ("tsc", vec!["--noEmit".into()], "tsc --noEmit")
     }
@@ -320,10 +284,8 @@ pub(super) fn select_js_linter(
     }
 }
 
-pub(super) fn select_rust_checker(
-    has_rust_glancer: bool,
-) -> (&'static str, Vec<String>, &'static str) {
-    if has_rust_glancer {
+pub(super) fn select_rust_checker(has_rg: bool) -> (&'static str, Vec<String>, &'static str) {
+    if has_rg {
         ("rust-glancer", vec!["check".into()], "rust-glancer check")
     } else {
         ("cargo", vec!["check".into(), "--quiet".into()], "cargo check")
@@ -345,22 +307,22 @@ pub(super) fn detect_cold_rust_checker() -> (&'static str, Vec<String>, &'static
 pub(super) fn rust_cargo_env_for(target_dir: &Path, constrained: bool) -> Vec<(String, String)> {
     let mut extra = vec![("CARGO_TARGET_DIR".into(), target_dir.display().to_string())];
     if constrained {
-        extra.push(("CARGO_BUILD_JOBS".into(), "1".into()));
-        extra.push(("CARGO_INCREMENTAL".into(), "0".into()));
-        extra.push(("CARGO_PROFILE_DEV_CODEGEN_UNITS".into(), "1".into()));
+        for (k, v) in [
+            ("CARGO_BUILD_JOBS", "1"),
+            ("CARGO_INCREMENTAL", "0"),
+            ("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1"),
+        ] {
+            extra.push((k.into(), v.into()));
+        }
     }
     sandbox_env(&extra)
-}
-
-pub(super) fn rust_cargo_env(target_dir: &Path) -> Vec<(String, String)> {
-    rust_cargo_env_for(target_dir, budget().is_constrained())
 }
 
 pub(super) fn merged_rust_cargo_env(
     target_dir: &Path,
     extra: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
-    let mut env = rust_cargo_env(target_dir);
+    let mut env = rust_cargo_env_for(target_dir, budget().is_constrained());
     for (k, v) in extra {
         if let Some(entry) = env.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(&k)) {
             entry.1 = v;
@@ -372,19 +334,13 @@ pub(super) fn merged_rust_cargo_env(
 }
 
 fn normalize_diag_token(tok: &str) -> String {
-    let no_colon = tok.trim_end_matches(':');
-    if let Some(rest) = no_colon.strip_prefix('L')
-        && !rest.is_empty()
-        && rest.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    let is_num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if tok.trim_end_matches(':').strip_prefix('L').is_some_and(is_num) {
         return String::new();
     }
     let mut parts = tok.split(':');
     let head = parts.next().unwrap_or(tok);
-    let second = parts.next();
-    let third = parts.next();
-    let is_num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if second.is_some_and(is_num) && third.is_none_or(|s| s.is_empty() || is_num(s)) {
+    if parts.next().is_some_and(is_num) && parts.next().is_none_or(|s| s.is_empty() || is_num(s)) {
         return head.to_string();
     }
     tok.to_string()
@@ -399,7 +355,6 @@ fn normalize_diag_key(diag: &str) -> String {
 }
 
 /// Compute net-new diagnostics introduced after an edit relative to a baseline snapshot.
-/// Uses line-shift-tolerant multiset subtraction so pre-existing lint debt is never blamed.
 pub fn net_new_diagnostics(baseline: &[String], current: &[String]) -> Vec<String> {
     if baseline.is_empty() {
         return current.to_vec();
@@ -408,19 +363,20 @@ pub fn net_new_diagnostics(baseline: &[String], current: &[String]) -> Vec<Strin
     for diag in baseline {
         *budget_map.entry(normalize_diag_key(diag)).or_insert(0) += 1;
     }
-
-    let mut net_new = Vec::new();
-    for diag in current {
-        let key = normalize_diag_key(diag);
-        if let Some(rem) = budget_map.get_mut(&key)
-            && *rem > 0
-        {
-            *rem -= 1;
-            continue;
-        }
-        net_new.push(diag.clone());
-    }
-    net_new
+    current
+        .iter()
+        .filter(|diag| {
+            let key = normalize_diag_key(diag);
+            match budget_map.get_mut(&key) {
+                Some(rem) if *rem > 0 => {
+                    *rem -= 1;
+                    false
+                }
+                _ => true,
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -429,46 +385,47 @@ mod tests {
 
     #[test]
     fn ruff_map_normalizes_verbatim_and_drive_case() {
-        let json_out = serde_json::json!([
-            {
-                "filename": r"\\?\d:\cerebras\refit\src\mod_a.py",
-                "code": "F401",
-                "message": "unused import",
-                "location": { "row": 3 }
-            },
-            {
-                "filename": r"D:\cerebras\refit\pkg\sub\b.py",
-                "code": "E501",
-                "message": "line too long",
-                "location": { "row": 12 }
-            }
+        let mk = |f: &str, c: &str, m: &str, r: u64| {
+            serde_json::json!({ "filename": f, "code": c, "message": m, "location": { "row": r } })
+        };
+        let json_out = serde_json::Value::Array(vec![
+            mk(r"\\?\d:\cerebras\refit\src\mod_a.py", "F401", "unused import", 3),
+            mk(r"D:\cerebras\refit\pkg\sub\b.py", "E501", "line too long", 12),
         ])
         .to_string();
 
         let mapped = ruff_map(&json_out, Path::new(r"D:\cerebras\refit"));
-        assert_eq!(mapped.len(), 2);
-        assert_eq!(mapped[0].0, "src/mod_a.py");
-        assert_eq!(mapped[0].1, "ruff F401 L3: unused import");
-        assert_eq!(mapped[1].0, "pkg/sub/b.py");
-        assert_eq!(mapped[1].1, "ruff E501 L12: line too long");
+        let expected = [
+            ("src/mod_a.py", "ruff F401 L3: unused import"),
+            ("pkg/sub/b.py", "ruff E501 L12: line too long"),
+        ];
+        assert_eq!(mapped.len(), expected.len());
+        for ((got_p, got_m), (exp_p, exp_m)) in mapped.iter().zip(expected) {
+            assert_eq!((got_p.as_str(), got_m.as_str()), (exp_p, exp_m));
+        }
     }
 
     #[test]
     fn cold_lsp_diff_net_new_diagnostics() {
-        let baseline = vec![
-            "ruff app.py F401 L3: unused import".to_string(),
-            "src/view.ts:10:5 error TS2322: type mismatch".to_string(),
-        ];
-        let current = vec![
-            "ruff app.py F401 L7: unused import".to_string(),
-            "ruff app.py F401 L15: unused import".to_string(),
-            "src/view.ts:14:5 error TS2322: type mismatch".to_string(),
-            "ruff app.py B006 L22: mutable default".to_string(),
-        ];
+        let baseline: Vec<String> = [
+            "ruff app.py F401 L3: unused import",
+            "src/view.ts:10:5 error TS2322: type mismatch",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let current: Vec<String> = [
+            "ruff app.py F401 L7: unused import",
+            "ruff app.py F401 L15: unused import",
+            "src/view.ts:14:5 error TS2322: type mismatch",
+            "ruff app.py B006 L22: mutable default",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
 
-        let diff = net_new_diagnostics(&baseline, &current);
         assert_eq!(
-            diff,
+            net_new_diagnostics(&baseline, &current),
             vec![
                 "ruff app.py F401 L15: unused import",
                 "ruff app.py B006 L22: mutable default",
@@ -477,25 +434,31 @@ mod tests {
         assert_eq!(net_new_diagnostics(&[], &current), current);
         assert!(net_new_diagnostics(&baseline, &baseline).is_empty());
 
-        assert_eq!(select_ts_checker(true, true).0, "tsrs");
-        assert_eq!(select_ts_checker(false, true).0, "oxlint");
-        assert_eq!(select_ts_checker(false, false).0, "tsc");
+        for (tsrs, ox_ta, exp) in [(true, true, "tsrs"), (false, true, "oxlint"), (false, false, "tsc")] {
+            assert_eq!(select_ts_checker(tsrs, ox_ta).0, exp);
+        }
+        for (ox, ta, ts, exp) in [
+            (true, true, true, "oxlint --type-aware"),
+            (true, false, true, "oxlint"),
+            (false, false, true, "biome lint"),
+        ] {
+            assert_eq!(select_js_linter(ox, ta, ts).2, exp);
+        }
+        for (rg, exp) in [(true, "rust-glancer"), (false, "cargo")] {
+            assert_eq!(select_rust_checker(rg).0, exp);
+        }
 
-        assert_eq!(select_js_linter(true, true, true).2, "oxlint --type-aware");
-        assert_eq!(select_js_linter(true, false, true).2, "oxlint");
-        assert_eq!(select_js_linter(false, false, true).2, "biome lint");
-
-        assert_eq!(select_rust_checker(true).0, "rust-glancer");
-        assert_eq!(select_rust_checker(false).0, "cargo");
-
-        let tight = rust_cargo_env_for(Path::new("/tmp/cargo-slot"), true);
-        let has_var = |env: &[(String, String)], key: &str, val: &str| {
-            env.iter().any(|(ek, ev)| ek == key && ev == val)
+        let has_var = |env: &[(String, String)], k: &str, v: &str| {
+            env.iter().any(|(ek, ev)| ek == k && ev == v)
         };
-        assert!(has_var(&tight, "CARGO_BUILD_JOBS", "1"));
-        assert!(has_var(&tight, "CARGO_INCREMENTAL", "0"));
-        assert!(has_var(&tight, "CARGO_PROFILE_DEV_CODEGEN_UNITS", "1"));
-
+        let tight = rust_cargo_env_for(Path::new("/tmp/cargo-slot"), true);
+        for (k, v) in [
+            ("CARGO_BUILD_JOBS", "1"),
+            ("CARGO_INCREMENTAL", "0"),
+            ("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1"),
+        ] {
+            assert!(has_var(&tight, k, v));
+        }
         let normal = rust_cargo_env_for(Path::new("/tmp/cargo-slot"), false);
         assert!(!has_var(&normal, "CARGO_BUILD_JOBS", "1"));
     }

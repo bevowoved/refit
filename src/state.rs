@@ -50,7 +50,6 @@ pub struct RunState {
     telemetry_dedup_skipped: AtomicU64,
     research_queries: AtomicU64,
     research_cache_hits: AtomicU64,
-
     paused: AtomicBool,
     abort_requested: AtomicBool,
     k_override: AtomicUsize,
@@ -100,7 +99,6 @@ impl RunState {
         if unit_id.is_empty() {
             return;
         }
-
         let mut q = self.priority_units.lock();
         if !q.contains(&unit_id) {
             q.push_back(unit_id);
@@ -111,13 +109,12 @@ impl RunState {
 
     pub fn record_rewind(&self, event: RewindEvent, flagged_units: &[String]) {
         self.rewind_trigger_count.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut log = self.rewind_events.lock();
-            if log.len() >= 64 {
-                log.pop_front();
-            }
-            log.push_back((event, flagged_units.to_vec()));
+        let mut log = self.rewind_events.lock();
+        if log.len() >= 64 {
+            log.pop_front();
         }
+        log.push_back((event, flagged_units.to_vec()));
+        drop(log);
         for uid in flagged_units {
             self.steer_prioritize(uid.clone());
         }
@@ -153,10 +150,8 @@ impl RunState {
     }
 
     pub fn k_override(&self) -> Option<usize> {
-        match self.k_override.load(Ordering::Acquire) {
-            0 => None,
-            k => Some(k),
-        }
+        let k = self.k_override.load(Ordering::Acquire);
+        (k != 0).then_some(k)
     }
 
     #[cfg(test)]
@@ -183,11 +178,14 @@ impl RunState {
     }
 
     pub fn steering_snapshot(&self) -> SteerState {
-        let mut skipped: Vec<String> = self.skipped_units.lock().iter().cloned().collect();
+        let mut skipped: Vec<String> = {
+            let guard = self.skipped_units.lock();
+            guard.iter().cloned().collect()
+        };
         skipped.sort();
-
-        let queue = self.priority_units.lock();
-        let priority_queue = queue.iter().cloned().collect();
+        let prio_guard = self.priority_units.lock();
+        let priority_queue = prio_guard.iter().cloned().collect();
+        drop(prio_guard);
         SteerState {
             paused: self.paused.load(Ordering::Acquire),
             abort_requested: self.abort_asked(),
@@ -198,8 +196,8 @@ impl RunState {
     }
 
     pub fn set_phase(&self, unit_id: &str, phase: &str, attempt: u32, loc_before: usize) {
-        self.units
-            .lock()
+        let mut units = self.units.lock();
+        units
             .entry(unit_id.to_string())
             .and_modify(|u| {
                 u.phase = phase.to_string();
@@ -230,27 +228,23 @@ impl RunState {
         loc_before: usize,
         loc_after: usize,
         hygiene_after: f64,
-        blake3_hash: String,
+        last_blake3: String,
     ) {
         self.committed_units.fetch_add(1, Ordering::Relaxed);
         if loc_after < loc_before {
             sub_atomic(&self.loc_after, (loc_before - loc_after) as u64);
         } else if loc_after > loc_before {
-            let extra = (loc_after - loc_before) as u64;
-            self.loc_after.fetch_add(extra, Ordering::Relaxed);
+            self.loc_after.fetch_add((loc_after - loc_before) as u64, Ordering::Relaxed);
         }
-
-        self.units.lock().insert(
-            unit_id.to_string(),
-            UnitState {
-                phase: "committed".into(),
-                attempt,
-                loc_before,
-                loc_after,
-                hygiene_after,
-                last_blake3: blake3_hash,
-            },
-        );
+        let st = UnitState {
+            phase: "committed".into(),
+            attempt,
+            loc_before,
+            loc_after,
+            hygiene_after,
+            last_blake3,
+        };
+        self.units.lock().insert(unit_id.to_string(), st);
     }
 
     pub fn add_hardlinks(&self, count: u64) {
@@ -339,12 +333,12 @@ mod tests {
         st.await_resume().await;
         assert!(t0.elapsed() < Duration::from_secs(1) && !st.steering_snapshot().paused);
 
-        st.steer_prioritize("blocked_child".into());
-        st.steer_prioritize("ready_leaf".into());
-        let pop = |want: &str| st.pop_ready(|u| u == want);
-        assert_eq!(pop("ready_leaf").as_deref(), Some("ready_leaf"));
+        for uid in ["blocked_child", "ready_leaf"] {
+            st.steer_prioritize(uid.into());
+        }
+        assert_eq!(st.pop_ready(|u| u == "ready_leaf").as_deref(), Some("ready_leaf"));
         assert_eq!(st.pop_ready(|_| false), None);
-        assert_eq!(pop("blocked_child").as_deref(), Some("blocked_child"));
+        assert_eq!(st.pop_ready(|u| u == "blocked_child").as_deref(), Some("blocked_child"));
         st.mark_blocked("orphan_u", "dependency skipped");
         assert_eq!(st.blocked_count(), 1);
 
@@ -353,10 +347,11 @@ mod tests {
             "verify_sig".into(),
             "abi_pin".into(),
         );
-        st.record_rewind(ev.clone(), &["caller_a".into(), "caller_b".into()]);
+        st.record_rewind(ev, &["caller_a".into(), "caller_b".into()]);
         assert_eq!(st.rewind_count(), 1);
-        assert_eq!(st.pop_prio().as_deref(), Some("caller_a"));
-        assert_eq!(st.pop_prio().as_deref(), Some("caller_b"));
+        for want in ["caller_a", "caller_b"] {
+            assert_eq!(st.pop_prio().as_deref(), Some(want));
+        }
         assert_eq!(st.drain_rewind_events().len(), 1);
     }
 }

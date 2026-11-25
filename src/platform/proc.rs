@@ -239,6 +239,25 @@ unsafe fn query_job_info<T>(
 }
 
 #[cfg(windows)]
+// SAFETY: Caller guarantees `T` is the exact Win32 POD struct matching `class` for `job`.
+unsafe fn set_job_info<T>(
+    job: windows_sys::Win32::Foundation::HANDLE,
+    class: windows_sys::Win32::System::JobObjects::JOBOBJECTINFOCLASS,
+    info: &T,
+) -> bool {
+    use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
+    // SAFETY: Caller guarantees `T` is POD matching `class`.
+    unsafe {
+        SetInformationJobObject(
+            job,
+            class,
+            std::ptr::from_ref(info).cast(),
+            std::mem::size_of_val(info) as u32,
+        ) != 0
+    }
+}
+
+#[cfg(windows)]
 fn detect_windows_job_limits(host_cpus: usize) -> (Option<usize>, Option<u64>) {
     use windows_sys::Win32::System::JobObjects::{
         JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
@@ -323,7 +342,10 @@ pub fn parse_cgroup_cpu_max(raw: &str) -> Option<usize> {
 #[cfg(any(target_os = "linux", test))]
 pub fn parse_cgroup_mem_limit(raw: &str) -> Option<u64> {
     let s = raw.trim();
-    (!s.is_empty() && s != "max").then(|| s.parse::<u64>().ok().filter(|&v| v > 0)).flatten()
+    if s.is_empty() || s == "max" {
+        return None;
+    }
+    s.parse::<u64>().ok().filter(|&v| v > 0)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -486,7 +508,11 @@ pub fn run_cmd(
     clear_env: bool, timeout_ms: u64,
 ) -> Result<SandboxResult> {
     let mut cmd = Command::new(program);
-    cmd.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if clear_env { cmd.env_clear(); }
     for (k, v) in env_overrides { cmd.env(k, v); }
     #[cfg(unix)]
@@ -554,7 +580,10 @@ fn set_pgid(cmd: &mut Command) {
 fn kill_child(child: &mut Child) {
     let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
     let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
-    if wait_timeout::ChildExt::wait_timeout(child, Duration::from_millis(100)).ok().flatten().is_none() {
+    let exited = wait_timeout::ChildExt::wait_timeout(child, Duration::from_millis(100))
+        .ok()
+        .flatten();
+    if exited.is_none() {
         let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
         let _ = child.kill();
     }
@@ -563,25 +592,27 @@ fn kill_child(child: &mut Child) {
 
 #[cfg(windows)]
 fn attach_job(child: &Child) -> Option<windows_sys::Win32::Foundation::HANDLE> {
-    use std::mem::{size_of, zeroed};
+    use std::mem::zeroed;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     };
     // SAFETY: Win32 Job Object creation/assignment with zeroed POD struct and valid child handle.
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if job.is_null() { return None; }
+        if job.is_null() {
+            return None;
+        }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let ok = SetInformationJobObject(
-            job, JobObjectExtendedLimitInformation,
-            (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ) != 0 && AssignProcessToJobObject(job, child.as_raw_handle()) != 0;
-        if !ok { CloseHandle(job); return None; }
+        let configured = set_job_info(job, JobObjectExtendedLimitInformation, &info);
+        let assigned = configured && AssignProcessToJobObject(job, child.as_raw_handle()) != 0;
+        if !assigned {
+            CloseHandle(job);
+            return None;
+        }
         Some(job)
     }
 }
@@ -650,23 +681,24 @@ mod tests {
 
     #[test]
     fn memgate_condvar_and_too_big() {
-        let g = Arc::new(MemGate::new(1024));
-        assert_eq!(g.try_reserve(2048).unwrap_err(), GateErr::TooBig { requested: 2048, capacity: 1024 });
-        let p1 = g.try_reserve(600).unwrap();
-        assert_eq!(g.used(), 600);
-        assert_eq!(g.try_reserve(500).unwrap_err(), GateErr::Busy);
+        let gate = Arc::new(MemGate::new(1024));
+        let too_big = GateErr::TooBig { requested: 2048, capacity: 1024 };
+        assert_eq!(gate.try_reserve(2048).unwrap_err(), too_big);
+        let first_permit = gate.try_reserve(600).unwrap();
+        assert_eq!(gate.used(), 600);
+        assert_eq!(gate.try_reserve(500).unwrap_err(), GateErr::Busy);
 
         // Verify Condvar wakes waiter promptly upon permit drop.
-        let g2 = g.clone();
+        let shared = Arc::clone(&gate);
         let waiter = std::thread::spawn(move || {
-            let p = g2.reserve_or_wait(500, Duration::from_secs(2)).unwrap();
-            assert_eq!(g2.used(), 500);
-            drop(p);
+            let permit = shared.reserve_or_wait(500, Duration::from_secs(2)).unwrap();
+            assert_eq!(shared.used(), 500);
+            drop(permit);
         });
         std::thread::sleep(Duration::from_millis(20));
-        drop(p1);
+        drop(first_permit);
         waiter.join().unwrap();
-        assert_eq!(g.used(), 0);
+        assert_eq!(gate.used(), 0);
     }
 
     #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]

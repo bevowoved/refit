@@ -265,6 +265,25 @@ fn splice_lines(doc: &str, chunks: &[&[&str]]) -> String {
     joined
 }
 
+fn find_unique_window(
+    doc: &[&str],
+    needle: &[&str],
+    from: usize,
+    eq_line: fn(&str, &str) -> bool,
+) -> Option<usize> {
+    if needle.is_empty() || from + needle.len() > doc.len() {
+        return None;
+    }
+    let mut hits = (from..=doc.len() - needle.len()).filter(|&i| {
+        needle
+            .iter()
+            .enumerate()
+            .all(|(j, nl)| eq_line(doc[i + j], nl))
+    });
+    let first = hits.next()?;
+    hits.next().is_none().then_some(first)
+}
+
 /// Zero-allocation line-window search using a borrowed predicate (`trim` or `eq_ws`).
 pub(crate) fn replace_window(
     doc: &str,
@@ -274,21 +293,7 @@ pub(crate) fn replace_window(
 ) -> Option<String> {
     let d_lines: Vec<&str> = doc.lines().collect();
     let s_lines: Vec<&str> = search.lines().collect();
-    if s_lines.is_empty() || s_lines.len() > d_lines.len() {
-        return None;
-    }
-
-    let mut hits = (0..=d_lines.len() - s_lines.len()).filter(|&i| {
-        s_lines
-            .iter()
-            .enumerate()
-            .all(|(j, sl)| eq_line(d_lines[i + j], sl))
-    });
-    let start = hits.next()?;
-    if hits.next().is_some() {
-        return None;
-    }
-
+    let start = find_unique_window(&d_lines, &s_lines, 0, eq_line)?;
     let r_lines: Vec<&str> = replace.lines().collect();
     Some(splice_lines(
         doc,
@@ -304,17 +309,7 @@ fn is_elision(line: &str) -> bool {
 }
 
 fn find_block(doc: &[&str], needle: &[&str], from: usize) -> Option<usize> {
-    if needle.is_empty() || from + needle.len() > doc.len() {
-        return None;
-    }
-    let mut hits = (from..=doc.len() - needle.len()).filter(|&i| {
-        needle
-            .iter()
-            .enumerate()
-            .all(|(j, nl)| doc[i + j].trim() == nl.trim())
-    });
-    let first = hits.next()?;
-    hits.next().is_none().then_some(first)
+    find_unique_window(doc, needle, from, |a, b| a.trim() == b.trim())
 }
 
 fn replace_elided(doc: &str, search: &str, replace: &str) -> Option<String> {

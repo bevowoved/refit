@@ -1,5 +1,5 @@
 use super::wal::{FileDiff, TxDiffReport, WalEvent, read_blob, storage_paths, visit_wal};
-use crate::platform::SieveCache;
+use crate::platform::{SieveCache, file_mtime_size};
 use crate::source::count_lines;
 use crate::types::{WalFileEntry, WalRecord};
 use anyhow::Result;
@@ -17,7 +17,7 @@ pub fn wal_timeline(repo_root: &Path) -> Result<Vec<WalEvent>> {
         return Ok(Vec::new());
     }
 
-    let (mtime_ns, wal_len) = crate::platform::file_mtime_size(&wal_path).unwrap_or((0, 0));
+    let (mtime_ns, wal_len) = file_mtime_size(&wal_path).unwrap_or((0, 0));
     let cache = TIMELINE_CACHE.get_or_init(|| SieveCache::new(8, 4 * 1024 * 1024));
     if let Some((cached_len, cached_mtime, cached_events)) = cache.get(&wal_path)
         && cached_len == wal_len
@@ -28,34 +28,20 @@ pub fn wal_timeline(repo_root: &Path) -> Result<Vec<WalEvent>> {
 
     let mut events = Vec::new();
     visit_wal(&wal_path, |rec| match rec {
-        WalRecord::Committed {
-            tx_id,
-            module_id,
-            head_rev,
-            ts_ms,
-            loc_delta,
-            files,
-        } => {
+        WalRecord::Committed { tx_id, module_id, head_rev, ts_ms, loc_delta, files } => {
             let delta = loc_delta.unwrap_or_else(|| calc_delta(&cas_dir, &files));
-            let paths = files.into_iter().map(|f| f.path).collect();
             events.push(WalEvent {
                 rev: head_rev,
                 tx_id,
                 module_id,
                 state: "COMMITTED".into(),
-                files: paths,
+                files: files.into_iter().map(|f| f.path).collect(),
                 ts_ms,
                 reason: None,
                 loc_delta: delta,
             });
         }
-        WalRecord::Rollback {
-            tx_id,
-            module_id,
-            gate,
-            reason,
-            ts_ms,
-        } => {
+        WalRecord::Rollback { tx_id, module_id, gate, reason, ts_ms } => {
             events.push(WalEvent {
                 rev: 0,
                 tx_id,
@@ -76,17 +62,8 @@ pub fn wal_timeline(repo_root: &Path) -> Result<Vec<WalEvent>> {
 }
 
 fn calc_delta(cas_dir: &Path, files: &[WalFileEntry]) -> i64 {
-    let mut delta = 0i64;
-    for f in files {
-        let old_l = fs::read(cas_dir.join(&f.old_blake3))
-            .map(|b| count_lines(&b) as i64)
-            .unwrap_or(0);
-        let new_l = fs::read(cas_dir.join(&f.new_blake3))
-            .map(|b| count_lines(&b) as i64)
-            .unwrap_or(0);
-        delta += new_l - old_l;
-    }
-    delta
+    let lines = |h: &str| fs::read(cas_dir.join(h)).map_or(0, |b| count_lines(&b) as i64);
+    files.iter().map(|f| lines(&f.new_blake3) - lines(&f.old_blake3)).sum()
 }
 
 pub fn diff_tx(repo_root: &Path, target_tx: &str) -> Result<Option<TxDiffReport>> {
@@ -97,21 +74,12 @@ pub fn diff_tx(repo_root: &Path, target_tx: &str) -> Result<Option<TxDiffReport>
 
     let mut matched: Option<(u64, String, String, Vec<WalFileEntry>)> = None;
     visit_wal(&wal_path, |rec| match rec {
-        WalRecord::Committed {
-            tx_id,
-            module_id,
-            head_rev,
-            files,
-            ..
-        } if tx_id == target_tx => {
+        WalRecord::Committed { tx_id, module_id, head_rev, files, .. } if tx_id == target_tx => {
             matched = Some((head_rev, module_id, "COMMITTED".into(), files));
         }
-        WalRecord::Prepared {
-            tx_id,
-            module_id,
-            files,
-            ..
-        } if tx_id == target_tx && matched.is_none() => {
+        WalRecord::Prepared { tx_id, module_id, files, .. }
+            if tx_id == target_tx && matched.is_none() =>
+        {
             matched = Some((0, module_id, "PREPARED".into(), files));
         }
         _ => {}
@@ -121,28 +89,24 @@ pub fn diff_tx(repo_root: &Path, target_tx: &str) -> Result<Option<TxDiffReport>
         return Ok(None);
     };
 
-    let mut diffs = Vec::with_capacity(wal_files.len());
-    for wf in wal_files {
-        let before = read_blob(&cas_dir, &wf.old_blake3).unwrap_or_default();
-        let after = read_blob(&cas_dir, &wf.new_blake3).unwrap_or_default();
-        let (added, removed, unified_diff) = make_diff(&wf.path, &before, &after);
-        diffs.push(FileDiff {
-            path: wf.path,
-            pre_hash: wf.old_blake3,
-            post_hash: wf.new_blake3,
-            added,
-            removed,
-            unified_diff,
-        });
-    }
+    let diffs = wal_files
+        .into_iter()
+        .map(|wf| {
+            let before = read_blob(&cas_dir, &wf.old_blake3).unwrap_or_default();
+            let after = read_blob(&cas_dir, &wf.new_blake3).unwrap_or_default();
+            let (added, removed, unified_diff) = make_diff(&wf.path, &before, &after);
+            FileDiff {
+                path: wf.path,
+                pre_hash: wf.old_blake3,
+                post_hash: wf.new_blake3,
+                added,
+                removed,
+                unified_diff,
+            }
+        })
+        .collect();
 
-    Ok(Some(TxDiffReport {
-        tx_id: target_tx.to_string(),
-        rev,
-        module_id,
-        state,
-        files: diffs,
-    }))
+    Ok(Some(TxDiffReport { tx_id: target_tx.to_string(), rev, module_id, state, files: diffs }))
 }
 
 pub fn make_diff(path: &str, before: &str, after: &str) -> (usize, usize, String) {
@@ -155,7 +119,6 @@ pub fn make_diff(path: &str, before: &str, after: &str) -> (usize, usize, String
             ChangeTag::Equal => {}
         }
     }
-
     let unified = diff
         .unified_diff()
         .context_radius(2)

@@ -60,16 +60,30 @@ fn idiom_automaton() -> &'static AhoCorasick {
 pub enum Severity { Veto, Warning }
 
 #[derive(Debug, Clone)]
-pub struct StrictFinding { pub severity: Severity, pub rule: &'static str, pub line: usize, pub detail: String }
+pub struct StrictFinding {
+    pub severity: Severity,
+    pub rule: &'static str,
+    pub line: usize,
+    pub detail: String,
+}
 
-fn push_finding(
-    findings: &mut Vec<StrictFinding>,
-    severity: Severity,
-    rule: &'static str,
-    line: usize,
-    detail: impl Into<String>,
-) {
-    findings.push(StrictFinding { severity, rule, line, detail: detail.into() });
+impl StrictFinding {
+    fn format_entry(&self) -> String {
+        format!("{} (L{}): {}", self.rule, self.line, self.detail)
+    }
+}
+
+fn veto_fmt(findings: &mut Vec<StrictFinding>, rule: &'static str, line: usize, detail: impl Into<String>) {
+    findings.push(StrictFinding { severity: Severity::Veto, rule, line, detail: detail.into() });
+}
+
+fn warn_fmt(findings: &mut Vec<StrictFinding>, rule: &'static str, line: usize, detail: impl Into<String>) {
+    findings.push(StrictFinding { severity: Severity::Warning, rule, line, detail: detail.into() });
+}
+
+#[inline]
+fn round4(val: f64) -> f64 {
+    (val * 10_000.0).round() / 10_000.0
 }
 
 #[derive(Debug, Clone)]
@@ -124,11 +138,12 @@ impl StrictReport {
             .map(|f| f.rule)
             .collect()
     }
+
     pub fn formatted_vetoes(&self) -> Vec<String> {
         self.findings
             .iter()
             .filter(|f| f.severity == Severity::Veto)
-            .map(|f| format!("{} (L{}): {}", f.rule, f.line, f.detail))
+            .map(StrictFinding::format_entry)
             .collect()
     }
 }
@@ -162,8 +177,7 @@ pub fn score_strict_calibrated(
     let calibrated = if total_delta == 0.0 && veto_cap >= 1.0 {
         strict_bound
     } else {
-        let raw = sigmoid_f64(logit_f64(base.score) - total_delta).min(veto_cap).min(strict_bound);
-        (raw * 10_000.0).round() / 10_000.0
+        round4(sigmoid_f64(logit_f64(base.score) - total_delta).min(veto_cap).min(strict_bound))
     };
     let t = telemetry.cloned().unwrap_or_default();
     let attn_mode = if t.attn_mode.is_empty() { "v07_exact" } else { t.attn_mode };
@@ -196,9 +210,12 @@ pub fn audit_anti_gaming(path: &str, before: &str, after: &str) -> AntiGamingAud
     let rep_before = audit_source_full(path, before, 0.8808, is_test, None);
     let rep_after = audit_source_full(path, after, 0.8808, is_test, None);
     let before_rules: BTreeSet<&str> = rep_before.veto_rules().into_iter().collect();
-    let introduced_vetoes = rep_after.findings.iter()
+    let introduced_vetoes = rep_after
+        .findings
+        .iter()
         .filter(|f| f.severity == Severity::Veto && !before_rules.contains(f.rule))
-        .map(|f| format!("{} (L{}): {}", f.rule, f.line, f.detail)).collect();
+        .map(StrictFinding::format_entry)
+        .collect();
     let after_vetoes = rep_after.formatted_vetoes();
     AntiGamingAudit {
         path: path.to_string(), passed: after_vetoes.is_empty(), veto_cap: rep_after.veto_cap,
@@ -208,16 +225,22 @@ pub fn audit_anti_gaming(path: &str, before: &str, after: &str) -> AntiGamingAud
 }
 
 #[cfg(test)]
-pub fn audit_source_with_test_flag(path: &str, content: &str, base_score: f64, is_test_only: bool) -> StrictReport {
+pub fn audit_source_with_test_flag(
+    path: &str,
+    content: &str,
+    base_score: f64,
+    is_test_only: bool,
+) -> StrictReport {
     audit_source_full(path, content, base_score, is_test_only, None)
 }
 
 pub fn is_test_only_path(rel: &str) -> bool {
     let norm = rel.replace('\\', "/");
     let fname = norm.rsplit('/').next().unwrap_or(&norm);
-    norm.starts_with("tests/") || norm.contains("/tests/") || fname == "testutil.rs"
-        || fname == "test_util.rs" || fname.ends_with("_test.rs")
-        || fname.ends_with("_tests.rs") || fname.ends_with("_test.go")
+    norm.starts_with("tests/")
+        || norm.contains("/tests/")
+        || matches!(fname, "testutil.rs" | "test_util.rs")
+        || ["_test.rs", "_tests.rs", "_test.go"].iter().any(|suf| fname.ends_with(suf))
 }
 
 #[cfg(test)]
@@ -225,22 +248,23 @@ pub fn find_cfg_test_mod_decls(rel_path: &str, src: &str) -> Vec<String> {
     let mut cur = LexCursor::new(LangKind::Rust, src.as_bytes());
     let mut toks = Vec::new();
     while let Some(t) = cur.next_token() {
-        if !matches!(t.kind, LexKind::LineComment | LexKind::BlockComment | LexKind::Newline) { toks.push(t); }
+        if !matches!(t.kind, LexKind::LineComment | LexKind::BlockComment | LexKind::Newline) {
+            toks.push(t);
+        }
     }
     let parent = rel_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let mut out = Vec::new();
     for idx in 0..toks.len() {
         let tok = toks[idx];
-        if tok.flags.in_test() && tok.kind == LexKind::Ident && tok.slice == b"mod"
+        if tok.flags.in_test()
+            && tok.kind == LexKind::Ident
+            && tok.slice == b"mod"
             && let Some(nt) = toks.get(idx + 1).filter(|n| n.kind == LexKind::Ident)
             && toks.get(idx + 2).is_some_and(|n| n.kind == LexKind::Semi)
         {
             let name = nt.as_str();
-            if parent.is_empty() {
-                out.push(format!("{name}.rs")); out.push(format!("{name}/mod.rs"));
-            } else {
-                out.push(format!("{parent}/{name}.rs")); out.push(format!("{parent}/{name}/mod.rs"));
-            }
+            let base = if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") };
+            out.extend([format!("{base}.rs"), format!("{base}/mod.rs")]);
         }
     }
     out
@@ -504,8 +528,10 @@ fn compute_calibration(base_score: f64, findings: &[StrictFinding]) -> (f64, f64
         veto_cap = veto_cap.min(cap);
         delta_slop += pen;
     }
-    if !has_veto { return (1.0, base_score); }
-    (veto_cap, (sigmoid_f64(logit_f64(base_score) - delta_slop).min(veto_cap) * 10_000.0).round() / 10_000.0)
+    if !has_veto {
+        return (1.0, base_score);
+    }
+    (veto_cap, round4(sigmoid_f64(logit_f64(base_score) - delta_slop).min(veto_cap)))
 }
 
 fn compute_delta_cross(ego: Option<&FileEgoContext>) -> f64 {
@@ -513,19 +539,23 @@ fn compute_delta_cross(ego: Option<&FileEgoContext>) -> f64 {
     let blast = (ctx.fan_in.saturating_mul(ctx.fan_out) as f64).sqrt();
     let churn_mult = 1.0 + ((ctx.churn_commits as f64) / 20.0).min(1.5);
     let mut raw = if blast > 6.0 { 0.08 * (blast - 6.0) * churn_mult } else { 0.0 };
-    if ctx.clone_cluster_hits > 0 { raw += 0.20 * (ctx.clone_cluster_hits.min(4) as f64); }
-    (raw * 10_000.0).round() / 10_000.0
+    if ctx.clone_cluster_hits > 0 {
+        raw += 0.20 * (ctx.clone_cluster_hits.min(4) as f64);
+    }
+    round4(raw)
 }
 
 fn compute_delta_slop(result: &HygieneResult, idiom_hits: usize, idiom_risk: f64) -> f64 {
     let mut delta = result.event_load.filter(|&l| l > 1.5).map_or(0.0, |l| 0.15 * (l - 1.5));
-    if idiom_hits >= 2 { delta += 0.25 * idiom_risk; }
-    (delta * 10_000.0).round() / 10_000.0
+    if idiom_hits >= 2 {
+        delta += 0.25 * idiom_risk;
+    }
+    round4(delta)
 }
 
 fn finalize_block_metrics(m: &mut BlockModuleMetrics, pub_fields: usize, ego: Option<&FileEgoContext>) {
     let impl_loc = m.impl_loc.max(1) as f64;
-    m.piir = ((((m.pub_items as f64) * 3.0) / impl_loc).clamp(0.0, 1.0) * 10_000.0).round() / 10_000.0;
+    m.piir = round4((((m.pub_items as f64) * 3.0) / impl_loc).clamp(0.0, 1.0));
     let ext_r = ego.map_or(0, |c| c.external_field_readers);
     if m.getter_leaks >= 2 || (pub_fields > 0 && ext_r >= 2) || (pub_fields > 0 && m.getter_leaks >= 1) {
         m.field_leaks = m.getter_leaks.max(pub_fields).max(ext_r);
@@ -553,36 +583,31 @@ fn finalize_block_metrics(m: &mut BlockModuleMetrics, pub_fields: usize, ego: Op
         }
     }
     let delta = compute_block_delta(m);
-    m.delta_block = (delta * 10_000.0).round() / 10_000.0;
-    let bscore = (sigmoid_f64(2.0 - delta) / sigmoid_f64(2.0)).clamp(0.0, 1.0);
-    m.block_score = (bscore * 10_000.0).round() / 10_000.0;
+    m.delta_block = round4(delta);
+    m.block_score = round4((sigmoid_f64(2.0 - delta) / sigmoid_f64(2.0)).clamp(0.0, 1.0));
 }
 
 fn compute_block_delta(m: &BlockModuleMetrics) -> f64 {
     let mut delta = 0.0f64;
-    if m.max_fn_loc > 60 {
-        delta += 0.015 * ((m.max_fn_loc - 60) as f64);
+    for (excess, weight) in [
+        (m.max_fn_loc.saturating_sub(60), 0.015),
+        (m.max_cognitive.saturating_sub(15), 0.10),
+        (m.max_params.saturating_sub(5), 0.25),
+        (m.max_bool_params.saturating_sub(1), 0.35),
+    ] {
+        if excess > 0 {
+            delta += weight * (excess as f64);
+        }
     }
-    if m.max_cognitive > 15 {
-        delta += 0.10 * ((m.max_cognitive - 15) as f64);
-    }
-    if m.max_params > 5 {
-        delta += 0.25 * ((m.max_params - 5) as f64);
-    }
-    if m.max_bool_params >= 2 {
-        delta += 0.35 * ((m.max_bool_params - 1) as f64);
-    }
-    if m.field_leaks > 0 {
-        delta += 0.75;
-    }
-    if m.shallow_module {
-        delta += 0.65 + 0.15 * (m.pub_items.saturating_sub(7) as f64);
-    }
-    if m.module_cycle {
-        delta += 1.20;
-    }
-    if m.tangle {
-        delta += 0.80;
+    for (on, pen) in [
+        (m.field_leaks > 0, 0.75),
+        (m.shallow_module, 0.65 + 0.15 * (m.pub_items.saturating_sub(7) as f64)),
+        (m.module_cycle, 1.20),
+        (m.tangle, 0.80),
+    ] {
+        if on {
+            delta += pen;
+        }
     }
     delta
 }
@@ -607,8 +632,12 @@ fn check_bidi_and_invisibles(src: &str, findings: &mut Vec<StrictFinding>) {
                 BIDI.iter().find(|&&(c, _)| c == ch).map(|&(_, t)| t)
             };
             if let Some(tag) = tag {
-                let msg = format!("forbidden invisible/BiDi control {tag} (CVE-2021-42574)");
-                push_finding(findings, Severity::Veto, "bidi_trojan_source", ln, msg);
+                veto_fmt(
+                    findings,
+                    "bidi_trojan_source",
+                    ln,
+                    format!("forbidden invisible/BiDi control {tag} (CVE-2021-42574)"),
+                );
                 break;
             }
         }
@@ -617,8 +646,7 @@ fn check_bidi_and_invisibles(src: &str, findings: &mut Vec<StrictFinding>) {
 
 #[inline]
 fn is_cyrillic_or_greek(ch: char) -> bool {
-    let cp = ch as u32;
-    matches!(cp, 0x0370..=0x03FF | 0x1F00..=0x1FFF | 0x0400..=0x052F)
+    matches!(ch as u32, 0x0370..=0x03FF | 0x1F00..=0x1FFF | 0x0400..=0x052F)
 }
 
 fn check_uts39_homoglyphs(tokens: &[StrictTok<'_>], lines: &[LineScan<'_>], findings: &mut Vec<StrictFinding>) {
@@ -633,24 +661,36 @@ fn check_uts39_homoglyphs(tokens: &[StrictTok<'_>], lines: &[LineScan<'_>], find
                 Some(format!("{scr} confusable U+{:04X} (looks like '{looks}') in code token", ch as u32))
             } else if is_cyrillic_or_greek(ch) {
                 Some(format!("Cyrillic/Greek script char U+{:04X} in code token", ch as u32))
-            } else { None }
+            } else {
+                None
+            }
         });
         if let Some(d) = detail && flagged.insert(tok.line) {
-            push_finding(findings, Severity::Veto, "uts39_homoglyph", tok.line, d);
+            veto_fmt(findings, "uts39_homoglyph", tok.line, d);
         }
     }
     for (ln, ls) in lines.iter().enumerate().skip(1) {
-        if ls.comment_slices.is_empty() || flagged.contains(&ln) { continue; }
+        if ls.comment_slices.is_empty() || flagged.contains(&ln) {
+            continue;
+        }
         for &cmt in &ls.comment_slices {
-            if cmt.is_ascii() { continue; }
+            if cmt.is_ascii() {
+                continue;
+            }
             let hit = cmt.split_whitespace().find_map(|w| {
-                w.bytes().any(|b| b.is_ascii_alphabetic())
-                    .then(|| w.chars().find(|&c| is_cyrillic_or_greek(c))).flatten()
+                w.bytes()
+                    .any(|b| b.is_ascii_alphabetic())
+                    .then(|| w.chars().find(|&c| is_cyrillic_or_greek(c)))
+                    .flatten()
             });
             if let Some(ch) = hit {
                 flagged.insert(ln);
-                let msg = format!("mixed Latin + Cyrillic/Greek homoglyph U+{:04X} in comment word", ch as u32);
-                push_finding(findings, Severity::Veto, "uts39_homoglyph", ln, msg);
+                veto_fmt(
+                    findings,
+                    "uts39_homoglyph",
+                    ln,
+                    format!("mixed Latin + Cyrillic/Greek homoglyph U+{:04X} in comment word", ch as u32),
+                );
                 break;
             }
         }
@@ -660,13 +700,15 @@ fn check_uts39_homoglyphs(tokens: &[StrictTok<'_>], lines: &[LineScan<'_>], find
 fn check_polyglot_suppressions(lines: &[LineScan<'_>], findings: &mut Vec<StrictFinding>) {
     const NEEDLES: &[&[u8]] = &[b"@ts-ignore", b"@ts-nocheck", b"eslint-disable", b"noqa"];
     for (ln, ls) in lines.iter().enumerate().skip(1) {
-        if ls.in_test || ls.comment_slices.is_empty() { continue; }
+        if ls.in_test || ls.comment_slices.is_empty() {
+            continue;
+        }
         let bad = ls.comment_slices.iter().any(|c| {
             let b = c.as_bytes();
             NEEDLES.iter().any(|n| crate::lex::find_ascii_ci(b, n).is_some())
         });
         if bad {
-            push_finding(findings, Severity::Veto, "lint_suppression", ln, "forbidden lint/typecheck suppression comment");
+            veto_fmt(findings, "lint_suppression", ln, "forbidden lint/typecheck suppression comment");
         }
     }
 }
@@ -675,7 +717,10 @@ fn check_attrs_and_macros(tokens: &[StrictTok<'_>], findings: &mut Vec<StrictFin
     let mut idx = 0usize;
     while idx < tokens.len() {
         let tok = &tokens[idx];
-        if tok.in_test { idx += 1; continue; }
+        if tok.in_test {
+            idx += 1;
+            continue;
+        }
         if tok.kind == LexKind::Hash && let Some(next_idx) = inspect_attr(tokens, idx, findings) {
             idx = next_idx;
             continue;
@@ -683,11 +728,17 @@ fn check_attrs_and_macros(tokens: &[StrictTok<'_>], findings: &mut Vec<StrictFin
         let open_after = tokens.get(idx + 2).is_some_and(|t| {
             matches!(t.kind, LexKind::LParen | LexKind::LBracket | LexKind::LBrace)
         });
-        if tok.kind == LexKind::Ident && matches!(tok.text, "todo" | "unimplemented")
-            && tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Bang) && open_after
+        if tok.kind == LexKind::Ident
+            && matches!(tok.text, "todo" | "unimplemented")
+            && tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Bang)
+            && open_after
         {
-            let msg = format!("forbidden production `{}!()` placeholder", tok.text);
-            push_finding(findings, Severity::Veto, "prod_placeholder_macro", tok.line, msg);
+            veto_fmt(
+                findings,
+                "prod_placeholder_macro",
+                tok.line,
+                format!("forbidden production `{}!()` placeholder", tok.text),
+            );
         }
         idx += 1;
     }
@@ -707,30 +758,22 @@ fn inspect_attr(tokens: &[StrictTok<'_>], idx: usize, findings: &mut Vec<StrictF
     let inner = &tokens[open + 1..pos.saturating_sub(1)];
     if let Some(first) = inner.first().filter(|t| t.kind == LexKind::Ident) {
         let ln = tokens[idx].line;
+        let has_id = |name: &str| inner.iter().any(|t| t.kind == LexKind::Ident && t.text == name);
         let has_reason = inner.windows(2).any(|w| {
-            let is_reason = w[0].kind == LexKind::Ident && w[0].text == "reason";
-            is_reason && w[1].kind == LexKind::Eq
+            w[0].kind == LexKind::Ident
+                && w[0].text == "reason"
+                && w[1].kind == LexKind::Eq
         });
         match first.text {
-            "allow" => push_finding(
-                findings, Severity::Veto, "lint_suppression", ln, "forbidden allow-attribute lint suppression",
-            ),
-            "cfg_attr" if inner.iter().any(|t| t.kind == LexKind::Ident && t.text == "allow") => {
-                push_finding(
-                    findings, Severity::Veto, "lint_suppression", ln,
-                    "forbidden cfg_attr allow lint suppression",
-                );
+            "allow" => veto_fmt(findings, "lint_suppression", ln, "forbidden allow-attribute lint suppression"),
+            "cfg_attr" if has_id("allow") => {
+                veto_fmt(findings, "lint_suppression", ln, "forbidden cfg_attr allow lint suppression");
             }
             "expect" if !has_reason => {
-                push_finding(
-                    findings, Severity::Veto, "lint_suppression", ln,
-                    "expect attribute missing explicit `reason = ...`",
-                );
+                veto_fmt(findings, "lint_suppression", ln, "expect attribute missing explicit `reason = ...`");
             }
-            "serde" if inner.iter().any(|t| t.kind == LexKind::Ident && t.text == "flatten") => {
-                push_finding(
-                    findings, Severity::Veto, "serde_flatten", ln, "forbidden serde flatten attribute",
-                );
+            "serde" if has_id("flatten") => {
+                veto_fmt(findings, "serde_flatten", ln, "forbidden serde flatten attribute");
             }
             _ => {}
         }
@@ -739,22 +782,33 @@ fn inspect_attr(tokens: &[StrictTok<'_>], idx: usize, findings: &mut Vec<StrictF
 }
 
 fn check_unsafe_and_unwraps(
-    tokens: &[StrictTok<'_>], lines: &[LineScan<'_>],
-    metrics: &mut StrictMetrics, findings: &mut Vec<StrictFinding>,
+    tokens: &[StrictTok<'_>],
+    lines: &[LineScan<'_>],
+    metrics: &mut StrictMetrics,
+    findings: &mut Vec<StrictFinding>,
 ) {
     for (idx, tok) in tokens.iter().enumerate() {
-        if tok.in_test { continue; }
+        if tok.in_test {
+            continue;
+        }
         let is_unwrap = tok.kind == LexKind::Dot
             && tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Ident && t.text == "unwrap")
             && tokens.get(idx + 2).is_some_and(|t| t.kind == LexKind::LParen);
         if is_unwrap {
             metrics.prod_unwraps += 1;
-            if idx >= 4 && tokens[idx - 4].kind == LexKind::Dot && tokens[idx - 3].kind == LexKind::Ident
+            if idx >= 4
+                && tokens[idx - 4].kind == LexKind::Dot
+                && tokens[idx - 3].kind == LexKind::Ident
                 && matches!(tokens[idx - 3].text, "lock" | "read" | "write")
-                && tokens[idx - 2].kind == LexKind::LParen && tokens[idx - 1].kind == LexKind::RParen
+                && tokens[idx - 2].kind == LexKind::LParen
+                && tokens[idx - 1].kind == LexKind::RParen
             {
-                let msg = format!("forbidden `.{}().unwrap()` lock-poison panic in prod", tokens[idx - 3].text);
-                push_finding(findings, Severity::Veto, "std_lock_unwrap", tok.line, msg);
+                veto_fmt(
+                    findings,
+                    "std_lock_unwrap",
+                    tok.line,
+                    format!("forbidden `.{}().unwrap()` lock-poison panic in prod", tokens[idx - 3].text),
+                );
             }
         }
         if tok.kind == LexKind::Ident && tok.text == "unsafe" {
@@ -762,35 +816,45 @@ fn check_unsafe_and_unwraps(
         }
     }
     if metrics.prod_unwraps >= 10 {
-        let msg = format!("excessive production `.unwrap()` count: {}", metrics.prod_unwraps);
-        push_finding(findings, Severity::Veto, "prod_unwrap_spam", 1, msg);
+        veto_fmt(findings, "prod_unwrap_spam", 1, format!("excessive production `.unwrap()` count: {}", metrics.prod_unwraps));
     } else if metrics.prod_unwraps > 0 {
-        let msg = format!("{} invariant-guarded prod `.unwrap()` call(s)", metrics.prod_unwraps);
-        push_finding(findings, Severity::Warning, "prod_unwrap_advisory", 1, msg);
+        warn_fmt(findings, "prod_unwrap_advisory", 1, format!("{} invariant-guarded prod `.unwrap()` call(s)", metrics.prod_unwraps));
     }
 }
 
 fn check_unsafe_site(
-    tokens: &[StrictTok<'_>], idx: usize, lines: &[LineScan<'_>],
-    metrics: &mut StrictMetrics, findings: &mut Vec<StrictFinding>,
+    tokens: &[StrictTok<'_>],
+    idx: usize,
+    lines: &[LineScan<'_>],
+    metrics: &mut StrictMetrics,
+    findings: &mut Vec<StrictFinding>,
 ) {
-    let is_attr = idx > 0 && tokens[idx - 1].kind == LexKind::LBracket
+    let is_attr = idx > 0
+        && tokens[idx - 1].kind == LexKind::LBracket
         && tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::LParen);
     let is_extern = tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Ident && t.text == "extern");
-    if is_attr || is_extern { return; }
+    if is_attr || is_extern {
+        return;
+    }
     let tok = &tokens[idx];
     metrics.unsafe_blocks += 1;
     let has_doc = (tok.line.saturating_sub(3).max(1)..=tok.line)
         .any(|ln| lines.get(ln).is_some_and(|ls| ls.has_safety_comment));
-    if has_doc { return; }
+    if has_doc {
+        return;
+    }
     if tok.in_os_cfg && !unsafe_block_contains_ub(tokens, idx) {
-        push_finding(
-            findings, Severity::Warning, "unsafe_os_ffi_missing_safety_doc", tok.line,
+        warn_fmt(
+            findings,
+            "unsafe_os_ffi_missing_safety_doc",
+            tok.line,
             "OS-FFI `unsafe` inside `#[cfg(windows|unix)]` lacks `// SAFETY:` doc",
         );
     } else {
-        push_finding(
-            findings, Severity::Veto, "unsafe_undocumented", tok.line,
+        veto_fmt(
+            findings,
+            "unsafe_undocumented",
+            tok.line,
             "undocumented `unsafe` block/fn missing `// SAFETY:` comment",
         );
     }
@@ -907,8 +971,12 @@ fn check_line_tails_blanks_and_comments(
                 || ls.has_pad_smuggle || (ls.tail_ops >= 3 && ts >= 16)
                 || ls.tail_ident_chars >= 24;
             if dense {
-                let msg = format!("line width {} > {MAX_COLS} with dense/smuggled code tail", ls.raw_cols);
-                push_finding(findings, Severity::Veto, "hidden_dense_tail", ln, msg);
+                veto_fmt(
+                    findings,
+                    "hidden_dense_tail",
+                    ln,
+                    format!("line width {} > {MAX_COLS} with dense/smuggled code tail", ls.raw_cols),
+                );
             }
         }
         let is_blank = !ls.has_code && !ls.has_nondoc_comment
@@ -941,14 +1009,19 @@ fn is_comment_echo_pair(lines: &[LineScan<'_>], ln: usize, body: &str) -> bool {
     for raw in crate::lex::iter_idents(body.as_bytes()) {
         if raw.len() >= 3 {
             let w = std::str::from_utf8(raw).unwrap_or("").to_ascii_lowercase();
-            if !STOP.contains(&w.as_str()) { c_words.insert(w); }
+            if !STOP.contains(&w.as_str()) {
+                c_words.insert(w);
+            }
         }
     }
-    if c_words.len() < 2 { return false; }
+    if c_words.len() < 2 {
+        return false;
+    }
     let end = (ln + 2).min(lines.len().saturating_sub(1));
     for next_ls in &lines[(ln + 1).min(lines.len())..=end] {
         if !next_ls.in_test && next_ls.has_code {
-            let shared = c_words.iter()
+            let shared = c_words
+                .iter()
                 .filter(|w| next_ls.code_idents.iter().any(|id| id.eq_ignore_ascii_case(w)))
                 .count();
             return shared >= 2 && (shared * 100) / c_words.len() >= 50;
@@ -958,32 +1031,29 @@ fn is_comment_echo_pair(lines: &[LineScan<'_>], ln: usize, body: &str) -> bool {
 }
 
 fn emit_blank_and_comment_vetoes(
-    metrics: &StrictMetrics, acc: &BlankCommentAcc, findings: &mut Vec<StrictFinding>,
+    metrics: &StrictMetrics,
+    acc: &BlankCommentAcc,
+    findings: &mut Vec<StrictFinding>,
 ) {
     if metrics.prod_lines >= 12 {
         let blank_ratio = metrics.blank_prod_lines as f64 / metrics.prod_lines as f64;
         if acc.max_consec_blank >= 3 {
-            let msg = format!("{} consecutive blank lines (>= 3)", acc.max_consec_blank);
-            push_finding(findings, Severity::Veto, "blank_line_stuffing", acc.max_consec_blank_line, msg);
+            veto_fmt(findings, "blank_line_stuffing", acc.max_consec_blank_line, format!("{} consecutive blank lines (>= 3)", acc.max_consec_blank));
         } else if metrics.blank_prod_lines >= 6 && blank_ratio > 0.32 {
-            let msg = format!("excessive blank-line ratio {}/{}", metrics.blank_prod_lines, metrics.prod_lines);
-            push_finding(findings, Severity::Veto, "blank_line_stuffing", 1, msg);
+            veto_fmt(findings, "blank_line_stuffing", 1, format!("excessive blank-line ratio {}/{}", metrics.blank_prod_lines, metrics.prod_lines));
         } else if acc.max_alt_blank >= 5 {
-            let msg = format!("{} interleaved blank pairs", acc.max_alt_blank);
-            push_finding(findings, Severity::Veto, "blank_line_stuffing", acc.max_alt_blank_line, msg);
+            veto_fmt(findings, "blank_line_stuffing", acc.max_alt_blank_line, format!("{} interleaved blank pairs", acc.max_alt_blank));
         }
     }
     if acc.echo_pairs >= 3 {
-        let msg = format!("{} non-doc comments echoing adjacent code", acc.echo_pairs);
-        push_finding(findings, Severity::Veto, "comment_echo_stuffing", acc.first_echo, msg);
+        veto_fmt(findings, "comment_echo_stuffing", acc.first_echo, format!("{} non-doc comments echoing adjacent code", acc.echo_pairs));
     } else if acc.cmt_code >= 4 {
-        let msg = format!("{} lines of commented-out code", acc.cmt_code);
-        push_finding(findings, Severity::Veto, "comment_echo_stuffing", acc.first_cmt_code, msg);
-    } else if acc.nonblank_prod >= 10 && acc.nondoc_pure >= 6
+        veto_fmt(findings, "comment_echo_stuffing", acc.first_cmt_code, format!("{} lines of commented-out code", acc.cmt_code));
+    } else if acc.nonblank_prod >= 10
+        && acc.nondoc_pure >= 6
         && (acc.nondoc_pure as f64 / acc.nonblank_prod as f64) > 0.35
     {
-        let msg = format!("excessive non-doc comment stuffing {}/{}", acc.nondoc_pure, acc.nonblank_prod);
-        push_finding(findings, Severity::Veto, "comment_echo_stuffing", 1, msg);
+        veto_fmt(findings, "comment_echo_stuffing", 1, format!("excessive non-doc comment stuffing {}/{}", acc.nondoc_pure, acc.nonblank_prod));
     }
 }
 
@@ -1201,27 +1271,37 @@ impl<'a> FnAnalyzer<'a> {
     }
 
     fn push_cf_brace(&mut self, pcf: PendingCf, tok: &StrictTok<'a>, lines: &[LineScan<'_>]) {
-        let parent_cf = self.brace_stack.iter().rev()
-            .take_while(|f| f.kind != BraceKind::FnBody)
-            .find(|f| f.kind == BraceKind::ControlFlow);
-        let compressed = parent_cf.is_some_and(|pf| {
-            pcf.kw_line > pf.line && pcf.line_indent <= pf.line_indent + 1
+        let mut parent_cf: Option<(usize, usize)> = None;
+        let (mut depth, mut same_ln) = (1usize, usize::from(pcf.kw_line == tok.line));
+        for frame in self.brace_stack.iter().rev() {
+            if frame.kind == BraceKind::FnBody {
+                break;
+            }
+            if frame.kind == BraceKind::ControlFlow {
+                parent_cf.get_or_insert((frame.line, frame.line_indent));
+                depth += 1;
+                same_ln += usize::from(frame.line == tok.line);
+            }
+        }
+        let compressed = parent_cf.is_some_and(|(pf_line, pf_indent)| {
+            pcf.kw_line > pf_line && pcf.line_indent <= pf_indent + 1
         });
         self.brace_stack.push(BraceFrame {
-            kind: BraceKind::ControlFlow, line: pcf.kw_line, line_indent: pcf.line_indent,
+            kind: BraceKind::ControlFlow,
+            line: pcf.kw_line,
+            line_indent: pcf.line_indent,
         });
-        let cf_frames = || self.brace_stack.iter().rev()
-            .take_while(|f| f.kind != BraceKind::FnBody)
-            .filter(|f| f.kind == BraceKind::ControlFlow);
-        let depth = cf_frames().count();
-        let same_ln = cf_frames().filter(|f| f.line == tok.line).count();
         if let Some(cur) = self.fn_stack.last_mut() {
             cur.max_cf_depth = cur.max_cf_depth.max(depth);
-            if compressed { cur.indent_compressed += 1; }
+            if compressed {
+                cur.indent_compressed += 1;
+            }
             let cnt = cur.cf_opens_by_line.entry(tok.line).or_insert(0);
             *cnt += 1;
             let semis = lines.get(tok.line).map_or(0, |l| l.total_semis);
-            if same_ln >= 3 || (*cnt >= 3 && (same_ln >= 2 || semis >= 2)) { cur.packed_cf_line = true; }
+            if same_ln >= 3 || (*cnt >= 3 && (same_ln >= 2 || semis >= 2)) {
+                cur.packed_cf_line = true;
+            }
             cur.last_bool_op = None;
         }
     }
@@ -1337,46 +1417,59 @@ fn analyze_functions_and_blocks(
             _ => step_fn_body_token(&mut state, tokens, idx, prev, is_go),
         }
     }
-    if !is_go && metrics.prod_bindings >= 10
+    if !is_go
+        && metrics.prod_bindings >= 10
         && (metrics.prod_golf_1char * 100) / metrics.prod_bindings >= 40
     {
-        let msg = format!(
-            "file-wide 1-char identifier golf {}/{}",
-            metrics.prod_golf_1char, metrics.prod_bindings
+        veto_fmt(
+            findings,
+            "identifier_golf",
+            1,
+            format!("file-wide 1-char identifier golf {}/{}", metrics.prod_golf_1char, metrics.prod_bindings),
         );
-        push_finding(findings, Severity::Veto, "identifier_golf", 1, msg);
     }
     pub_fields
 }
 
 fn check_decl_and_surface<'a>(
-    tokens: &[StrictTok<'a>], idx: usize, is_go: bool, state: &mut FnAnalyzer<'a>,
-    block: &mut BlockModuleMetrics, findings: &mut Vec<StrictFinding>,
+    tokens: &[StrictTok<'a>],
+    idx: usize,
+    is_go: bool,
+    state: &mut FnAnalyzer<'a>,
+    block: &mut BlockModuleMetrics,
+    findings: &mut Vec<StrictFinding>,
 ) -> usize {
     let (tok, mut pub_fields) = (&tokens[idx], 0usize);
     if !is_go && tok.kind == LexKind::Ident {
         if matches!(tok.text, "struct" | "enum" | "trait") {
-            if is_pub_before(tokens, idx) { block.pub_items += 1; }
-            if tok.text == "struct" { pub_fields = count_pub_struct_fields(tokens, idx); }
-            let golf_name = tokens.get(idx + 1)
+            if is_pub_before(tokens, idx) {
+                block.pub_items += 1;
+            }
+            if tok.text == "struct" {
+                pub_fields = count_pub_struct_fields(tokens, idx);
+            }
+            let golf_name = tokens
+                .get(idx + 1)
                 .filter(|n| n.kind == LexKind::Ident && n.text.chars().count() == 1);
             if let Some(nt) = golf_name {
-                let msg = format!("1-char {} name `{}`", tok.text, nt.text);
-                push_finding(findings, Severity::Veto, "identifier_golf", nt.line, msg);
+                veto_fmt(findings, "identifier_golf", nt.line, format!("1-char {} name `{}`", tok.text, nt.text));
             }
         } else if matches!(tok.text, "const" | "type")
-            && state.fn_stack.is_empty() && is_pub_before(tokens, idx)
+            && state.fn_stack.is_empty()
+            && is_pub_before(tokens, idx)
         {
             block.pub_items += 1;
         }
     }
-    if tok.kind == LexKind::Ident && ((is_go && tok.text == "func") || (!is_go && tok.text == "fn"))
+    if tok.kind == LexKind::Ident
+        && ((is_go && tok.text == "func") || (!is_go && tok.text == "fn"))
         && let Some((mut pfn, has_body)) = parse_fn_header(tokens, idx, is_go)
     {
-        if pfn.is_pub { block.pub_items += 1; }
+        if pfn.is_pub {
+            block.pub_items += 1;
+        }
         if !is_go && pfn.name.chars().count() == 1 {
-            let msg = format!("1-char prod function name `{}`", pfn.name);
-            push_finding(findings, Severity::Veto, "identifier_golf", pfn.line, msg);
+            veto_fmt(findings, "identifier_golf", pfn.line, format!("1-char prod function name `{}`", pfn.name));
         }
         if has_body {
             pfn.paren_depth = state.paren_depth;
@@ -1455,24 +1548,32 @@ fn finalize_fn(
         || acc.indent_compressed >= 4
         || acc.packed_cf_line;
     if too_deep {
-        let msg = format!(
-            "fn `{}`: cf_depth={} (<{MAX_CF_DEPTH_VETO}), cognitive={} (<={MAX_COGNITIVE_VETO}), compressed={}, packed={}",
-            acc.name, acc.max_cf_depth, acc.cognitive, acc.indent_compressed, acc.packed_cf_line
+        veto_fmt(
+            findings,
+            "deep_nesting_spaghetti",
+            acc.line,
+            format!(
+                "fn `{}`: cf_depth={} (<{MAX_CF_DEPTH_VETO}), cognitive={} (<={MAX_COGNITIVE_VETO}), compressed={}, packed={}",
+                acc.name, acc.max_cf_depth, acc.cognitive, acc.indent_compressed, acc.packed_cf_line
+            ),
         );
-        push_finding(findings, Severity::Veto, "deep_nesting_spaghetti", acc.line, msg);
     } else if acc.max_cf_depth >= WARN_CF_DEPTH || acc.cognitive >= WARN_COGNITIVE {
-        let msg = format!(
-            "fn `{}` borderline: cf_depth={}, cognitive={}",
-            acc.name, acc.max_cf_depth, acc.cognitive
+        warn_fmt(
+            findings,
+            "complexity_borderline",
+            acc.line,
+            format!("fn `{}` borderline: cf_depth={}, cognitive={}", acc.name, acc.max_cf_depth, acc.cognitive),
         );
-        push_finding(findings, Severity::Warning, "complexity_borderline", acc.line, msg);
     }
-    if acc.total_bindings >= 5 && acc.golf_1char >= 4
+    if acc.total_bindings >= 5
+        && acc.golf_1char >= 4
         && (acc.golf_1char * 100) / acc.total_bindings >= 55
     {
-        let msg = format!(
-            "fn `{}` 1-char variable golf {}/{}", acc.name, acc.golf_1char, acc.total_bindings
+        veto_fmt(
+            findings,
+            "identifier_golf",
+            acc.line,
+            format!("fn `{}` 1-char variable golf {}/{}", acc.name, acc.golf_1char, acc.total_bindings),
         );
-        push_finding(findings, Severity::Veto, "identifier_golf", acc.line, msg);
     }
 }

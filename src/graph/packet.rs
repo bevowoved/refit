@@ -378,7 +378,8 @@ fn abi_summary_enriched(
         }
         (!sigs.is_empty()).then(|| format!("- {rel}: {}", sigs.join(" | ")))
     };
-    let lines: Vec<String> = par_map(&rels, extract).into_iter().flatten().collect();
+    let mapped = par_map(&rels, extract);
+    let lines: Vec<String> = mapped.into_iter().flatten().collect();
     if lines.is_empty() {
         return String::new();
     }
@@ -435,10 +436,14 @@ fn first_doc_sentence(src: &str) -> Option<String> {
             .or_else(|| t.strip_prefix("\"\"\""))
             .or_else(|| t.strip_prefix("# "));
         if let Some(raw) = cleaned {
-            let trimmed = raw.trim().trim_end_matches("*/").trim_end_matches("\"\"\"").trim();
+            let trimmed = raw
+                .trim()
+                .trim_end_matches("*/")
+                .trim_end_matches("\"\"\"")
+                .trim();
             if trimmed.len() >= 8 {
-                let sentence = trimmed.split(". ").next().unwrap_or(trimmed).trim();
-                return Some(sentence.to_string());
+                let first = trimmed.split(". ").next().unwrap_or(trimmed);
+                return Some(first.trim().to_string());
             }
         }
     }
@@ -461,8 +466,11 @@ fn synthetic_summary(
         parts.push(format!("(->{fan_in})"));
     }
     if !exports.is_empty() {
-        let joined = exports.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
-        parts.push(format!("exports:[{joined}]"));
+        let mut top = Vec::with_capacity(exports.len().min(5));
+        for e in exports.iter().take(5) {
+            top.push(e.as_str());
+        }
+        parts.push(format!("exports:[{}]", top.join(", ")));
     }
     if let Some(d) = first_doc_sentence(src) {
         parts.push(char_prefix(&d, 72).to_string());

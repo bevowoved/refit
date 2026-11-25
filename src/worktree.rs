@@ -1,3 +1,4 @@
+use crate::platform::{SidecarLock, check_rel, now_ms, paths::canonical_root};
 use anyhow::{Context, Result};
 use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
@@ -21,40 +22,34 @@ fn git_run(dir: &Path, args: &[&str]) -> Result<Output> {
 
 fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
     let out = git_run(dir, args).ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn capture_dirty(repo_root: &Path) -> Option<String> {
-    let status = git_stdout(repo_root, &["status", "--porcelain"])?;
-    if status.is_empty() {
+    if git_stdout(repo_root, &["status", "--porcelain"])?.is_empty() {
         return None;
     }
-
     let oid = git_stdout(repo_root, &["stash", "create", "refit-worktree-carryover"])?;
     (!oid.is_empty()).then_some(oid)
 }
 
 fn copy_untracked(repo_root: &Path, wt_path: &Path) -> bool {
-    let Some(list) = git_stdout(repo_root, &["ls-files", "--others", "--exclude-standard"])
-    else {
+    let Some(list) = git_stdout(repo_root, &["ls-files", "--others", "--exclude-standard"]) else {
         return false;
     };
-
     let mut copied = false;
     for line in list.lines() {
         let rel = line.trim().replace('\\', "/");
-        if rel.is_empty() || !crate::platform::check_rel(&rel) {
+        if rel.is_empty() || !check_rel(&rel) {
             continue;
         }
-
-        let src = repo_root.join(&rel);
-        let dst = wt_path.join(&rel);
+        let (src, dst) = (repo_root.join(&rel), wt_path.join(&rel));
         if !src.is_file() {
             continue;
         }
-
         if let Some(p) = dst.parent() {
             let _ = std::fs::create_dir_all(p);
         }
@@ -64,19 +59,17 @@ fn copy_untracked(repo_root: &Path, wt_path: &Path) -> bool {
 }
 
 fn git_lock_path(repo_root: &Path) -> PathBuf {
-    if let Some(common) = git_stdout(repo_root, &["rev-parse", "--git-common-dir"]) {
-        let p = PathBuf::from(common);
-        let dir = if p.is_absolute() { p } else { repo_root.join(p) };
-        return dir.join("refit-git.lock");
-    }
-    repo_root.join(".git").join("refit-git.lock")
+    let dir = git_stdout(repo_root, &["rev-parse", "--git-common-dir"]).map_or_else(
+        || repo_root.join(".git"),
+        |common| {
+            let p = PathBuf::from(common);
+            if p.is_absolute() { p } else { repo_root.join(p) }
+        },
+    );
+    dir.join("refit-git.lock")
 }
 
-pub fn open_worktree(
-    repo_root: &Path,
-    run_id: &str,
-    include_dirty: bool,
-) -> Result<Worktree> {
+pub fn open_worktree(repo_root: &Path, run_id: &str, include_dirty: bool) -> Result<Worktree> {
     if !git_run(repo_root, &["rev-parse", "--is-inside-work-tree"])?.status.success() {
         anyhow::bail!("{} is not a git repository", repo_root.display());
     }
@@ -85,19 +78,19 @@ pub fn open_worktree(
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect();
-    let canonical_repo = crate::platform::paths::canonical_root(repo_root);
-    let _git_lock = crate::platform::SidecarLock::acquire(&git_lock_path(&canonical_repo))?;
+    let canonical_repo = canonical_root(repo_root);
+    let _git_lock = SidecarLock::acquire(&git_lock_path(&canonical_repo))?;
     let parent = canonical_repo
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let name = canonical_repo.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
 
-    let mut branch = format!("refit/{safe}");
-    let mut wt_path = parent.join(format!(".{name}-worktree-{safe}"));
+    let (mut branch, mut wt_path) =
+        (format!("refit/{safe}"), parent.join(format!(".{name}-worktree-{safe}")));
     if wt_path.exists() {
         let _ = git_run(&canonical_repo, &["worktree", "prune"]);
-        let suffix = crate::platform::now_ms();
+        let suffix = now_ms();
         branch = format!("refit/{safe}-{suffix}");
         wt_path = parent.join(format!(".{name}-worktree-{safe}-{suffix}"));
     }
@@ -111,10 +104,7 @@ pub fn open_worktree(
     drop(_git_lock);
 
     let wt = Worktree {
-        core_repo: canonical_repo.clone(),
-        worktree_path: wt_path,
-        branch,
-        carried_dirty_changes: false,
+        core_repo: canonical_repo, worktree_path: wt_path, branch, carried_dirty_changes: false,
     };
     let mut guard = DropGuard::new(wt, |w| {
         let _ = remove_worktree(&w);
@@ -123,12 +113,10 @@ pub fn open_worktree(
     if let Some(oid) = dirty_oid {
         let apply = git_run(&guard.worktree_path, &["stash", "apply", "--quiet", &oid])?;
         if !apply.status.success() {
-            let err = String::from_utf8_lossy(&apply.stderr);
-            anyhow::bail!("dirty carryover failed: {}", err.trim());
+            anyhow::bail!("dirty carryover failed: {}", String::from_utf8_lossy(&apply.stderr).trim());
         }
         guard.carried_dirty_changes = true;
     }
-
     if include_dirty {
         guard.carried_dirty_changes |= copy_untracked(repo_root, &guard.worktree_path);
     }
@@ -143,9 +131,7 @@ pub fn list_worktrees(repo_root: &Path) -> Vec<String> {
     let Some(text) = git_stdout(repo_root, &["worktree", "list", "--porcelain"]) else {
         return Vec::new();
     };
-
-    let mut out = Vec::new();
-    let mut cur_path: Option<&str> = None;
+    let (mut out, mut cur_path) = (Vec::new(), None);
     for line in text.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
             cur_path = Some(p.trim());
@@ -159,7 +145,7 @@ pub fn list_worktrees(repo_root: &Path) -> Vec<String> {
 }
 
 pub fn remove_worktree(wt: &Worktree) -> Result<()> {
-    let _git_lock = crate::platform::SidecarLock::acquire(&git_lock_path(&wt.core_repo)).ok();
+    let _git_lock = SidecarLock::acquire(&git_lock_path(&wt.core_repo)).ok();
     let wt_str = wt.worktree_path.display().to_string();
     let _ = git_run(&wt.core_repo, &["worktree", "remove", "--force", &wt_str]);
     if wt.branch.starts_with("refit/") {
@@ -181,7 +167,8 @@ mod tests {
 
         let wt = open_worktree(repo.path(), "test-run-42", false).unwrap();
         assert!(wt.worktree_path.exists() && wt.branch == "refit/test-run-42");
-        fs::write(wt.worktree_path.join("app.py"), "def greet() -> str:\n    return 'ref'\n").unwrap();
+        fs::write(wt.worktree_path.join("app.py"), "def greet() -> str:\n    return 'ref'\n")
+            .unwrap();
         assert_eq!(repo.read("app.py"), orig);
         assert!(diffstat(&wt).contains("app.py"));
 
@@ -197,10 +184,8 @@ mod tests {
             assert!(!item.worktree_path.exists());
         }
 
-        // Verify relative `.` canonicalizes to a real path with non-empty parent & repo name.
-        let dot = crate::platform::paths::canonical_root(Path::new("."));
-        assert!(dot.is_absolute());
+        let dot = canonical_root(Path::new("."));
+        assert!(dot.is_absolute() && dot.file_name().is_some());
         assert!(dot.parent().is_some_and(|p| !p.as_os_str().is_empty()));
-        assert!(dot.file_name().is_some());
     }
 }

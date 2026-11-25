@@ -4,9 +4,9 @@ use crate::source::{RepoSnapshot, ext_of, parse_deps, supported_ext};
 use crate::types::{InfraFinding, UnusedDep};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use fixedbitset::FixedBitSet;
-use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -18,12 +18,7 @@ impl Eco {
     const ALL: [Self; 4] = [Self::Npm, Self::Cargo, Self::Python, Self::Go];
 
     fn from_ext(ext: &str) -> Self {
-        match ext.to_ascii_lowercase().as_str() {
-            "rs" => Self::Cargo,
-            "py" => Self::Python,
-            "go" => Self::Go,
-            _ => Self::Npm,
-        }
+        match ext.to_ascii_lowercase().as_str() { "rs" => Self::Cargo, "py" => Self::Python, "go" => Self::Go, _ => Self::Npm }
     }
 
     fn from_name(name: &str) -> Self {
@@ -59,15 +54,11 @@ impl EcoBuilder {
     }
 
     fn add_pattern(&mut self, pat: &str, slot: usize) {
-        let pat_id = if let Some(&existing) = self.pat_ids.get(pat) {
-            existing
-        } else {
-            let id = self.patterns.len();
+        let pat_id = *self.pat_ids.entry(pat.to_string()).or_insert_with(|| {
             self.patterns.push(pat.to_string());
-            self.pat_ids.insert(pat.to_string(), id);
             self.pat_slots.push(Vec::new());
-            id
-        };
+            self.patterns.len() - 1
+        });
         if !self.pat_slots[pat_id].contains(&slot) { self.pat_slots[pat_id].push(slot); }
     }
 
@@ -116,87 +107,97 @@ fn is_word_span(bytes: &[u8], start: usize, end: usize) -> bool {
 enum Kind { Tf, Docker, Gha, Sql }
 
 const UNTRUSTED_GHA_SOURCES: &[&str] = &[
-    "github.event.issue.title",
-    "github.event.issue.body",
-    "github.event.pull_request.title",
-    "github.event.pull_request.body",
-    "github.event.pull_request.head.ref",
-    "github.event.pull_request.head.label",
-    "github.event.comment.body",
-    "github.event.review.body",
-    "github.event.review_comment.body",
-    "github.event.discussion.title",
-    "github.event.discussion.body",
-    "github.head_ref",
-    "github.event.head_commit.message",
-    "github.event.head_commit.author",
+    "github.event.issue.title", "github.event.issue.body",
+    "github.event.pull_request.title", "github.event.pull_request.body",
+    "github.event.pull_request.head.ref", "github.event.pull_request.head.label",
+    "github.event.comment.body", "github.event.review.body", "github.event.review_comment.body",
+    "github.event.discussion.title", "github.event.discussion.body", "github.head_ref",
+    "github.event.head_commit.message", "github.event.head_commit.author",
 ];
 
-fn push_finding(
-    out: &mut Vec<InfraFinding>,
-    file: &str,
-    line: usize,
-    severity: &str,
-    rule_id: &str,
-    message: &str,
-) {
-    out.push(InfraFinding {
-        file: file.to_string(),
-        line,
-        severity: severity.into(),
-        rule_id: rule_id.into(),
-        message: message.into(),
-    });
+struct FindingSink<'a> {
+    rel: &'a str,
+    out: &'a mut Vec<InfraFinding>,
+    prev_ignore: Option<Vec<String>>,
+    inline_ignore: Option<Vec<String>>,
+}
+
+impl<'a> FindingSink<'a> {
+    fn new(rel: &'a str, out: &'a mut Vec<InfraFinding>) -> Self {
+        Self { rel, out, prev_ignore: None, inline_ignore: None }
+    }
+
+    fn skip_blank_or_comment(&mut self, raw_trim: &str, code_empty: bool) -> bool {
+        if raw_trim.is_empty() {
+            self.prev_ignore = None;
+            return true;
+        }
+        if code_empty {
+            self.prev_ignore = parse_ignore_directive(raw_trim);
+            return true;
+        }
+        false
+    }
+
+    fn begin_line(&mut self, raw: &str) { self.inline_ignore = parse_ignore_directive(raw); }
+
+    fn end_line(&mut self) {
+        self.prev_ignore = None;
+        self.inline_ignore = None;
+    }
+
+    fn is_suppressed(&self, rule_id: &str) -> bool {
+        let matches = |list: &Vec<String>| {
+            list.is_empty() || list.iter().any(|item| item.eq_ignore_ascii_case(rule_id))
+        };
+        self.inline_ignore.as_ref().is_some_and(matches)
+            || self.prev_ignore.as_ref().is_some_and(matches)
+    }
+
+    fn emit(&mut self, line: usize, severity: &str, rule_id: &str, message: &str) {
+        if !self.is_suppressed(rule_id) { self.emit_raw(line, severity, rule_id, message); }
+    }
+
+    fn emit_raw(&mut self, line: usize, severity: &str, rule_id: &str, message: &str) {
+        self.out.push(InfraFinding {
+            file: self.rel.to_string(), line,
+            severity: severity.into(), rule_id: rule_id.into(), message: message.into(),
+        });
+    }
 }
 
 fn parse_ignore_directive(raw_line: &str) -> Option<Vec<String>> {
     let pos = find_ascii_ci(raw_line.as_bytes(), b"refit:")?;
     let rest = raw_line[pos + 6..].trim_start();
-    if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("ignore") {
-        return None;
-    }
+    if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("ignore") { return None; }
     let after = rest[6..].trim_start();
     if let Some(bracketed) = after.strip_prefix('[')
         && let Some((inner, _)) = bracketed.split_once(']')
     {
-        let rules: Vec<String> = inner
+        let rules = inner
             .split(',')
-            .map(|tok| tok.trim().to_ascii_lowercase())
-            .filter(|tok| !tok.is_empty())
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty())
             .collect();
         return Some(rules);
     }
     Some(Vec::new())
 }
 
-fn is_suppressed(rule_id: &str, inline: Option<&[String]>, prev: Option<&[String]>) -> bool {
-    let matches_list = |list: &[String]| {
-        list.is_empty() || list.iter().any(|item| item.eq_ignore_ascii_case(rule_id))
-    };
-    inline.is_some_and(matches_list) || prev.is_some_and(matches_list)
-}
-
 /// Snapshot-backed infra & unused-dependency scan sharing the single `RepoSnapshot` tree walk.
 pub fn scan_parts_snap(
-    repo_root: &Path,
-    snap: &RepoSnapshot,
+    repo_root: &Path, snap: &RepoSnapshot,
 ) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>) {
-    let mut infra_count = 0usize;
-    let mut findings = Vec::new();
-    let mut manifests = Vec::new();
+    let (mut infra_count, mut findings, mut manifests) = (0usize, Vec::new(), Vec::new());
 
     for (rel, fname, abs) in &snap.manifest_rels {
-        if let Ok(txt) = fs::read_to_string(abs) {
-            manifests.push((rel.clone(), fname.clone(), txt));
-        }
+        if let Ok(txt) = fs::read_to_string(abs) { manifests.push((rel.clone(), fname.clone(), txt)); }
     }
     for (rel, abs) in &snap.infra_rels {
         let fname = abs.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let ext_lo = ext_of(abs);
-        let Some(kind) = infra_kind(rel, fname, &ext_lo) else { continue };
+        let Some(kind) = infra_kind(rel, fname, &ext_of(abs)) else { continue };
         infra_count += 1;
-        let Ok(txt) = fs::read_to_string(abs) else { continue };
-        scan_file(rel, kind, &txt, &mut findings);
+        if let Ok(txt) = fs::read_to_string(abs) { scan_file(rel, kind, &txt, &mut findings); }
     }
 
     let unused = if manifests.is_empty() {
@@ -205,22 +206,15 @@ pub fn scan_parts_snap(
         let (parsed, mut matchers) = collect_manifest_deps(&manifests);
         for rel in &snap.all_rels {
             let ext = ext_of(rel);
-            if !supported_ext(&ext) {
-                continue;
-            }
-            let eco = Eco::from_ext(&ext);
-            let Some(m) = matchers[eco.idx()].as_mut() else { continue };
-            if m.is_complete() {
-                continue;
-            }
+            if !supported_ext(&ext) { continue; }
+            let Some(m) = matchers[Eco::from_ext(&ext).idx()].as_mut() else { continue };
+            if m.is_complete() { continue; }
             if let Some(bytes) = snap.preloaded.get(rel) {
                 m.scan_bytes(bytes);
             } else if let Ok(bytes) = fs::read(repo_root.join(rel)) {
                 m.scan_bytes(&bytes);
             }
-            if all_matchers_complete(&matchers) {
-                break;
-            }
+            if matchers.iter().all(|e| e.as_ref().is_none_or(EcoMatcher::is_complete)) { break; }
         }
         collect_unused_from_matchers(parsed, &matchers)
     };
@@ -230,45 +224,35 @@ pub fn scan_parts_snap(
 /// Scan Terraform, Dockerfiles, GitHub Actions, SQL, and unused manifest dependencies.
 #[cfg(test)]
 pub fn scan_parts(
-    repo_root: &Path,
-    _preloaded: Option<&BTreeMap<String, Vec<u8>>>,
+    repo_root: &Path, _preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>) {
     scan_parts_snap(repo_root, &RepoSnapshot::capture(repo_root, true))
 }
 
 fn infra_kind(rel: &str, fname: &str, ext: &str) -> Option<Option<Kind>> {
-    if fname.starts_with("Dockerfile") || fname.ends_with(".dockerfile") {
-        return Some(Some(Kind::Docker));
-    }
-    if ext == "tf" || ext == "tfvars" {
-        return Some(Some(Kind::Tf));
-    }
-    if rel.starts_with(".github/workflows/") && matches!(ext, "yml" | "yaml") {
-        return Some(Some(Kind::Gha));
-    }
-    if ext == "sql" {
-        return Some(Some(Kind::Sql));
-    }
-    if fname.starts_with("docker-compose") && matches!(ext, "yml" | "yaml") {
-        return Some(None);
-    }
-    None
+    if fname.starts_with("Dockerfile") || fname.ends_with(".dockerfile") { Some(Some(Kind::Docker)) }
+    else if matches!(ext, "tf" | "tfvars") { Some(Some(Kind::Tf)) }
+    else if rel.starts_with(".github/workflows/") && matches!(ext, "yml" | "yaml") { Some(Some(Kind::Gha)) }
+    else if ext == "sql" { Some(Some(Kind::Sql)) }
+    else if fname.starts_with("docker-compose") && matches!(ext, "yml" | "yaml") { Some(None) }
+    else { None }
 }
 
 fn scan_file(rel: &str, kind: Option<Kind>, txt: &str, out: &mut Vec<InfraFinding>) {
+    let mut sink = FindingSink::new(rel, out);
     for (idx, line) in txt.lines().enumerate() {
         if let Some(sk) = find_secret(line) {
-            push_finding(
-                out, rel, idx + 1, "critical", &format!("infra_secret_{sk}"),
+            sink.emit_raw(
+                idx + 1, "critical", &format!("infra_secret_{sk}"),
                 "Hardcoded credential/secret committed in infrastructure config",
             );
         }
     }
     match kind {
-        Some(Kind::Gha) => scan_gha(rel, txt, out),
-        Some(Kind::Docker) => scan_docker(rel, txt, out),
-        Some(Kind::Tf) => scan_tf(rel, txt, out),
-        Some(Kind::Sql) => scan_sql(rel, txt, out),
+        Some(Kind::Gha) => scan_gha(txt, &mut sink),
+        Some(Kind::Docker) => scan_docker(txt, &mut sink),
+        Some(Kind::Tf) => scan_tf(txt, &mut sink),
+        Some(Kind::Sql) => scan_sql(txt, &mut sink),
         None => {}
     }
 }
@@ -286,16 +270,14 @@ fn strip_yaml_inline_comment(line: &str) -> &str {
 }
 
 fn extract_gha_uses(code: &str) -> Option<&str> {
-    let rest = code.strip_prefix("uses:").or_else(|| code.strip_prefix("- uses:"))?;
-    let val = rest.trim().trim_matches(['"', '\'']);
+    let val = code.strip_prefix("uses:").or_else(|| code.strip_prefix("- uses:"))?.trim().trim_matches(['"', '\'']);
     (!val.is_empty()).then_some(val)
 }
 
 fn is_pinned_gha_action(uses_ref: &str) -> bool {
     if uses_ref.starts_with("./") || uses_ref.starts_with("../") { return true; }
     if uses_ref.starts_with("docker://") { return uses_ref.contains("@sha256:"); }
-    uses_ref.rsplit_once('@')
-        .is_some_and(|(_, rev)| rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()))
+    uses_ref.rsplit_once('@').is_some_and(|(_, rev)| rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn extract_gha_sink_rhs(trimmed: &str) -> Option<&str> {
@@ -314,30 +296,23 @@ fn is_untrusted_gha_source(expr_lo: &str) -> bool {
         || (expr_lo.contains("github.event.pages") && expr_lo.contains(".page_name"))
 }
 
-fn check_gha_sink_line(
-    rel: &str, ln: usize, line: &str,
-    inline_ign: Option<&[String]>, prev_ign: Option<&[String]>, out: &mut Vec<InfraFinding>,
-) {
+fn check_gha_sink_line(ln: usize, line: &str, sink: &mut FindingSink<'_>) {
     let (mut rest, mut flagged_inj, mut flagged_sec) = (line, false, false);
     while let Some(open) = rest.find("${{") {
         let after_open = &rest[open + 3..];
         let Some(close) = after_open.find("}}") else { break };
         let expr_lo = after_open[..close].to_ascii_lowercase();
-        if !flagged_inj && is_untrusted_gha_source(&expr_lo)
-            && !is_suppressed("gha_script_injection", inline_ign, prev_ign)
-        {
+        if !flagged_inj && is_untrusted_gha_source(&expr_lo) {
             flagged_inj = true;
-            push_finding(
-                out, rel, ln, "high", "gha_script_injection",
+            sink.emit(
+                ln, "high", "gha_script_injection",
                 "Untrusted `${{ github.event.* }}` interpolation in run/script risks injection",
             );
         }
-        if !flagged_sec && expr_lo.contains("secrets.")
-            && !is_suppressed("gha_secrets_outside_env", inline_ign, prev_ign)
-        {
+        if !flagged_sec && expr_lo.contains("secrets.") {
             flagged_sec = true;
-            push_finding(
-                out, rel, ln, "high", "gha_secrets_outside_env",
+            sink.emit(
+                ln, "high", "gha_secrets_outside_env",
                 "Secret `${{ secrets.* }}` interpolated directly in shell sink instead of `env:`",
             );
         }
@@ -353,45 +328,34 @@ fn gha_key_column(indent: usize, trimmed: &str) -> usize {
     indent
 }
 
-fn scan_gha(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
-    let (mut in_run_block, mut run_indent, mut prev_ignore) = (false, 0usize, None::<Vec<String>>);
+fn scan_gha(txt: &str, sink: &mut FindingSink<'_>) {
+    let (mut in_run_block, mut run_indent) = (false, 0usize);
     for (idx, raw) in txt.lines().enumerate() {
         let (ln, indent, trimmed) = (idx + 1, raw.bytes().take_while(|&b| b == b' ').count(), raw.trim());
-        if trimmed.is_empty() { prev_ignore = None; continue; }
-        if trimmed.starts_with('#') { prev_ignore = parse_ignore_directive(trimmed); continue; }
+        if sink.skip_blank_or_comment(trimmed, trimmed.starts_with('#')) { continue; }
         if in_run_block && indent <= run_indent { in_run_block = false; }
 
-        let inline_ign = parse_ignore_directive(raw);
+        sink.begin_line(raw);
         let code = strip_yaml_inline_comment(trimmed).trim();
         if !in_run_block {
-            if code.contains("write-all")
-                && !is_suppressed("gha_write_all_perms", inline_ign.as_deref(), prev_ignore.as_deref())
-            {
-                push_finding(
-                    out, rel, ln, "high", "gha_write_all_perms",
-                    "Workflow grants overly broad `write-all` permissions",
-                );
+            if code.contains("write-all") {
+                sink.emit(ln, "high", "gha_write_all_perms", "Workflow grants overly broad `write-all` permissions");
             }
-            if let Some(uses_ref) = extract_gha_uses(code) && !is_pinned_gha_action(uses_ref)
-                && !is_suppressed("gha_unpinned_action", inline_ign.as_deref(), prev_ignore.as_deref())
-            {
-                push_finding(
-                    out, rel, ln, "medium", "gha_unpinned_action",
-                    "Action not pinned to immutable 40-hex commit SHA",
-                );
+            if let Some(uses_ref) = extract_gha_uses(code) && !is_pinned_gha_action(uses_ref) {
+                sink.emit(ln, "medium", "gha_unpinned_action", "Action not pinned to immutable 40-hex commit SHA");
             }
             if let Some(rhs) = extract_gha_sink_rhs(trimmed) {
                 if is_yaml_block_scalar(rhs) {
                     in_run_block = true;
                     run_indent = gha_key_column(indent, trimmed);
                 } else {
-                    check_gha_sink_line(rel, ln, rhs, inline_ign.as_deref(), prev_ignore.as_deref(), out);
+                    check_gha_sink_line(ln, rhs, sink);
                 }
             }
         } else {
-            check_gha_sink_line(rel, ln, trimmed, inline_ign.as_deref(), prev_ignore.as_deref(), out);
+            check_gha_sink_line(ln, trimmed, sink);
         }
-        prev_ignore = None;
+        sink.end_line();
     }
 }
 
@@ -410,56 +374,46 @@ fn is_whitelisted_nonroot_image(image: &str) -> bool {
         || (base.contains("distroless") && base.contains("nonroot"))
 }
 
-fn scan_docker(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
+fn scan_docker(txt: &str, sink: &mut FindingSink<'_>) {
     let (mut has_stage, mut stage_non_root, mut stage_from_line, mut stage_root_ignored) =
         (false, false, 1usize, false);
-    let mut prev_ignore: Option<Vec<String>> = None;
 
     for (idx, raw) in txt.lines().enumerate() {
         let (ln, trimmed) = (idx + 1, raw.trim());
-        if trimmed.is_empty() { prev_ignore = None; continue; }
-        if trimmed.starts_with('#') { prev_ignore = parse_ignore_directive(trimmed); continue; }
+        if sink.skip_blank_or_comment(trimmed, trimmed.starts_with('#')) { continue; }
 
-        let (inline_ign, up) = (parse_ignore_directive(raw), trimmed.to_ascii_uppercase());
+        sink.begin_line(raw);
+        let up = trimmed.to_ascii_uppercase();
         if up.starts_with("FROM ") {
             has_stage = true;
             stage_from_line = ln;
             let image = extract_docker_from_image(trimmed);
             stage_non_root = is_whitelisted_nonroot_image(image);
-            stage_root_ignored =
-                is_suppressed("docker_runs_as_root", inline_ign.as_deref(), prev_ignore.as_deref());
-            if image.to_ascii_lowercase().ends_with(":latest")
-                && !is_suppressed("docker_latest_tag", inline_ign.as_deref(), prev_ignore.as_deref())
-            {
-                push_finding(
-                    out, rel, ln, "medium", "docker_latest_tag",
+            stage_root_ignored = sink.is_suppressed("docker_runs_as_root");
+            if image.to_ascii_lowercase().ends_with(":latest") {
+                sink.emit(
+                    ln, "medium", "docker_latest_tag",
                     "Unpinned `:latest` base image causes non-reproducible builds",
                 );
             }
         } else if up.starts_with("USER ") {
-            let user = trimmed.split_whitespace().nth(1).unwrap_or("").split(':').next().unwrap_or("");
+            let tok = trimmed.split_whitespace().nth(1).unwrap_or("");
+            let user = tok.split(':').next().unwrap_or("");
             stage_non_root = !user.is_empty() && !user.eq_ignore_ascii_case("root") && user != "0";
-        } else if up.starts_with("ADD ") && (trimmed.contains("http://") || trimmed.contains("https://"))
-            && !is_suppressed("docker_add_remote_url", inline_ign.as_deref(), prev_ignore.as_deref())
-        {
-            push_finding(
-                out, rel, ln, "high", "docker_add_remote_url",
+        } else if up.starts_with("ADD ") && (trimmed.contains("http://") || trimmed.contains("https://")) {
+            sink.emit(
+                ln, "high", "docker_add_remote_url",
                 "Dockerfile `ADD` fetches remote URL without integrity checksum",
             );
         }
-        if has_baked(trimmed, &up)
-            && !is_suppressed("docker_baked_secret", inline_ign.as_deref(), prev_ignore.as_deref())
-        {
-            push_finding(
-                out, rel, ln, "high", "docker_baked_secret",
-                "Sensitive ENV/ARG value baked into Docker image layer",
-            );
+        if has_baked(trimmed, &up) {
+            sink.emit(ln, "high", "docker_baked_secret", "Sensitive ENV/ARG value baked into Docker image layer");
         }
-        prev_ignore = None;
+        sink.end_line();
     }
     if has_stage && !stage_non_root && !stage_root_ignored {
-        push_finding(
-            out, rel, stage_from_line, "high", "docker_runs_as_root",
+        sink.emit_raw(
+            stage_from_line, "high", "docker_runs_as_root",
             "Final Dockerfile stage missing non-root `USER` instruction",
         );
     }
@@ -468,24 +422,15 @@ fn scan_docker(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
 fn has_baked(trimmed: &str, up: &str) -> bool {
     let is_env = up.starts_with("ENV ") || up.starts_with("ARG ");
     let sensitive = up.contains("SECRET") || up.contains("PASSWORD") || up.contains("API_KEY");
-    if !(is_env && sensitive) {
-        return false;
-    }
-
+    if !(is_env && sensitive) { return false; }
     let rest = trimmed[4..].trim();
-    let val = rest
-        .split_once('=')
-        .or_else(|| rest.split_once(char::is_whitespace))
-        .map(|(_, v)| v.trim().trim_matches(['"', '\'']))
-        .unwrap_or("");
+    let val = rest.split_once('=').or_else(|| rest.split_once(char::is_whitespace))
+        .map(|(_, v)| v.trim().trim_matches(['"', '\''])).unwrap_or("");
     !val.is_empty() && !val.starts_with('$')
 }
 
 fn strip_hcl_line(raw: &str, in_block_comment: &mut bool) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
-    let mut pos = 0usize;
-
+    let (bytes, mut out, mut pos) = (raw.as_bytes(), String::with_capacity(raw.len()), 0usize);
     while pos < bytes.len() {
         if *in_block_comment {
             if bytes.get(pos..pos + 2) == Some(b"*/") {
@@ -538,16 +483,20 @@ fn classify_tf_block(header: &str) -> TfBlockKind {
         || lo.contains("\"aws_vpc_security_group_egress_rule\"")
     { return TfBlockKind::Egress; }
     if lo.contains("\"aws_security_group_rule\"") { return TfBlockKind::SgRule; }
-    if lo.contains("\"aws_route\"") || lo.contains("\"google_compute_route\"") || lo.contains("\"azurerm_route\"") {
-        return TfBlockKind::Route;
-    }
+    if lo.contains("\"aws_route\"") || lo.contains("\"google_compute_route\"")
+        || lo.contains("\"azurerm_route\"")
+    { return TfBlockKind::Route; }
     TfBlockKind::Other
 }
 
 fn count_hcl_braces(code: &str) -> (usize, usize) {
     let (mut opens, mut closes) = (0usize, 0usize);
     scan_code(code.as_bytes(), b"\"", |_, cur| {
-        if cur == b'{' { opens += 1; } else if cur == b'}' { closes += 1; }
+        match cur {
+            b'{' => opens += 1,
+            b'}' => closes += 1,
+            _ => {}
+        }
         ControlFlow::Continue(())
     });
     (opens, closes)
@@ -570,13 +519,13 @@ fn update_tf_block(blk: &mut TfBlock, code: &str, lower: &str, ln: usize, cidr_s
     }
 }
 
-fn flush_tf_block(rel: &str, blk: TfBlock, out: &mut Vec<InfraFinding>) {
+fn flush_tf_block(blk: TfBlock, sink: &mut FindingSink<'_>) {
     let is_ingress = blk.kind == TfBlockKind::Ingress
         || (blk.kind == TfBlockKind::SgRule && !blk.rule_is_egress);
     let Some(cidr_ln) = blk.open_cidr_line.filter(|_| is_ingress) else { return };
     if !matches!((blk.from_port, blk.to_port), (Some(80), Some(80)) | (Some(443), Some(443))) {
-        push_finding(
-            out, rel, cidr_ln, "high", "tf_open_cidr",
+        sink.emit_raw(
+            cidr_ln, "high", "tf_open_cidr",
             "Ingress security rule open to 0.0.0.0/0 or ::/0 on non-80/443 port",
         );
     }
@@ -587,27 +536,22 @@ fn is_tf_wildcard_iam(code: &str, lower: &str) -> bool {
         && (code.contains("\"*\"") || code.contains("\\\"*\\\"")))
 }
 
-fn scan_tf(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
+fn scan_tf(txt: &str, sink: &mut FindingSink<'_>) {
     let (mut in_block_comment, mut has_req_providers) = (false, false);
-    let (mut prov_block, mut unversioned_provs, mut blocks, mut prev_ignore) =
-        (None::<(usize, bool)>, Vec::new(), Vec::<TfBlock>::new(), None::<Vec<String>>);
+    let (mut prov_block, mut unversioned_provs, mut blocks) =
+        (None::<(usize, bool)>, Vec::new(), Vec::<TfBlock>::new());
 
     for (idx, raw) in txt.lines().enumerate() {
         let (ln, raw_trim) = (idx + 1, raw.trim());
-        if raw_trim.is_empty() { prev_ignore = None; continue; }
         let code_owned = strip_hcl_line(raw, &mut in_block_comment);
         let code = code_owned.trim();
-        if code.is_empty() { prev_ignore = parse_ignore_directive(raw_trim); continue; }
+        if sink.skip_blank_or_comment(raw_trim, code.is_empty()) { continue; }
 
-        let (inline_ign, lower) = (parse_ignore_directive(raw), code.to_ascii_lowercase());
+        sink.begin_line(raw);
+        let lower = code.to_ascii_lowercase();
         if lower.contains("required_providers") { has_req_providers = true; }
-        if is_tf_wildcard_iam(code, &lower)
-            && !is_suppressed("tf_wildcard_iam", inline_ign.as_deref(), prev_ignore.as_deref())
-        {
-            push_finding(
-                out, rel, ln, "critical", "tf_wildcard_iam",
-                "Overly permissive wildcard IAM policy (`*` / `*:*`)",
-            );
+        if is_tf_wildcard_iam(code, &lower) {
+            sink.emit(ln, "critical", "tf_wildcard_iam", "Overly permissive wildcard IAM policy (`*` / `*:*`)");
         }
         let (opens, closes) = count_hcl_braces(code);
         track_tf_provider(code, &lower, ln, opens, closes, &mut prov_block, &mut unversioned_provs);
@@ -617,18 +561,14 @@ fn scan_tf(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
             for _ in 1..opens { blocks.push(TfBlock::new(TfBlockKind::Other)); }
         }
         if let Some(top) = blocks.last_mut() {
-            let sup = is_suppressed("tf_open_cidr", inline_ign.as_deref(), prev_ignore.as_deref());
-            update_tf_block(top, code, &lower, ln, sup);
+            update_tf_block(top, code, &lower, ln, sink.is_suppressed("tf_open_cidr"));
         }
-        for _ in 0..closes { if let Some(popped) = blocks.pop() { flush_tf_block(rel, popped, out); } }
-        prev_ignore = None;
+        for _ in 0..closes { if let Some(popped) = blocks.pop() { flush_tf_block(popped, sink); } }
+        sink.end_line();
     }
     if !has_req_providers {
         for prov_ln in unversioned_provs {
-            push_finding(
-                out, rel, prov_ln, "medium", "tf_unversioned_provider",
-                "Terraform provider lacks pinned version constraint",
-            );
+            sink.emit_raw(prov_ln, "medium", "tf_unversioned_provider", "Terraform provider lacks pinned version constraint");
         }
     }
 }
@@ -669,7 +609,8 @@ fn strip_sql_comment(raw: &str) -> &str {
 }
 
 fn normalize_sql_upper(code: &str) -> String {
-    code.split_whitespace().map(str::to_ascii_uppercase).collect::<Vec<_>>().join(" ")
+    let words: Vec<String> = code.split_whitespace().map(str::to_ascii_uppercase).collect();
+    words.join(" ")
 }
 
 fn is_down_migration(rel: &str) -> bool {
@@ -677,35 +618,29 @@ fn is_down_migration(rel: &str) -> bool {
     lower.ends_with(".down.sql") || lower.ends_with("_down.sql") || lower.contains("/down/")
 }
 
-fn scan_sql(rel: &str, txt: &str, out: &mut Vec<InfraFinding>) {
-    let (down_file, mut prev_ignore) = (is_down_migration(rel), None::<Vec<String>>);
+fn scan_sql(txt: &str, sink: &mut FindingSink<'_>) {
+    let down_file = is_down_migration(sink.rel);
     for (idx, raw) in txt.lines().enumerate() {
         let (ln, raw_trim) = (idx + 1, raw.trim());
-        if raw_trim.is_empty() { prev_ignore = None; continue; }
         let code = strip_sql_comment(raw).trim();
-        if code.is_empty() { prev_ignore = parse_ignore_directive(raw_trim); continue; }
-        let (inline_ign, stmt_up) = (parse_ignore_directive(raw), normalize_sql_upper(code));
+        if sink.skip_blank_or_comment(raw_trim, code.is_empty()) { continue; }
+
+        sink.begin_line(raw);
+        let stmt_up = normalize_sql_upper(code);
         let is_temp_drop = stmt_up.starts_with("DROP TEMP TABLE ")
             || stmt_up.starts_with("DROP TEMPORARY TABLE ");
         let is_destructive = !is_temp_drop && ((stmt_up.starts_with("DROP TABLE ") && !stmt_up.contains("IF EXISTS"))
             || stmt_up.starts_with("TRUNCATE TABLE ") || stmt_up.starts_with("TRUNCATE "));
-        if !down_file && is_destructive
-            && !is_suppressed("sql_destructive_migration", inline_ign.as_deref(), prev_ignore.as_deref())
-        {
-            push_finding(
-                out, rel, ln, "high", "sql_destructive_migration",
+        if !down_file && is_destructive {
+            sink.emit(
+                ln, "high", "sql_destructive_migration",
                 "Unguarded destructive DROP/TRUNCATE statement in SQL migration",
             );
         }
-        if (stmt_up.contains("IDENTIFIED BY '") || stmt_up.contains("WITH PASSWORD '"))
-            && !is_suppressed("sql_hardcoded_password", inline_ign.as_deref(), prev_ignore.as_deref())
-        {
-            push_finding(
-                out, rel, ln, "critical", "sql_hardcoded_password",
-                "Hardcoded database password literal in SQL script",
-            );
+        if stmt_up.contains("IDENTIFIED BY '") || stmt_up.contains("WITH PASSWORD '") {
+            sink.emit(ln, "critical", "sql_hardcoded_password", "Hardcoded database password literal in SQL script");
         }
-        prev_ignore = None;
+        sink.end_line();
     }
 }
 
@@ -719,40 +654,20 @@ fn collect_manifest_deps(
             let eco = Eco::from_name(dep.ecosystem);
             let slot = builders[eco.idx()].add_dep(eco, &dep.package);
             parsed.push(ParsedDep {
-                manifest: manifest.clone(),
-                ecosystem: dep.ecosystem,
-                package: dep.package,
-                eco,
-                slot,
+                manifest: manifest.clone(), ecosystem: dep.ecosystem, package: dep.package, eco, slot,
             });
         }
     }
-    let [b0, b1, b2, b3] = builders;
-    let matchers = [
-        b0.build(Eco::ALL[0]),
-        b1.build(Eco::ALL[1]),
-        b2.build(Eco::ALL[2]),
-        b3.build(Eco::ALL[3]),
-    ];
+    let matchers = Eco::ALL.map(|eco| std::mem::take(&mut builders[eco.idx()]).build(eco));
     (parsed, matchers)
 }
 
-fn all_matchers_complete(matchers: &[Option<EcoMatcher>; 4]) -> bool {
-    matchers.iter().all(|m| m.as_ref().is_none_or(EcoMatcher::is_complete))
-}
-
 fn collect_unused_from_matchers(
-    parsed: Vec<ParsedDep>,
-    matchers: &[Option<EcoMatcher>; 4],
+    parsed: Vec<ParsedDep>, matchers: &[Option<EcoMatcher>; 4],
 ) -> Vec<UnusedDep> {
-    parsed
-        .into_iter()
-        .filter(|dep| !matchers[dep.eco.idx()].as_ref().is_some_and(|m| m.hits.contains(dep.slot)))
-        .map(|dep| UnusedDep {
-            manifest: dep.manifest,
-            ecosystem: dep.ecosystem.into(),
-            package: dep.package,
-        })
+    parsed.into_iter()
+        .filter(|d| !matchers[d.eco.idx()].as_ref().is_some_and(|m| m.hits.contains(d.slot)))
+        .map(|d| UnusedDep { manifest: d.manifest, ecosystem: d.ecosystem.into(), package: d.package })
         .collect()
 }
 
@@ -764,9 +679,7 @@ mod tests {
     #[test]
     fn infra_gha_2q_taint_multistage_docker_tf_sql_precision() {
         let gha_safe = concat!(
-            "jobs:\n",
-            "  safe:\n",
-            "    steps:\n",
+            "jobs:\n  safe:\n    steps:\n",
             "      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # v4\n",
             "      - env:\n",
             "          TITLE: ${{ github.event.issue.title }}\n",
@@ -774,91 +687,57 @@ mod tests {
             "        if: ${{ github.event.pull_request.number > 0 }}\n",
             "        run: echo \"$TITLE\" ${{ github.event.pull_request.number }}\n",
             "      # never do echo ${{ github.event.issue.title }}\n",
-            "      - run: |\n",
-            "          echo \"$SAFE_TITLE\"\n",
-            "        env:\n",
+            "      - run: |\n          echo \"$SAFE_TITLE\"\n        env:\n",
             "          SAFE_TITLE: ${{ github.event.issue.title }}\n",
             "          SAFE_TOKEN: ${{ secrets.DEPLOY_TOKEN }}\n",
             "      - run: echo ${{ github.event.comment.body }} # refit: ignore[gha_script_injection]\n",
         );
         let gha_unsafe = concat!(
-            "jobs:\n",
-            "  bad:\n",
-            "    steps:\n",
-            "      - uses: actions/checkout@v4\n",
-            "      - run: |\n",
+            "jobs:\n  bad:\n    steps:\n      - uses: actions/checkout@v4\n      - run: |\n",
             "          echo \"${{ github.event.issue.title }}\"\n",
             "          curl -H \"Auth: ${{ secrets.API_TOKEN }}\" https://example.com\n",
         );
         let docker_multistage_root = concat!(
-            "FROM node:20 AS builder\n",
-            "USER appuser\n",
-            "RUN npm run build\n",
-            "FROM debian:12-slim\n",
-            "COPY --from=builder /app /app\n",
+            "FROM node:20 AS builder\nUSER appuser\nRUN npm run build\n",
+            "FROM debian:12-slim\nCOPY --from=builder /app /app\n",
         );
-        let docker_scratch = "FROM node:20 AS build\nFROM scratch\nCOPY --from=build /bin/app /app\n";
-        let docker_nonroot = "FROM gcr.io/distroless/static-debian12:nonroot\nENTRYPOINT [\"/app\"]\n";
         let tf_cfg = concat!(
-            "# cidr_blocks = [\"0.0.0.0/0\"]\n",
-            "// policy = \"{\\\"Action\\\": \\\"*:*\\\"}\"\n",
+            "# cidr_blocks = [\"0.0.0.0/0\"]\n// policy = \"{\\\"Action\\\": \\\"*:*\\\"}\"\n",
             "terraform { required_providers { aws = { version = \"~> 5.0\" } } }\n",
             "resource \"aws_security_group\" \"web\" {\n",
-            "  ingress {\n",
-            "    from_port = 443\n",
-            "    to_port = 443\n",
-            "    cidr_blocks = [\"0.0.0.0/0\"]\n",
-            "  }\n",
-            "  egress {\n",
-            "    from_port = 0\n",
-            "    to_port = 0\n",
-            "    cidr_blocks = [\"0.0.0.0/0\"]\n",
-            "  }\n",
-            "  ingress {\n",
-            "    from_port = 22\n",
-            "    to_port = 22\n",
-            "    cidr_blocks = [\"0.0.0.0/0\"]\n",
-            "  }\n",
-            "}\n",
+            "  ingress {\n    from_port = 443\n    to_port = 443\n    cidr_blocks = [\"0.0.0.0/0\"]\n  }\n",
+            "  egress {\n    from_port = 0\n    to_port = 0\n    cidr_blocks = [\"0.0.0.0/0\"]\n  }\n",
+            "  ingress {\n    from_port = 22\n    to_port = 22\n    cidr_blocks = [\"0.0.0.0/0\"]\n  }\n}\n",
         );
-        let sql_up = "DROP TEMPORARY TABLE scratch_buf;\nDROP TABLE legacy_users;\n";
-        let sql_down = "DROP TABLE legacy_users;\nTRUNCATE TABLE audit_log;\n";
-
-        let dir = TempRepo::with_files(
-            "infra_prec",
-            &[
-                (".github/workflows/safe.yml", gha_safe),
-                (".github/workflows/unsafe.yml", gha_unsafe),
-                ("Dockerfile", docker_multistage_root),
-                ("scratch.dockerfile", docker_scratch),
-                ("nonroot.dockerfile", docker_nonroot),
-                ("infra/sg.tf", tf_cfg),
-                ("migrations/001_init.up.sql", sql_up),
-                ("migrations/001_init.down.sql", sql_down),
-            ],
-        );
+        let dir = TempRepo::with_files("infra_prec", &[
+            (".github/workflows/safe.yml", gha_safe),
+            (".github/workflows/unsafe.yml", gha_unsafe),
+            ("Dockerfile", docker_multistage_root),
+            ("scratch.dockerfile", "FROM node:20 AS build\nFROM scratch\nCOPY --from=build /bin/app /app\n"),
+            ("nonroot.dockerfile", "FROM gcr.io/distroless/static-debian12:nonroot\nENTRYPOINT [\"/app\"]\n"),
+            ("infra/sg.tf", tf_cfg),
+            ("migrations/001_init.up.sql", "DROP TEMPORARY TABLE scratch_buf;\nDROP TABLE legacy_users;\n"),
+            ("migrations/001_init.down.sql", "DROP TABLE legacy_users;\nTRUNCATE TABLE audit_log;\n"),
+        ]);
 
         let (_, _, findings) = scan_parts(dir.path(), None);
-        let by_file = |file: &str, rule: &str| {
-            findings.iter().filter(|f| f.file == file && f.rule_id == rule).count()
-        };
-
-        assert_eq!(by_file(".github/workflows/safe.yml", "gha_script_injection"), 0);
-        assert_eq!(by_file(".github/workflows/safe.yml", "gha_secrets_outside_env"), 0);
-        assert_eq!(by_file(".github/workflows/safe.yml", "gha_unpinned_action"), 0);
-
-        assert_eq!(by_file(".github/workflows/unsafe.yml", "gha_script_injection"), 1);
-        assert_eq!(by_file(".github/workflows/unsafe.yml", "gha_secrets_outside_env"), 1);
-        assert_eq!(by_file(".github/workflows/unsafe.yml", "gha_unpinned_action"), 1);
-
-        assert_eq!(by_file("Dockerfile", "docker_runs_as_root"), 1);
-        assert_eq!(by_file("scratch.dockerfile", "docker_runs_as_root"), 0);
-        assert_eq!(by_file("nonroot.dockerfile", "docker_runs_as_root"), 0);
-
-        assert_eq!(by_file("infra/sg.tf", "tf_wildcard_iam"), 0);
-        assert_eq!(by_file("infra/sg.tf", "tf_open_cidr"), 1);
-
-        assert_eq!(by_file("migrations/001_init.up.sql", "sql_destructive_migration"), 1);
-        assert_eq!(by_file("migrations/001_init.down.sql", "sql_destructive_migration"), 0);
+        for (file, rule, expected) in [
+            (".github/workflows/safe.yml", "gha_script_injection", 0),
+            (".github/workflows/safe.yml", "gha_secrets_outside_env", 0),
+            (".github/workflows/safe.yml", "gha_unpinned_action", 0),
+            (".github/workflows/unsafe.yml", "gha_script_injection", 1),
+            (".github/workflows/unsafe.yml", "gha_secrets_outside_env", 1),
+            (".github/workflows/unsafe.yml", "gha_unpinned_action", 1),
+            ("Dockerfile", "docker_runs_as_root", 1),
+            ("scratch.dockerfile", "docker_runs_as_root", 0),
+            ("nonroot.dockerfile", "docker_runs_as_root", 0),
+            ("infra/sg.tf", "tf_wildcard_iam", 0),
+            ("infra/sg.tf", "tf_open_cidr", 1),
+            ("migrations/001_init.up.sql", "sql_destructive_migration", 1),
+            ("migrations/001_init.down.sql", "sql_destructive_migration", 0),
+        ] {
+            let count = findings.iter().filter(|f| f.file == file && f.rule_id == rule).count();
+            assert_eq!(count, expected, "{file}:{rule}");
+        }
     }
 }

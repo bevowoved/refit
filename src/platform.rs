@@ -229,7 +229,8 @@ pub fn ensure_cachedir_tag(dir: &Path) {
 pub fn has_cachedir_tag(dir: &Path) -> bool {
     let Ok(mut f) = File::open(dir.join("CACHEDIR.TAG")) else { return false };
     let mut head = [0u8; 43];
-    f.read_exact(&mut head).is_ok() && head.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55")
+    f.read_exact(&mut head).is_ok()
+        && head.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55")
 }
 
 fn advise_file(file: &File, len: u64, dontneed: bool) {
@@ -257,23 +258,34 @@ pub fn sync_file_barrier(file: &File) -> io::Result<()> {
 }
 
 fn write_atomic_with<T>(target: &Path, write_fn: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
-    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).with_context(|| format!("create parent dir {}", parent.display()))?;
+    let parent = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create parent dir {}", parent.display()))?;
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = u32::from_le_bytes(os_random_bytes::<4>().unwrap_or([0; 4]));
     let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
     let tmp = parent.join(format!(".refit.tmp.{}.{seq}.{nonce:08x}.{name}", std::process::id()));
 
     let outcome = (|| -> Result<T> {
-        let mut f = File::create(&tmp).with_context(|| format!("create temp file {}", tmp.display()))?;
+        let mut f = File::create(&tmp)
+            .with_context(|| format!("create temp file {}", tmp.display()))?;
         let res = write_fn(&mut f)?;
         sync_file_barrier(&f)?;
         advise_file(&f, f.metadata().map(|m| m.len()).unwrap_or(0), true);
         Ok(res)
     })();
     match outcome {
-        Ok(val) => { replace_file(&tmp, target, parent)?; Ok(val) }
-        Err(err) => { let _ = fs::remove_file(&tmp); Err(err) }
+        Ok(val) => {
+            replace_file(&tmp, target, parent)?;
+            Ok(val)
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
     }
 }
 
@@ -317,7 +329,8 @@ pub fn compress_file_zstd(src: &Path, dst: &Path, level: i32) -> Result<(u64, u6
 }
 
 pub fn mkdir_private(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("create private directory {}", path.display()))?;
+    fs::create_dir_all(path)
+        .with_context(|| format!("create private directory {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -347,13 +360,18 @@ pub fn file_mtime_size(path: &Path) -> Option<(u64, u64)> {
 }
 
 pub fn now_unix_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+    let Ok(dur) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    dur.as_nanos() as u64
 }
 
 /// Racy-git 2-second guard: only trust a stat cache hit when `now - mtime_ns >= 2s`.
 #[inline]
 pub fn stat_cache_fresh(entry: &StatEntry, mtime_ns: u64, size: u64, now_ns: u64) -> bool {
-    entry.size == size && entry.mtime_ns == mtime_ns && now_ns.saturating_sub(mtime_ns) >= RACY_GIT_NS
+    entry.size == size
+        && entry.mtime_ns == mtime_ns
+        && now_ns.saturating_sub(mtime_ns) >= RACY_GIT_NS
 }
 
 pub fn load_stat_cache(path: &Path) -> BTreeMap<String, StatEntry> {
@@ -480,7 +498,9 @@ fn is_lock_unsupported(err: &io::Error) -> bool {
 fn try_acquire_excl_once(lock_path: &Path) -> Result<Option<SidecarLock>> {
     let name = lock_path.file_name().and_then(|s| s.to_str()).unwrap_or("refit.lock");
     let lease = lock_path.with_file_name(format!("{name}.excl"));
-    match OpenOptions::new().create_new(true).write(true).open(&lease) {
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    match opts.open(&lease) {
         Ok(mut f) => {
             let _ = writeln!(f, "{} {}", std::process::id(), now_ms());
             Ok(Some(SidecarLock::ExclLease(lease)))
@@ -505,18 +525,30 @@ fn acquire_excl_fallback(lock_path: &Path) -> Result<SidecarLock> {
 
 fn reap_stale_excl(lease: &Path) {
     #[cfg(unix)]
-    if let Ok(raw) = fs::read_to_string(lease)
-        && let Some(pid) = raw.split_whitespace().next().and_then(|s| s.parse::<i32>().ok())
-        && pid > 0
-        && matches!(
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-            Ok(()) | Err(nix::errno::Errno::EPERM)
-        )
-    {
-        return;
+    if let Ok(raw) = fs::read_to_string(lease) {
+        let pid = raw
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<i32>().ok());
+        if let Some(pid) = pid
+            && pid > 0
+            && matches!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                Ok(()) | Err(nix::errno::Errno::EPERM)
+            )
+        {
+            return;
+        }
     }
-    let Ok(meta) = fs::metadata(lease) else { return };
-    if meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|a| a > Duration::from_secs(60)) {
+    let Ok(meta) = fs::metadata(lease) else {
+        return;
+    };
+    let stale = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .is_some_and(|age| age > Duration::from_secs(60));
+    if stale {
         let _ = fs::remove_file(lease);
     }
 }
@@ -588,7 +620,10 @@ impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
                 idx = (idx + 1) % len;
                 continue;
             }
-            let visited = self.map.get_index_mut(idx).is_some_and(|(_, (_, _, v))| std::mem::replace(v, false));
+            let visited = self
+                .map
+                .get_index_mut(idx)
+                .is_some_and(|(_, (_, _, v))| std::mem::replace(v, false));
             if !visited {
                 if let Some((_, (_, w, _))) = self.map.shift_remove_index(idx) {
                     self.total_weight = self.total_weight.saturating_sub(w);
@@ -606,7 +641,11 @@ impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
         let w = weight.max(1);
         if w > self.max_bytes {
             let (i, _, (prev, old_w, _)) = self.map.shift_remove_full(&key)?;
-            if i < self.hand { self.hand = self.hand.saturating_sub(1); } else { self.clamp_hand(); }
+            if i < self.hand {
+                self.hand = self.hand.saturating_sub(1);
+            } else {
+                self.clamp_hand();
+            }
             self.total_weight = self.total_weight.saturating_sub(old_w);
             return Some(prev);
         }
@@ -614,7 +653,10 @@ impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
             self.total_weight = self.total_weight.saturating_sub(*slot_w).saturating_add(w);
             (*slot_w, *visited) = (w, true);
             let prev = std::mem::replace(slot_val, val);
-            while self.total_weight > self.max_bytes && self.map.len() > 1 && self.evict_one_except(Some(&key)) {}
+            while self.total_weight > self.max_bytes
+                && self.map.len() > 1
+                && self.evict_one_except(Some(&key))
+            {}
             return Some(prev);
         }
         while (self.map.len() >= self.max_entries
@@ -634,7 +676,10 @@ impl<K: Eq + Hash + Clone, V: Clone> SieveCache<K, V> {
         Self {
             inner: Mutex::new(SieveState {
                 map: IndexMap::with_hasher(FxBuildHasher),
-                hand: 0, total_weight: 0, max_entries: max_entries.max(1), max_bytes: max_bytes.max(1),
+                hand: 0,
+                total_weight: 0,
+                max_entries: max_entries.max(1),
+                max_bytes: max_bytes.max(1),
             }),
         }
     }
@@ -672,7 +717,12 @@ impl<K: Eq + Hash + Clone, V: Clone> SieveCache<K, V> {
     pub fn len(&self) -> usize { self.inner.lock().map.len() }
 
     pub fn snapshot(&self) -> Vec<(K, V)> {
-        self.inner.lock().map.iter().map(|(k, (v, _, _))| (k.clone(), v.clone())).collect()
+        let guard = self.inner.lock();
+        guard
+            .map
+            .iter()
+            .map(|(k, (v, _, _))| (k.clone(), v.clone()))
+            .collect()
     }
 }
 
@@ -701,7 +751,9 @@ impl EpochRegistry {
     }
 
     #[inline]
-    pub fn slot_epoch(&self, key: &str) -> u64 { self.slots[Self::slot_idx(key)].load(Ordering::Acquire) }
+    pub fn slot_epoch(&self, key: &str) -> u64 {
+        self.slots[Self::slot_idx(key)].load(Ordering::Acquire)
+    }
 
     /// Single-authority monotonic publish (`+1` exact) for ABI cutoff or single-key updates.
     #[inline]
@@ -744,7 +796,8 @@ pub fn env_truthy(name: &str) -> bool {
 
 /// Parse trimmed env var `name` into `T`.
 pub fn env_parse<T: FromStr>(name: &str) -> Option<T> {
-    std::env::var(name).ok()?.trim().parse::<T>().ok()
+    let raw = std::env::var(name).ok()?;
+    raw.trim().parse::<T>().ok()
 }
 
 /// Extract trimmed body lines from Go `keyword ( ... )` blocks and single-line `keyword ...` entries.
@@ -1045,22 +1098,24 @@ mod tests {
         let tmp = TempRepo::new("io_stat_v2");
         let cache = tmp.join(".refit/cache/stat.bin");
 
-        // 1. Stale RFST0001 LZ4-prepended bytes must safely return empty map (zero panic).
+        // Stale v1 LZ4-framed and Zstd-framed RFST0001 caches must safely return empty maps.
         let mut fake_v1_lz4 = vec![12, 0, 0, 0];
         fake_v1_lz4.extend_from_slice(b"RFST0001\x00\x00\x00\x00");
-        write_atomic(&cache, &fake_v1_lz4).unwrap();
-        assert!(load_stat_cache(&cache).is_empty());
-
-        // Even Zstd-compressed RFST0001 bytes must be rejected by STAT_MAGIC = RFST0002.
         let zst_v1 = zstd::bulk::compress(b"RFST0001\x00\x00\x00\x00", 1).unwrap();
-        write_atomic(&cache, &zst_v1).unwrap();
-        assert!(load_stat_cache(&cache).is_empty());
+        for stale_payload in [&fake_v1_lz4, &zst_v1] {
+            write_atomic(&cache, stale_payload).unwrap();
+            assert!(load_stat_cache(&cache).is_empty());
+        }
 
-        // 2. Round-trip v2 Zstd stat.bin + 2-second racy-git guard.
+        // Round-trip v2 Zstd stat.bin + 2-second racy-git guard.
         let old_ns = 1_000_000_000_000u64;
         let now_ns = old_ns + 5_000_000_000;
-        let mut map = BTreeMap::new();
-        map.insert("src/a.rs".into(), StatEntry { mtime_ns: old_ns, size: 128, blake3: "abcd".into() });
+        let entry = StatEntry {
+            mtime_ns: old_ns,
+            size: 128,
+            blake3: "abcd".into(),
+        };
+        let map = BTreeMap::from([("src/a.rs".to_string(), entry)]);
         save_stat_cache(&cache, &map).unwrap();
 
         assert!(has_cachedir_tag(&tmp.join(".refit/cache")));

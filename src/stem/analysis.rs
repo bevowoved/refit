@@ -2,10 +2,9 @@
 //! and 16-byte proof-lattice witness analysis (merged `csr` + `genome` + `witness`).
 
 use crate::lex::ident_byte;
-use crate::platform::{read_zstd, write_zstd};
+use crate::platform::{par_map, read_zstd, write_zstd};
 use crate::source::{dir_of, read_text, stem_of};
 use crate::types::{CloneCluster, FileEgoContext};
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -58,7 +57,10 @@ const _: () = assert!(std::mem::size_of::<RefWitness>() == 16);
 
 impl Default for RefWitness {
     fn default() -> Self {
-        Self { prod_file_a: NO_FILE, prod_file_b: NO_FILE, test_file: NO_FILE, prod_files_sat: 0, flags_and_test: 0 }
+        Self {
+            prod_file_a: NO_FILE, prod_file_b: NO_FILE, test_file: NO_FILE,
+            prod_files_sat: 0, flags_and_test: 0,
+        }
     }
 }
 
@@ -80,21 +82,20 @@ impl RefWitness {
 
     #[inline]
     pub fn record_test(&mut self, fid: u32) {
-        let cur = self.flags_and_test & WITNESS_TEST_COUNT_MASK;
-        if self.test_file == NO_FILE {
-            self.test_file = fid;
-            self.set_test_count(cur.saturating_add(1));
-        } else if self.test_file != fid {
-            self.set_test_count(cur.saturating_add(1));
+        if self.test_file == NO_FILE || self.test_file != fid {
+            if self.test_file == NO_FILE {
+                self.test_file = fid;
+            }
+            let next = self.test_count().saturating_add(1).min(WITNESS_TEST_COUNT_MASK);
+            self.flags_and_test = (self.flags_and_test & !WITNESS_TEST_COUNT_MASK) | next;
         }
     }
 
-    #[inline] pub fn add_flag(&mut self, flag: u16) { self.flags_and_test |= flag & !WITNESS_TEST_COUNT_MASK; }
-    #[inline] pub fn test_count(self) -> u16 { self.flags_and_test & WITNESS_TEST_COUNT_MASK }
-    #[inline]
-    fn set_test_count(&mut self, count: u16) {
-        self.flags_and_test = (self.flags_and_test & !WITNESS_TEST_COUNT_MASK) | count.min(WITNESS_TEST_COUNT_MASK);
+    #[inline] pub fn add_flag(&mut self, flag: u16) {
+        self.flags_and_test |= flag & !WITNESS_TEST_COUNT_MASK;
     }
+
+    #[inline] pub fn test_count(self) -> u16 { self.flags_and_test & WITNESS_TEST_COUNT_MASK }
 
     #[inline]
     pub fn has_cross_file_prod_caller(self, def_file: u32) -> bool {
@@ -106,12 +107,16 @@ impl RefWitness {
     pub fn has_external_flag(self) -> bool {
         (self.flags_and_test & (WITNESS_GLOB_REEXPORT | WITNESS_MACRO_ATTR | WITNESS_EXTERNAL)) != 0
     }
+
     #[inline] pub fn has_dynamic_flag(self) -> bool { (self.flags_and_test & WITNESS_DYNAMIC_REF) != 0 }
 }
 
 /// Compact `u32` path interner eliminating repeated `String` clones across symbol/graph tables.
 #[derive(Debug, Default)]
-pub struct PathArena { paths: Vec<String>, by_path: FxHashMap<String, u32> }
+pub struct PathArena {
+    paths: Vec<String>,
+    by_path: FxHashMap<String, u32>,
+}
 
 impl PathArena {
     pub fn with_capacity(cap: usize) -> Self {
@@ -131,6 +136,8 @@ impl PathArena {
     }
 
     pub fn id_of(&self, path: &str) -> Option<u32> { self.by_path.get(path).copied() }
+    pub fn path(&self, id: usize) -> &str { &self.paths[id] }
+    pub fn into_paths(self) -> Vec<String> { self.paths }
 }
 
 /// 4-Tier Deletion-Safety Proof Lattice.
@@ -146,7 +153,9 @@ impl ProofTier {
             Self::T4ExternalOrMacro => "T4ExternalOrMacro",
         }
     }
-    #[inline] pub fn is_dead_candidate(self) -> bool { matches!(self, Self::T1ProvenDead | Self::T2LikelyDead) }
+
+    #[inline]
+    pub fn is_dead_candidate(self) -> bool { matches!(self, Self::T1ProvenDead | Self::T2LikelyDead) }
 }
 
 pub fn classify_symbol(
@@ -159,7 +168,11 @@ pub fn classify_symbol(
     let dyn_or_test = witness.test_count() > 0 || intra_non_def_hits > 0
         || (boundary_flags & BOUNDARY_DYNAMIC_REF) != 0 || witness.has_dynamic_flag();
     if dyn_or_test { return Some(ProofTier::T3DynamicOrTestOnly); }
-    Some(if (boundary_flags & DEF_VIS_INTERNAL) != 0 { ProofTier::T1ProvenDead } else { ProofTier::T2LikelyDead })
+    Some(if (boundary_flags & DEF_VIS_INTERNAL) != 0 {
+        ProofTier::T1ProvenDead
+    } else {
+        ProofTier::T2LikelyDead
+    })
 }
 
 /// Portable 128-bit multiply-XOR mixer (`rapidhash`-style) shared across STEM, clones & SimiFlow.
@@ -177,16 +190,12 @@ pub fn rapid_hash64(bytes: &[u8], seed: u64) -> u64 {
     let mut h = seed ^ rapid_mum(seed ^ S0, S1) ^ (bytes.len() as u64);
     let mut i = 0usize;
     while i + 8 <= bytes.len() {
-        let chunk = u64::from_le_bytes([
-            bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3],
-            bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7],
-        ]);
+        let chunk = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap_or([0; 8]));
         h = rapid_mum(h ^ chunk ^ S1, S2);
         i += 8;
     }
     if i < bytes.len() {
-        let mut tail = 0u64;
-        let mut shift = 0u32;
+        let (mut tail, mut shift) = (0u64, 0u32);
         while i < bytes.len() {
             tail |= (bytes[i] as u64) << shift;
             shift += 8;
@@ -207,9 +216,7 @@ pub fn rapid_hash_u64(x: u64, seed: u64) -> u64 {
 pub const SYM_HASH_SEED: u64 = 0x517c_c1b7_2722_0a95;
 
 #[inline]
-pub fn hash_symbol(name: &str) -> u64 {
-    rapid_hash64(name.as_bytes(), SYM_HASH_SEED)
-}
+pub fn hash_symbol(name: &str) -> u64 { rapid_hash64(name.as_bytes(), SYM_HASH_SEED) }
 
 // ============================================================================
 // 2. Compact CSR Graph, Pearce Iterative SCC, Ego Graph & Deep-Module Rules
@@ -217,19 +224,11 @@ pub fn hash_symbol(name: &str) -> u64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EdgeKind {
-    Runtime,
-    TypeOnly,
-    Dynamic,
-    ModDecl,
-    TestImport,
-}
+pub enum EdgeKind { Runtime, TypeOnly, Dynamic, ModDecl, TestImport }
 
 impl EdgeKind {
     #[inline]
-    pub fn is_runtime_scc(self) -> bool {
-        matches!(self, Self::Runtime | Self::Dynamic | Self::ModDecl)
-    }
+    pub fn is_runtime_scc(self) -> bool { matches!(self, Self::Runtime | Self::Dynamic | Self::ModDecl) }
 }
 
 /// Compact Compressed Sparse Row directed graph using flat `u32` arrays.
@@ -250,14 +249,9 @@ impl CsrGraph {
         sorted.sort_unstable();
         sorted.dedup();
 
-        let mut deg = vec![0u32; n];
-        for &(u, _) in &sorted {
-            deg[u as usize] += 1;
-        }
         let mut offsets = vec![0u32; n + 1];
-        for i in 0..n {
-            offsets[i + 1] = offsets[i] + deg[i];
-        }
+        for &(u, _) in &sorted { offsets[u as usize + 1] += 1; }
+        for i in 0..n { offsets[i + 1] += offsets[i]; }
         let mut cur = offsets.clone();
         let mut targets = vec![0u32; sorted.len()];
         for &(u, v) in &sorted {
@@ -270,17 +264,13 @@ impl CsrGraph {
 
     /// Build a CSR graph and mapped `u32` edge list from named nodes and edges.
     pub fn from_named_edges(nodes: &[String], edges: &[(String, String)]) -> (Self, Vec<(u32, u32)>) {
-        let mut idx_map: FxHashMap<&str, u32> =
-            FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
-        for (i, rel) in nodes.iter().enumerate() {
-            idx_map.insert(rel.as_str(), i as u32);
-        }
+        let idx_map = index_source_rels(nodes);
         let mut csr_edges = Vec::with_capacity(edges.len());
         for (src, dst) in edges {
             if let (Some(&u), Some(&v)) = (idx_map.get(src.as_str()), idx_map.get(dst.as_str()))
                 && u != v
             {
-                csr_edges.push((u, v));
+                csr_edges.push((u as u32, v as u32));
             }
         }
         let csr = Self::from_edges(nodes.len(), &csr_edges);
@@ -291,9 +281,7 @@ impl CsrGraph {
     pub fn pearce_scc(&self) -> Vec<Vec<u32>> {
         let mut state = PearceState::new(self);
         for start in 0..self.n {
-            if state.rindex[start] == 0 {
-                state.visit_from(start);
-            }
+            if state.rindex[start] == 0 { state.visit_from(start); }
         }
         state.comps
     }
@@ -327,7 +315,6 @@ impl<'a> PearceState<'a> {
         self.rindex[start] = self.next_idx;
         self.next_idx += 1;
         self.call_stack.push((start as u32, self.graph.offsets[start], true));
-
         while let Some((node, edge_idx, is_root)) = self.call_stack.pop() {
             if let Some(finished_root) = self.advance_node(node, edge_idx, is_root) {
                 self.finish_node(node, finished_root);
@@ -377,9 +364,7 @@ impl<'a> PearceState<'a> {
         let mut comp = vec![root];
         let root_rindex = self.rindex[root_u];
         while let Some(&top) = self.stack.last() {
-            if self.rindex[top as usize] < root_rindex {
-                break;
-            }
+            if self.rindex[top as usize] < root_rindex { break; }
             self.stack.pop();
             self.rindex[top as usize] = self.comp_id;
             comp.push(top);
@@ -406,6 +391,15 @@ const COMMON_GENERIC_FIELDS: &[&str] = &[
     "value", "score", "count", "index", "key", "msg", "code", "len", "pos",
 ];
 
+/// Optional graph context passed into ego-graph and deep-module analysis.
+pub struct ArchGraphRef<'a> {
+    pub all_edges: &'a [(String, String)],
+    pub runtime_edges: &'a [(String, String)],
+    pub metrics: &'a BTreeMap<String, ModuleMetrics>,
+    pub defs_by_file: Option<&'a BTreeMap<String, Vec<String>>>,
+    pub refs_by_file: Option<&'a BTreeMap<String, Vec<String>>>,
+}
+
 fn index_source_rels(source_rels: &[String]) -> FxHashMap<&str, usize> {
     let mut map = FxHashMap::with_capacity_and_hasher(source_rels.len(), Default::default());
     for (idx, rel) in source_rels.iter().enumerate() {
@@ -414,26 +408,52 @@ fn index_source_rels(source_rels: &[String]) -> FxHashMap<&str, usize> {
     map
 }
 
-fn build_importers_of(source_rels: &[String], edges: &[(String, String)]) -> Vec<FxHashSet<usize>> {
-    let id_of = index_source_rels(source_rels);
-    let mut importers = vec![FxHashSet::default(); source_rels.len()];
-    for (src, dst) in edges {
-        if let (Some(&s), Some(&d)) = (id_of.get(src.as_str()), id_of.get(dst.as_str())) && s != d {
-            importers[d].insert(s);
-        }
-    }
-    importers
+struct ImportLeakCtx<'a> {
+    source_rels: &'a [String],
+    importers_of: Vec<FxHashSet<usize>>,
+    field_readers: FxHashMap<&'a str, FxHashSet<usize>>,
 }
 
-fn build_field_readers<'a>(
-    source_rels: &[String], metrics: &'a BTreeMap<String, ModuleMetrics>,
-) -> FxHashMap<&'a str, FxHashSet<usize>> {
-    let mut field_readers: FxHashMap<&'a str, FxHashSet<usize>> = FxHashMap::default();
-    for (idx, rel) in source_rels.iter().enumerate() {
-        let Some(metric) = metrics.get(rel) else { continue };
-        for field in &metric.field_reads { field_readers.entry(field.as_str()).or_default().insert(idx); }
+impl<'a> ImportLeakCtx<'a> {
+    fn new(source_rels: &'a [String], arch: &ArchGraphRef<'a>) -> Self {
+        let id_of = index_source_rels(source_rels);
+        let mut importers_of = vec![FxHashSet::default(); source_rels.len()];
+        for (src, dst) in arch.all_edges {
+            if let (Some(&s), Some(&d)) = (id_of.get(src.as_str()), id_of.get(dst.as_str()))
+                && s != d
+            {
+                importers_of[d].insert(s);
+            }
+        }
+        let mut field_readers: FxHashMap<&'a str, FxHashSet<usize>> = FxHashMap::default();
+        for (idx, rel) in source_rels.iter().enumerate() {
+            let Some(metric) = arch.metrics.get(rel) else { continue };
+            for field in &metric.field_reads {
+                field_readers.entry(field.as_str()).or_default().insert(idx);
+            }
+        }
+        Self { source_rels, importers_of, field_readers }
     }
-    field_readers
+
+    fn max_leak(&self, idx: usize, rel: &str, arch: &ArchGraphRef<'_>) -> Option<(String, usize)> {
+        let metric = arch.metrics.get(rel)?;
+        let importers = &self.importers_of[idx];
+        let mut best: Option<(String, usize)> = None;
+        for pub_field in &metric.pub_fields {
+            let Some(readers) = self.field_readers.get(pub_field.as_str()) else { continue };
+            let is_generic = COMMON_GENERIC_FIELDS.contains(&pub_field.as_str());
+            let count = readers.iter().filter(|&&r| {
+                r != idx && importers.contains(&r) && (!is_generic
+                    || reader_refs_definer_type(
+                        rel, &self.source_rels[r], arch.defs_by_file, arch.refs_by_file,
+                    ))
+            }).count();
+            if count > best.as_ref().map_or(0, |(_, c)| *c) {
+                best = Some((pub_field.clone(), count));
+            }
+        }
+        best
+    }
 }
 
 fn reader_refs_definer_type(
@@ -442,7 +462,9 @@ fn reader_refs_definer_type(
     refs_by_file: Option<&BTreeMap<String, Vec<String>>>,
 ) -> bool {
     let (Some(defs_map), Some(refs_map)) = (defs_by_file, refs_by_file) else { return false };
-    let (Some(defs), Some(refs)) = (defs_map.get(definer_rel), refs_map.get(reader_rel)) else { return false };
+    let (Some(defs), Some(refs)) = (defs_map.get(definer_rel), refs_map.get(reader_rel)) else {
+        return false;
+    };
     for sym in defs {
         let is_type = sym.as_bytes().first().is_some_and(u8::is_ascii_uppercase);
         if is_type && refs.iter().any(|r| r == sym) {
@@ -452,37 +474,31 @@ fn reader_refs_definer_type(
     false
 }
 
-fn max_scoped_field_leak_for_file(
-    idx: usize, rel: &str, source_rels: &[String], importers: &FxHashSet<usize>,
-    field_readers: &FxHashMap<&str, FxHashSet<usize>>, arch: &ArchGraphRef<'_>,
-) -> Option<(String, usize)> {
-    let metric = arch.metrics.get(rel)?;
-    let mut best: Option<(String, usize)> = None;
-    for pub_field in &metric.pub_fields {
-        let Some(readers) = field_readers.get(pub_field.as_str()) else { continue };
-        let is_generic = COMMON_GENERIC_FIELDS.contains(&pub_field.as_str());
-        let count = readers.iter().filter(|&&r| {
-            r != idx && importers.contains(&r) && (!is_generic
-                || reader_refs_definer_type(rel, &source_rels[r], arch.defs_by_file, arch.refs_by_file))
-        }).count();
-        if count > best.as_ref().map_or(0, |(_, c)| *c) { best = Some((pub_field.clone(), count)); }
-    }
-    best
+fn is_barrel_file(rel: &str) -> bool {
+    let fname = rel.rsplit('/').next().unwrap_or(rel);
+    matches!(fname, "mod.rs" | "lib.rs" | "index.ts" | "index.js" | "__init__.py")
 }
 
-/// Optional graph context passed into `build_ego_contexts` and `deep_module_findings_with_csr`.
-pub struct ArchGraphRef<'a> {
-    pub all_edges: &'a [(String, String)],
-    pub runtime_edges: &'a [(String, String)],
-    pub metrics: &'a BTreeMap<String, ModuleMetrics>,
-    pub defs_by_file: Option<&'a BTreeMap<String, Vec<String>>>,
-    pub refs_by_file: Option<&'a BTreeMap<String, Vec<String>>>,
-}
-
-/// Single-pass `O(V + E)` ego-graph context builder feeding `hygiene::strict` and audit triage.
-pub fn build_ego_contexts(
+/// Single-pass `O(V + E)` ego-context builder and 4-rule deep-module evaluator.
+pub fn analyze_ego_and_deep_modules(
     source_rels: &[String], sccs: &[Vec<u32>], arch: &ArchGraphRef<'_>,
     file_churn: &BTreeMap<String, u32>, clone_clusters: &[CloneCluster],
+) -> (FxHashMap<String, FileEgoContext>, Vec<String>) {
+    let leak_ctx = ImportLeakCtx::new(source_rels, arch);
+    let leaks: Vec<Option<(String, usize)>> = source_rels
+        .iter()
+        .enumerate()
+        .map(|(idx, rel)| leak_ctx.max_leak(idx, rel, arch))
+        .collect();
+    let ego = build_ego_with_leaks(source_rels, sccs, arch, file_churn, clone_clusters, &leaks);
+    let findings = collect_deep_module_findings(source_rels, sccs, arch, &ego, &leaks);
+    (ego, findings)
+}
+
+fn build_ego_with_leaks(
+    source_rels: &[String], sccs: &[Vec<u32>], arch: &ArchGraphRef<'_>,
+    file_churn: &BTreeMap<String, u32>, clone_clusters: &[CloneCluster],
+    leaks: &[Option<(String, usize)>],
 ) -> FxHashMap<String, FileEgoContext> {
     let n = source_rels.len();
     let id_of = index_source_rels(source_rels);
@@ -496,10 +512,11 @@ pub fn build_ego_contexts(
             neighbor_dirs[d].insert(dir_of(src));
         }
     }
-
     let mut in_cycle = vec![false; n];
     for comp in sccs.iter().filter(|c| c.len() >= 2) {
-        for &id in comp { if let Some(slot) = in_cycle.get_mut(id as usize) { *slot = true; } }
+        for &id in comp {
+            if let Some(slot) = in_cycle.get_mut(id as usize) { *slot = true; }
+        }
     }
     let mut clone_hits = vec![0usize; n];
     for cluster in clone_clusters {
@@ -507,17 +524,12 @@ pub fn build_ego_contexts(
             if let Some(&idx) = id_of.get(file.as_str()) { clone_hits[idx] += 1; }
         }
     }
-
-    let importers_of = build_importers_of(source_rels, arch.all_edges);
-    let field_readers = build_field_readers(source_rels, arch.metrics);
     let mut out = FxHashMap::with_capacity_and_hasher(n, Default::default());
     for (idx, rel) in source_rels.iter().enumerate() {
         let (fi, fo, ndirs) = (fan_in[idx], fan_out[idx], neighbor_dirs[idx].len());
         let tangle = fi >= 6 && fo >= 6 && ndirs >= 2
             && (0.35..=0.65).contains(&((fo as f64) / ((fi + fo) as f64)));
-        let external_field_readers = max_scoped_field_leak_for_file(
-            idx, rel, source_rels, &importers_of[idx], &field_readers, arch,
-        ).map_or(0, |(_, count)| count);
+        let external_field_readers = leaks[idx].as_ref().map_or(0, |(_, count)| *count);
         out.insert(rel.clone(), FileEgoContext {
             fan_in: fi, fan_out: fo, neighbor_dirs: ndirs, has_module_cycle: in_cycle[idx],
             tangle, external_field_readers, clone_cluster_hits: clone_hits[idx],
@@ -527,30 +539,26 @@ pub fn build_ego_contexts(
     out
 }
 
-fn is_barrel_file(rel: &str) -> bool {
-    let fname = rel.rsplit('/').next().unwrap_or(rel);
-    matches!(fname, "mod.rs" | "lib.rs" | "index.ts" | "index.js" | "__init__.py")
-}
-
-/// Evaluate all 4 deep-module architectural rules reusing a prebuilt CSR SCC list & ego map.
-pub fn deep_module_findings_with_csr(
+fn collect_deep_module_findings(
     source_rels: &[String], sccs: &[Vec<u32>], arch: &ArchGraphRef<'_>,
-    ego: &FxHashMap<String, FileEgoContext>,
+    ego: &FxHashMap<String, FileEgoContext>, leaks: &[Option<(String, usize)>],
 ) -> Vec<String> {
     let mut findings = Vec::new();
-    let mut cycles: Vec<Vec<&str>> = Vec::new();
-    for comp in sccs.iter().filter(|c| c.len() >= 2) {
-        let mut files: Vec<&str> = Vec::with_capacity(comp.len());
-        for &id in comp {
-            files.push(source_rels[id as usize].as_str());
-        }
-        files.sort_unstable();
-        cycles.push(files);
-    }
+    let mut cycles: Vec<Vec<&str>> = sccs
+        .iter()
+        .filter(|c| c.len() >= 2)
+        .map(|comp| {
+            let mut files: Vec<&str> = comp
+                .iter()
+                .map(|&id| source_rels[id as usize].as_str())
+                .collect();
+            files.sort_unstable();
+            files
+        })
+        .collect();
     cycles.sort();
     for cyc in cycles.into_iter().take(12) {
-        let head = &cyc[..cyc.len().min(4)];
-        let preview = head.join(" <-> ");
+        let preview = cyc[..cyc.len().min(4)].join(" <-> ");
         findings.push(format!("[module-cycle] {preview} ({} files)", cyc.len()));
     }
     for rel in source_rels {
@@ -562,37 +570,29 @@ pub fn deep_module_findings_with_csr(
             ));
         }
     }
-    let importers_of = build_importers_of(source_rels, arch.all_edges);
-    let field_readers = build_field_readers(source_rels, arch.metrics);
-    let mut leak_count = 0usize;
-    for (idx, rel) in source_rels.iter().enumerate() {
-        if leak_count >= 12 { break; }
-        if let Some((f, n)) = max_scoped_field_leak_for_file(
-            idx, rel, source_rels, &importers_of[idx], &field_readers, arch,
-        ) && n >= 2 {
-            findings.push(format!(
-                "[field-leak] {rel}: public field `.{f}` accessed directly by {n} external modules"
-            ));
-            leak_count += 1;
-        }
+    for (rel, (field, n)) in source_rels
+        .iter()
+        .zip(leaks)
+        .filter_map(|(r, l)| l.as_ref().filter(|(_, n)| *n >= 2).map(|p| (r, p)))
+        .take(12)
+    {
+        findings.push(format!(
+            "[field-leak] {rel}: public field `.{field}` accessed directly by {n} external modules"
+        ));
     }
-    let mut shallow_count = 0usize;
-    for rel in source_rels {
-        if shallow_count >= 12 { break; }
-        let Some(m) = arch.metrics.get(rel).filter(|m| m.loc > 0) else { continue };
+    let shallow_iter = source_rels.iter().filter_map(|rel| {
+        let m = arch.metrics.get(rel).filter(|m| m.loc > 0)?;
         let pr = if m.total_fns > 0 { (m.passthrough_fns as f64) / (m.total_fns as f64) } else { 0.0 };
         let trivial = !is_barrel_file(rel) && m.loc <= 30 && m.total_fns >= 1
             && m.exported_symbols >= 1 && m.passthrough_fns == m.total_fns;
         let dense = m.exported_symbols >= 4 && m.total_fns >= 3
             && (m.exported_symbols as f64) / (m.loc as f64) > 0.20 && pr >= 0.60;
-        if trivial || dense {
-            findings.push(format!(
-                "[shallow-module] {rel}: {} exports in {} LOC ({:.0}% passthrough wrappers)",
-                m.exported_symbols, m.loc, pr * 100.0
-            ));
-            shallow_count += 1;
-        }
-    }
+        (trivial || dense).then(|| format!(
+            "[shallow-module] {rel}: {} exports in {} LOC ({:.0}% passthrough wrappers)",
+            m.exported_symbols, m.loc, pr * 100.0
+        ))
+    });
+    findings.extend(shallow_iter.take(12));
     findings.truncate(40);
     findings
 }
@@ -603,37 +603,21 @@ pub fn deep_module_findings_with_csr(
 
 type StrIndexMap<'a> = FxHashMap<&'a str, Vec<usize>>;
 
-fn record_stem_hits(
-    base: &str,
-    tidx: usize,
-    stem_to_srcs: &StrIndexMap<'_>,
-    matched_by_src: &mut [BTreeSet<usize>],
-) {
-    if let Some(srcs) = stem_to_srcs.get(base) {
-        for &sidx in srcs {
-            matched_by_src[sidx].insert(tidx);
-        }
-    }
-}
-
 fn match_single_test_stem(
-    test_stem: &str,
-    tidx: usize,
-    stem_to_srcs: &StrIndexMap<'_>,
+    test_stem: &str, tidx: usize, stem_to_srcs: &StrIndexMap<'_>,
     matched_by_src: &mut [BTreeSet<usize>],
 ) {
-    if let Some(base) = test_stem.strip_prefix("test_") {
-        record_stem_hits(base, tidx, stem_to_srcs, matched_by_src);
-    }
-    for suffix in ["_test", ".test", ".spec"] {
-        if let Some(base) = test_stem.strip_suffix(suffix) {
-            record_stem_hits(base, tidx, stem_to_srcs, matched_by_src);
+    let mut hit = |base: &str| {
+        if let Some(srcs) = stem_to_srcs.get(base) {
+            for &sidx in srcs { matched_by_src[sidx].insert(tidx); }
         }
+    };
+    if let Some(base) = test_stem.strip_prefix("test_") { hit(base); }
+    for suffix in ["_test", ".test", ".spec"] {
+        if let Some(base) = test_stem.strip_suffix(suffix) { hit(base); }
     }
     for (pos, byte) in test_stem.bytes().enumerate() {
-        if byte == b'_' && pos + 1 < test_stem.len() {
-            record_stem_hits(&test_stem[pos + 1..], tidx, stem_to_srcs, matched_by_src);
-        }
+        if byte == b'_' && pos + 1 < test_stem.len() { hit(&test_stem[pos + 1..]); }
     }
 }
 
@@ -642,61 +626,47 @@ fn collect_unmatched_lookups<'a>(
     pymod_to_src: &'a FxHashMap<String, Vec<usize>>,
     matched_by_src: &[BTreeSet<usize>],
 ) -> (StrIndexMap<'a>, StrIndexMap<'a>) {
-    let mut needed_stems: StrIndexMap<'a> = FxHashMap::default();
-    let mut needed_pymods: StrIndexMap<'a> = FxHashMap::default();
+    let (mut needed_stems, mut needed_pymods): (StrIndexMap<'a>, StrIndexMap<'a>) =
+        (FxHashMap::default(), FxHashMap::default());
     for (sidx, src) in source_files.iter().enumerate() {
-        if !matched_by_src[sidx].is_empty() {
-            continue;
-        }
+        if !matched_by_src[sidx].is_empty() { continue; }
         let stem = stem_of(Path::new(src));
-        if stem.len() >= 3 {
-            needed_stems.entry(stem).or_default().push(sidx);
-        }
+        if stem.len() >= 3 { needed_stems.entry(stem).or_default().push(sidx); }
     }
     for (pymod, srcs) in pymod_to_src {
-        let unmatched: Vec<usize> = srcs
-            .iter()
-            .copied()
-            .filter(|&sidx| {
-                matched_by_src[sidx].is_empty() && stem_of(Path::new(&source_files[sidx])).len() >= 3
-            })
-            .collect();
-        if !unmatched.is_empty() {
-            needed_pymods.insert(pymod.as_str(), unmatched);
-        }
+        let unmatched: Vec<usize> = srcs.iter().copied().filter(|&sidx| {
+            matched_by_src[sidx].is_empty() && stem_of(Path::new(&source_files[sidx])).len() >= 3
+        }).collect();
+        if !unmatched.is_empty() { needed_pymods.insert(pymod.as_str(), unmatched); }
     }
     (needed_stems, needed_pymods)
 }
 
 fn record_dotted_pymod_hits(
-    span: &str,
-    needed_pymods: &StrIndexMap<'_>,
-    hit_set: &mut FxHashSet<usize>,
+    span: &str, needed_pymods: &StrIndexMap<'_>, hit_set: &mut FxHashSet<usize>,
 ) {
-    if let Some(srcs) = needed_pymods.get(span) {
-        hit_set.extend(srcs.iter().copied());
-    }
+    if let Some(srcs) = needed_pymods.get(span) { hit_set.extend(srcs.iter().copied()); }
     let mut dot_scan = span;
     while let Some((head, _)) = dot_scan.rsplit_once('.') {
-        if let Some(srcs) = needed_pymods.get(head) {
-            hit_set.extend(srcs.iter().copied());
-        }
+        if let Some(srcs) = needed_pymods.get(head) { hit_set.extend(srcs.iter().copied()); }
         dot_scan = head;
     }
 }
 
+#[inline]
+fn take_ident_end(bytes: &[u8], mut pos: usize, allow_dot: bool) -> usize {
+    while pos < bytes.len() && (ident_byte(bytes[pos]) || (allow_dot && bytes[pos] == b'.')) {
+        pos += 1;
+    }
+    pos
+}
+
 fn scan_ident_or_pymod(
-    body: &str,
-    bytes: &[u8],
-    start: usize,
-    needed_stems: &StrIndexMap<'_>,
-    needed_pymods: &StrIndexMap<'_>,
+    body: &str, bytes: &[u8], start: usize,
+    needed_stems: &StrIndexMap<'_>, needed_pymods: &StrIndexMap<'_>,
     hit_set: &mut FxHashSet<usize>,
 ) -> usize {
-    let mut end = start;
-    while end < bytes.len() && (ident_byte(bytes[end]) || bytes[end] == b'.') {
-        end += 1;
-    }
+    let end = take_ident_end(bytes, start, true);
     let span = &body[start..end];
     if span.contains('.') {
         record_dotted_pymod_hits(span, needed_pymods, hit_set);
@@ -704,16 +674,9 @@ fn scan_ident_or_pymod(
     }
     if matches!(span, "import" | "from") {
         let mut p = end;
-        while p < bytes.len() && bytes[p] == b' ' {
-            p += 1;
-        }
-        let id_start = p;
-        while p < bytes.len() && ident_byte(bytes[p]) {
-            p += 1;
-        }
-        if p > id_start
-            && let Some(srcs) = needed_stems.get(&body[id_start..p])
-        {
+        while p < bytes.len() && bytes[p] == b' ' { p += 1; }
+        let id_end = take_ident_end(bytes, p, false);
+        if id_end > p && let Some(srcs) = needed_stems.get(&body[p..id_end]) {
             hit_set.extend(srcs.iter().copied());
         }
     }
@@ -721,23 +684,14 @@ fn scan_ident_or_pymod(
 }
 
 fn scan_test_body_hits(
-    body: &str,
-    needed_stems: &StrIndexMap<'_>,
-    needed_pymods: &StrIndexMap<'_>,
+    body: &str, needed_stems: &StrIndexMap<'_>, needed_pymods: &StrIndexMap<'_>,
 ) -> Vec<usize> {
-    let mut hit_set = FxHashSet::default();
-    let bytes = body.as_bytes();
-    let mut pos = 0usize;
-
+    let (mut hit_set, bytes, mut pos) = (FxHashSet::default(), body.as_bytes(), 0usize);
     while pos < bytes.len() {
         let byte = bytes[pos];
         if byte == b'/' && pos + 1 < bytes.len() && ident_byte(bytes[pos + 1]) {
-            let start = pos + 1;
-            let mut end = start;
-            while end < bytes.len() && ident_byte(bytes[end]) {
-                end += 1;
-            }
-            if let Some(srcs) = needed_stems.get(&body[start..end]) {
+            let end = take_ident_end(bytes, pos + 1, false);
+            if let Some(srcs) = needed_stems.get(&body[pos + 1..end]) {
                 hit_set.extend(srcs.iter().copied());
             }
             pos = end;
@@ -752,9 +706,7 @@ fn scan_test_body_hits(
 
 /// Inverted-posting test matcher replacing the O(|S|*|T|) body scan with zero retained test bodies.
 pub fn match_tests_inverted(
-    repo_root: &Path,
-    source_files: &[String],
-    test_files: &[String],
+    repo_root: &Path, source_files: &[String], test_files: &[String],
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> HashMap<String, Vec<String>> {
     let mut stem_to_srcs: StrIndexMap<'_> =
@@ -764,15 +716,12 @@ pub fn match_tests_inverted(
 
     for (sidx, src) in source_files.iter().enumerate() {
         let stem = stem_of(Path::new(src));
-        if !stem.is_empty() {
-            stem_to_srcs.entry(stem).or_default().push(sidx);
-        }
+        if !stem.is_empty() { stem_to_srcs.entry(stem).or_default().push(sidx); }
         if src.ends_with(".py") {
             let pymod = src.trim_end_matches(".py").replace('/', ".");
             pymod_to_src.entry(pymod).or_default().push(sidx);
         }
     }
-
     for (tidx, tf) in test_files.iter().enumerate() {
         match_single_test_stem(stem_of(Path::new(tf)), tidx, &stem_to_srcs, &mut matched_by_src);
     }
@@ -780,29 +729,13 @@ pub fn match_tests_inverted(
     let (needed_stems, needed_pymods) =
         collect_unmatched_lookups(source_files, &pymod_to_src, &matched_by_src);
     if !needed_stems.is_empty() || !needed_pymods.is_empty() {
-        let scan_one = |(tidx, tf): (usize, &String)| -> (usize, Vec<usize>) {
-            let Some(txt) = read_text(repo_root, tf, preloaded) else {
-                return (tidx, Vec::new());
-            };
-            (tidx, scan_test_body_hits(&txt, &needed_stems, &needed_pymods))
-        };
-        let postings: Vec<(usize, Vec<usize>)> = if crate::platform::budget().is_constrained() {
-            let mut out = Vec::with_capacity(test_files.len());
-            for item in test_files.iter().enumerate() {
-                out.push(scan_one(item));
-            }
-            out
-        } else {
-            test_files
-                .par_iter()
-                .enumerate()
-                .map(scan_one)
-                .collect()
-        };
-        for (tidx, hits) in postings {
-            for sidx in hits {
-                matched_by_src[sidx].insert(tidx);
-            }
+        let postings = par_map(test_files, |tf| {
+            read_text(repo_root, tf, preloaded).map_or_else(Vec::new, |txt| {
+                scan_test_body_hits(&txt, &needed_stems, &needed_pymods)
+            })
+        });
+        for (tidx, hits) in postings.into_iter().enumerate() {
+            for sidx in hits { matched_by_src[sidx].insert(tidx); }
         }
     }
 
@@ -878,18 +811,19 @@ fn read_hex_oid(path: &Path) -> Option<String> {
     is_valid_oid(trimmed).then(|| trimmed.to_string())
 }
 
+fn resolve_rel_dir(base: &Path, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw.trim());
+    if path.is_absolute() { path } else { base.join(path) }
+}
+
 fn find_packed_ref_oid(common_dir: &Path, ref_name: &str) -> Option<String> {
     let raw = std::fs::read_to_string(common_dir.join("packed-refs")).ok()?;
     for line in raw.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(['#', '^']) {
-            continue;
-        }
+        if trimmed.is_empty() || trimmed.starts_with(['#', '^']) { continue; }
         let mut parts = trimmed.split_whitespace();
         let (Some(oid), Some(name)) = (parts.next(), parts.next()) else { continue };
-        if name == ref_name && is_valid_oid(oid) {
-            return Some(oid.to_string());
-        }
+        if name == ref_name && is_valid_oid(oid) { return Some(oid.to_string()); }
     }
     None
 }
@@ -901,9 +835,10 @@ pub fn resolve_git_head_oid(repo_root: &Path) -> Option<String> {
         dot_git
     } else if dot_git.is_file() {
         let ptr = std::fs::read_to_string(&dot_git).ok()?;
-        let p = PathBuf::from(ptr.trim().strip_prefix("gitdir:")?.trim());
-        if p.is_absolute() { p } else { repo_root.join(p) }
-    } else { return None };
+        resolve_rel_dir(repo_root, ptr.trim().strip_prefix("gitdir:")?)
+    } else {
+        return None;
+    };
 
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head_trim = head.trim();
@@ -911,17 +846,16 @@ pub fn resolve_git_head_oid(repo_root: &Path) -> Option<String> {
         return is_valid_oid(head_trim).then(|| head_trim.to_string());
     };
     if let Some(oid) = read_hex_oid(&git_dir.join(ref_name)) { return Some(oid); }
-    let common_dir = std::fs::read_to_string(git_dir.join("commondir")).ok().map(|raw| {
-        let p = PathBuf::from(raw.trim());
-        if p.is_absolute() { p } else { git_dir.join(p) }
-    }).unwrap_or_else(|| git_dir.clone());
+    let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
+        .ok()
+        .map(|raw| resolve_rel_dir(&git_dir, &raw))
+        .unwrap_or_else(|| git_dir.clone());
     read_hex_oid(&common_dir.join(ref_name)).or_else(|| find_packed_ref_oid(&common_dir, ref_name))
 }
 
 #[derive(Default)]
 struct NpmiCounts {
-    path_to_id: FxHashMap<String, usize>,
-    id_to_path: Vec<String>,
+    arena: PathArena,
     file_commits: Vec<u32>,
     churn_commits: Vec<u32>,
     co_counts: FxHashMap<u64, u32>,
@@ -931,13 +865,12 @@ struct NpmiCounts {
 
 impl NpmiCounts {
     fn intern_path(&mut self, path: &str) -> usize {
-        if let Some(&existing) = self.path_to_id.get(path) { return existing; }
-        let next_id = self.id_to_path.len();
-        self.id_to_path.push(path.to_string());
-        self.file_commits.push(0);
-        self.churn_commits.push(0);
-        self.path_to_id.insert(path.to_string(), next_id);
-        next_id
+        let id = self.arena.intern(path) as usize;
+        if id == self.file_commits.len() {
+            self.file_commits.push(0);
+            self.churn_commits.push(0);
+        }
+        id
     }
 
     fn record_commit(
@@ -947,7 +880,9 @@ impl NpmiCounts {
         if raw.len() >= BULK_COMMIT_LIMIT { return; }
         commit_ids.clear();
         for path in raw {
-            if is_ignored_cochange_path(path) || live_files.is_some_and(|l| !l.contains(path.as_str())) {
+            if is_ignored_cochange_path(path)
+                || live_files.is_some_and(|live| !live.contains(path.as_str()))
+            {
                 continue;
             }
             commit_ids.push(self.intern_path(path));
@@ -969,13 +904,11 @@ impl NpmiCounts {
 
     fn finalize(self, min_support: u32) -> GenomeSummary {
         let n_f = self.valid_commits.max(1) as f64;
-        let mut ranked: Vec<(f64, CochangePair)> = self.co_counts.iter()
-            .filter_map(|(&key, &c_xy)| {
-                let pair = score_npmi_pair(&self, key, c_xy, min_support, n_f)?;
-                let avg = self.co_decay.get(&key).copied().unwrap_or(c_xy as f64) / (c_xy as f64);
-                Some((pair.npmi * (0.85 + 0.15 * avg.clamp(0.0, 1.0)), pair))
-            })
-            .collect();
+        let mut ranked: Vec<(f64, CochangePair)> = self.co_counts.iter().filter_map(|(&key, &c_xy)| {
+            let pair = score_npmi_pair(&self, key, c_xy, min_support, n_f)?;
+            let avg = self.co_decay.get(&key).copied().unwrap_or(c_xy as f64) / (c_xy as f64);
+            Some((pair.npmi * (0.85 + 0.15 * avg.clamp(0.0, 1.0)), pair))
+        }).collect();
         ranked.sort_by(|(sa, a), (sb, b)| {
             sb.partial_cmp(sa).unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.commits.cmp(&a.commits))
@@ -983,12 +916,8 @@ impl NpmiCounts {
                 .then_with(|| a.file_b.cmp(&b.file_b))
         });
         let pairs = ranked.into_iter().map(|(_, p)| p).collect();
-        let mut file_commits = BTreeMap::new();
-        for (path, cnt) in self.id_to_path.into_iter().zip(self.churn_commits) {
-            if cnt > 0 {
-                file_commits.insert(path, cnt);
-            }
-        }
+        let file_commits = self.arena.into_paths().into_iter()
+            .zip(self.churn_commits).filter(|(_, cnt)| *cnt > 0).collect();
         GenomeSummary { pairs, file_commits }
     }
 }
@@ -998,15 +927,14 @@ fn score_npmi_pair(
 ) -> Option<CochangePair> {
     if c_xy < min_support { return None; }
     let (idx_a, idx_b) = ((key >> 32) as usize, (key & 0xffff_ffff) as usize);
-    let (p_xy, p_x, p_y) = (
-        (c_xy as f64) / n_f, (counts.file_commits[idx_a] as f64) / n_f, (counts.file_commits[idx_b] as f64) / n_f,
-    );
+    let p_xy = (c_xy as f64) / n_f;
+    let (p_x, p_y) = ((counts.file_commits[idx_a] as f64) / n_f, (counts.file_commits[idx_b] as f64) / n_f);
     if p_x <= 0.0 || p_y <= 0.0 || p_xy <= 0.0 { return None; }
     let pmi = (p_xy / (p_x * p_y)).ln();
     let npmi = (pmi / (-p_xy.ln()).max(1e-9)).clamp(-1.0, 1.0);
     if npmi <= 0.05 { return None; }
-    let (pa, pb) = (&counts.id_to_path[idx_a], &counts.id_to_path[idx_b]);
-    let (file_a, file_b) = if pa <= pb { (pa.clone(), pb.clone()) } else { (pb.clone(), pa.clone()) };
+    let (pa, pb) = (counts.arena.path(idx_a), counts.arena.path(idx_b));
+    let (file_a, file_b) = if pa <= pb { (pa.into(), pb.into()) } else { (pb.into(), pa.into()) };
     Some(CochangePair { file_a, file_b, npmi, commits: c_xy })
 }
 
@@ -1024,62 +952,39 @@ fn parse_git_status_line(
 ) {
     let mut cols = trimmed.split('\t');
     let status = cols.next().unwrap_or("");
-    if status.starts_with('R') {
-        if let (Some(old_p), Some(new_p)) = (cols.next(), cols.next()) {
-            let (old_n, new_n) = (old_p.replace('\\', "/"), new_p.replace('\\', "/"));
-            let canon = rename_map.get(&new_n).cloned().unwrap_or(new_n);
-            rename_map.insert(old_n, canon.clone());
-            current.push(canon);
-        }
-    } else if let Some(path) = cols.next() {
-        let norm = path.replace('\\', "/");
+    let Some(first) = cols.next() else { return };
+    if status.starts_with('R') && let Some(new_p) = cols.next() {
+        let (old_n, new_n) = (first.replace('\\', "/"), new_p.replace('\\', "/"));
+        let canon = rename_map.get(&new_n).cloned().unwrap_or(new_n);
+        rename_map.insert(old_n, canon.clone());
+        current.push(canon);
+    } else {
+        let norm = first.replace('\\', "/");
         current.push(rename_map.get(&norm).cloned().unwrap_or(norm));
     }
 }
 
-/// Stream up to 2,500 non-merge commits from `git log` into `NpmiCounts`, cached by `.git/HEAD` OID.
-pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeSummary {
-    let Some(head_oid) = resolve_git_head_oid(repo_root) else { return GenomeSummary::default() };
-    let live: FxHashSet<&str> = source_rels.iter().map(String::as_str).collect();
-    let cache_path = repo_root.join(".refit/cache/genome.zst");
-
-    if let Some(cached) = read_zstd::<GenomeCache>(&cache_path)
-        && cached.version == GENOME_CACHE_VERSION && cached.head_oid == head_oid
-    {
-        let pairs = if live.is_empty() {
-            cached.pairs
-        } else {
-            cached.pairs.into_iter()
-                .filter(|p| live.contains(p.file_a.as_str()) && live.contains(p.file_b.as_str()))
-                .collect()
-        };
-        return GenomeSummary { pairs, file_commits: cached.file_commits };
-    }
-
-    let Ok(mut child) = Command::new("git")
+fn stream_git_cochange(
+    repo_root: &Path, live_opt: Option<&FxHashSet<&str>>,
+) -> Option<GenomeSummary> {
+    let mut child = Command::new("git")
         .args(["log", "--no-merges", "--name-status", "-M", "-n", "2500", "--format=COMMIT %ct"])
         .current_dir(repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return GenomeSummary::default();
-    };
+        .ok()?;
     let Some(stdout) = child.stdout.take() else {
         let _ = child.wait();
-        return GenomeSummary::default();
+        return None;
     };
 
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let (started, mut reader) = (Instant::now(), BufReader::with_capacity(64 * 1024, stdout));
     let (mut line, mut current) = (String::new(), Vec::with_capacity(BULK_COMMIT_LIMIT));
     let (mut commit_ids, mut rename_map) = (Vec::with_capacity(BULK_COMMIT_LIMIT), FxHashMap::default());
     let (mut counts, mut current_decay, mut commit_count) = (NpmiCounts::default(), 1.0f64, 0usize);
-    let live_opt = (!live.is_empty()).then_some(&live);
 
     while let Ok(n) = reader.read_line(&mut line) {
         if n == 0 || started.elapsed() >= GIT_LOG_TIMEOUT { break; }
@@ -1104,13 +1009,35 @@ pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeS
         let _ = child.kill();
         let _ = child.wait();
     }
+    Some(counts.finalize(MIN_COCHANGE_SUPPORT))
+}
 
-    let summary = counts.finalize(MIN_COCHANGE_SUPPORT);
-    let top_pairs: Vec<CochangePair> = summary.pairs[..summary.pairs.len().min(200)].to_vec();
+/// Stream up to 2,500 non-merge commits from `git log` into `NpmiCounts`, cached by `.git/HEAD` OID.
+pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeSummary {
+    let Some(head_oid) = resolve_git_head_oid(repo_root) else { return GenomeSummary::default() };
+    let live: FxHashSet<&str> = source_rels.iter().map(String::as_str).collect();
+    let cache_path = repo_root.join(".refit/cache/genome.zst");
+
+    if let Some(cached) = read_zstd::<GenomeCache>(&cache_path)
+        && cached.version == GENOME_CACHE_VERSION && cached.head_oid == head_oid
+    {
+        let pairs = if live.is_empty() {
+            cached.pairs
+        } else {
+            cached.pairs.into_iter()
+                .filter(|p| live.contains(p.file_a.as_str()) && live.contains(p.file_b.as_str()))
+                .collect()
+        };
+        return GenomeSummary { pairs, file_commits: cached.file_commits };
+    }
+
+    let Some(summary) = stream_git_cochange(repo_root, (!live.is_empty()).then_some(&live)) else {
+        return GenomeSummary::default();
+    };
     let entry = GenomeCache {
         version: GENOME_CACHE_VERSION,
         head_oid,
-        pairs: top_pairs,
+        pairs: summary.pairs[..summary.pairs.len().min(200)].to_vec(),
         file_commits: summary.file_commits.clone(),
     };
     let _ = write_zstd(&cache_path, &entry);
@@ -1118,9 +1045,9 @@ pub fn analyze_git_cochange(repo_root: &Path, source_rels: &[String]) -> GenomeS
 }
 
 pub fn format_genome_twins(summary: &GenomeSummary, limit: usize) -> Vec<String> {
-    summary.pairs.iter().take(limit)
-        .map(|p| format!("{} <-> {} (npmi={:.2}, commits={})", p.file_a, p.file_b, p.npmi, p.commits))
-        .collect()
+    summary.pairs.iter().take(limit).map(|p| {
+        format!("{} <-> {} (npmi={:.2}, commits={})", p.file_a, p.file_b, p.npmi, p.commits)
+    }).collect()
 }
 
 #[cfg(test)]
@@ -1130,75 +1057,45 @@ mod tests {
     use crate::testutil::{TempRepo, TestRng};
     use crate::untangle::{AuditScope, untangle_repo_with_scope};
 
-    struct TarjanRef<'a> {
-        graph: &'a CsrGraph, index: Vec<u32>, lowlink: Vec<u32>, on_stack: Vec<bool>,
-        scc_stack: Vec<u32>, call_stack: Vec<(u32, u32)>, next_idx: u32, comps: Vec<Vec<u32>>,
-    }
-
-    impl<'a> TarjanRef<'a> {
-        fn run(graph: &'a CsrGraph) -> Vec<Vec<u32>> {
-            let n = graph.n;
-            let mut st = Self {
-                graph, index: vec![0; n], lowlink: vec![0; n], on_stack: vec![false; n],
-                scc_stack: Vec::new(), call_stack: Vec::new(), next_idx: 1, comps: Vec::new(),
-            };
-            for start in 0..n { if st.index[start] == 0 { st.visit(start); } }
-            st.comps
+    fn tarjan_ref(graph: &CsrGraph) -> Vec<Vec<u32>> {
+        struct State<'a> {
+            g: &'a CsrGraph, idx: Vec<u32>, low: Vec<u32>,
+            on_stack: Vec<bool>, stack: Vec<u32>, next: u32, comps: Vec<Vec<u32>>,
         }
-
-        fn push_node(&mut self, node: usize) {
-            self.index[node] = self.next_idx;
-            self.lowlink[node] = self.next_idx;
-            self.next_idx += 1;
-            self.scc_stack.push(node as u32);
-            self.on_stack[node] = true;
-            self.call_stack.push((node as u32, self.graph.offsets[node]));
-        }
-
-        fn pop_scc(&mut self, root: u32) {
-            let mut comp = Vec::new();
-            while let Some(w) = self.scc_stack.pop() {
-                self.on_stack[w as usize] = false;
-                comp.push(w);
-                if w == root { break; }
-            }
-            self.comps.push(comp);
-        }
-
-        fn step_edges(&mut self, v: u32, mut ei: u32) -> bool {
-            let vu = v as usize;
-            let end = self.graph.offsets[vu + 1];
-            while ei < end {
-                let w = self.graph.targets[ei as usize] as usize;
-                ei += 1;
-                if self.index[w] == 0 {
-                    self.call_stack.push((v, ei));
-                    self.push_node(w);
-                    return true;
-                }
-                if self.on_stack[w] && self.index[w] < self.lowlink[vu] {
-                    self.lowlink[vu] = self.index[w];
+        fn dfs(v: usize, st: &mut State<'_>) {
+            st.idx[v] = st.next;
+            st.low[v] = st.next;
+            st.next += 1;
+            st.stack.push(v as u32);
+            st.on_stack[v] = true;
+            for ei in (st.g.offsets[v] as usize)..(st.g.offsets[v + 1] as usize) {
+                let w = st.g.targets[ei] as usize;
+                if st.idx[w] == 0 {
+                    dfs(w, st);
+                    st.low[v] = st.low[v].min(st.low[w]);
+                } else if st.on_stack[w] {
+                    st.low[v] = st.low[v].min(st.idx[w]);
                 }
             }
-            false
-        }
-
-        fn visit(&mut self, start: usize) {
-            self.push_node(start);
-            while let Some((v, ei)) = self.call_stack.pop() {
-                if self.step_edges(v, ei) {
-                    continue;
+            if st.low[v] == st.idx[v] {
+                let mut comp = Vec::new();
+                while let Some(w) = st.stack.pop() {
+                    st.on_stack[w as usize] = false;
+                    comp.push(w);
+                    if w == v as u32 { break; }
                 }
-                let vu = v as usize;
-                if self.lowlink[vu] == self.index[vu] {
-                    self.pop_scc(v);
-                }
-                if let Some(&(parent, _)) = self.call_stack.last() {
-                    let pu = parent as usize;
-                    self.lowlink[pu] = self.lowlink[pu].min(self.lowlink[vu]);
-                }
+                st.comps.push(comp);
             }
         }
+        let n = graph.n;
+        let mut st = State {
+            g: graph, idx: vec![0; n], low: vec![0; n],
+            on_stack: vec![false; n], stack: Vec::new(), next: 1, comps: Vec::new(),
+        };
+        for v in 0..n {
+            if st.idx[v] == 0 { dfs(v, &mut st); }
+        }
+        st.comps
     }
 
     fn canonicalize_sccs(mut comps: Vec<Vec<u32>>) -> Vec<Vec<u32>> {
@@ -1208,19 +1105,19 @@ mod tests {
     }
 
     fn to_string_vec(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| (*s).to_string()).collect()
+        let mut out = Vec::with_capacity(items.len());
+        for &s in items {
+            out.push(s.to_string());
+        }
+        out
     }
 
     fn mk_metric(
         loc: usize, exp: usize, fns: usize, pass: usize, pubs: &[&str], reads: &[&str],
     ) -> ModuleMetrics {
         ModuleMetrics {
-            loc,
-            exported_symbols: exp,
-            total_fns: fns,
-            passthrough_fns: pass,
-            pub_fields: to_string_vec(pubs),
-            field_reads: to_string_vec(reads),
+            loc, exported_symbols: exp, total_fns: fns, passthrough_fns: pass,
+            pub_fields: to_string_vec(pubs), field_reads: to_string_vec(reads),
         }
     }
 
@@ -1235,7 +1132,7 @@ mod tests {
                 edges.extend([(b, b + 1), (b + 1, b + 2), (b + 2, b), (b + 1, b + 3), (b + 3, b + 1)]);
             }
             let csr = CsrGraph::from_edges(n, &edges);
-            assert_eq!(canonicalize_sccs(csr.pearce_scc()), canonicalize_sccs(TarjanRef::run(&csr)));
+            assert_eq!(canonicalize_sccs(csr.pearce_scc()), canonicalize_sccs(tarjan_ref(&csr)));
         }
         let n = 1500usize;
         let mut chain: Vec<(u32, u32)> = (0..n as u32 - 1).map(|i| (i, i + 1)).collect();
@@ -1246,15 +1143,16 @@ mod tests {
 
     #[test]
     fn test_csr_shallow_stub_and_scoped_field_leak() {
+        let smoke = "from pkg.beta_core import run_beta\ndef test_b(): assert run_beta() == 2\n";
         let dir = TempRepo::with_files("inv_tests", &[
             ("pkg/alpha.py", "def run_alpha():\n    return 1\n"),
             ("pkg/beta_core.py", "def run_beta():\n    return 2\n"),
             ("pkg/orphan.py", "def iso():\n    return 0\n"),
             ("tests/test_alpha.py", "def test_a(): pass\n"),
-            ("tests/test_smoke.py", "from pkg.beta_core import run_beta\ndef test_b(): assert run_beta() == 2\n"),
+            ("tests/test_smoke.py", smoke),
         ]);
-        let srcs = vec!["pkg/alpha.py".into(), "pkg/beta_core.py".into(), "pkg/orphan.py".into()];
-        let tests = vec!["tests/test_alpha.py".into(), "tests/test_smoke.py".into()];
+        let srcs = to_string_vec(&["pkg/alpha.py", "pkg/beta_core.py", "pkg/orphan.py"]);
+        let tests = to_string_vec(&["tests/test_alpha.py", "tests/test_smoke.py"]);
         let matched = match_tests_inverted(dir.path(), &srcs, &tests, None);
         assert_eq!(matched["pkg/alpha.py"], vec!["tests/test_alpha.py"]);
         assert_eq!(matched["pkg/beta_core.py"], vec!["tests/test_smoke.py"]);
@@ -1279,21 +1177,25 @@ mod tests {
             all_edges: &edges, runtime_edges: &edges, metrics: &metrics,
             defs_by_file: None, refs_by_file: None,
         };
-        let ego = build_ego_contexts(&rels, &sccs, &arch, &BTreeMap::new(), &[]);
-        let findings = deep_module_findings_with_csr(&rels, &sccs, &arch, &ego);
+        let (ego, findings) =
+            analyze_ego_and_deep_modules(&rels, &sccs, &arch, &BTreeMap::new(), &[]);
 
-        assert!(findings.iter().any(|f| f.starts_with("[module-cycle]")));
-        assert!(findings.iter().any(|f| f.contains("[field-leak]") && f.contains(".raw_token")));
-        assert!(!findings.iter().any(|f| f.contains(".line")), "generic .line leaked: {findings:?}");
-        assert!(findings.iter().any(|f| f.contains("[shallow-module] src/syntax_stub.rs")));
-        assert!(!findings.iter().any(|f| f.contains("src/sub/mod.rs")), "barrel flagged: {findings:?}");
+        for (needle, want) in [
+            ("[module-cycle]", true),
+            (".raw_token", true),
+            ("[shallow-module] src/syntax_stub.rs", true),
+            (".line", false),
+            ("src/sub/mod.rs", false),
+        ] {
+            assert_eq!(findings.iter().any(|f| f.contains(needle)), want, "{needle} in {findings:?}");
+        }
         assert_eq!(ego["src/model.rs"].external_field_readers, 2);
         assert!(ego["src/a.rs"].has_module_cycle);
     }
 
     #[test]
     fn test_genome_npmi_hub_demotion_lockfile_filter_and_wipe_guard() {
-        let mut bulk = vec!["src/hub.rs".into(), "Cargo.lock".into()];
+        let mut bulk = to_string_vec(&["src/hub.rs", "Cargo.lock"]);
         bulk.extend((0..45).map(|i| format!("src/bulk_{i}.rs")));
         let mut commits = vec![bulk];
         for c in 0..60 {
@@ -1309,7 +1211,8 @@ mod tests {
         assert!(!summary.pairs.iter().any(|p| p.file_a.ends_with(".lock") || p.file_b.ends_with(".lock")));
         let top2: Vec<(&str, &str)> = summary.pairs.iter().take(2)
             .map(|p| (p.file_a.as_str(), p.file_b.as_str())).collect();
-        assert!(top2.contains(&("src/route.rs", "src/schema.rs")) && top2.contains(&("src/auth.rs", "src/session.rs")));
+        assert!(top2.contains(&("src/route.rs", "src/schema.rs")));
+        assert!(top2.contains(&("src/auth.rs", "src/session.rs")));
         assert!(check_wipe_guard(100, 19) && !check_wipe_guard(100, 20) && !check_wipe_guard(40, 2));
         assert!(recency_decay(0) > 0.99 && recency_decay(14 * 86_400) < 0.40);
     }
@@ -1331,12 +1234,14 @@ mod tests {
         let head = resolve_git_head_oid(repo.path()).expect("real git HEAD OID");
         assert_eq!(head.len(), 40);
 
-        let full = untangle_repo_with_scope(repo.path(), &HygieneScorer::new(), AuditScope::Full).unwrap();
+        let full =
+            untangle_repo_with_scope(repo.path(), &HygieneScorer::new(), AuditScope::Full).unwrap();
         let cached = read_zstd::<GenomeCache>(&repo.join(".refit/cache/genome.zst")).unwrap();
         assert_eq!(cached.head_oid, head);
         assert!(cached.file_commits.get("src/a.rs").copied().unwrap_or(0) >= 1);
 
-        let sustain = untangle_repo_with_scope(repo.path(), &HygieneScorer::new(), AuditScope::Sustain).unwrap();
+        let sustain =
+            untangle_repo_with_scope(repo.path(), &HygieneScorer::new(), AuditScope::Sustain).unwrap();
         assert_eq!(sustain.total_source_files, full.total_source_files);
         assert!(sustain.genome_twins.is_empty() && sustain.capability_clusters.is_empty());
         assert!(sustain.deep_module_findings.is_empty() && sustain.doc_drift_findings.is_empty());
@@ -1347,25 +1252,32 @@ mod tests {
         assert_eq!(std::mem::size_of::<RefWitness>(), 16);
         let mut w = RefWitness::default();
         assert!(!w.has_cross_file_prod_caller(0));
-        w.record_prod(3); w.record_prod(3);
+        w.record_prod(3);
+        w.record_prod(3);
         assert_eq!(w.prod_files_sat, 1);
         assert!(!w.has_cross_file_prod_caller(3) && w.has_cross_file_prod_caller(4));
         w.record_prod(7);
         assert_eq!(w.prod_files_sat, 2);
         assert!(w.has_cross_file_prod_caller(3) && w.has_cross_file_prod_caller(7));
-        w.record_test(10); w.record_test(10); w.record_test(11);
+        w.record_test(10);
+        w.record_test(10);
+        w.record_test(11);
         assert_eq!(w.test_count(), 2);
 
         let empty = RefWitness::default();
-        assert_eq!(classify_symbol(0, empty, 0, DEF_VIS_INTERNAL), Some(ProofTier::T1ProvenDead));
-        assert_eq!(classify_symbol(0, empty, 0, 0), Some(ProofTier::T2LikelyDead));
-        assert_eq!(classify_symbol(0, empty, 1, 0), Some(ProofTier::T3DynamicOrTestOnly));
-        assert_eq!(classify_symbol(0, empty, 0, BOUNDARY_DYNAMIC_REF), Some(ProofTier::T3DynamicOrTestOnly));
-        for flag in [
-            BOUNDARY_FFI_NO_MANGLE, BOUNDARY_CTOR_INVENTORY, BOUNDARY_MACRO_DERIVE,
-            BOUNDARY_PY_ALL, BOUNDARY_FRAMEWORK_ROUTE, BOUNDARY_ENTRYPOINT_OR_GLOB,
+        for (intra, flags, expected) in [
+            (0, DEF_VIS_INTERNAL, ProofTier::T1ProvenDead),
+            (0, 0, ProofTier::T2LikelyDead),
+            (1, 0, ProofTier::T3DynamicOrTestOnly),
+            (0, BOUNDARY_DYNAMIC_REF, ProofTier::T3DynamicOrTestOnly),
+            (0, BOUNDARY_FFI_NO_MANGLE, ProofTier::T4ExternalOrMacro),
+            (0, BOUNDARY_CTOR_INVENTORY, ProofTier::T4ExternalOrMacro),
+            (0, BOUNDARY_MACRO_DERIVE, ProofTier::T4ExternalOrMacro),
+            (0, BOUNDARY_PY_ALL, ProofTier::T4ExternalOrMacro),
+            (0, BOUNDARY_FRAMEWORK_ROUTE, ProofTier::T4ExternalOrMacro),
+            (0, BOUNDARY_ENTRYPOINT_OR_GLOB, ProofTier::T4ExternalOrMacro),
         ] {
-            assert_eq!(classify_symbol(0, empty, 0, flag), Some(ProofTier::T4ExternalOrMacro));
+            assert_eq!(classify_symbol(0, empty, intra, flags), Some(expected));
         }
         let mut live = RefWitness::default();
         live.record_prod(9);

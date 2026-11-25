@@ -16,14 +16,12 @@ use crate::types::{
 };
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuditScope {
-    Full,
-    Sustain,
-}
+pub enum AuditScope { Full, Sustain }
 
 #[cfg(test)]
 pub fn scan_infra(repo_root: &Path) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>) {
@@ -65,8 +63,9 @@ pub fn untangle_repo_with_scope(
                 metrics: &sym_graph.metrics_by_file,
                 defs_by_file: Some(&sym_graph.defs_by_file), refs_by_file: Some(&sym_graph.refs_by_file),
             };
-            let ego = analysis::build_ego_contexts(source_rels, &sccs, &arch, &genome.file_commits, &clone_clusters);
-            let deep = analysis::deep_module_findings_with_csr(source_rels, &sccs, &arch, &ego);
+            let (_ego, deep) = analysis::analyze_ego_and_deep_modules(
+                source_rels, &sccs, &arch, &genome.file_commits, &clone_clusters,
+            );
             (caps, drift, twins, deep)
         } else {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
@@ -84,7 +83,7 @@ pub fn untangle_repo_with_scope(
 
 fn rank_files(
     repo_root: &Path, source_rels: &[String], preloaded: &BTreeMap<String, Vec<u8>>,
-    per_file_h: &HashMap<String, crate::types::HygieneResult>, snap: &crate::stem::SymbolGraph,
+    per_file_h: &HashMap<String, crate::types::HygieneResult>, snap: &SymbolGraph,
 ) -> (Vec<GodFileScore>, Vec<String>) {
     let (mut god_files, mut orphans) = (Vec::new(), Vec::new());
     for rel in source_rels {
@@ -95,13 +94,9 @@ fn rank_files(
         let fo = snap.fan_out.get(rel).copied().unwrap_or(0);
         if fi == 0 && fo == 0 && !entrypoint(rel) { orphans.push(rel.clone()); }
         let risk = (1.0 - h_score).max(0.02) * (loc.max(2) as f64).ln() * (1.0 + (fi + fo) as f64);
-        let rec = if loc >= 500 && h_score < 0.75 {
-            "split_god_file"
-        } else if h_score < 0.85 {
-            "refactor_in_place"
-        } else {
-            "keep"
-        };
+        let rec = if loc >= 500 && h_score < 0.75 { "split_god_file" }
+            else if h_score < 0.85 { "refactor_in_place" }
+            else { "keep" };
         if rec != "keep" || risk >= 6.0 {
             god_files.push(GodFileScore {
                 file: rel.clone(), loc, hygiene_score: h_score, fan_in: fi, fan_out: fo,
@@ -142,6 +137,15 @@ fn build_triage(
     plan
 }
 
+fn push_md_section<T>(
+    md: &mut String, header: &str, items: &[T], limit: usize, mut fmt_item: impl FnMut(&mut String, &T),
+) {
+    if items.is_empty() { return; }
+    md.push_str(header);
+    for item in items.iter().take(limit) { fmt_item(md, item); }
+    md.push('\n');
+}
+
 pub fn render_audit(report: &AuditReport) -> String {
     let mut md = format!(
         concat!(
@@ -155,72 +159,91 @@ pub fn render_audit(report: &AuditReport) -> String {
         report.hygiene_median, report.hygiene_p10, report.scc_count, report.dead_symbols.len(),
         report.clone_clusters.len(), report.unused_deps.len(), report.infra_findings.len()
     );
-    if !report.triage_plan.is_empty() {
-        md.push_str("## Prioritized Triage Plan\n\n| Priority | Action | Target | Reason |\n| :--- | :--- | :--- | :--- |\n");
-        for t in report.triage_plan.iter().take(25) {
-            md.push_str(&format!("| P{} | `{}` | `{}` | {} |\n", t.priority, t.action, t.file, t.reason));
-        }
-        md.push('\n');
-    }
-    if !report.god_files.is_empty() {
-        md.push_str("## Top Structural Risk / God Files\n\n");
-        for g in report.god_files.iter().take(10) {
-            md.push_str(&format!(
-                "- `{}` — {} LOC, hygiene `{:.3}`, fan-in `{}`, fan-out `{}`, risk `{:.2}` -> **{}**\n",
-                g.file, g.loc, g.hygiene_score, g.fan_in, g.fan_out, g.risk_score, g.recommendation
-            ));
-        }
-        md.push('\n');
-    }
+    push_md_section(
+        &mut md,
+        "## Prioritized Triage Plan\n\n| Priority | Action | Target | Reason |\n| :--- | :--- | :--- | :--- |\n",
+        &report.triage_plan, 25,
+        |s, t| { let _ = writeln!(s, "| P{} | `{}` | `{}` | {} |", t.priority, t.action, t.file, t.reason); },
+    );
+    push_md_section(&mut md, "## Top Structural Risk / God Files\n\n", &report.god_files, 10, |s, g| {
+        let _ = writeln!(
+            s, "- `{}` — {} LOC, hygiene `{:.3}`, fan-in `{}`, fan-out `{}`, risk `{:.2}` -> **{}**",
+            g.file, g.loc, g.hygiene_score, g.fan_in, g.fan_out, g.risk_score, g.recommendation
+        );
+    });
     for (hdr, items) in [
         ("## Deep-Module Architectural Findings\n\n", &report.deep_module_findings),
         ("## Top Git Co-Change Twins (Clean-Room NPMI)\n\n", &report.genome_twins),
     ] {
-        if !items.is_empty() {
-            md.push_str(hdr);
-            for s in items.iter().take(15) { md.push_str(&format!("- {s}\n")); }
-            md.push('\n');
-        }
+        push_md_section(&mut md, hdr, items, 15, |s, item| {
+            let _ = writeln!(s, "- {item}");
+        });
     }
-    if !report.doc_drift_findings.is_empty() {
-        md.push_str("## Documentation & Comment Drift (ReCite / DOCER)\n\n");
-        for df in report.doc_drift_findings.iter().take(20) {
-            md.push_str(&format!("- `{}` L{} [{}]: `{}` — {}\n", df.file, df.line, df.kind, df.reference, df.message));
-        }
-        md.push('\n');
-    }
-    if !report.dep_advisories.is_empty() {
-        md.push_str("## Dependency Advisories & SemVer Hops\n\n");
-        for adv in report.dep_advisories.iter().take(25) {
-            let latest = adv.latest.as_deref().unwrap_or(&adv.installed);
-            let hops = if adv.hops.is_empty() {
-                String::new()
-            } else {
-                format!(" (hops: {}, breaking: {})", adv.hops.join(" -> "), adv.breaking_hops)
-            };
-            let guard = adv.keep_guard.as_deref().map(|g| format!(" [keep-guard: {g}]")).unwrap_or_default();
-            md.push_str(&format!(
-                "- [{}] `{}/{}` `{}` -> `{}`{} — {}{}\n",
-                adv.kind, adv.ecosystem, adv.name, adv.installed, latest, hops, adv.recommendation, guard
-            ));
-        }
-        md.push('\n');
-    }
+    push_md_section(
+        &mut md, "## Documentation & Comment Drift (ReCite / DOCER)\n\n", &report.doc_drift_findings, 20,
+        |s, df| { let _ = writeln!(s, "- `{}` L{} [{}]: `{}` — {}", df.file, df.line, df.kind, df.reference, df.message); },
+    );
+    push_md_section(&mut md, "## Dependency Advisories & SemVer Hops\n\n", &report.dep_advisories, 25, |s, adv| {
+        let latest = adv.latest.as_deref().unwrap_or(&adv.installed);
+        let hops = if adv.hops.is_empty() {
+            String::new()
+        } else {
+            format!(" (hops: {}, breaking: {})", adv.hops.join(" -> "), adv.breaking_hops)
+        };
+        let guard = adv.keep_guard.as_deref().map(|g| format!(" [keep-guard: {g}]")).unwrap_or_default();
+        let _ = writeln!(
+            s, "- [{}] `{}/{}` `{}` -> `{}`{} — {}{}",
+            adv.kind, adv.ecosystem, adv.name, adv.installed, latest, hops, adv.recommendation, guard
+        );
+    });
     md
 }
 
-pub fn write_sustain(
-    repo_root: &Path,
-    report: &AuditReport,
-    dry_run: bool,
+fn write_sustain_docs(
+    repo_root: &Path, report: &AuditReport, agents: String, dry_run: bool,
 ) -> Result<SustainFiles> {
-    let dirs: BTreeSet<&str> = report
-        .god_files
-        .iter()
-        .filter_map(|g| g.file.split('/').next())
-        .collect();
-    let layers = dirs.len().max(1);
+    let layers = report.god_files.iter().filter_map(|g| g.file.split('/').next())
+        .collect::<BTreeSet<_>>().len().max(1);
+    let invariants = concat!(
+        "rules:\n",
+        "- id: no_ui_to_db_direct_import\n  paths: [src/ui/, app/components/, ui/]\n",
+        "  forbid_import: \"db\"\n",
+        "  message: \"UI components must call service/API boundaries, not DB modules\"\n",
+        "- id: no_wildcard_iam\n  languages: [tf, yml, yaml]\n  forbid: \"*:*\"\n",
+        "  message: \"Wildcard IAM permissions forbidden under SOC 2 / ISO 27001\"\n"
+    );
+    let adr = format!(
+        concat!(
+            "# ADR-001: Architectural Untangling & Sustainability Baseline\n\n- **Status:** Accepted\n",
+            "- **Baseline:** {} source files, {} infra files, median hygiene `{:.3}`, ",
+            "{} SCCs, {} clone clusters, {} dead exported symbols.\n",
+            "- **Decision:** Enforce layered boundaries via `.refit/invariants.yml` ",
+            "and CI scans via `.github/workflows/refit-guard.yml`.\n"
+        ),
+        report.total_source_files, report.total_infra_files, report.hygiene_median,
+        report.scc_count, report.clone_clusters.len(), report.dead_symbols.len()
+    );
+    let ci = concat!(
+        "name: refit-sustain-guard\non:\n  pull_request:\npermissions:\n  contents: read\n",
+        "jobs:\n  untangle-guard:\n    runs-on: ubuntu-latest\n    steps:\n",
+        "      - uses: actions/checkout@v4\n      - name: Run refit structural & hygiene audit\n",
+        "        run: refit audit . --markdown\n"
+    );
+    let items = [
+        ("AGENTS.md", agents),
+        (".refit/invariants.yml", invariants.into()),
+        ("docs/ADR-001-untangle.md", adr),
+        (".github/workflows/refit-guard.yml", ci.into()),
+    ];
+    let mut written = Vec::with_capacity(items.len());
+    for (rel, body) in items {
+        if !dry_run { write_atomic(&repo_root.join(rel), body.as_bytes())?; }
+        written.push(rel.to_string());
+    }
+    Ok(SustainFiles { files_written: written, invariant_rules_count: 2, layers_detected: layers })
+}
 
+pub fn write_sustain(repo_root: &Path, report: &AuditReport, dry_run: bool) -> Result<SustainFiles> {
     let agents = format!(
         concat!(
             "# AGENTS.md — Repository Sustainability Guardrails\n\n",
@@ -238,73 +261,13 @@ pub fn write_sustain(
         ),
         report.scc_count
     );
-
-    let invariants = concat!(
-        "rules:\n",
-        "- id: no_ui_to_db_direct_import\n",
-        "  paths: [src/ui/, app/components/, ui/]\n",
-        "  forbid_import: \"db\"\n",
-        "  message: \"UI components must call service/API boundaries, not DB modules\"\n",
-        "- id: no_wildcard_iam\n",
-        "  languages: [tf, yml, yaml]\n",
-        "  forbid: \"*:*\"\n",
-        "  message: \"Wildcard IAM permissions forbidden under SOC 2 / ISO 27001\"\n"
-    );
-
-    let adr = format!(
-        concat!(
-            "# ADR-001: Architectural Untangling & Sustainability Baseline\n\n",
-            "- **Status:** Accepted\n",
-            "- **Baseline:** {} source files, {} infra files, median hygiene `{:.3}`, ",
-            "{} SCCs, {} clone clusters, {} dead exported symbols.\n",
-            "- **Decision:** Enforce layered boundaries via `.refit/invariants.yml` ",
-            "and CI scans via `.github/workflows/refit-guard.yml`.\n"
-        ),
-        report.total_source_files,
-        report.total_infra_files,
-        report.hygiene_median,
-        report.scc_count,
-        report.clone_clusters.len(),
-        report.dead_symbols.len()
-    );
-
-    let ci = concat!(
-        "name: refit-sustain-guard\n",
-        "on:\n  pull_request:\n",
-        "permissions:\n  contents: read\n",
-        "jobs:\n  untangle-guard:\n    runs-on: ubuntu-latest\n    steps:\n",
-        "      - uses: actions/checkout@v4\n",
-        "      - name: Run refit structural & hygiene audit\n",
-        "        run: refit audit . --markdown\n"
-    );
-
-    let items = [
-        ("AGENTS.md", agents),
-        (".refit/invariants.yml", invariants.into()),
-        ("docs/ADR-001-untangle.md", adr),
-        (".github/workflows/refit-guard.yml", ci.into()),
-    ];
-
-    let mut written = Vec::with_capacity(items.len());
-    for (rel, body) in items {
-        if !dry_run {
-            write_atomic(&repo_root.join(rel), body.as_bytes())?;
-        }
-        written.push(rel.to_string());
-    }
-
-    Ok(SustainFiles {
-        files_written: written,
-        invariant_rules_count: 2,
-        layers_detected: layers,
-    })
+    write_sustain_docs(repo_root, report, agents, dry_run)
 }
 
 /// Compile and lint an audit report using ASD-STE100 Issue 9 rules + optional user `--ste-dict`.
 #[cfg(any(feature = "ste100", test))]
 pub fn render_audit_ste100(
-    report: &AuditReport,
-    dict_path: Option<&Path>,
+    report: &AuditReport, dict_path: Option<&Path>,
 ) -> Result<(String, ste100::DocumentLintReport)> {
     let dict = dict_path.map(ste100::SteDictionary::load_from_file).transpose()?;
     let compiled = ste100::compile_audit_markdown(report);
@@ -315,13 +278,9 @@ pub fn render_audit_ste100(
 /// Generate sustainability guardrails normalized and linted with ASD-STE100 Issue 9 rules.
 #[cfg(any(feature = "ste100", test))]
 pub fn write_sustain_ste100(
-    repo_root: &Path,
-    report: &AuditReport,
-    dry_run: bool,
-    dict_path: Option<&Path>,
+    repo_root: &Path, report: &AuditReport, dry_run: bool, dict_path: Option<&Path>,
 ) -> Result<(SustainFiles, ste100::DocumentLintReport)> {
     let dict = dict_path.map(ste100::SteDictionary::load_from_file).transpose()?;
-    let sustain = write_sustain(repo_root, report, dry_run)?;
     let agents_doc = format!(
         concat!(
             "# AGENTS.md\n\n",
@@ -334,10 +293,8 @@ pub fn write_sustain_ste100(
         report.scc_count
     );
     let normalized = ste100::normalize_clarity_verbs(&agents_doc);
-    if !dry_run {
-        write_atomic(&repo_root.join("AGENTS.md"), normalized.as_bytes())?;
-    }
     let lint = ste100::lint_markdown(&normalized, dict.as_ref());
+    let sustain = write_sustain_docs(repo_root, report, normalized, dry_run)?;
     Ok((sustain, lint))
 }
 
@@ -388,6 +345,12 @@ struct DriftCtx<'a> {
     npm_scripts: Option<&'a BTreeSet<String>>,
 }
 
+impl DriftCtx<'_> {
+    fn is_missing_path(&self, clean_path: &str) -> bool {
+        !self.repo_files.contains(clean_path) && !self.repo_root.join(clean_path).exists()
+    }
+}
+
 fn push_drift(out: &mut Vec<DocDriftFinding>, file: &str, line: usize, kind: &str, reference: String, message: String) {
     out.push(DocDriftFinding { file: file.to_string(), line, kind: kind.into(), reference, message });
 }
@@ -413,8 +376,9 @@ fn scan_doc_drift(repo_root: &Path, repo_snap: &RepoSnapshot, snap: &SymbolGraph
         if let Ok(content) = fs::read_to_string(abs) { scan_markdown_doc(&ctx, rel, &content, &mut findings); }
     }
     for rel in repo_snap.source_rels.iter().filter(|r| !test_path(r)) {
-        let Some(bytes) = read_bytes(repo_root, rel, Some(&repo_snap.preloaded)) else { continue };
-        scan_source_comments(&ctx, rel, &String::from_utf8_lossy(&bytes), &mut findings);
+        if let Some(bytes) = read_bytes(repo_root, rel, Some(&repo_snap.preloaded)) {
+            scan_source_comments(&ctx, rel, &String::from_utf8_lossy(&bytes), &mut findings);
+        }
     }
     findings.sort_by(|a, b| {
         a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line))
@@ -433,7 +397,10 @@ fn scan_markdown_doc(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec
     let mut in_fence = false;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") { in_fence = !in_fence; continue; }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
         if in_fence || trimmed.is_empty() || contains_ignore_marker(trimmed) { continue; }
         for span in iter_backtick_spans(line) { check_doc_span(ctx, rel, idx + 1, span, out); }
     }
@@ -444,15 +411,19 @@ fn contains_ignore_marker(text: &str) -> bool { find_ascii_ci(text.as_bytes(), b
 fn check_doc_span(ctx: &DriftCtx<'_>, doc_file: &str, ln: usize, span: &str, out: &mut Vec<DocDriftFinding>) {
     if let Some(script) = extract_cli_script_ref(span) {
         if let Some(scripts) = ctx.npm_scripts && !scripts.contains(script) && !is_placeholder_text(script) {
-            let msg = format!("Documented script `{script}` missing from package.json scripts");
-            push_drift(out, doc_file, ln, "doc_stale_cli", span.to_string(), msg);
+            push_drift(
+                out, doc_file, ln, "doc_stale_cli", span.to_string(),
+                format!("Documented script `{script}` missing from package.json scripts"),
+            );
         }
         return;
     }
     if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs) {
-        if !ctx.repo_files.contains(clean_path) && !ctx.repo_root.join(clean_path).exists() {
-            let msg = format!("Referenced file path `{clean_path}` does not exist in repository");
-            push_drift(out, doc_file, ln, "doc_stale_path", clean_path.to_string(), msg);
+        if ctx.is_missing_path(clean_path) {
+            push_drift(
+                out, doc_file, ln, "doc_stale_path", clean_path.to_string(),
+                format!("Referenced file path `{clean_path}` does not exist in repository"),
+            );
         }
         return;
     }
@@ -460,8 +431,10 @@ fn check_doc_span(ctx: &DriftCtx<'_>, doc_file: &str, ln: usize, span: &str, out
         && let Some(sym) = parse_backtick_call_symbol(span)
         && !is_ignored_symbol(sym) && !ctx.known_symbols.contains(sym)
     {
-        let msg = format!("Referenced symbol `{sym}()` not found in live codebase");
-        push_drift(out, doc_file, ln, "doc_stale_symbol", format!("{sym}()"), msg);
+        push_drift(
+            out, doc_file, ln, "doc_stale_symbol", format!("{sym}()"),
+            format!("Referenced symbol `{sym}()` not found in live codebase"),
+        );
     }
 }
 
@@ -487,9 +460,7 @@ fn is_placeholder_text(text: &str) -> bool {
 fn parse_repo_path_candidate<'a>(span: &'a str, repo_dirs: &BTreeSet<String>) -> Option<&'a str> {
     if span.contains(char::is_whitespace) || span.contains("://")
         || span.starts_with(['/', '~', '@']) || has_placeholder_chars(span)
-    {
-        return None;
-    }
+    { return None; }
     let no_frag = span.split('#').next().unwrap_or(span);
     let stripped = match no_frag.rsplit_once(':') {
         Some((h, t)) if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || b == b'-') => h,
@@ -498,9 +469,7 @@ fn parse_repo_path_candidate<'a>(span: &'a str, repo_dirs: &BTreeSet<String>) ->
     let clean = stripped.trim_start_matches("./");
     if !clean.contains('/') || clean.contains("..") || is_placeholder_text(clean)
         || RUNTIME_PREFIXES.iter().any(|p| clean.starts_with(p))
-    {
-        return None;
-    }
+    { return None; }
     let (top, _) = clean.split_once('/')?;
     if !KNOWN_PATH_ROOTS.contains(&top) && !repo_dirs.contains(top) { return None; }
     let (_, ext) = clean.rsplit_once('.')?;
@@ -522,7 +491,7 @@ fn check_comment_line(ctx: &DriftCtx<'_>, rel: &str, ln: usize, comment: &str, o
     if comment.is_empty() || contains_ignore_marker(comment) { return; }
     for span in iter_backtick_spans(comment) {
         if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs)
-            && !ctx.repo_files.contains(clean_path) && !ctx.repo_root.join(clean_path).exists()
+            && ctx.is_missing_path(clean_path)
         {
             push_drift(out, rel, ln, "doc_stale_path", clean_path.to_string(), format!("Comment cites missing file `{clean_path}`"));
         }
@@ -558,19 +527,15 @@ fn scan_comment_call_refs(ctx: &DriftCtx<'_>, rel: &str, ln: usize, comment: &st
         }
         let start = pos;
         pos += 1;
-        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
-            pos += 1;
-        }
+        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') { pos += 1; }
         let is_call = pos + 1 < bytes.len() && bytes[pos] == b'(' && bytes[pos + 1] == b')';
-        let after_dot = start > 0 && bytes[start - 1] == b'.';
-        if !is_call || after_dot {
-            continue;
-        }
+        if !is_call || (start > 0 && bytes[start - 1] == b'.') { continue; }
         let sym = &comment[start..pos];
-        let trackable = sym.len() >= 5 && !is_ignored_symbol(sym) && !is_placeholder_text(sym);
-        if trackable && !ctx.known_symbols.contains(sym) {
-            let msg = format!("Stale comment reference `{sym}()` not found in live codebase");
-            push_drift(out, rel, ln, "doc_stale_symbol", format!("{sym}()"), msg);
+        if sym.len() >= 5 && !is_ignored_symbol(sym) && !is_placeholder_text(sym) && !ctx.known_symbols.contains(sym) {
+            push_drift(
+                out, rel, ln, "doc_stale_symbol", format!("{sym}()"),
+                format!("Stale comment reference `{sym}()` not found in live codebase"),
+            );
         }
     }
 }
@@ -588,28 +553,18 @@ mod tests {
             "    const checksum = parts.length * 31;\n",
             "    const output = checksum + normalized.length;\n",
         );
-        let a1 = format!("export function authOne(raw: string) {{\n{block}    return output;\n}}\n");
-        let a2 = format!("export function authTwo(raw: string) {{\n{block}    return output;\n}}\n");
-        let tf = "provider \"aws\" {}\nresource \"aws_iam_policy\" \"bad\" {\n  policy = \"{\\\"Action\\\": \\\"*:*\\\"}\"\n}\n";
-        let py = "[project]\ndependencies = [\"ghost-py-pkg>=1.0\"]\n[tool.ruff]\nline-length = 88\n";
-        let go = "module example.com/app\n\nrequire (\n\tgithub.com/unused/mod v1.0.0\n)\n";
-        let ci = "permissions: write-all\nsteps:\n  - uses: actions/checkout@main\n  - run: echo ${{ github.event.issue.title }}\n";
-
-        let dir = TempRepo::with_files(
-            "unt_all",
-            &[
-                ("src/auth_v1.ts", &a1),
-                ("src/auth_v2.ts", &a2),
-                ("src/app.py", "import os\n"),
-                ("src/main.go", "package main\nfunc main() {}\n"),
-                ("package.json", r#"{"dependencies":{"unused-ghost-pkg":"^1.0.0"}}"#),
-                ("pyproject.toml", py),
-                ("go.mod", go),
-                ("infra/main.tf", tf),
-                ("Dockerfile", "FROM node:latest\nENV API_KEY=hardcoded\n"),
-                (".github/workflows/ci.yml", ci),
-            ],
-        );
+        let dir = TempRepo::with_files("unt_all", &[
+            ("src/auth_v1.ts", &format!("export function authOne(raw: string) {{\n{block}    return output;\n}}\n")),
+            ("src/auth_v2.ts", &format!("export function authTwo(raw: string) {{\n{block}    return output;\n}}\n")),
+            ("src/app.py", "import os\n"),
+            ("src/main.go", "package main\nfunc main() {}\n"),
+            ("package.json", r#"{"dependencies":{"unused-ghost-pkg":"^1.0.0"}}"#),
+            ("pyproject.toml", "[project]\ndependencies = [\"ghost-py-pkg>=1.0\"]\n[tool.ruff]\nline-length = 88\n"),
+            ("go.mod", "module example.com/app\n\nrequire (\n\tgithub.com/unused/mod v1.0.0\n)\n"),
+            ("infra/main.tf", "provider \"aws\" {}\nresource \"aws_iam_policy\" \"bad\" {\n  policy = \"{\\\"Action\\\": \\\"*:*\\\"}\"\n}\n"),
+            ("Dockerfile", "FROM node:latest\nENV API_KEY=hardcoded\n"),
+            (".github/workflows/ci.yml", "permissions: write-all\nsteps:\n  - uses: actions/checkout@main\n  - run: echo ${{ github.event.issue.title }}\n"),
+        ]);
 
         let rep = untangle_repo(dir.path(), &HygieneScorer::new()).unwrap();
         assert!(!rep.clone_clusters.is_empty() && !rep.capability_clusters.is_empty());
@@ -651,45 +606,42 @@ mod tests {
             "// Delegates to live_verify_token() safely\n",
             "// Legacy note: previously called legacy_parse_wal() and `src/ghost_prod.rs`\n",
             "pub fn live_verify_token(raw: &str) -> bool { !raw.is_empty() }\n",
-            "#[cfg(test)]\n",
-            "mod tests {\n",
+            "#[cfg(test)]\nmod tests {\n",
             "    // Comment inside cfg(test) citing fake_test_only_fn() and `src/ghost_test.rs`\n",
-            "    #[test]\n",
-            "    fn ok() { assert!(super::live_verify_token(\"x\")); }\n",
-            "}\n",
+            "    #[test]\n    fn ok() { assert!(super::live_verify_token(\"x\")); }\n}\n",
         );
         let readme = concat!(
-            "# Demo\n",
-            "Live `src/auth.rs` calls `live_verify_token()`.\n",
+            "# Demo\nLive `src/auth.rs` calls `live_verify_token()`.\n",
             "Dead `src/deleted_legacy.rs`, `old_broken_helper()`, `npm run ghost-task`.\n",
             "Ignore `src/example/foo.rs`, `to_string()`, and live `npm run build`.\n",
         );
-        let dir = TempRepo::with_files(
-            "doc_drift_cfg",
-            &[
-                ("src/auth.rs", auth_rs),
-                ("tests/smoke_test.rs", "// Mentions test_only_ghost_fn() in test path\n"),
-                ("README.md", readme),
-                ("package.json", r#"{"scripts":{"build":"vite build"}}"#),
-            ],
-        );
+        let dir = TempRepo::with_files("doc_drift_cfg", &[
+            ("src/auth.rs", auth_rs),
+            ("tests/smoke_test.rs", "// Mentions test_only_ghost_fn() in test path\n"),
+            ("README.md", readme),
+            ("package.json", r#"{"scripts":{"build":"vite build"}}"#),
+        ]);
 
         let rep = untangle_repo(dir.path(), &HygieneScorer::new()).unwrap();
-        let has = |file: &str, kind: &str, r: &str| {
-            rep.doc_drift_findings.iter().any(|f| f.file == file && f.kind == kind && f.reference == r)
-        };
-        assert!(has("src/auth.rs", "doc_stale_symbol", "legacy_parse_wal()"), "{:?}", rep.doc_drift_findings);
-        assert!(has("src/auth.rs", "doc_stale_path", "src/ghost_prod.rs"), "{:?}", rep.doc_drift_findings);
-        assert!(has("README.md", "doc_stale_path", "src/deleted_legacy.rs"), "{:?}", rep.doc_drift_findings);
-        assert!(has("README.md", "doc_stale_symbol", "old_broken_helper()"), "{:?}", rep.doc_drift_findings);
-        assert!(has("README.md", "doc_stale_cli", "npm run ghost-task"), "{:?}", rep.doc_drift_findings);
-
-        // Zero false positives on #[cfg(test)] block, test-only path, placeholders, or live symbols.
-        for bad in ["fake_test_only_fn", "ghost_test.rs", "test_only_ghost_fn", "live_verify_token", "example", "to_string", "npm run build"] {
+        for (file, kind, r) in [
+            ("src/auth.rs", "doc_stale_symbol", "legacy_parse_wal()"),
+            ("src/auth.rs", "doc_stale_path", "src/ghost_prod.rs"),
+            ("README.md", "doc_stale_path", "src/deleted_legacy.rs"),
+            ("README.md", "doc_stale_symbol", "old_broken_helper()"),
+            ("README.md", "doc_stale_cli", "npm run ghost-task"),
+        ] {
+            assert!(
+                rep.doc_drift_findings.iter().any(|f| f.file == file && f.kind == kind && f.reference == r),
+                "missing ({file}, {kind}, {r}) in {:?}", rep.doc_drift_findings
+            );
+        }
+        for bad in [
+            "fake_test_only_fn", "ghost_test.rs", "test_only_ghost_fn",
+            "live_verify_token", "example", "to_string", "npm run build",
+        ] {
             assert!(
                 !rep.doc_drift_findings.iter().any(|f| f.reference.contains(bad)),
-                "false positive `{bad}` in {:?}",
-                rep.doc_drift_findings
+                "false positive `{bad}` in {:?}", rep.doc_drift_findings
             );
         }
     }

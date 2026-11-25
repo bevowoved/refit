@@ -409,7 +409,9 @@ fn prune_rules(rules: &mut Vec<LearnRule>) {
         return;
     }
     rules.sort_by(|a, b| {
-        b.hits.saturating_add(b.helpful * 2).cmp(&a.hits.saturating_add(a.helpful * 2)).then_with(|| a.key.cmp(&b.key))
+        let score_b = b.hits.saturating_add(b.helpful * 2);
+        let score_a = a.hits.saturating_add(a.helpful * 2);
+        score_b.cmp(&score_a).then_with(|| a.key.cmp(&b.key))
     });
     rules.truncate(MAX_RULES);
 }
@@ -419,7 +421,11 @@ fn credit_one(rules: &mut [LearnRule], dir_prefix: &str, key: &str) -> bool {
         r.helpful += 1;
         return true;
     }
-    if let Some(r) = rules.iter_mut().filter(|r| r.key == key && (r.dir_prefix == "*" || r.hits >= 2)).max_by_key(|r| r.hits) {
+    let fallback = rules
+        .iter_mut()
+        .filter(|r| r.key == key && (r.dir_prefix == "*" || r.hits >= 2))
+        .max_by_key(|r| r.hits);
+    if let Some(r) = fallback {
         r.helpful += 1;
         return true;
     }
@@ -487,7 +493,8 @@ mod tests {
             store.record_failure(gate, "pkg/core", msg);
         }
         let s1 = store.rule_suffix("pkg/core").0;
-        assert!(s1 == store.rule_suffix("pkg/core").0 && s1.len() <= 420 && s1.lines().filter(|l| l.starts_with("- [")).count() <= 3);
+        let bullets = s1.lines().filter(|l| l.starts_with("- [")).count();
+        assert!(s1 == store.rule_suffix("pkg/core").0 && s1.len() <= 420 && bullets <= 3);
 
         let (_dir2, s2) = open_store("learn_api");
         for (gate, msg) in [
@@ -552,7 +559,8 @@ mod tests {
         LearnStore::open(repo.path()).unwrap().record_failure("gate3_ruff", "src", "B006 mutable default");
         let val = query_learn_and_rewind(repo.path(), Some("legacy_parse"), RewindTrigger::NewDepAdvisory).unwrap();
         assert_eq!((&val["rules_count"], &val["rewind"]["trigger"]), (&json!(1), &json!("new_dep_advisory")));
-        let affected: Vec<&str> = val["rewind"]["affected_files"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        let raw_aff = val["rewind"]["affected_files"].as_array().unwrap();
+        let affected: Vec<&str> = raw_aff.iter().filter_map(Value::as_str).collect();
         assert!(affected.contains(&"src/b.rs") && affected.contains(&"src/c.rs"));
     }
 }

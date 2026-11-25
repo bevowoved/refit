@@ -1,10 +1,12 @@
 pub(crate) mod analysis;
 mod parse;
-pub(crate) mod sst;
 
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
-use crate::platform::{mkdir_private, read_zstd, walk_files, write_zstd};
+use crate::platform::{
+    ensure_cachedir_tag, env_trimmed, env_truthy, mkdir_private, par_map, parse_go_block_lines,
+    read_zstd, walk_files, write_atomic, write_zstd,
+};
 use crate::source::{
     RepoScan, RepoSnapshot, dir_of, entrypoint, ext_of, read_bytes, rel_norm, same_family,
     scan_files, stem_of,
@@ -15,18 +17,31 @@ use analysis::{
     ModuleMetrics, PathArena, RefWitness, WITNESS_DYNAMIC_REF, WITNESS_EXTERNAL,
     WITNESS_GLOB_REEXPORT, WITNESS_MACRO_ATTR, check_wipe_guard, classify_symbol, hash_symbol,
 };
+use anyhow::Result;
 use parse::{FileSymbols, parse_symbols};
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
 const CACHE_VERSION: &str = "0.6.0";
+const SST_MAGIC: &[u8; 8] = b"RFST0004";
+const SST_MIN_FILES: usize = 500;
+const SST_MIN_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+const RESTART_INTERVAL: usize = 8;
+const TARGET_BLOCK_BYTES: usize = 8 * 1024;
+const MAX_BLOCK_BYTES: usize = 16 * 1024;
+const MAX_BLOCK_KEYS: usize = 256;
+const MAX_DECOMP_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+const SST_HEADER_LEN: usize = 30;
+const VERSION_KEY: &[u8] = b"\0__version__";
+const EDGES_KEY: &[u8] = b"\0__edges__";
 
 const STEM_SQL: &str = concat!(
     "WITH uniq AS (SELECT name FROM symbols GROUP BY name ",
@@ -77,10 +92,7 @@ struct SymbolCacheRef<'a> {
     test_hashes: &'a BTreeMap<String, (String, Vec<u64>)>,
 }
 
-struct TsConfigScope {
-    pkg_dir: String,
-    aliases: Vec<(String, String)>,
-}
+struct TsConfigScope { pkg_dir: String, aliases: Vec<(String, String)> }
 
 struct LookupTables {
     all_rels: FxHashSet<String>,
@@ -94,13 +106,18 @@ struct LookupTables {
 
 pub fn locate_stem(hint: Option<&Path>) -> Option<PathBuf> {
     if let Some(h) = hint.filter(|p| p.exists()) { return Some(h.to_path_buf()); }
-    if let Ok(env_bin) = std::env::var("REFIT_STEM_BIN") {
-        let p = PathBuf::from(env_bin);
-        if p.exists() { return Some(p); }
+    if let Some(p) = env_trimmed("REFIT_STEM_BIN").map(PathBuf::from).filter(|p| p.exists()) {
+        return Some(p);
     }
     let bin = if cfg!(windows) { "stem.exe" } else { "stem" };
-    let sibling = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(bin)));
-    sibling.into_iter().chain(std::iter::once(PathBuf::from(".tools").join(bin))).find(|c| c.exists())
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(bin)));
+    if let Some(p) = sibling.filter(|c| c.exists()) {
+        return Some(p);
+    }
+    let local = PathBuf::from(".tools").join(bin);
+    local.exists().then_some(local)
 }
 
 pub fn scan_edges(
@@ -110,7 +127,7 @@ pub fn scan_edges(
     let (mut disc, _, _, _) = discover_internal(repo_root, preloaded, None);
     let mut edge_set: HashSet<(String, String)> = disc.edges.into_iter().collect();
     let mut rt_set: HashSet<(String, String)> = disc.runtime_edges.into_iter().collect();
-    let want_ext = stem_bin_hint.is_some() || std::env::var("REFIT_USE_STEM_BIN").as_deref() == Ok("1");
+    let want_ext = stem_bin_hint.is_some() || env_truthy("REFIT_USE_STEM_BIN");
     if want_ext && query_ext(repo_root, stem_bin_hint, &mut edge_set) {
         disc.used_stem = true;
         rt_set.extend(edge_set.iter().cloned());
@@ -138,7 +155,10 @@ fn query_ext(repo_root: &Path, hint: Option<&Path>, edge_set: &mut HashSet<(Stri
     let Ok(mut child) = cmd.spawn() else { return false };
     let init = json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": { "name": "refit", "version": "0.5.0" } }
+        "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": { "name": "refit", "version": "0.5.0" }
+        }
     });
     let call = json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -180,23 +200,35 @@ pub fn load_symbols(repo_root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8
     discover_internal(repo_root, preloaded, None).3
 }
 
-fn file_edge_lists(edges: &[(String, String)], norm: &str) -> (Vec<String>, Vec<String>) {
-    let deps = edges.iter().filter(|(s, _)| s == norm).map(|(_, d)| d.clone()).collect();
-    let dependents = edges.iter().filter(|(_, d)| d == norm).map(|(s, _)| s.clone()).collect();
-    (deps, dependents)
+fn file_query_json(
+    norm: &str, defs: &[String], imports: &[String], edges: &[(String, String)],
+    fan_in: usize, fan_out: usize,
+) -> Value {
+    let deps: Vec<String> = edges
+        .iter()
+        .filter(|(s, _)| s == norm)
+        .map(|(_, d)| d.clone())
+        .collect();
+    let dependents: Vec<String> = edges
+        .iter()
+        .filter(|(_, d)| d == norm)
+        .map(|(s, _)| s.clone())
+        .collect();
+    json!({
+        "file": norm, "defs": defs, "imports": imports,
+        "deps": deps, "dependents": dependents, "fan_in": fan_in, "fan_out": fan_out
+    })
 }
 
 pub fn query_symbols(repo_root: &Path, symbol: Option<&str>, file: Option<&str>) -> Value {
     if symbol.is_none() && let Some(f) = file {
         let norm = f.replace('\\', "/");
-        if let Some(hit) = sst::query_file_sst(repo_root, CACHE_VERSION, &norm) {
-            let (deps, dependents) = file_edge_lists(&hit.edges, &norm);
+        if let Some(hit) = query_file_sst(repo_root, CACHE_VERSION, &norm) {
             let fan_in = hit.runtime_edges.iter().filter(|(_, d)| d == &norm).count();
             let fan_out = hit.runtime_edges.iter().filter(|(s, _)| s == &norm).count();
-            return json!({
-                "file": norm, "defs": hit.sym.defs, "imports": hit.sym.imports,
-                "deps": deps, "dependents": dependents, "fan_in": fan_in, "fan_out": fan_out
-            });
+            return file_query_json(
+                &norm, &hit.sym.defs, &hit.sym.imports, &hit.edges, fan_in, fan_out,
+            );
         }
     }
     query_symbol_graph(&load_symbols(repo_root, None), symbol, file)
@@ -204,11 +236,18 @@ pub fn query_symbols(repo_root: &Path, symbol: Option<&str>, file: Option<&str>)
 
 pub fn query_symbol_graph(snap: &SymbolGraph, symbol: Option<&str>, file: Option<&str>) -> Value {
     if let Some(sym) = symbol {
-        let definers: Vec<String> = snap.defs_by_file.iter()
-            .filter(|(_, defs)| defs.iter().any(|d| d == sym)).map(|(f, _)| f.clone()).collect();
-        let callers: Vec<String> = snap.refs_by_file.iter()
+        let definers: Vec<String> = snap
+            .defs_by_file
+            .iter()
+            .filter(|(_, defs)| defs.iter().any(|d| d == sym))
+            .map(|(f, _)| f.clone())
+            .collect();
+        let callers: Vec<String> = snap
+            .refs_by_file
+            .iter()
             .filter(|(f, refs)| !definers.contains(*f) && refs.iter().any(|r| r == sym))
-            .map(|(f, _)| f.clone()).collect();
+            .map(|(f, _)| f.clone())
+            .collect();
         return json!({
             "symbol": sym, "definers": definers, "callers": callers,
             "is_dead": !definers.is_empty() && callers.is_empty()
@@ -216,15 +255,11 @@ pub fn query_symbol_graph(snap: &SymbolGraph, symbol: Option<&str>, file: Option
     }
     if let Some(f) = file {
         let norm = f.replace('\\', "/");
-        let (deps, dependents) = file_edge_lists(&snap.edges, &norm);
-        return json!({
-            "file": norm,
-            "defs": snap.defs_by_file.get(&norm).cloned().unwrap_or_default(),
-            "imports": snap.imports_by_file.get(&norm).cloned().unwrap_or_default(),
-            "deps": deps, "dependents": dependents,
-            "fan_in": snap.fan_in.get(&norm).copied().unwrap_or(0),
-            "fan_out": snap.fan_out.get(&norm).copied().unwrap_or(0)
-        });
+        let defs = snap.defs_by_file.get(&norm).map(Vec::as_slice).unwrap_or(&[]);
+        let imports = snap.imports_by_file.get(&norm).map(Vec::as_slice).unwrap_or(&[]);
+        let fan_in = snap.fan_in.get(&norm).copied().unwrap_or(0);
+        let fan_out = snap.fan_out.get(&norm).copied().unwrap_or(0);
+        return file_query_json(&norm, defs, imports, &snap.edges, fan_in, fan_out);
     }
     json!({
         "indexed_files": snap.defs_by_file.len(), "total_edges": snap.edges.len(),
@@ -284,7 +319,7 @@ fn apply_tsconfig_paths(
 
 fn load_tsconfig_resolved(repo_root: &Path, cfg_path: &Path, depth: usize) -> (String, Vec<(String, String)>) {
     if depth > 8 { return (String::new(), Vec::new()); }
-    let Ok(raw) = std::fs::read_to_string(cfg_path) else { return (String::new(), Vec::new()) };
+    let Ok(raw) = fs::read_to_string(cfg_path) else { return (String::new(), Vec::new()) };
     let Ok(val) = serde_json::from_str::<Value>(&strip_jsonc(&raw)) else { return (String::new(), Vec::new()) };
 
     let cfg_dir = cfg_path.parent().unwrap_or(repo_root);
@@ -335,20 +370,17 @@ fn discover_ts_scopes(repo_root: &Path, pre_ts_configs: Option<&[PathBuf]>) -> V
 }
 
 fn parse_go_work_dirs(work_text: &str, mod_dirs: &mut Vec<PathBuf>) {
-    let mut in_use = false;
-    for line in work_text.lines().map(str::trim) {
-        if line.starts_with("use (") { in_use = true; continue; }
-        if in_use && line.starts_with(')') { in_use = false; continue; }
-        let cand = if in_use { Some(line) } else { line.strip_prefix("use ") };
-        if let Some(raw) = cand {
-            let cleaned = raw.split("//").next().unwrap_or("").trim().trim_matches('"').trim_start_matches("./");
-            if !cleaned.is_empty() { mod_dirs.push(PathBuf::from(cleaned)); }
+    for raw in parse_go_block_lines(work_text, "use") {
+        let no_comment = raw.split("//").next().unwrap_or("");
+        let cleaned = no_comment.trim().trim_matches('"').trim_start_matches("./");
+        if !cleaned.is_empty() {
+            mod_dirs.push(PathBuf::from(cleaned));
         }
     }
 }
 
 fn read_go_mod_path(go_mod_path: &Path) -> Option<String> {
-    let txt = std::fs::read_to_string(go_mod_path).ok()?;
+    let txt = fs::read_to_string(go_mod_path).ok()?;
     txt.lines().map(str::trim).find_map(|line| {
         let mod_path = line.strip_prefix("module ")?.split_whitespace().next()?.trim_matches('"');
         (!mod_path.is_empty()).then(|| mod_path.to_string())
@@ -358,11 +390,15 @@ fn read_go_mod_path(go_mod_path: &Path) -> Option<String> {
 fn discover_go_modules(repo_root: &Path) -> Vec<(String, String)> {
     let mut mod_dirs = Vec::new();
     if repo_root.join("go.mod").exists() { mod_dirs.push(PathBuf::new()); }
-    if let Ok(work) = std::fs::read_to_string(repo_root.join("go.work")) {
+    if let Ok(work) = fs::read_to_string(repo_root.join("go.work")) {
         parse_go_work_dirs(&work, &mut mod_dirs);
     }
     mod_dirs.into_iter().filter_map(|sub| {
-        let gm = if sub.as_os_str().is_empty() { repo_root.join("go.mod") } else { repo_root.join(&sub).join("go.mod") };
+        let gm = if sub.as_os_str().is_empty() {
+            repo_root.join("go.mod")
+        } else {
+            repo_root.join(&sub).join("go.mod")
+        };
         read_go_mod_path(&gm).map(|m| (sub.to_string_lossy().replace('\\', "/"), m))
     }).collect()
 }
@@ -381,23 +417,31 @@ fn join_rel(base_dir: &str, rel_import: &str) -> String {
     joined
 }
 
-fn register_py_init_files(all_files: &[(String, String, Option<PathBuf>)], mod_to_rel: &mut FxHashMap<String, String>) {
-    for (rel, ext, _) in all_files {
-        if ext == "py" && let Some(pkg) = rel.strip_suffix("/__init__.py") {
-            mod_to_rel.insert(pkg.replace('/', "."), rel.clone());
-            if let Some(s) = pkg.strip_prefix("src/") { mod_to_rel.insert(s.replace('/', "."), rel.clone()); }
+fn register_py_path(
+    mod_to_rel: &mut FxHashMap<String, String>, stem: &str, rel: &str, force_src: bool,
+) {
+    mod_to_rel.insert(stem.replace('/', "."), rel.to_string());
+    if let Some(s) = stem.strip_prefix("src/") {
+        let key = s.replace('/', ".");
+        if force_src || !mod_to_rel.contains_key(&key) {
+            mod_to_rel.insert(key, rel.to_string());
         }
     }
 }
 
-fn register_py_source(rel: &str, mod_to_rel: &mut FxHashMap<String, String>) {
-    mod_to_rel.insert(rel.trim_end_matches(".py").replace('/', "."), rel.to_string());
-    if let Some(stripped) = rel.strip_prefix("src/") {
-        mod_to_rel.entry(stripped.trim_end_matches(".py").replace('/', ".")).or_insert_with(|| rel.to_string());
+fn register_py_init_files(
+    all_files: &[(String, String, Option<PathBuf>)], mod_to_rel: &mut FxHashMap<String, String>,
+) {
+    for (rel, ext, _) in all_files {
+        if ext == "py" && let Some(pkg) = rel.strip_suffix("/__init__.py") {
+            register_py_path(mod_to_rel, pkg, rel, true);
+        }
     }
 }
 
-fn register_rs_source(rel: &str, mod_to_rel: &mut FxHashMap<String, String>, crate_roots: &mut FxHashSet<String>) {
+fn register_rs_source(
+    rel: &str, mod_to_rel: &mut FxHashMap<String, String>, crate_roots: &mut FxHashSet<String>,
+) {
     if let Some(mod_dir) = rel.strip_suffix("/mod.rs") { mod_to_rel.insert(mod_dir.to_string(), rel.to_string()); }
     if rel == "src/lib.rs" || rel == "src/main.rs" || rel.starts_with("src/") {
         crate_roots.insert("src".to_string());
@@ -444,7 +488,7 @@ fn build_tables(
         tbl.all_rels.insert(rel.clone());
         let path = Path::new(rel);
         if ext == "py" {
-            register_py_source(rel, &mut tbl.mod_to_rel);
+            register_py_path(&mut tbl.mod_to_rel, rel.trim_end_matches(".py"), rel, false);
         } else {
             let no_ext = rel.rsplit_once('.').map_or(rel.as_str(), |(h, _)| h);
             tbl.mod_to_rel.insert(no_ext.to_string(), rel.clone());
@@ -463,131 +507,89 @@ fn build_tables(
     tbl
 }
 
+fn cache_paths(repo_root: &Path) -> (PathBuf, PathBuf) {
+    (repo_root.join(".refit/cache/symbol_index.zst"), repo_root.join(".refit/cache/sym.sst"))
+}
+
 pub(crate) fn should_use_sst(file_count: usize, est_json_bytes: u64) -> bool {
-    let forced = std::env::var("REFIT_FORCE_SST").ok().is_some_and(|v| {
-        let t = v.trim();
-        !t.is_empty() && !matches!(t.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
-    });
-    forced
+    env_truthy("REFIT_FORCE_SST")
         || (cfg!(feature = "sst-storage")
-            && (file_count >= sst::SST_MIN_FILES || est_json_bytes >= sst::SST_MIN_INDEX_BYTES))
+            && (file_count >= SST_MIN_FILES || est_json_bytes >= SST_MIN_INDEX_BYTES))
 }
 
 fn estimate_symbol_json_bytes(files: &BTreeMap<String, FileSymbols>) -> u64 {
-    files
-        .iter()
-        .map(|(rel, f)| {
-            let sym_bytes: usize = f.defs.iter().map(|s| s.len() + 3).sum::<usize>()
-                + f.imports.iter().map(|s| s.len() + 3).sum::<usize>()
-                + f.refs_tokens.iter().map(|s| s.len() + 3).sum::<usize>();
-            (rel.len() + sym_bytes + 128) as u64
-        })
-        .sum()
+    files.iter().map(|(rel, f)| {
+        let sym_bytes: usize = f.defs.iter().map(|s| s.len() + 3).sum::<usize>()
+            + f.imports.iter().map(|s| s.len() + 3).sum::<usize>()
+            + f.refs_tokens.iter().map(|s| s.len() + 3).sum::<usize>();
+        (rel.len() + sym_bytes + 128) as u64
+    }).sum()
 }
 
 fn load_cached_symbols(repo_root: &Path) -> SymbolCache {
-    let cache_path = repo_root.join(".refit/cache/symbol_index.zst");
-    let sst_path = repo_root.join(".refit/cache/sym.sst");
+    let (cache_path, sst_path) = cache_paths(repo_root);
     if cache_path.is_file()
-        && let Some(idx) =
-            read_zstd::<SymbolCache>(&cache_path).filter(|idx| idx.version == CACHE_VERSION)
+        && let Some(idx) = read_zstd::<SymbolCache>(&cache_path).filter(|i| i.version == CACHE_VERSION)
     {
         return idx;
     }
-    if sst_path.is_file()
-        && let Some(files) = sst::load_symbol_sst(&sst_path, CACHE_VERSION)
-    {
-        return SymbolCache {
-            version: CACHE_VERSION.to_string(),
-            files,
-            test_hashes: BTreeMap::new(),
-        };
+    if sst_path.is_file() && let Some(files) = load_symbol_sst(&sst_path, CACHE_VERSION) {
+        return SymbolCache { version: CACHE_VERSION.into(), files, test_hashes: BTreeMap::new() };
     }
     SymbolCache::default()
 }
 
 fn persist_symbol_caches(
-    repo_root: &Path,
-    new_files: &BTreeMap<String, FileSymbols>,
+    repo_root: &Path, new_files: &BTreeMap<String, FileSymbols>,
     new_test_hashes: &BTreeMap<String, (String, Vec<u64>)>,
-    edges: &[(String, String)],
-    runtime_edges: &[(String, String)],
-    prev_len: usize,
+    edges: &[(String, String)], runtime_edges: &[(String, String)], prev_len: usize,
 ) {
-    let cache_path = repo_root.join(".refit/cache/symbol_index.zst");
-    let sst_path = repo_root.join(".refit/cache/sym.sst");
+    let (cache_path, sst_path) = cache_paths(repo_root);
     if check_wipe_guard(prev_len, new_files.len()) {
         tracing::warn!(
-            prev_files = prev_len,
-            new_files = new_files.len(),
+            prev_files = prev_len, new_files = new_files.len(),
             "index-wipe guard triggered (>80% files vanished); keeping previous symbol index cache"
         );
         return;
     }
-    let est_bytes = estimate_symbol_json_bytes(new_files);
-    if should_use_sst(new_files.len(), est_bytes) {
-        if sst::save_symbol_sst(
-            &sst_path,
-            CACHE_VERSION,
-            new_files,
-            edges,
-            runtime_edges,
-            prev_len,
-        )
-        .is_ok_and(|written| written)
+    if should_use_sst(new_files.len(), estimate_symbol_json_bytes(new_files)) {
+        if save_symbol_sst(&sst_path, CACHE_VERSION, new_files, edges, runtime_edges, prev_len)
+            .is_ok_and(|written| written)
         {
-            let _ = std::fs::remove_file(&cache_path);
+            let _ = fs::remove_file(&cache_path);
         }
     } else {
         let next_ref = SymbolCacheRef {
-            version: CACHE_VERSION,
-            files: new_files,
-            test_hashes: new_test_hashes,
+            version: CACHE_VERSION, files: new_files, test_hashes: new_test_hashes,
         };
-        if write_zstd(&cache_path, &next_ref).is_ok() {
-            let _ = std::fs::remove_file(&sst_path);
-        }
+        if write_zstd(&cache_path, &next_ref).is_ok() { let _ = fs::remove_file(&sst_path); }
     }
 }
 
 fn discover_internal(
-    repo_root: &Path,
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
-    repo_snap: Option<&RepoSnapshot>,
+    repo_root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8>>>, repo_snap: Option<&RepoSnapshot>,
 ) -> (EdgeScan, usize, usize, SymbolGraph) {
     let started = Instant::now();
     let prev = load_cached_symbols(repo_root);
-
     let scan: RepoScan = match repo_snap {
         Some(s) => s.to_repo_scan(),
         None => scan_files(repo_root, preloaded),
     };
     let tables = build_tables(
-        repo_root,
-        &scan.sources,
-        &scan.all,
-        repo_snap.map(|s| s.ts_configs.as_slice()),
+        repo_root, &scan.sources, &scan.all, repo_snap.map(|s| s.ts_configs.as_slice()),
     );
 
-    let parse_one = |(rel, ext, _): &(String, String, Option<PathBuf>)| -> Option<(String, FileSymbols, bool)> {
+    let parsed_rows = par_map(&scan.sources, |(rel, ext, _)| {
         let bytes = read_bytes(repo_root, rel, preloaded)?;
         let hash = MvccStore::hash_bytes(&bytes);
         if let Some(hit) = prev.files.get(rel).filter(|f| f.blake3 == hash) {
             return Some((rel.clone(), hit.clone(), false));
         }
-        let entry = parse_symbols(ext, &String::from_utf8_lossy(&bytes), hash);
-        Some((rel.clone(), entry, true))
-    };
+        Some((rel.clone(), parse_symbols(ext, &String::from_utf8_lossy(&bytes), hash), true))
+    });
 
-    let parsed_rows: Vec<(String, FileSymbols, bool)> = if crate::platform::budget().is_constrained() {
-        scan.sources.iter().filter_map(parse_one).collect()
-    } else {
-        scan.sources.par_iter().filter_map(parse_one).collect()
-    };
-
-    let (mut parsed_n, mut cached_n) = (0usize, 0usize);
-    let mut new_files = BTreeMap::new();
-    for (rel, entry, was_parsed) in parsed_rows {
+    let (mut parsed_n, mut cached_n, mut new_files) = (0usize, 0usize, BTreeMap::new());
+    for (rel, entry, was_parsed) in parsed_rows.into_iter().flatten() {
         if was_parsed {
             parsed_n += 1;
         } else {
@@ -600,71 +602,35 @@ fn discover_internal(
     let (new_test_hashes, test_changed) =
         collect_test_hashes_cached(repo_root, preloaded, &scan.tests, &prev.test_hashes);
     let want_sst = should_use_sst(new_files.len(), estimate_symbol_json_bytes(&new_files));
-    let cache_exists = repo_root.join(".refit/cache/symbol_index.zst").is_file();
-    let sst_exists = repo_root.join(".refit/cache/sym.sst").is_file();
+    let (cache_path, sst_path) = cache_paths(repo_root);
+    let (cache_exists, sst_exists) = (cache_path.is_file(), sst_path.is_file());
     let format_mismatch = if want_sst { !sst_exists || cache_exists } else { !cache_exists || sst_exists };
     if parsed_n > 0 || test_changed || prev.files.len() != new_files.len() || format_mismatch {
-        persist_symbol_caches(
-            repo_root,
-            &new_files,
-            &new_test_hashes,
-            &edges,
-            &runtime_edges,
-            prev.files.len(),
-        );
+        persist_symbol_caches(repo_root, &new_files, &new_test_hashes, &edges, &runtime_edges, prev.files.len());
     }
-    let snap = build_graph(
-        new_files,
-        &new_test_hashes,
-        &edges,
-        &runtime_edges,
-        &glob_reexport_targets,
-    );
-
-    (
-        EdgeScan {
-            used_stem: false,
-            index_ms: started.elapsed().as_millis() as u64,
-            edges,
-            runtime_edges,
-        },
-        parsed_n,
-        cached_n,
-        snap,
-    )
+    let snap = build_graph(new_files, &new_test_hashes, &edges, &runtime_edges, &glob_reexport_targets);
+    let edge_scan = EdgeScan {
+        used_stem: false, index_ms: started.elapsed().as_millis() as u64, edges, runtime_edges,
+    };
+    (edge_scan, parsed_n, cached_n, snap)
 }
 
 fn collect_file_edges(
-    rel: &str,
-    entry: &FileSymbols,
-    tbl: &LookupTables,
-    edge_set: &mut FxHashSet<(String, String)>,
-    rt_set: &mut FxHashSet<(String, String)>,
+    rel: &str, entry: &FileSymbols, tbl: &LookupTables,
+    edge_set: &mut FxHashSet<(String, String)>, rt_set: &mut FxHashSet<(String, String)>,
     glob_targets: &mut FxHashSet<String>,
 ) {
-    let src_dir = dir_of(rel);
-    let src_ext = ext_of(rel);
-
-    for imp in &entry.typed_imports {
-        if imp.kind == EdgeKind::TestImport {
-            continue;
-        }
+    let (src_dir, src_ext) = (dir_of(rel), ext_of(rel));
+    for imp in entry.typed_imports.iter().filter(|i| i.kind != EdgeKind::TestImport) {
         for target in resolve_import(&imp.target, rel, &src_dir, &src_ext, tbl) {
-            if target == rel || !tbl.all_rels.contains(&target) {
-                continue;
-            }
+            if target == rel || !tbl.all_rels.contains(&target) { continue; }
             edge_set.insert((rel.to_string(), target.clone()));
-            if imp.kind.is_runtime_scc() {
-                rt_set.insert((rel.to_string(), target));
-            }
+            if imp.kind.is_runtime_scc() { rt_set.insert((rel.to_string(), target)); }
         }
     }
-
     for glob in &entry.glob_reexports {
         for target in resolve_import(glob, rel, &src_dir, &src_ext, tbl) {
-            if target != rel {
-                glob_targets.insert(target);
-            }
+            if target != rel { glob_targets.insert(target); }
         }
     }
 }
@@ -672,14 +638,11 @@ fn collect_file_edges(
 type EdgeTuple = (Vec<(String, String)>, Vec<(String, String)>, FxHashSet<String>);
 
 fn collect_edges(files: &BTreeMap<String, FileSymbols>, tbl: &LookupTables) -> EdgeTuple {
-    let mut edge_set: FxHashSet<(String, String)> = FxHashSet::default();
-    let mut rt_set: FxHashSet<(String, String)> = FxHashSet::default();
-    let mut glob_targets: FxHashSet<String> = FxHashSet::default();
-
+    let (mut edge_set, mut rt_set, mut glob_targets) =
+        (FxHashSet::default(), FxHashSet::default(), FxHashSet::default());
     for (rel, entry) in files {
         collect_file_edges(rel, entry, tbl, &mut edge_set, &mut rt_set, &mut glob_targets);
     }
-
     let mut edges: Vec<(String, String)> = edge_set.into_iter().collect();
     let mut runtime_edges: Vec<(String, String)> = rt_set.into_iter().collect();
     edges.sort();
@@ -699,50 +662,31 @@ fn compute_fan_counts(
 }
 
 fn record_def_boundary_witnesses(
-    entry: &FileSymbols,
-    is_glob: bool,
-    witnesses: &mut FxHashMap<u64, RefWitness>,
+    entry: &FileSymbols, is_glob: bool, witnesses: &mut FxHashMap<u64, RefWitness>,
 ) {
     for (idx, sym) in entry.defs.iter().enumerate() {
         let flags = entry.def_meta.get(idx).map_or(0, |meta| meta.boundary_flags);
-        let has_ffi = (flags & BOUNDARY_FFI_NO_MANGLE) != 0;
-        let has_macro = (flags & BOUNDARY_MACRO_DERIVE) != 0;
-        if !is_glob && !has_ffi && !has_macro {
-            continue;
-        }
+        let (has_ffi, has_macro) =
+            ((flags & BOUNDARY_FFI_NO_MANGLE) != 0, (flags & BOUNDARY_MACRO_DERIVE) != 0);
+        if !is_glob && !has_ffi && !has_macro { continue; }
         let witness = witnesses.entry(hash_symbol(sym)).or_default();
-        if is_glob {
-            witness.add_flag(WITNESS_GLOB_REEXPORT);
-        }
-        if has_ffi {
-            witness.add_flag(WITNESS_EXTERNAL);
-        }
-        if has_macro {
-            witness.add_flag(WITNESS_MACRO_ATTR);
-        }
+        if is_glob { witness.add_flag(WITNESS_GLOB_REEXPORT); }
+        if has_ffi { witness.add_flag(WITNESS_EXTERNAL); }
+        if has_macro { witness.add_flag(WITNESS_MACRO_ATTR); }
     }
 }
 
 fn record_source_witnesses(
-    files: &BTreeMap<String, FileSymbols>,
-    glob_targets: &FxHashSet<String>,
-    arena: &mut PathArena,
-    witnesses: &mut FxHashMap<u64, RefWitness>,
+    files: &BTreeMap<String, FileSymbols>, glob_targets: &FxHashSet<String>,
+    arena: &mut PathArena, witnesses: &mut FxHashMap<u64, RefWitness>,
 ) {
     for (rel, entry) in files {
         let fid = arena.intern(rel);
-        for tok in &entry.refs_tokens {
-            witnesses.entry(hash_symbol(tok)).or_default().record_prod(fid);
-        }
-        for tok in &entry.test_refs_tokens {
-            witnesses.entry(hash_symbol(tok)).or_default().record_test(fid);
-        }
+        for tok in &entry.refs_tokens { witnesses.entry(hash_symbol(tok)).or_default().record_prod(fid); }
+        for tok in &entry.test_refs_tokens { witnesses.entry(hash_symbol(tok)).or_default().record_test(fid); }
         record_def_boundary_witnesses(entry, glob_targets.contains(rel), witnesses);
         for attr_sym in &entry.attr_refs {
-            witnesses
-                .entry(hash_symbol(attr_sym))
-                .or_default()
-                .add_flag(WITNESS_DYNAMIC_REF);
+            witnesses.entry(hash_symbol(attr_sym)).or_default().add_flag(WITNESS_DYNAMIC_REF);
         }
     }
 }
@@ -750,82 +694,56 @@ fn record_source_witnesses(
 type TestHashMap = BTreeMap<String, (String, Vec<u64>)>;
 
 fn collect_test_hashes_cached(
-    repo_root: &Path,
-    preloaded: Option<&BTreeMap<String, Vec<u8>>>,
-    tests: &[(String, String, Option<PathBuf>)],
-    prev_test_hashes: &TestHashMap,
+    repo_root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8>>>,
+    tests: &[(String, String, Option<PathBuf>)], prev_test_hashes: &TestHashMap,
 ) -> (TestHashMap, bool) {
-    let scan_test = |(rel, ext, _): &(String, String, Option<PathBuf>)| -> Option<(String, String, Vec<u64>, bool)> {
+    let rows = par_map(tests, |(rel, ext, _)| {
         let bytes = read_bytes(repo_root, rel, preloaded)?;
         let hash = MvccStore::hash_bytes(&bytes);
-        if let Some((prev_h, cached_ids)) = prev_test_hashes.get(rel)
-            && prev_h == &hash
-        {
+        if let Some((prev_h, cached_ids)) = prev_test_hashes.get(rel) && prev_h == &hash {
             return Some((rel.clone(), hash, cached_ids.clone(), false));
         }
         let parsed = parse_symbols(ext, &String::from_utf8_lossy(&bytes), String::new());
-        let mut hashes: Vec<u64> = parsed
-            .refs_tokens
-            .iter()
-            .chain(parsed.test_refs_tokens.iter())
-            .map(|sym| hash_symbol(sym))
-            .collect();
+        let mut hashes: Vec<u64> = parsed.refs_tokens.iter()
+            .chain(parsed.test_refs_tokens.iter()).map(|s| hash_symbol(s)).collect();
         hashes.sort_unstable();
         hashes.dedup();
         Some((rel.clone(), hash, hashes, true))
-    };
+    });
 
-    let rows: Vec<(String, String, Vec<u64>, bool)> = if crate::platform::budget().is_constrained() {
-        tests.iter().filter_map(scan_test).collect()
-    } else {
-        tests.par_iter().filter_map(scan_test).collect()
-    };
-
-    let mut changed = rows.len() != prev_test_hashes.len();
-    let mut map = BTreeMap::new();
-    for (rel, hash, ids, was_parsed) in rows {
+    let (mut changed, mut map) = (false, BTreeMap::new());
+    for (rel, hash, ids, was_parsed) in rows.into_iter().flatten() {
         changed |= was_parsed;
         map.insert(rel, (hash, ids));
     }
+    changed |= map.len() != prev_test_hashes.len();
     (map, changed)
 }
 
 fn collect_dead_symbols_for_file(
-    rel: &str,
-    fid: u32,
-    entry: &FileSymbols,
-    glob_targets: &FxHashSet<String>,
-    witnesses: &FxHashMap<u64, RefWitness>,
-    dead: &mut Vec<DeadSymbol>,
+    rel: &str, fid: u32, entry: &FileSymbols, glob_targets: &FxHashSet<String>,
+    witnesses: &FxHashMap<u64, RefWitness>, dead: &mut Vec<DeadSymbol>,
 ) {
-    let is_boundary_file = entrypoint(rel)
-        || rel.ends_with("layout.tsx")
-        || rel.ends_with("layout.ts")
-        || glob_targets.contains(rel);
+    let is_boundary_file = entrypoint(rel) || rel.ends_with("layout.tsx")
+        || rel.ends_with("layout.ts") || glob_targets.contains(rel);
     let file_boundary = if is_boundary_file { BOUNDARY_ENTRYPOINT_OR_GLOB } else { 0 };
-
     for (idx, sym) in entry.defs.iter().enumerate() {
         let meta = entry.def_meta.get(idx).copied().unwrap_or_default();
         let witness = witnesses.get(&hash_symbol(sym)).copied().unwrap_or_default();
-        let combined_flags = meta.boundary_flags | file_boundary;
-        if let Some(tier) = classify_symbol(fid, witness, meta.intra_non_def_hits, combined_flags)
+        if let Some(tier) =
+            classify_symbol(fid, witness, meta.intra_non_def_hits, meta.boundary_flags | file_boundary)
             && tier.is_dead_candidate()
         {
             dead.push(DeadSymbol {
-                file: rel.to_string(),
-                symbol: sym.clone(),
-                proof_tier: Some(tier.as_str().to_string()),
+                file: rel.to_string(), symbol: sym.clone(), proof_tier: Some(tier.as_str().into()),
             });
         }
     }
 }
 
 fn build_graph(
-    files: BTreeMap<String, FileSymbols>,
-    test_hashes: &TestHashMap,
-    edges: &[(String, String)],
-    runtime_edges: &[(String, String)],
-    glob_targets: &FxHashSet<String>,
+    files: BTreeMap<String, FileSymbols>, test_hashes: &TestHashMap,
+    edges: &[(String, String)], runtime_edges: &[(String, String)], glob_targets: &FxHashSet<String>,
 ) -> SymbolGraph {
     let (fan_in, fan_out) = compute_fan_counts(runtime_edges);
     let mut arena = PathArena::with_capacity(files.len() + test_hashes.len());
@@ -934,6 +852,346 @@ fn resolve_stem(imp: &str, src_dir: &str, src_ext: &str, tbl: &LookupTables) -> 
     if matches.len() == 1 { vec![matches[0].clone()] } else { Vec::new() }
 }
 
+// ============================================================================
+// Folded Zstd Front-Coded (`k = 8`) SST Index (`RFST0004`)
+// ============================================================================
+
+#[cfg(test)]
+fn pkg_id_for_rel(rel: &str) -> String {
+    let mut parts = rel.split('/');
+    let Some(first) = parts.next() else { return "root".into() };
+    if matches!(first, "packages" | "crates" | "apps" | "libs" | "services")
+        && let Some(second) = parts.next() && !second.is_empty()
+    {
+        return format!("{first}/{second}");
+    }
+    if parts.next().is_some() { first.to_string() } else { "root".into() }
+}
+
+#[cfg(test)]
+fn package_abi_changed(prev: Option<&[u8; 32]>, next: &[u8; 32]) -> bool { prev != Some(next) }
+
+#[inline]
+fn read_le_u32(buf: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(buf.get(off..off + 4)?.try_into().ok()?))
+}
+
+#[inline]
+fn read_le_u64(buf: &[u8], off: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(buf.get(off..off + 8)?.try_into().ok()?))
+}
+
+#[inline]
+fn write_varint(out: &mut Vec<u8>, mut val: u32) {
+    while val >= 0x80 {
+        out.push(((val as u8) & 0x7F) | 0x80);
+        val >>= 7;
+    }
+    out.push(val as u8);
+}
+
+#[inline]
+fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u32> {
+    let (mut out, mut shift) = (0u32, 0u32);
+    while *pos < buf.len() && shift < 32 {
+        let b = buf[*pos];
+        *pos += 1;
+        out |= ((b & 0x7F) as u32) << shift;
+        if (b & 0x80) == 0 { return Some(out); }
+        shift += 7;
+    }
+    None
+}
+
+fn encode_front_coded_block(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(entries.len().saturating_mul(24).max(64));
+    let mut restarts = Vec::with_capacity((entries.len() / RESTART_INTERVAL) + 1);
+    let mut prev: &[u8] = b"";
+    for (idx, &(key, val)) in entries.iter().enumerate() {
+        let shared = if idx % RESTART_INTERVAL == 0 {
+            restarts.push(data.len() as u16);
+            0
+        } else {
+            let mut n = 0usize;
+            while n < prev.len() && n < key.len() && prev[n] == key[n] {
+                n += 1;
+            }
+            n
+        };
+        let suffix = &key[shared..];
+        write_varint(&mut data, shared as u32);
+        write_varint(&mut data, suffix.len() as u32);
+        data.extend_from_slice(suffix);
+        write_varint(&mut data, val.len() as u32);
+        data.extend_from_slice(val);
+        prev = key;
+    }
+    for &off in &restarts { data.extend_from_slice(&off.to_le_bytes()); }
+    data.extend_from_slice(&(restarts.len() as u16).to_le_bytes());
+    data.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    data
+}
+
+fn block_tail_meta(block: &[u8]) -> Option<(usize, usize, usize)> {
+    let tail = block.len();
+    if tail < 4 { return None; }
+    let n_keys = u16::from_le_bytes([block[tail - 2], block[tail - 1]]) as usize;
+    let n_rest = u16::from_le_bytes([block[tail - 4], block[tail - 3]]) as usize;
+    let rest_bytes = n_rest.checked_mul(2)?.checked_add(4)?;
+    (n_rest > 0 && rest_bytes <= tail).then_some((n_keys, n_rest, tail - rest_bytes))
+}
+
+#[inline]
+fn read_fc_entry<'a>(block: &'a [u8], pos: &mut usize, cur: &mut Vec<u8>) -> Option<&'a [u8]> {
+    let shared = read_varint(block, pos)? as usize;
+    let slen = read_varint(block, pos)? as usize;
+    let suffix = block.get(*pos..pos.checked_add(slen)?)?;
+    *pos += slen;
+    let vlen = read_varint(block, pos)? as usize;
+    let val = block.get(*pos..pos.checked_add(vlen)?)?;
+    *pos += vlen;
+    if shared > cur.len() { return None; }
+    cur.truncate(shared);
+    cur.extend_from_slice(suffix);
+    Some(val)
+}
+
+fn lookup_front_coded_block<'a>(block: &'a [u8], target: &[u8]) -> Option<&'a [u8]> {
+    let (n_keys, n_rest, rest_start) = block_tail_meta(block)?;
+    let rest_off = |i: usize| -> Option<usize> {
+        let o = rest_start.checked_add(i.checked_mul(2)?)?;
+        let b = block.get(o..o + 2)?;
+        Some(u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let (mut lo, mut hi) = (0usize, n_rest);
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mut p = rest_off(mid)?;
+        let _shared = read_varint(block, &mut p)?;
+        let slen = read_varint(block, &mut p)? as usize;
+        if block.get(p..p.checked_add(slen)?)? <= target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let (mut pos, mut cur) = (rest_off(lo)?, Vec::with_capacity(64));
+    for _ in 0..n_keys.saturating_sub(lo * RESTART_INTERVAL).min(RESTART_INTERVAL) {
+        let val = read_fc_entry(block, &mut pos, &mut cur)?;
+        match cur.as_slice().cmp(target) {
+            Ordering::Equal => return Some(val),
+            Ordering::Greater => return None,
+            Ordering::Less => {}
+        }
+    }
+    None
+}
+
+fn decode_front_coded_block(block: &[u8], out: &mut Vec<(Vec<u8>, Vec<u8>)>) -> Option<()> {
+    let (n_keys, _, _) = block_tail_meta(block)?;
+    let (mut pos, mut cur) = (0usize, Vec::with_capacity(64));
+    for _ in 0..n_keys {
+        let val = read_fc_entry(block, &mut pos, &mut cur)?;
+        out.push((cur.clone(), val.to_vec()));
+    }
+    Some(())
+}
+
+#[inline]
+fn blake3_tag(chunks: &[&[u8]]) -> u32 {
+    let mut h = blake3::Hasher::new();
+    for chunk in chunks { h.update(chunk); }
+    let d = h.finalize();
+    let b = d.as_bytes();
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+#[inline]
+fn sst_block_tag(offset: u64, comp_len: u32, raw_len: u32, comp: &[u8]) -> u32 {
+    blake3_tag(&[&offset.to_le_bytes(), &comp_len.to_le_bytes(), &raw_len.to_le_bytes(), comp])
+}
+
+struct BlockAnchor { first_key: Vec<u8>, offset: u64, comp_len: u32, raw_len: u32, tag: u32 }
+
+fn parse_sst_anchors(footer: &[u8], index_offset: u64, block_count: usize) -> Option<Vec<BlockAnchor>> {
+    let (mut pos, mut anchors) = (0usize, Vec::with_capacity(block_count.min(4096)));
+    for _ in 0..block_count {
+        let klen = read_varint(footer, &mut pos)? as usize;
+        let first_key = footer.get(pos..pos.checked_add(klen)?)?.to_vec();
+        pos += klen;
+        let m = footer.get(pos..pos + 20)?;
+        pos += 20;
+        let (offset, comp_len) = (read_le_u64(m, 0)?, read_le_u32(m, 8)?);
+        let (raw_len, tag) = (read_le_u32(m, 12)?, read_le_u32(m, 16)?);
+        let end = offset.checked_add(comp_len as u64)?;
+        if offset < SST_HEADER_LEN as u64 || end > index_offset || raw_len as usize > MAX_DECOMP_BLOCK_BYTES {
+            return None;
+        }
+        anchors.push(BlockAnchor { first_key, offset, comp_len, raw_len, tag });
+    }
+    (pos == footer.len()).then_some(anchors)
+}
+
+fn next_sst_block_end(entries: &[(&[u8], &[u8])], idx: usize) -> usize {
+    let (mut est, mut end) = (0usize, idx);
+    while end < entries.len() && (end - idx) < MAX_BLOCK_KEYS {
+        let sz = entries[end].0.len() + entries[end].1.len() + 8;
+        if end > idx && (est >= TARGET_BLOCK_BYTES || est + sz > MAX_BLOCK_BYTES) { break; }
+        est += sz;
+        end += 1;
+    }
+    end
+}
+
+struct SstIndex {
+    file: File,
+    anchors: Vec<BlockAnchor>,
+    entry_count: usize,
+    blocks_decoded: usize,
+    last_block: Option<(usize, Vec<u8>)>,
+}
+
+impl SstIndex {
+    fn write_atomic(path: &Path, entries: &[(&[u8], &[u8])], prev_entries: usize) -> Result<bool> {
+        if check_wipe_guard(prev_entries, entries.len()) {
+            tracing::warn!(prev_entries, new_entries = entries.len(), "SST wipe guard triggered; preserving prior SST");
+            return Ok(false);
+        }
+        let mut raw = vec![0u8; SST_HEADER_LEN];
+        let (mut anchors, mut idx) = (Vec::new(), 0usize);
+        while idx < entries.len() {
+            let end = next_sst_block_end(entries, idx);
+            let block = encode_front_coded_block(&entries[idx..end]);
+            if block.len() > MAX_DECOMP_BLOCK_BYTES {
+                tracing::warn!(block_len = block.len(), "SST block exceeds cap; skipping write");
+                return Ok(false);
+            }
+            let comp = zstd::bulk::compress(&block, 1)?;
+            let (offset, comp_len, raw_len) =
+                (raw.len() as u64, u32::try_from(comp.len())?, u32::try_from(block.len())?);
+            let tag = sst_block_tag(offset, comp_len, raw_len, &comp);
+            anchors.push(BlockAnchor { first_key: entries[idx].0.to_vec(), offset, comp_len, raw_len, tag });
+            raw.extend_from_slice(&comp);
+            idx = end;
+        }
+        let index_offset = raw.len() as u64;
+        for a in &anchors {
+            write_varint(&mut raw, a.first_key.len() as u32);
+            raw.extend_from_slice(&a.first_key);
+            raw.extend_from_slice(&a.offset.to_le_bytes());
+            for word in [a.comp_len, a.raw_len, a.tag] { raw.extend_from_slice(&word.to_le_bytes()); }
+        }
+        raw[0..8].copy_from_slice(SST_MAGIC);
+        raw[8] = 1;
+        raw[10..14].copy_from_slice(&(anchors.len() as u32).to_le_bytes());
+        raw[14..18].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        raw[18..26].copy_from_slice(&index_offset.to_le_bytes());
+        let ftag = blake3_tag(&[&raw[0..26], &raw[index_offset as usize..]]);
+        raw[26..30].copy_from_slice(&ftag.to_le_bytes());
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            ensure_cachedir_tag(parent);
+        }
+        write_atomic(path, &raw)?;
+        Ok(true)
+    }
+
+    fn open(path: &Path) -> Option<Self> {
+        let mut file = File::open(path).ok()?;
+        let file_len = file.metadata().ok()?.len();
+        if file_len < SST_HEADER_LEN as u64 { return None; }
+        let mut hdr = [0u8; SST_HEADER_LEN];
+        file.read_exact(&mut hdr).ok()?;
+        if &hdr[0..8] != SST_MAGIC || hdr[8] != 1 { return None; }
+        let (block_count, entry_count) = (read_le_u32(&hdr, 10)? as usize, read_le_u32(&hdr, 14)? as usize);
+        let (index_offset, expected_tag) = (read_le_u64(&hdr, 18)?, read_le_u32(&hdr, 26)?);
+        let footer_len = file_len.checked_sub(index_offset)?;
+        if index_offset < SST_HEADER_LEN as u64 || footer_len > MAX_DECOMP_BLOCK_BYTES as u64 {
+            return None;
+        }
+        let mut footer = vec![0u8; usize::try_from(footer_len).ok()?];
+        file.seek(SeekFrom::Start(index_offset)).ok()?;
+        file.read_exact(&mut footer).ok()?;
+        if blake3_tag(&[&hdr[0..26], &footer]) != expected_tag { return None; }
+        let anchors = parse_sst_anchors(&footer, index_offset, block_count)?;
+        Some(Self { file, anchors, entry_count, blocks_decoded: 0, last_block: None })
+    }
+
+    fn decode_block(&mut self, block_idx: usize) -> Option<&[u8]> {
+        if !self.last_block.as_ref().is_some_and(|(idx, _)| *idx == block_idx) {
+            let a = &self.anchors[block_idx];
+            let mut comp = vec![0u8; a.comp_len as usize];
+            self.file.seek(SeekFrom::Start(a.offset)).ok()?;
+            self.file.read_exact(&mut comp).ok()?;
+            if sst_block_tag(a.offset, a.comp_len, a.raw_len, &comp) != a.tag { return None; }
+            let raw = zstd::bulk::decompress(&comp, a.raw_len as usize).ok()?;
+            if raw.len() != a.raw_len as usize { return None; }
+            self.blocks_decoded += 1;
+            self.last_block = Some((block_idx, raw));
+        }
+        self.last_block.as_ref().map(|(_, buf)| buf.as_slice())
+    }
+
+    fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        let block_idx = match self.anchors.binary_search_by(|a| a.first_key.as_slice().cmp(key)) {
+            Ok(exact) => exact,
+            Err(0) => return None,
+            Err(pos) => pos - 1,
+        };
+        lookup_front_coded_block(self.decode_block(block_idx)?, key).map(<[u8]>::to_vec)
+    }
+
+    fn decode_all(&mut self) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::with_capacity(self.entry_count);
+        for idx in 0..self.anchors.len() {
+            decode_front_coded_block(self.decode_block(idx)?, &mut out)?;
+        }
+        (out.len() == self.entry_count).then_some(out)
+    }
+
+    #[cfg(test)]
+    fn blocks_decoded(&self) -> usize { self.blocks_decoded }
+}
+
+fn load_symbol_sst(path: &Path, expected_version: &str) -> Option<BTreeMap<String, FileSymbols>> {
+    let mut sst = SstIndex::open(path)?;
+    if sst.get(VERSION_KEY).as_deref() != Some(expected_version.as_bytes()) { return None; }
+    let mut files = BTreeMap::new();
+    for (key, val) in sst.decode_all()? {
+        if let Some(rel) = key.strip_prefix(b"f:") {
+            files.insert(String::from_utf8(rel.to_vec()).ok()?, serde_json::from_slice(&val).ok()?);
+        }
+    }
+    Some(files)
+}
+
+fn save_symbol_sst(
+    path: &Path, version: &str, files: &BTreeMap<String, FileSymbols>,
+    edges: &[(String, String)], runtime_edges: &[(String, String)], prev_entries: usize,
+) -> Result<bool> {
+    let mut encoded = Vec::with_capacity(files.len() + 2);
+    encoded.push((VERSION_KEY.to_vec(), version.as_bytes().to_vec()));
+    encoded.push((EDGES_KEY.to_vec(), serde_json::to_vec(&(edges, runtime_edges))?));
+    for (rel, sym) in files {
+        encoded.push((format!("f:{rel}").into_bytes(), serde_json::to_vec(sym)?));
+    }
+    encoded.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+    let refs: Vec<(&[u8], &[u8])> = encoded.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+    SstIndex::write_atomic(path, &refs, prev_entries)
+}
+
+struct FileSstLookup { sym: FileSymbols, edges: Vec<(String, String)>, runtime_edges: Vec<(String, String)> }
+
+fn query_file_sst(repo_root: &Path, expected_version: &str, norm_rel: &str) -> Option<FileSstLookup> {
+    let (_, sst_path) = cache_paths(repo_root);
+    let mut sst = sst_path.is_file().then(|| SstIndex::open(&sst_path))??;
+    if sst.get(VERSION_KEY).as_deref() != Some(expected_version.as_bytes()) { return None; }
+    let sym: FileSymbols = serde_json::from_slice(&sst.get(format!("f:{norm_rel}").as_bytes())?).ok()?;
+    let disk_bytes = fs::read(repo_root.join(norm_rel)).ok()?;
+    if MvccStore::hash_bytes(&disk_bytes) != sym.blake3 { return None; }
+    let (edges, runtime_edges) = serde_json::from_slice(&sst.get(EDGES_KEY)?).ok()?;
+    Some(FileSstLookup { sym, edges, runtime_edges })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,17 +1207,17 @@ mod tests {
             "pub fn base_fn() -> i32 { 1 }\n#[cfg(test)]\nmod tests {\n",
             "    use crate::top::top_fn;\n    #[test] fn t() { assert_eq!(top_fn(), 1); }\n}\n",
         );
-        let dir = TempRepo::with_files(
-            "sym_all",
-            &[
-                ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["src/*"]}}}"#),
-                ("src/core/auth.ts", "export function verifyToken() { return true; }\nexport function unusedGhost() { return false; }\n"),
-                ("src/ui/login.tsx", "import { verifyToken } from '../core/auth';\nexport default function Login() { return verifyToken(); }\n"),
-                ("src/ui/profile.tsx", "import { verifyToken } from '@/core/auth';\nexport function Profile() { return verifyToken(); }\n"),
-                ("src/leaf.rs", leaf),
-                ("src/top.rs", "use crate::leaf::base_fn;\npub fn top_fn() -> i32 { base_fn() }\n"),
-            ],
-        );
+        let auth = "export function verifyToken() { return true; }\nexport function unusedGhost() { return false; }\n";
+        let login = "import { verifyToken } from '../core/auth';\nexport default function Login() { return verifyToken(); }\n";
+        let profile = "import { verifyToken } from '@/core/auth';\nexport function Profile() { return verifyToken(); }\n";
+        let dir = TempRepo::with_files("sym_all", &[
+            ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["src/*"]}}}"#),
+            ("src/core/auth.ts", auth),
+            ("src/ui/login.tsx", login),
+            ("src/ui/profile.tsx", profile),
+            ("src/leaf.rs", leaf),
+            ("src/top.rs", "use crate::leaf::base_fn;\npub fn top_fn() -> i32 { base_fn() }\n"),
+        ]);
 
         let (d1, p1, c1) = index_stats(dir.path());
         assert_eq!((p1, c1), (5, 0));
@@ -986,68 +1244,137 @@ mod tests {
 
     #[test]
     fn test_t1_t4_boundaries_recursive_self_call_and_monorepo_resolution() {
-        let dir = TempRepo::with_files(
-            "stem_v2_v4",
-            &[
-                ("tsconfig.base.json", r#"{"compilerOptions":{"paths":{"@shared/*":["packages/shared/src/*"]}}}"#),
-                ("packages/web/tsconfig.json", r#"{"extends":"../../tsconfig.base.json","compilerOptions":{"paths":{"@web/*":["src/*"]}}}"#),
-                ("packages/shared/src/types.ts", "export interface UserDto { id: string }\nexport function liveShared() { return 1; }\n"),
-                ("packages/web/src/a.ts", "import type { UserDto } from '@shared/types';\nimport { liveShared } from '@shared/types';\nexport function runWeb(u: UserDto) { return liveShared() + u.id.length; }\n"),
-                ("packages/web/src/b.ts", "import type { runWeb } from '@web/a';\nexport const keepTypeEdgeOutOfScc = 1;\n"),
-                (
-                    "src/rules.rs",
-                    concat!(
-                        "use crate::sub::{\n",
-                        "    mod_helper,\n",
-                        "};\n",
-                        "#[unsafe(no_mangle)]\n",
-                        "pub extern \"C\" fn abi_export() -> i32 { 1 }\n",
-                        "#[ctor::ctor]\n",
-                        "pub fn ctor_hook() {}\n",
-                        "pub(crate) fn recursive_dead(n: u32) -> u32 {\n",
-                        "    if n == 0 { 0 } else { recursive_dead(n - 1) }\n",
-                        "}\n",
-                        "pub(crate) fn intra_helper() -> i32 { mod_helper() }\n",
-                        "pub fn entry_caller() -> i32 { intra_helper() }\n",
-                        "pub(crate) fn test_only_helper() -> i32 { 42 }\n",
-                        "#[cfg(test)]\n",
-                        "mod tests {\n",
-                        "    fn chk(buf: [u8; 16]) -> usize { buf.len() + super::test_only_helper() as usize }\n",
-                        "}\n",
-                    ),
-                ),
-                ("src/sub/mod.rs", "pub fn mod_helper() -> i32 { 7 }\n"),
-                ("src/pymod/api.py", "__all__ = ['public_exported']\ndef public_exported():\n    return 1\ndef dead_py_helper():\n    return 2\n"),
-                ("go.mod", "module example.com/acme\n\ngo 1.24\n"),
-                ("pkg/store/store.go", "package store\n//go:linkname LinkedHook runtime.hook\nfunc LinkedHook() int { return 1 }\nfunc UnusedGoFn() int { return 2 }\n"),
-                ("pkg/api/handler.go", "package api\nimport \"example.com/acme/pkg/store\"\nfunc ServeHTTP() int { return store.LinkedHook() }\n"),
-            ],
+        let web_a = concat!(
+            "import type { UserDto } from '@shared/types';\n",
+            "import { liveShared } from '@shared/types';\n",
+            "export function runWeb(u: UserDto) { return liveShared() + u.id.length; }\n",
         );
+        let rules = concat!(
+            "use crate::sub::{\n    mod_helper,\n};\n",
+            "#[unsafe(no_mangle)]\npub extern \"C\" fn abi_export() -> i32 { 1 }\n",
+            "#[ctor::ctor]\npub fn ctor_hook() {}\n",
+            "pub(crate) fn recursive_dead(n: u32) -> u32 {\n",
+            "    if n == 0 { 0 } else { recursive_dead(n - 1) }\n}\n",
+            "pub(crate) fn intra_helper() -> i32 { mod_helper() }\n",
+            "pub fn entry_caller() -> i32 { intra_helper() }\n",
+            "pub(crate) fn test_only_helper() -> i32 { 42 }\n",
+            "#[cfg(test)]\nmod tests {\n",
+            "    fn chk(buf: [u8; 16]) -> usize { buf.len() + super::test_only_helper() as usize }\n}\n",
+        );
+        let store_go = concat!(
+            "package store\n//go:linkname LinkedHook runtime.hook\n",
+            "func LinkedHook() int { return 1 }\nfunc UnusedGoFn() int { return 2 }\n",
+        );
+        let handler_go = concat!(
+            "package api\nimport \"example.com/acme/pkg/store\"\n",
+            "func ServeHTTP() int { return store.LinkedHook() }\n",
+        );
+        let dir = TempRepo::with_files("stem_v2_v4", &[
+            ("tsconfig.base.json", r#"{"compilerOptions":{"paths":{"@shared/*":["packages/shared/src/*"]}}}"#),
+            ("packages/web/tsconfig.json", r#"{"extends":"../../tsconfig.base.json","compilerOptions":{"paths":{"@web/*":["src/*"]}}}"#),
+            ("packages/shared/src/types.ts", "export interface UserDto { id: string }\nexport function liveShared() { return 1; }\n"),
+            ("packages/web/src/a.ts", web_a),
+            ("packages/web/src/b.ts", "import type { runWeb } from '@web/a';\nexport const keepTypeEdgeOutOfScc = 1;\n"),
+            ("src/rules.rs", rules),
+            ("src/sub/mod.rs", "pub fn mod_helper() -> i32 { 7 }\n"),
+            ("src/pymod/api.py", "__all__ = ['public_exported']\ndef public_exported():\n    return 1\ndef dead_py_helper():\n    return 2\n"),
+            ("go.mod", "module example.com/acme\n\ngo 1.24\n"),
+            ("pkg/store/store.go", store_go),
+            ("pkg/api/handler.go", handler_go),
+        ]);
 
         let (disc, snap) = index_repo(dir.path(), None);
-        // Multi-line Rust `use crate::sub::{ mod_helper };` -> `src/sub/mod.rs`
         assert!(has_edge(&disc.runtime_edges, "src/rules.rs", "src/sub/mod.rs"));
-        // tsconfig extends `@shared/*` -> Runtime edge
         assert!(has_edge(&disc.runtime_edges, "packages/web/src/a.ts", "packages/shared/src/types.ts"));
-        // TS `import type` is NOT in runtime_edges (cannot create runtime SCC cycles!)
         assert!(!has_edge(&disc.runtime_edges, "packages/web/src/b.ts", "packages/web/src/a.ts"));
-        // Go go.mod full module path import resolution
         assert!(has_edge(&disc.runtime_edges, "pkg/api/handler.go", "pkg/store/store.go"));
 
-        let dead_names: HashMap<&str, Option<&str>> = snap
-            .dead_symbols
-            .iter()
-            .map(|d| (d.symbol.as_str(), d.proof_tier.as_deref()))
-            .collect();
-
-        // Recursive self-call with no other callers MUST still be caught as T1ProvenDead!
+        let dead_names: HashMap<&str, Option<&str>> =
+            snap.dead_symbols.iter().map(|d| (d.symbol.as_str(), d.proof_tier.as_deref())).collect();
         assert_eq!(dead_names.get("recursive_dead"), Some(&Some("T1ProvenDead")));
         assert_eq!(dead_names.get("dead_py_helper"), Some(&Some("T2LikelyDead")));
         assert_eq!(dead_names.get("UnusedGoFn"), Some(&Some("T2LikelyDead")));
-
-        // T3 (intra-file + inline cfg(test) with [u8; 16]!) and T4 boundaries MUST NOT be flagged dead!
-        for safe in ["intra_helper", "test_only_helper", "abi_export", "ctor_hook", "public_exported", "LinkedHook", "ServeHTTP"] {
+        for safe in [
+            "intra_helper", "test_only_helper", "abi_export", "ctor_hook",
+            "public_exported", "LinkedHook", "ServeHTTP",
+        ] {
             assert!(!dead_names.contains_key(safe), "false dead symbol: {safe}");
         }
+    }
+
+    #[test]
+    fn sst_zstd_lazy_lookup_and_threshold_gate() {
+        assert_eq!(pkg_id_for_rel("packages/core/src/lib.rs"), "packages/core");
+        assert_eq!(pkg_id_for_rel("src/lib.rs"), "src");
+        assert_eq!(pkg_id_for_rel("lib.rs"), "root");
+        let (h1, h2) = ([1u8; 32], [2u8; 32]);
+        assert!(
+            package_abi_changed(None, &h1)
+                && !package_abi_changed(Some(&h1), &h1)
+                && package_abi_changed(Some(&h1), &h2)
+        );
+
+        fn as_pairs(entries: &[(String, String)]) -> Vec<(&str, &str)> {
+            entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        }
+        let small: Vec<_> = (0..20)
+            .map(|i| (format!("src/s_{i:02}.rs"), format!("pub fn small_fn_{i}() -> i32 {{ {i} }}\n")))
+            .collect();
+        let small_repo = TempRepo::with_files("sst_small", &as_pairs(&small));
+        let _ = index_repo(small_repo.path(), None);
+        assert!(small_repo.join(".refit/cache/symbol_index.zst").is_file());
+        assert!(!small_repo.join(".refit/cache/sym.sst").exists());
+        assert!(!should_use_sst(20, 4096));
+
+        let mut big = vec![("src/m_000.rs".to_string(), "pub fn sym_000() -> i32 { 0 }\n".to_string())];
+        for i in 1..520 {
+            let p = i - 1;
+            let body = format!(
+                "use crate::m_{p:03}::sym_{p:03};\npub fn sym_{i:03}() -> i32 {{ sym_{p:03}() + {i} }}\n"
+            );
+            big.push((format!("src/m_{i:03}.rs"), body));
+        }
+        let big_repo = TempRepo::with_files("sst_big", &as_pairs(&big));
+        let (disc, snap) = index_repo(big_repo.path(), None);
+        let (zst_path, sst_path) = cache_paths(big_repo.path());
+        if cfg!(feature = "sst-storage") {
+            assert!(should_use_sst(520, 4096) && sst_path.is_file() && !zst_path.exists());
+        } else {
+            let loaded = read_zstd::<Value>(&zst_path).unwrap();
+            let files: BTreeMap<String, FileSymbols> =
+                serde_json::from_value(loaded["files"].clone()).unwrap();
+            assert!(save_symbol_sst(&sst_path, "0.6.0", &files, &disc.edges, &disc.runtime_edges, 0).unwrap());
+            let _ = fs::remove_file(&zst_path);
+        }
+
+        let sst_bytes = fs::read(&sst_path).unwrap();
+        assert_eq!(&sst_bytes[0..8], SST_MAGIC);
+        let mut idx = SstIndex::open(&sst_path).unwrap();
+        let decoded = idx.decode_all().unwrap();
+        let raw_json: usize = decoded.iter().map(|(k, v)| k.len() + v.len()).sum();
+        assert!(
+            (sst_bytes.len() as f64) < (raw_json as f64) * 0.35,
+            "sst={}B raw={}B", sst_bytes.len(), raw_json
+        );
+
+        let mut lazy = SstIndex::open(&sst_path).unwrap();
+        assert_eq!(lazy.blocks_decoded(), 0);
+        let sym_250: FileSymbols = serde_json::from_slice(&lazy.get(b"f:src/m_250.rs").unwrap()).unwrap();
+        assert_eq!((lazy.blocks_decoded(), sym_250.defs), (1, vec!["sym_250".to_string()]));
+
+        let q_sst = query_symbols(big_repo.path(), None, Some("src/m_250.rs"));
+        assert_eq!(q_sst["defs"], json!(snap.defs_by_file["src/m_250.rs"]));
+        assert_eq!(q_sst["imports"], json!(snap.imports_by_file["src/m_250.rs"]));
+        assert_eq!(
+            (&q_sst["fan_in"], &q_sst["fan_out"]),
+            (&json!(snap.fan_in["src/m_250.rs"]), &json!(snap.fan_out["src/m_250.rs"]))
+        );
+
+        let mut tampered = sst_bytes;
+        let mid = SST_HEADER_LEN + (tampered.len() - SST_HEADER_LEN) / 3;
+        tampered[mid] ^= 0x01;
+        fs::write(&sst_path, &tampered).unwrap();
+        assert!(load_symbol_sst(&sst_path, "0.6.0").is_none());
+        assert_eq!(query_symbols(big_repo.path(), None, Some("src/m_250.rs")), q_sst);
     }
 }

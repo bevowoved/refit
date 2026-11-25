@@ -34,31 +34,22 @@ const PROFILES: [(&str, &str); 4] = [
 ];
 
 pub(super) fn read_prompt(skill_path: &Path) -> String {
-    match fs::read_to_string(skill_path) {
-        Ok(raw) if raw.len() >= 200 => raw,
-        _ => DEFAULT_PROMPT.into(),
-    }
+    let raw = fs::read_to_string(skill_path).ok();
+    raw.filter(|s| s.len() >= 200).unwrap_or_else(|| DEFAULT_PROMPT.into())
 }
 
 pub(super) fn prefix_map(base_skill: &str) -> BTreeMap<String, String> {
-    PROFILES
-        .into_iter()
-        .map(|(lang, prof)| (lang.into(), format!("{base_skill}\n\n{prof}")))
-        .collect()
+    PROFILES.into_iter().map(|(l, p)| (l.into(), format!("{base_skill}\n\n{p}"))).collect()
 }
 
 pub(super) fn guess_lang(unit: &ModuleUnit) -> &'static str {
     let ext = unit.files.first().map_or("", |f| ext_str(Path::new(f)));
-    if ext.eq_ignore_ascii_case("py") {
-        "py"
-    } else if ext.eq_ignore_ascii_case("rs") {
-        "rs"
-    } else if ext.eq_ignore_ascii_case("go") {
-        "go"
-    } else if is_js(ext) {
-        "ts"
-    } else {
-        "polyglot"
+    match ext.to_ascii_lowercase().as_str() {
+        "py" => "py",
+        "rs" => "rs",
+        "go" => "go",
+        _ if is_js(ext) => "ts",
+        _ => "polyglot",
     }
 }
 

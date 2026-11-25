@@ -9,8 +9,8 @@ pub use ops::{EvalOptions, SparseAttnTelemetry};
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
 use crate::platform::{
-    MemGate, SieveCache, budget, collect_os_memory, ensure_cachedir_tag, under_memory_pressure,
-    write_atomic,
+    MemGate, SieveCache, budget, collect_os_memory, ensure_cachedir_tag, env_truthy,
+    under_memory_pressure, write_atomic,
 };
 use crate::source::{quantile, read_text};
 use crate::types::{FileEgoContext, HygieneResult, Squiggle};
@@ -263,11 +263,6 @@ fn hygiene_entry_weight(key: &str, res: &HygieneResult) -> usize {
         .saturating_add(cal_b)
 }
 
-fn env_approx_long() -> bool {
-    std::env::var("REFIT_APPROX_LONG")
-        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-}
-
 pub struct HygieneScorer {
     cache: SieveCache<String, HygieneResult>,
     in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -334,7 +329,7 @@ impl HygieneScorer {
         override_weights: Option<Arc<weights::ResolvedWeights>>,
     ) -> Self {
         let disk_path = repo_root.join(".refit/cache/hygiene_v07_cache.zst");
-        let opts = EvalOptions { approx_long: env_approx_long(), ..EvalOptions::default() };
+        let opts = EvalOptions { approx_long: env_truthy("REFIT_APPROX_LONG"), ..EvalOptions::default() };
         let scorer = Self::with_path(Some(disk_path.clone()), override_weights, opts);
         let prefix = scorer.weights_blake3_prefix().to_string();
         if let Some(saved) = read_hygiene_cache(&disk_path, &prefix) {
@@ -441,7 +436,7 @@ impl HygieneScorer {
         ego: Option<&FileEgoContext>,
     ) -> HygieneResult {
         let (base, telemetry) = self.score_content_with_opts(path, content, self.default_opts);
-        let zero_ratio = model::weight_zero_ratio(self.active_weights());
+        let zero_ratio = self.active_weights().weight_zero_ratio;
         strict::score_strict_calibrated(path, content, &base, ego, telemetry.as_ref(), zero_ratio)
     }
 
@@ -528,11 +523,17 @@ mod tests {
         for s in list {
             let ln = s["line"].as_u64().unwrap() as usize;
             let raw_kind = s["kind"].as_str().unwrap();
-            let raw_prob = s["probability"].as_f64().unwrap();
-            let prob = (raw_prob * 10_000.0).round() as i64;
+            let raw_p = s["probability"].as_f64().unwrap();
+            let prob = (raw_p * 10_000.0).round() as i64;
             out.push((ln, raw_kind.to_string(), prob));
         }
         out
+    }
+
+    fn append_repeat(out: &mut String, count: usize, f: impl Fn(usize) -> String) {
+        for idx in 0..count {
+            out.push_str(&f(idx));
+        }
     }
 
     #[test]
@@ -893,9 +894,14 @@ mod tests {
         fs::remove_file(wdir.join("hygiene.json")).unwrap();
         let unpinned_err = HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap();
         assert!(unpinned_err.to_string().contains("unpinned"));
+        let assert_npz_err = |bytes: &[u8], needle: Option<&str>| {
+            let err = weights::load_weights_from_npz(bytes).err().unwrap();
+            if let Some(want) = needle {
+                assert!(err.to_string().contains(want), "got {err}");
+            }
+        };
         let oversized = vec![0u8; weights::MAX_NPZ_ARCHIVE_BYTES + 1];
-        let over_err = weights::load_weights_from_npz(&oversized).err().unwrap();
-        assert!(over_err.to_string().contains("exceeds"));
+        assert_npz_err(&oversized, Some("exceeds"));
 
         let bomb_raw = vec![0u8; weights::MAX_NPY_ENTRY_BYTES + 4096];
         let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
@@ -903,9 +909,8 @@ mod tests {
         let comp = enc.finish().unwrap();
         assert!(comp.len() < 16 * 1024);
         let bomb_zip = build_single_entry_zip("trits.npy", 8, &comp, bomb_raw.len() as u32);
-        let bomb_err = weights::load_weights_from_npz(&bomb_zip).err().unwrap();
-        assert!(bomb_err.to_string().contains("zip-bomb"));
-        assert!(weights::load_weights_from_npz(&real_npz[..40]).is_err());
+        assert_npz_err(&bomb_zip, Some("zip-bomb"));
+        assert_npz_err(&real_npz[..40], None);
     }
 
     #[test]
@@ -940,9 +945,7 @@ mod tests {
     #[test]
     fn default_v07_zero_delta_parity() {
         let mut long_src = String::with_capacity(48 * 1024);
-        for i in 0..1400 {
-            long_src.push_str(&format!("pub const ITEM_{i}: usize = {};\n", i * 3 + 1));
-        }
+        append_repeat(&mut long_src, 1400, |i| format!("pub const ITEM_{i}: usize = {};\n", i * 3 + 1));
         let w = weights::v07_weights();
         let (res, sparse_alloc) = model::reset_and_check_sparse_alloc_on_default(&long_src, w);
         let scalar = model::score_v07_scalar_only(&long_src, w);
@@ -968,31 +971,33 @@ mod tests {
     );
 
     fn build_far_clone_fixture(renamed: bool) -> String {
-        let block_b = if renamed {
-            CLONE_FN_BLOCK
-                .replace("process_order_alpha", "process_order_omega")
-                .replace("raw_input", "src_slice")
-                .replace("limit", "bound")
-                .replace("fee_bps", "tax_bps")
-                .replace("total", "accum")
-        } else {
-            CLONE_FN_BLOCK.to_string()
-        };
-        let mut out = String::with_capacity(48 * 1024);
-        for i in 0..30 {
-            out.push_str(&format!("pub fn preamble_fn_{i}(v: u64) -> u64 {{\n    v.wrapping_add({})\n}}\n", i * 7 + 3));
+        let mut block_b = CLONE_FN_BLOCK.to_string();
+        if renamed {
+            for (from, to) in [
+                ("process_order_alpha", "process_order_omega"),
+                ("raw_input", "src_slice"),
+                ("limit", "bound"),
+                ("fee_bps", "tax_bps"),
+                ("total", "accum"),
+            ] {
+                block_b = block_b.replace(from, to);
+            }
         }
+        let mut out = String::with_capacity(48 * 1024);
+        append_repeat(&mut out, 30, |i| {
+            format!("pub fn preamble_fn_{i}(v: u64) -> u64 {{\n    v.wrapping_add({})\n}}\n", i * 7 + 3)
+        });
         out.push_str(CLONE_FN_BLOCK);
-        for i in 0..260 {
-            out.push_str(&format!(
+        append_repeat(&mut out, 260, |i| {
+            format!(
                 "pub fn mid_worker_{i}(arg_{i}: u64) -> u64 {{\n    let res_{i} = arg_{i}.wrapping_mul({}) ^ {};\n    res_{i}\n}}\n",
                 i * 11 + 5, i * 13 + 9
-            ));
-        }
+            )
+        });
         out.push_str(&block_b);
-        for i in 0..80 {
-            out.push_str(&format!("pub fn epilogue_fn_{i}(z: u64) -> u64 {{\n    z.saturating_sub({})\n}}\n", i * 5 + 2));
-        }
+        append_repeat(&mut out, 80, |i| {
+            format!("pub fn epilogue_fn_{i}(z: u64) -> u64 {{\n    z.saturating_sub({})\n}}\n", i * 5 + 2)
+        });
         out
     }
 
@@ -1002,44 +1007,62 @@ mod tests {
         let approx_opts = EvalOptions { approx_long: true, approx_threshold: 1024 };
         for (label, renamed, min_hits) in [("exact", false, 12usize), ("renamed", true, 7usize)] {
             let src = build_far_clone_fixture(renamed);
-            let default_res = scorer.score_content(&format!("far_{label}.rs"), &src);
-            let (approx_res, tel_opt) = scorer.score_content_with_opts(&format!("far_{label}.rs"), &src, approx_opts);
+            let path = format!("far_{label}.rs");
+            let default_res = scorer.score_content(&path, &src);
+            let (approx_res, tel_opt) = scorer.score_content_with_opts(&path, &src, approx_opts);
             let tel = tel_opt.expect("cold approx_long run must return SparseAttnTelemetry");
             let dup_hits = approx_res
                 .squiggles
                 .iter()
                 .filter(|s| s.kind == "duplicate_block" && s.probability >= 0.80)
                 .count();
-            assert!(dup_hits >= min_hits, "{label}: expected >= {min_hits} duplicate_block hits >= 0.80, got {dup_hits} (def={}, app={})", default_res.score, approx_res.score);
-            assert!(default_res.score - approx_res.score >= 0.08, "{label}: score drop < 0.08 (def={}, app={})", default_res.score, approx_res.score);
+            assert!(
+                dup_hits >= min_hits,
+                "{label}: expected >= {min_hits} duplicate_block hits >= 0.80, got {dup_hits} (def={}, app={})",
+                default_res.score, approx_res.score
+            );
+            assert!(
+                default_res.score - approx_res.score >= 0.08,
+                "{label}: score drop < 0.08 (def={}, app={})",
+                default_res.score, approx_res.score
+            );
             assert!(tel.mli_reused && tel.engram_bytes > 0 && tel.engram_bytes <= 128 * 1024 && tel.cobs_blocks > 0);
             assert_eq!(tel.attn_mode, "v07_cobs2_engram_lsa_mli");
-            assert_eq!(scorer.score_content(&format!("far_{label}.rs"), &src).score, default_res.score);
+            assert_eq!(scorer.score_content(&path, &src).score, default_res.score);
         }
     }
 
     #[test]
     fn wired_cobs2_real_strict_preserves_local_squiggles() {
         let scorer = HygieneScorer::new();
-        let strict_src = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hygiene/strict.rs")).unwrap();
+        let strict_src = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hygiene/strict.rs"),
+        )
+        .unwrap();
         let def_strict = scorer.score_content("src/hygiene/strict.rs", &strict_src);
-        let (app_strict, tel_opt) = scorer.score_content_with_opts("src/hygiene/strict.rs", &strict_src, EvalOptions { approx_long: true, approx_threshold: 256 });
+        let opts_strict = EvalOptions { approx_long: true, approx_threshold: 256 };
+        let (app_strict, tel_opt) =
+            scorer.score_content_with_opts("src/hygiene/strict.rs", &strict_src, opts_strict);
         assert!(tel_opt.is_some() && app_strict.score <= def_strict.score + 0.005);
         for sq in def_strict.squiggles.iter().filter(|s| s.kind == "duplicate_block") {
-            assert!(app_strict.squiggles.iter().any(|a| a.kind == "duplicate_block" && a.line == sq.line), "lost strict.rs:L{}", sq.line);
+            assert!(
+                app_strict.squiggles.iter().any(|a| a.kind == "duplicate_block" && a.line == sq.line),
+                "lost strict.rs:L{}", sq.line
+            );
         }
 
         let mut long_local = String::with_capacity(48 * 1024);
-        for i in 0..380 {
-            long_local.push_str(&format!("pub fn pad_top_{i}(x: u64) -> u64 {{\n    x.wrapping_add({})\n}}\n", i * 3 + 1));
-        }
+        append_repeat(&mut long_local, 380, |i| {
+            format!("pub fn pad_top_{i}(x: u64) -> u64 {{\n    x.wrapping_add({})\n}}\n", i * 3 + 1)
+        });
         long_local.push_str(CLONE_FN_BLOCK);
         long_local.push_str(&CLONE_FN_BLOCK.replace("process_order_alpha", "process_order_beta"));
-        for i in 0..120 {
-            long_local.push_str(&format!("pub fn pad_bot_{i}(y: u64) -> u64 {{\n    y.wrapping_mul({})\n}}\n", i * 5 + 2));
-        }
+        append_repeat(&mut long_local, 120, |i| {
+            format!("pub fn pad_bot_{i}(y: u64) -> u64 {{\n    y.wrapping_mul({})\n}}\n", i * 5 + 2)
+        });
         let def_loc = scorer.score_content("long_local.rs", &long_local);
-        let (app_loc, _) = scorer.score_content_with_opts("long_local.rs", &long_local, EvalOptions { approx_long: true, approx_threshold: 1024 });
+        let opts_loc = EvalOptions { approx_long: true, approx_threshold: 1024 };
+        let (app_loc, _) = scorer.score_content_with_opts("long_local.rs", &long_local, opts_loc);
         let def_dups: Vec<usize> = def_loc
             .squiggles
             .iter()
@@ -1048,7 +1071,10 @@ mod tests {
             .collect();
         assert!(!def_dups.is_empty(), "fixture must have local duplicate_block squiggles");
         for ln in def_dups {
-            assert!(app_loc.squiggles.iter().any(|s| s.kind == "duplicate_block" && s.line == ln), "lost local dup at L{ln}");
+            assert!(
+                app_loc.squiggles.iter().any(|s| s.kind == "duplicate_block" && s.line == ln),
+                "lost local dup at L{ln}"
+            );
         }
         assert!(app_loc.score <= def_loc.score + 0.005);
     }

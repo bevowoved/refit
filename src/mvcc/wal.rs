@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const WAL_MAGIC: &[u8; 4] = b"RFWL";
-pub const WAL_HEADER_LEN: usize = 20; // magic(4) + len(4) + crc32c(4) + seq(8)
+pub const WAL_HEADER_LEN: usize = 20;
 pub const WAL_MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
 const CRC32C_POLY: u32 = 0x82F6_3B78;
 
@@ -71,8 +71,12 @@ pub enum WalHaltError {
 impl fmt::Display for WalHaltError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MidFileCorruption(off) => write!(f, "WAL clean-halt: mid-file corruption at byte offset {off}"),
-            Self::UnrecoverableRollback(detail) => write!(f, "WAL clean-halt: unrecoverable rollback ({detail})"),
+            Self::MidFileCorruption(off) => {
+                write!(f, "WAL clean-halt: mid-file corruption at byte offset {off}")
+            }
+            Self::UnrecoverableRollback(detail) => {
+                write!(f, "WAL clean-halt: unrecoverable rollback ({detail})")
+            }
         }
     }
 }
@@ -117,7 +121,7 @@ pub fn encode_wal_frame(seq: u64, payload: &[u8]) -> Result<Vec<u8>> {
     let mut frame = Vec::with_capacity(WAL_HEADER_LEN + payload.len() + 1);
     frame.extend_from_slice(WAL_MAGIC);
     frame.write_u32::<LittleEndian>(payload.len() as u32)?;
-    frame.write_u32::<LittleEndian>(0)?; // placeholder for CRC32C
+    frame.write_u32::<LittleEndian>(0)?;
     frame.write_u64::<LittleEndian>(seq)?;
     frame.extend_from_slice(payload);
     let checksum = crc32c(&frame[12..]);
@@ -195,7 +199,10 @@ fn parse_frame_header(buf: &[u8], pos: usize) -> Option<(usize, u32, u64)> {
 fn is_valid_framed_at(buf: &[u8], pos: usize) -> bool {
     let Some((len, expected_crc, _)) = parse_frame_header(buf, pos) else { return false };
     let end = pos.saturating_add(WAL_HEADER_LEN).saturating_add(len);
-    len <= WAL_MAX_FRAME_LEN && end < buf.len() && buf[end] == b'\n' && crc32c(&buf[pos + 12..end]) == expected_crc
+    len <= WAL_MAX_FRAME_LEN
+        && end < buf.len()
+        && buf[end] == b'\n'
+        && crc32c(&buf[pos + 12..end]) == expected_crc
 }
 
 fn has_valid_record_after(buf: &[u8], from: usize) -> bool {
@@ -218,6 +225,14 @@ fn has_valid_record_after(buf: &[u8], from: usize) -> bool {
     false
 }
 
+fn tail_or_corrupt(buf: &[u8], cursor: usize) -> std::result::Result<StepOutcome, WalHaltError> {
+    if has_valid_record_after(buf, cursor) {
+        Err(WalHaltError::MidFileCorruption(cursor))
+    } else {
+        Ok(StepOutcome::StopAtTornTail)
+    }
+}
+
 fn parse_framed_step(
     buf: &[u8],
     cursor: usize,
@@ -232,11 +247,7 @@ fn parse_framed_step(
     };
     let frame_end = cursor.saturating_add(WAL_HEADER_LEN).saturating_add(len);
     if len > WAL_MAX_FRAME_LEN || frame_end >= buf.len() {
-        return if has_valid_record_after(buf, cursor) {
-            Err(WalHaltError::MidFileCorruption(cursor))
-        } else {
-            Ok(StepOutcome::StopAtTornTail)
-        };
+        return tail_or_corrupt(buf, cursor);
     }
     if crc32c(&buf[cursor + 12..frame_end]) != expected_crc || buf[frame_end] != b'\n' {
         return if frame_end + 1 < buf.len() && !is_all_zero(&buf[frame_end + 1..]) {
@@ -245,7 +256,11 @@ fn parse_framed_step(
             Ok(StepOutcome::StopAtTornTail)
         };
     }
-    let seq_ok = if last_framed_seq > 0 { seq == last_framed_seq + 1 } else { seq == 1 || seq == (valid_records as u64) + 1 };
+    let seq_ok = if last_framed_seq > 0 {
+        seq == last_framed_seq + 1
+    } else {
+        seq == 1 || seq == (valid_records as u64) + 1
+    };
     if !seq_ok {
         return Err(WalHaltError::MidFileCorruption(cursor));
     }
@@ -256,11 +271,7 @@ fn parse_framed_step(
 
 fn parse_jsonl_step(buf: &[u8], cursor: usize) -> std::result::Result<StepOutcome, WalHaltError> {
     let Some(rel_nl) = memchr(b'\n', &buf[cursor..]) else {
-        return if has_valid_record_after(buf, cursor) {
-            Err(WalHaltError::MidFileCorruption(cursor))
-        } else {
-            Ok(StepOutcome::StopAtTornTail)
-        };
+        return tail_or_corrupt(buf, cursor);
     };
     let line_end = cursor + rel_nl;
     let trimmed = buf[cursor..line_end].trim_ascii();
@@ -292,10 +303,8 @@ pub fn scan_wal_bytes(
             parse_jsonl_step(buf, cursor)?
         } else if matches!(buf[cursor], b'\n' | b'\r' | b' ' | b'\t') {
             StepOutcome::Skip(cursor + 1)
-        } else if has_valid_record_after(buf, cursor) {
-            return Err(WalHaltError::MidFileCorruption(cursor));
         } else {
-            StepOutcome::StopAtTornTail
+            tail_or_corrupt(buf, cursor)?
         };
         match step {
             StepOutcome::Record { rec, next_cursor, framed_seq } => {
@@ -358,10 +367,12 @@ pub fn storage_paths(repo_root: &Path) -> (PathBuf, PathBuf) {
     if wal.exists() || cas.exists() {
         return (wal, cas);
     }
-    let (alt_wal, alt_cas) = (repo_root.join(".refit/mvcc/wal.jsonl"), repo_root.join(".refit/mvcc/cas"));
+    let alt_wal = repo_root.join(".refit/mvcc/wal.jsonl");
+    let alt_cas = repo_root.join(".refit/mvcc/cas");
     if alt_wal.exists() || alt_cas.exists() { (alt_wal, alt_cas) } else { (wal, cas) }
 }
 
 pub fn read_blob(cas_dir: &Path, hash: &str) -> Option<String> {
-    fs::read(cas_dir.join(hash)).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
+    let bytes = fs::read(cas_dir.join(hash)).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }

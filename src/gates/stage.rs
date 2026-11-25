@@ -1,11 +1,13 @@
 #[cfg(test)]
 use super::runners::find_tool_in_dirs;
 use super::runners::find_tool_on_path;
-use crate::platform::{SidecarLock, budget, ensure_cachedir_tag, now_ms, walk_files};
+use crate::platform::{
+    SidecarLock, budget, ensure_cachedir_tag, env_parse, env_truthy, file_mtime_size, now_ms,
+    par_map, walk_files,
+};
 use crate::source::{rel_norm, work_dir};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -134,11 +136,22 @@ fn prune_cache_dirs_lru(dirs: &[PathBuf], max_bytes: u64) -> Result<CacheGcStats
     Ok(CacheGcStats { evicted_entries, freed_bytes, remaining_bytes: total })
 }
 
+fn is_fresh_stage_tx(meta: &fs::Metadata) -> bool {
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    let Ok(age) = mtime.elapsed() else {
+        return false;
+    };
+    age.as_secs() < 600
+}
+
 fn is_protected_stage_entry(path: &Path, name: &str, meta: &fs::Metadata) -> bool {
-    name == "CACHEDIR.TAG"
-        || (name == "cargo-slots" && cargo_slots_has_active_lock(path))
-        || (name.starts_with("tx-") && meta.is_dir()
-            && meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age.as_secs() < 600))
+    match name {
+        "CACHEDIR.TAG" => true,
+        "cargo-slots" => cargo_slots_has_active_lock(path),
+        _ => name.starts_with("tx-") && meta.is_dir() && is_fresh_stage_tx(meta),
+    }
 }
 
 fn cargo_slots_has_active_lock(slots_dir: &Path) -> bool {
@@ -151,40 +164,46 @@ fn cargo_slots_has_active_lock(slots_dir: &Path) -> bool {
 }
 
 fn collect_lru_entries(dir: &Path, out: &mut Vec<(u64, PathBuf, bool, u64)>) -> Result<()> {
-    if !dir.exists() { return Ok(()); }
-    for item in fs::read_dir(dir).with_context(|| format!("read cache dir {}", dir.display()))?.flatten() {
-        let (name, path) = (item.file_name().to_string_lossy().into_owned(), item.path());
+    if !dir.exists() {
+        return Ok(());
+    }
+    let rd = fs::read_dir(dir).with_context(|| format!("read cache dir {}", dir.display()))?;
+    for item in rd.flatten() {
+        let name = item.file_name().to_string_lossy().into_owned();
+        let path = item.path();
         let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-        if is_protected_stage_entry(&path, &name, &meta) { continue; }
-        let (is_dir, fb) = (meta.is_dir(), system_time_ns(meta.modified().ok()));
-        let (size, mtime_ns) = if is_dir { measure_dir_tree(&path, fb) } else { (meta.len(), fb) };
+        if is_protected_stage_entry(&path, &name, &meta) {
+            continue;
+        }
+        let is_dir = meta.is_dir();
+        let (fb, fsize) = file_mtime_size(&path).unwrap_or((0, meta.len()));
+        let (size, mtime_ns) = if is_dir { measure_dir_tree(&path, fb) } else { (fsize, fb) };
         out.push((mtime_ns, path, is_dir, size));
     }
     Ok(())
 }
 
 fn measure_dir_tree(root: &Path, fallback_mtime: u64) -> (u64, u64) {
-    let (mut stack, mut total, mut newest, mut saw) = (vec![root.to_path_buf()], 0u64, 0u64, false);
+    let mut stack = vec![root.to_path_buf()];
+    let (mut total, mut newest, mut saw) = (0u64, 0u64, false);
     while let Some(cur) = stack.pop() {
         let Ok(rd) = fs::read_dir(&cur) else { continue };
         for entry in rd.flatten() {
             let path = entry.path();
             let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-            if meta.file_type().is_symlink() { continue; }
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if meta.is_dir() {
                 stack.push(path);
-            } else {
+            } else if let Some((mtime_ns, len)) = file_mtime_size(&path) {
                 saw = true;
-                total = total.saturating_add(meta.len());
-                newest = newest.max(system_time_ns(meta.modified().ok()));
+                total = total.saturating_add(len);
+                newest = newest.max(mtime_ns);
             }
         }
     }
     (total, if saw { newest } else { fallback_mtime })
-}
-
-fn system_time_ns(ts: Option<SystemTime>) -> u64 {
-    ts.and_then(|v| v.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64)
 }
 
 /// Validate `UV_LINK_MODE`, explicitly rejecting `symlink` (`Err`).
@@ -226,10 +245,6 @@ pub fn polyglot_cache_env(repo_root: &Path) -> Vec<(String, String)> {
     ];
     env.extend(py_worktree_cache_env(repo_root));
     env
-}
-
-fn env_truthy(var: &str) -> bool {
-    std::env::var(var).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
 }
 
 fn build_rust_cache_env_core(
@@ -282,7 +297,7 @@ pub(super) struct CargoSlot {
 }
 
 fn max_cargo_slots() -> usize {
-    std::env::var("REFIT_CARGO_SLOTS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(2, |n| n.clamp(1, 2))
+    env_parse::<usize>("REFIT_CARGO_SLOTS").map_or(2, |n| n.clamp(1, 2))
 }
 
 impl CargoSlot {
@@ -348,12 +363,21 @@ pub fn encode_lsp(payload: &serde_json::Value) -> Vec<u8> {
 #[cfg(test)]
 pub fn decode_lsp(raw: &[u8]) -> Option<(serde_json::Value, usize)> {
     let hdr_end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let len: usize = std::str::from_utf8(&raw[..hdr_end]).ok()?.lines().find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok()).flatten()
+    let hdr_text = std::str::from_utf8(&raw[..hdr_end]).ok()?;
+    let len: usize = hdr_text.lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        if k.trim().eq_ignore_ascii_case("content-length") {
+            v.trim().parse().ok()
+        } else {
+            None
+        }
     })?;
     let end = hdr_end + 4 + len;
-    (raw.len() >= end).then(|| serde_json::from_slice(&raw[hdr_end + 4..end]).ok().map(|v| (v, end))).flatten()
+    if raw.len() < end {
+        return None;
+    }
+    let val = serde_json::from_slice(&raw[hdr_end + 4..end]).ok()?;
+    Some((val, end))
 }
 
 fn link_or_copy_file(src: &Path, dst: &Path) -> Result<(u64, u64)> {
@@ -365,15 +389,12 @@ fn link_or_copy_file(src: &Path, dst: &Path) -> Result<(u64, u64)> {
 }
 
 fn link_or_copy_pairs(pairs: &[(PathBuf, PathBuf)]) -> Result<(u64, u64)> {
-    let step = |(hl, cp): (u64, u64), (s, d): &(PathBuf, PathBuf)| -> Result<(u64, u64)> {
-        let (dh, dc) = link_or_copy_file(s, d)?;
-        Ok((hl + dh, cp + dc))
-    };
-    if budget().is_constrained() {
-        return pairs.iter().try_fold((0u64, 0u64), step);
-    }
-    pairs.par_iter().try_fold(|| (0u64, 0u64), step)
-        .try_reduce(|| (0u64, 0u64), |a, b| Ok((a.0 + b.0, a.1 + b.1)))
+    par_map(pairs, |(s, d)| link_or_copy_file(s, d))
+        .into_iter()
+        .try_fold((0u64, 0u64), |(hl, cp), item| {
+            let (dh, dc) = item?;
+            Ok((hl + dh, cp + dc))
+        })
 }
 
 pub(super) fn materialize_stage(
@@ -421,19 +442,21 @@ mod tests {
     #[test]
     fn stage_copy_failure_propagates_and_sentinel_guard() {
         let tmp = TempRepo::with_files("stage_err", &[("src/a.rs", "pub fn ok() -> u8 { 42 }\n")]);
-        let dst_dir = tmp.join("out_stage");
-        fs::create_dir_all(&dst_dir).unwrap();
-
-        let err = link_or_copy_pairs(&[(tmp.join("src/missing.rs"), dst_dir.join("target.rs"))]).unwrap_err();
-        assert!(err.to_string().contains("stage materialize failed"));
-        let occupied = dst_dir.join("occupied_dir");
+        let dst = tmp.join("out_stage");
+        let occupied = dst.join("occupied_dir");
         fs::create_dir_all(&occupied).unwrap();
-        assert!(link_or_copy_pairs(&[(tmp.join("src/a.rs"), occupied)]).unwrap_err().to_string().contains("stage materialize failed"));
+
+        for (s, d) in [(tmp.join("src/missing.rs"), dst.join("target.rs")), (tmp.join("src/a.rs"), occupied)] {
+            let err = link_or_copy_pairs(&[(s, d)]).unwrap_err();
+            assert!(err.to_string().contains("stage materialize failed"));
+        }
 
         let stage = materialize_stage(tmp.path(), &BTreeMap::new(), &[]).unwrap();
         let mut buf = [0xFFu8; 64];
-        let n = fs::File::open(stage.join("src/a.rs")).unwrap().read(&mut buf).unwrap();
-        assert!(n > 0 && &buf[..n] == b"pub fn ok() -> u8 { 42 }\n" && buf[n..].iter().all(|&b| b == 0xFF));
+        let mut file = fs::File::open(stage.join("src/a.rs")).unwrap();
+        let n = file.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"pub fn ok() -> u8 { 42 }\n");
+        assert!(buf[n..].iter().all(|&b| b == 0xFF));
     }
 
     #[test]
@@ -441,26 +464,27 @@ mod tests {
         let tmp = TempRepo::with_files("stage_cache_orch", &[("src/a.rs", "pub fn x() -> u8 { 7 }\n")]);
         let src = tmp.join("src/a.rs");
 
-        // 1. clone_or_copy EPERM/EXDEV/ENOSYS -> hardlink -> verified copy cascade.
         for (idx, code) in [1i32, 18, 38].into_iter().enumerate() {
-            let hl = clone_or_copy_cascade(&src, &tmp.join(&format!("hl_{idx}.rs")), |_, _| Err(io::Error::from_raw_os_error(code)), |s, d| fs::hard_link(s, d)).unwrap();
+            let raw_err = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(code));
+            let perm = |_: &Path, _: &Path| Err(io::Error::new(io::ErrorKind::PermissionDenied, "EPERM"));
+            let hl = clone_or_copy_cascade(&src, &tmp.join(&format!("hl_{idx}.rs")), raw_err, |s, d| fs::hard_link(s, d)).unwrap();
             assert_eq!(hl, CloneOutcome::HardLinked);
             let dst_cp = tmp.join(&format!("cp_{idx}.rs"));
-            let cp = clone_or_copy_cascade(&src, &dst_cp, |_, _| Err(io::Error::new(io::ErrorKind::PermissionDenied, "EPERM")), |_, _| Err(io::Error::from_raw_os_error(code))).unwrap();
-            assert_eq!(cp, CloneOutcome::Copied);
-            assert_eq!(fs::read(&dst_cp).unwrap(), fs::read(&src).unwrap());
+            let cp = clone_or_copy_cascade(&src, &dst_cp, perm, raw_err).unwrap();
+            assert_eq!((cp, fs::read(&dst_cp).unwrap()), (CloneOutcome::Copied, fs::read(&src).unwrap()));
         }
         assert!(clone_or_copy(&tmp.join("missing.rs"), &tmp.join("never.rs")).is_err());
 
-        // 2. UV_LINK_MODE=symlink ban + safe polyglot env with zero dead REFIT_* vars.
         assert!(validate_uv_link_mode("symlink").is_err());
         assert_eq!(validate_uv_link_mode("hardlink").unwrap(), "hardlink");
         assert!(matches!(resolve_uv_link_mode(Some("symlink")), "hardlink" | "clone"));
         let poly = polyglot_cache_env(tmp.path());
-        assert!(env_val(&poly, "UV_CACHE_DIR").is_some() && matches!(env_val(&poly, "UV_LINK_MODE"), Some("hardlink" | "clone" | "copy")));
-        assert!(env_val(&poly, "REFIT_JS_RELINKER").is_none() && env_val(&poly, "REFIT_BUN_LINKER_ARGS").is_none());
+        assert!(env_val(&poly, "UV_CACHE_DIR").is_some());
+        assert!(matches!(env_val(&poly, "UV_LINK_MODE"), Some("hardlink" | "clone" | "copy")));
+        for dead in ["REFIT_JS_RELINKER", "REFIT_BUN_LINKER_ARGS"] {
+            assert!(env_val(&poly, dead).is_none());
+        }
 
-        // 3. CACHEDIR.TAG + LRU GC protecting CACHEDIR.TAG and active locked cargo-slots.
         for d in &ensure_cache_dirs_tagged(tmp.path()) {
             assert!(has_cachedir_tag(d));
         }
@@ -473,24 +497,34 @@ mod tests {
 
         let gc = prune_repo_caches(tmp.path(), 2048).unwrap();
         assert!(gc.evicted_entries >= 1 && gc.remaining_bytes <= 2048);
-        assert!(has_cachedir_tag(&cache_dir) && slot.dir.join("active.bin").exists() && !cache_dir.join("old.bin").exists());
+        assert!(has_cachedir_tag(&cache_dir) && slot.dir.join("active.bin").exists());
+        assert!(!cache_dir.join("old.bin").exists());
 
-        // 4. Conditional mbx/kache wrapper activation (absent omits wrapper; present emits RUSTC_WRAPPER).
-        let gb32 = 32 * 1024 * 1024 * 1024;
+        let (gb32, gb8) = (32u64 << 30, 8u64 << 30);
         let absent = build_rust_cache_env_core(tmp.path(), &slot.dir, true, None, gb32, false, true);
-        assert!(env_val(&absent, "RUSTC_WRAPPER").is_none() && env_val(&absent, "MBX_CACHE_DIR").is_none());
-        assert!(env_val(&absent, "MBX_BLAZE").is_none() && env_val(&absent, "REFIT_RUST_CACHE_KEY").is_none());
-        assert_eq!(env_val(&absent, "CARGO_INCREMENTAL"), Some("0"));
+        for (k, exp) in [
+            ("RUSTC_WRAPPER", None),
+            ("MBX_CACHE_DIR", None),
+            ("MBX_BLAZE", None),
+            ("REFIT_RUST_CACHE_KEY", None),
+            ("CARGO_INCREMENTAL", Some("0")),
+        ] {
+            assert_eq!(env_val(&absent, k), exp);
+        }
 
         let bin_dir = tmp.join("fake_bin");
         fs::create_dir_all(&bin_dir).unwrap();
         fs::write(bin_dir.join(if cfg!(windows) { "mbx.exe" } else { "mbx" }), b"stub").unwrap();
         let mbx_path = find_tool_in_dirs(&[bin_dir], "mbx").unwrap();
-        let with_mbx = build_rust_cache_env_core(tmp.path(), &slot.dir, false, Some((RustCacheBackend::Mbx, &mbx_path)), gb32, false, true);
+        let wrap = Some((RustCacheBackend::Mbx, mbx_path.as_path()));
+        let with_mbx = build_rust_cache_env_core(tmp.path(), &slot.dir, false, wrap, gb32, false, true);
+        let expect_blaze = cfg!(any(target_os = "linux", target_os = "macos")).then_some("1");
         assert_eq!(env_val(&with_mbx, "RUSTC_WRAPPER"), Some(mbx_path.to_str().unwrap()));
-        assert!(env_val(&with_mbx, "MBX_CACHE_DIR").is_some() && env_val(&with_mbx, "MBX_EXCLUDE_OUT_DIR") == Some("1"));
-        assert_eq!(env_val(&with_mbx, "MBX_BLAZE"), cfg!(any(target_os = "linux", target_os = "macos")).then_some("1"));
-        let low_mem = build_rust_cache_env_core(tmp.path(), &slot.dir, false, Some((RustCacheBackend::Mbx, &mbx_path)), 8 * 1024 * 1024 * 1024, false, true);
+        assert_eq!(env_val(&with_mbx, "MBX_EXCLUDE_OUT_DIR"), Some("1"));
+        assert_eq!(env_val(&with_mbx, "MBX_BLAZE"), expect_blaze);
+        assert!(env_val(&with_mbx, "MBX_CACHE_DIR").is_some());
+
+        let low_mem = build_rust_cache_env_core(tmp.path(), &slot.dir, false, wrap, gb8, false, true);
         assert!(env_val(&low_mem, "MBX_BLAZE").is_none());
         drop(slot);
     }

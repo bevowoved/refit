@@ -2,7 +2,7 @@
 //! ETag `304` sparse-index client, SemVer breaking-hop planner, `std-replacement-data`
 //! (`MSRV <= 1.100`), `RustSec` unmaintained advisories, and counterexample keep-crate guards.
 
-use crate::platform::{ensure_cachedir_tag, now_ms, read_zstd, write_zstd};
+use crate::platform::{ensure_cachedir_tag, now_ms, parse_go_block_lines, read_zstd, write_zstd};
 use crate::source::parse_deps;
 use crate::types::DepAdvisory;
 use futures_util::stream::{self, StreamExt};
@@ -134,56 +134,66 @@ pub fn parse_semver_lenient(raw: &str) -> Option<Version> {
     Version::parse(&cand).ok()
 }
 
+const STD_REPLACEMENTS: &[(&str, u32, &str)] = &[
+    ("lazy_static", 80, "std::sync::LazyLock"),
+    ("once_cell", 70, "std::sync::OnceLock"),
+    ("fs2", 89, "std::fs::File::lock"),
+    ("fs4", 89, "std::fs::File::lock"),
+    ("atty", 70, "std::io::IsTerminal"),
+    ("is-terminal", 70, "std::io::IsTerminal"),
+    ("scopeguard", 100, "std::mem::DropGuard"),
+    ("byteorder", 32, "primitive from_be_bytes/to_le_bytes"),
+    ("matches", 42, "std::matches!"),
+    ("try_from", 34, "std::convert::TryFrom"),
+    ("num_cpus", 59, "std::thread::available_parallelism (respect cgroup v2 cpu.max)"),
+];
+
+const RUSTSEC_UNMAINTAINED: &[(&str, &str, &str)] = &[
+    ("serde_yaml", "RUSTSEC-2024-0320", "serde_yaml_ng / yaml-rust2"),
+    ("fxhash", "RUSTSEC-2025-0001", "rustc-hash"),
+    ("instant", "RUSTSEC-2024-0384", "web-time"),
+    ("dotenv", "RUSTSEC-2021-0141", "dotenvy"),
+    ("yaml-rust", "RUSTSEC-2024-0320", "yaml-rust2"),
+    ("structopt", "RUSTSEC-2022-0001", "clap"),
+    ("ansi_term", "RUSTSEC-2021-0139", "anstyle"),
+    ("failure", "RUSTSEC-2020-0036", "anyhow / thiserror"),
+    ("mach", "RUSTSEC-2020-0168", "mach2"),
+    ("net2", "RUSTSEC-2020-0016", "socket2"),
+];
+
+const KEEP_GUARDS: &[(&str, &str)] = &[
+    ("mimalloc", "keeps RSS bounded with immediate purge vs glibc ptmalloc arenas"),
+    ("memchr", "SIMD-vectorized byte search outperforms scalar loops"),
+    ("similar", "patience/Myers diff outperforms naive line diffing"),
+    ("petgraph", "battle-tested graph algorithms with low overhead"),
+    ("blake3", "SIMD cryptographic hashing beats sha2/handwritten digests"),
+    ("zstd", "bounded windowLog streaming compression beats raw/gzip"),
+    ("governor", "lock-free GCRA rate pacing avoids burst drift"),
+    ("parking_lot", "compact non-poisoning locks outperform legacy mutexes"),
+    ("dunce", "safe Windows verbatim prefix stripping preserving UNC/reserved names"),
+    ("aho-corasick", "single-pass multi-pattern automaton avoids O(N*M) passes"),
+    ("tree-sitter", "incremental error-tolerant parsing"),
+];
+
+#[inline]
+fn is_semver_breaking(prev: &Version, next: &Version) -> bool {
+    next.major > prev.major || (next.major == 0 && prev.major == 0 && next.minor > prev.minor)
+}
+
 /// Official `rust-lang/std-replacement-data` subset gated by project MSRV minor (`<= 1.100`).
 pub fn std_replacement(crate_name: &str, project_msrv_minor: u32) -> Option<(u32, &'static str)> {
-    let (req_minor, replacement) = match crate_name {
-        "lazy_static" => (80, "std::sync::LazyLock"),
-        "once_cell" => (70, "std::sync::OnceLock"),
-        "fs2" | "fs4" => (89, "std::fs::File::lock"),
-        "atty" | "is-terminal" => (70, "std::io::IsTerminal"),
-        "scopeguard" => (100, "std::mem::DropGuard"),
-        "byteorder" => (32, "primitive from_be_bytes/to_le_bytes"),
-        "matches" => (42, "std::matches!"),
-        "try_from" => (34, "std::convert::TryFrom"),
-        "num_cpus" => (59, "std::thread::available_parallelism (respect cgroup v2 cpu.max)"),
-        _ => return None,
-    };
-    (project_msrv_minor >= req_minor).then_some((req_minor, replacement))
+    let &(_, req_minor, repl) = STD_REPLACEMENTS.iter().find(|&&(k, _, _)| k == crate_name)?;
+    (project_msrv_minor >= req_minor).then_some((req_minor, repl))
 }
 
 /// `RustSec` unmaintained / unsound advisory drop-in recommendations.
 pub fn rustsec_unmaintained(crate_name: &str) -> Option<(&'static str, &'static str)> {
-    match crate_name {
-        "serde_yaml" => Some(("RUSTSEC-2024-0320", "serde_yaml_ng / yaml-rust2")),
-        "fxhash" => Some(("RUSTSEC-2025-0001", "rustc-hash")),
-        "instant" => Some(("RUSTSEC-2024-0384", "web-time")),
-        "dotenv" => Some(("RUSTSEC-2021-0141", "dotenvy")),
-        "yaml-rust" => Some(("RUSTSEC-2024-0320", "yaml-rust2")),
-        "structopt" => Some(("RUSTSEC-2022-0001", "clap")),
-        "ansi_term" => Some(("RUSTSEC-2021-0139", "anstyle")),
-        "failure" => Some(("RUSTSEC-2020-0036", "anyhow / thiserror")),
-        "mach" => Some(("RUSTSEC-2020-0168", "mach2")),
-        "net2" => Some(("RUSTSEC-2020-0016", "socket2")),
-        _ => None,
-    }
+    RUSTSEC_UNMAINTAINED.iter().find(|&&(k, _, _)| k == crate_name).map(|&(_, adv, repl)| (adv, repl))
 }
 
 /// Counterexample keep-crate guard blocking naive "strip crate" false positives.
 pub fn counterexample_keep_guard(crate_name: &str) -> Option<&'static str> {
-    match crate_name {
-        "mimalloc" => Some("keeps RSS bounded with immediate purge vs glibc ptmalloc arenas"),
-        "memchr" => Some("SIMD-vectorized byte search outperforms scalar loops"),
-        "similar" => Some("patience/Myers diff outperforms naive line diffing"),
-        "petgraph" => Some("battle-tested graph algorithms with low overhead"),
-        "blake3" => Some("SIMD cryptographic hashing beats sha2/handwritten digests"),
-        "zstd" => Some("bounded windowLog streaming compression beats raw/gzip"),
-        "governor" => Some("lock-free GCRA rate pacing avoids burst drift"),
-        "parking_lot" => Some("compact non-poisoning locks outperform legacy mutexes"),
-        "dunce" => Some("safe Windows verbatim prefix stripping preserving UNC/reserved names"),
-        "aho-corasick" => Some("single-pass multi-pattern automaton avoids O(N*M) passes"),
-        "tree-sitter" => Some("incremental error-tolerant parsing"),
-        _ => None,
-    }
+    KEEP_GUARDS.iter().find(|&&(k, _)| k == crate_name).map(|&(_, why)| why)
 }
 
 /// Classify a dependency and compute its SemVer hop plan over intermediate releases.
@@ -201,30 +211,29 @@ pub fn plan_dep_hops(
     let mut prev_ver = installed_ver.clone();
     for (v, rel) in &newer {
         hops.push(rel.version.clone());
-        let semver_break = prev_ver.as_ref().is_some_and(|p| {
-            v.major > p.major || (v.major == 0 && p.major == 0 && v.minor > p.minor)
-        });
-        if rel.breaking || semver_break { breaking_count += 1; }
-        if rel.security { security_count += 1; }
+        if rel.breaking || prev_ver.as_ref().is_some_and(|p| is_semver_breaking(p, v)) {
+            breaking_count += 1;
+        }
+        if rel.security {
+            security_count += 1;
+        }
         prev_ver = Some(v.clone());
     }
     let latest = hops.last().cloned().unwrap_or_else(|| installed.to_string());
     let keep_guard = (eco == Ecosystem::Cargo).then(|| counterexample_keep_guard(name)).flatten();
-    let verdict = if eco == Ecosystem::Cargo {
-        if let Some((since_minor, replacement)) = std_replacement(name, project_msrv_minor) {
-            ReuseVerdict::ReplaceWithStd { since_minor, replacement }
-        } else if let Some((advisory, replacement)) = rustsec_unmaintained(name) {
-            ReuseVerdict::ReplaceUnmaintained { advisory, replacement }
-        } else if !hops.is_empty() {
-            ReuseVerdict::UpgradeWithChangelog
-        } else {
-            ReuseVerdict::KeepUpToDate
-        }
-    } else if !hops.is_empty() {
-        ReuseVerdict::UpgradeWithChangelog
-    } else {
+    let cargo_verdict = (eco == Ecosystem::Cargo).then(|| {
+        std_replacement(name, project_msrv_minor)
+            .map(|(since_minor, replacement)| ReuseVerdict::ReplaceWithStd { since_minor, replacement })
+            .or_else(|| {
+                rustsec_unmaintained(name)
+                    .map(|(advisory, replacement)| ReuseVerdict::ReplaceUnmaintained { advisory, replacement })
+            })
+    }).flatten();
+    let verdict = cargo_verdict.unwrap_or(if hops.is_empty() {
         ReuseVerdict::KeepUpToDate
-    };
+    } else {
+        ReuseVerdict::UpgradeWithChangelog
+    });
     HopPlan {
         ecosystem: eco, name: name.to_string(), installed: installed.to_string(), latest,
         hops, breaking_count, security_count, verdict, keep_guard,
@@ -323,43 +332,54 @@ fn split_pnpm_pkg_key(raw_key: &str) -> Option<(String, String)> {
     (!name.is_empty() && !ver.is_empty()).then(|| (name.to_string(), ver.to_string()))
 }
 
-/// Stream-parse `go.mod` as primary source and `go.sum` strictly for integrity verification.
-pub fn extract_go_mod_and_sum(mut go_mod: impl BufRead, go_sum: Option<impl BufRead>) -> Vec<LockedDep> {
+fn collect_go_sum_hashes(mut sum_r: impl BufRead) -> FxHashSet<(String, String)> {
     let mut sum_hashes: FxHashSet<(String, String)> = FxHashSet::default();
-    if let Some(mut sum_r) = go_sum {
-        let mut line = String::new();
-        while sum_r.read_line(&mut line).is_ok_and(|n| n > 0) {
-            let mut toks = line.split_whitespace();
-            if let (Some(m), Some(v), Some(h)) = (toks.next(), toks.next(), toks.next())
-                && h.starts_with("h1:")
-            {
-                sum_hashes.insert((m.to_string(), v.strip_suffix("/go.mod").unwrap_or(v).to_string()));
-            }
-            line.clear();
-        }
-    }
-    let (mut out, mut in_req, mut line) = (Vec::new(), false, String::new());
-    while go_mod.read_line(&mut line).is_ok_and(|n| n > 0) {
-        let t = line.trim();
-        if t.starts_with("require (") {
-            in_req = true;
-        } else if in_req && t.starts_with(')') {
-            in_req = false;
-        } else if let Some(b) = (if in_req { Some(t) } else { t.strip_prefix("require ") })
-            .filter(|s| !s.is_empty() && !s.starts_with("//"))
+    let mut line = String::new();
+    while sum_r.read_line(&mut line).is_ok_and(|n| n > 0) {
+        let mut fields = line.split_whitespace();
+        if let (Some(mod_path), Some(raw_ver), Some(hash)) =
+            (fields.next(), fields.next(), fields.next())
+            && hash.starts_with("h1:")
         {
-            let direct = !b.contains("// indirect");
-            let code = b.split("//").next().unwrap_or(b);
-            let mut toks = code.split_whitespace();
-            if let (Some(m), Some(v)) = (toks.next(), toks.next()) {
-                let verified = sum_hashes.is_empty() || sum_hashes.contains(&(m.to_string(), v.to_string()));
-                out.push(LockedDep {
-                    ecosystem: Ecosystem::Go, name: m.to_string(), version: v.to_string(),
-                    direct, marker: None, integrity_verified: verified,
-                });
-            }
+            let clean_ver = raw_ver.strip_suffix("/go.mod").unwrap_or(raw_ver);
+            sum_hashes.insert((mod_path.to_string(), clean_ver.to_string()));
         }
         line.clear();
+    }
+    sum_hashes
+}
+
+/// Stream-parse `go.mod` as primary source and `go.sum` strictly for integrity verification.
+pub fn extract_go_mod_and_sum(
+    go_mod: impl BufRead,
+    go_sum: Option<impl BufRead>,
+) -> Vec<LockedDep> {
+    let sum_hashes = go_sum.map(collect_go_sum_hashes).unwrap_or_default();
+    let Some(mod_txt) = read_bounded_utf8(go_mod) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in parse_go_block_lines(&mod_txt, "require") {
+        let direct = !entry.contains("// indirect");
+        let before_comment = entry.split_once("//").map_or(entry, |(head, _)| head);
+        let code = before_comment.trim();
+        let mut parts = code.split_whitespace();
+        let Some(module) = parts.next() else {
+            continue;
+        };
+        let Some(version) = parts.next() else {
+            continue;
+        };
+        let pair = (module.to_string(), version.to_string());
+        let verified = sum_hashes.is_empty() || sum_hashes.contains(&pair);
+        out.push(LockedDep {
+            ecosystem: Ecosystem::Go,
+            name: pair.0,
+            version: pair.1,
+            direct,
+            marker: None,
+            integrity_verified: verified,
+        });
     }
     out
 }
@@ -376,34 +396,35 @@ pub fn project_msrv_minor(repo_root: &Path) -> u32 {
         .map_or(100, |v| v.minor as u32)
 }
 
+fn direct_manifest_deps(repo_root: &Path, file: &str, skip_local: bool) -> FxHashSet<String> {
+    fs::read_to_string(repo_root.join(file))
+        .ok()
+        .map(|txt| {
+            parse_deps(file, &txt)
+                .into_iter()
+                .filter(|d| !skip_local || !d.is_local)
+                .map(|d| d.package)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract pinned dependencies across Cargo, pnpm v9, uv, and Go lockfiles in `repo_root`.
 pub fn extract_repo_lockfiles(repo_root: &Path) -> Vec<LockedDep> {
     let mut deps = Vec::new();
     if let Ok(f) = File::open(repo_root.join("Cargo.lock")) {
-        let mut direct = FxHashSet::default();
-        if let Ok(txt) = fs::read_to_string(repo_root.join("Cargo.toml")) {
-            for dep in parse_deps("Cargo.toml", &txt) {
-                if !dep.is_local {
-                    direct.insert(dep.package);
-                }
-            }
-        }
-        deps.extend(extract_cargo_lock(f, &direct));
+        deps.extend(extract_cargo_lock(f, &direct_manifest_deps(repo_root, "Cargo.toml", true)));
     }
     if let Ok(f) = File::open(repo_root.join("pnpm-lock.yaml")) {
         deps.extend(extract_pnpm_lock_v9(BufReader::with_capacity(LOCKFILE_BUF_BYTES, f)));
     }
     if let Ok(f) = File::open(repo_root.join("uv.lock")) {
-        let mut direct = FxHashSet::default();
-        if let Ok(txt) = fs::read_to_string(repo_root.join("pyproject.toml")) {
-            for dep in parse_deps("pyproject.toml", &txt) {
-                direct.insert(dep.package);
-            }
-        }
-        deps.extend(extract_uv_lock(f, &direct));
+        deps.extend(extract_uv_lock(f, &direct_manifest_deps(repo_root, "pyproject.toml", false)));
     }
     if let Ok(mod_f) = File::open(repo_root.join("go.mod")) {
-        let sum_r = File::open(repo_root.join("go.sum")).ok().map(|f| BufReader::with_capacity(LOCKFILE_BUF_BYTES, f));
+        let sum_r = File::open(repo_root.join("go.sum"))
+            .ok()
+            .map(|f| BufReader::with_capacity(LOCKFILE_BUF_BYTES, f));
         deps.extend(extract_go_mod_and_sum(BufReader::with_capacity(LOCKFILE_BUF_BYTES, mod_f), sum_r));
     }
     deps
@@ -433,17 +454,15 @@ fn parse_sparse_index_versions(body: &str) -> Vec<String> {
 }
 
 fn versions_to_release_refs(versions: &[String]) -> Vec<ReleaseNoteRef> {
-    let mut parsed: Vec<(Version, &str)> = Vec::with_capacity(versions.len());
-    for s in versions {
-        if let Ok(v) = Version::parse(s) {
-            parsed.push((v, s.as_str()));
-        }
-    }
+    let mut parsed: Vec<(Version, &str)> = versions
+        .iter()
+        .filter_map(|s| Version::parse(s).ok().map(|v| (v, s.as_str())))
+        .collect();
     parsed.sort_by(|a, b| a.0.cmp(&b.0));
     parsed.dedup_by(|a, b| a.0 == b.0);
     let (mut out, mut prev) = (Vec::with_capacity(parsed.len()), None::<&Version>);
     for (v, raw) in &parsed {
-        let breaking = prev.is_some_and(|p| v.major > p.major || (v.major == 0 && p.major == 0 && v.minor > p.minor));
+        let breaking = prev.is_some_and(|p| is_semver_breaking(p, v));
         out.push(ReleaseNoteRef { version: (*raw).to_string(), breaking, security: false });
         prev = Some(v);
     }

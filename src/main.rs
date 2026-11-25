@@ -283,38 +283,32 @@ fn emit_audit_ste100(
     )
 }
 
-async fn cmd_audit(
-    repo: &Path, markdown: bool, do_research: bool, ste100: bool, ste_dict: Option<&Path>, approx_long: bool,
-) -> Result<()> {
-    let mut scorer = hygiene::HygieneScorer::open_persistent(repo);
-    scorer.set_approx_long(approx_long);
-    let mut report = untangle::untangle_repo(repo, &scorer)?;
-    let dep_res = if do_research {
-        let (advisories, res) = research::WebClient::for_repo(repo, None).audit_deps_full(repo).await;
-        report.dep_advisories = advisories;
-        res
-    } else { Vec::new() };
-    emit_audit_output(&report, &dep_res, markdown, ste100, ste_dict)
-}
-
 async fn cmd_probe(
     upstream: String, model: String, api_key_file: Option<PathBuf>,
     openclaw_url: Option<String>, openclaw_token: Option<String>,
 ) -> Result<()> {
     let (key, addr) = (read_key(api_key_file.as_ref())?, "127.0.0.1:18799".to_string());
     let tel = telemetry::TelemetryHub::new(std::env::temp_dir().join("refit-probe.jsonl"))?;
-    let (pstate, handle) = proxy::start_proxy(proxy::ProxyConfig::new(addr.clone(), upstream, key, model.clone()), tel).await?;
+    let cfg = proxy::ProxyConfig::new(addr.clone(), upstream, key, model.clone());
+    let (pstate, handle) = proxy::start_proxy(cfg, tel).await?;
     let client = platform::new_http("refit-probe/0.5.0", 120, 4)?;
     let url = openclaw_url.as_ref().map_or_else(
         || format!("http://{addr}/v1/chat/completions"),
         |oc| format!("{}/chat/completions", oc.trim_end_matches('/')),
     );
-    let mut req = client.post(&url).header("x-refit-module", "probe").header("x-refit-attempt", "1").json(&json!({
+    let body_req = json!({
         "model": model, "stream": false, "max_completion_tokens": 32,
         "reasoning_effort": "low", "reasoning_format": "parsed", "temperature": 1.0,
         "messages": [{"role": "system", "content": "Reply OK."}, {"role": "user", "content": "OK"}]
-    }));
-    if let Some(tok) = openclaw_token { req = req.bearer_auth(tok); }
+    });
+    let mut req = client
+        .post(&url)
+        .header("x-refit-module", "probe")
+        .header("x-refit-attempt", "1")
+        .json(&body_req);
+    if let Some(tok) = openclaw_token {
+        req = req.bearer_auth(tok);
+    }
     let resp = req.send().await?;
     let code = resp.status().as_u16();
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
@@ -330,7 +324,10 @@ async fn cmd_probe(
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn build_rt(multi: bool) -> Result<tokio::runtime::Runtime> {
@@ -348,14 +345,19 @@ fn build_rt(multi: bool) -> Result<tokio::runtime::Runtime> {
 fn cmd_audit_sync(
     repo: &Path, markdown: bool, do_research: bool, ste100: bool, ste_dict: Option<&Path>, approx_long: bool,
 ) -> Result<()> {
-    if !do_research {
-        let mut scorer = hygiene::HygieneScorer::open_persistent(repo);
-        scorer.set_approx_long(approx_long);
-        let report = untangle::untangle_repo(repo, &scorer)?;
-        platform::collect_os_memory();
-        return emit_audit_output(&report, &[], markdown, ste100, ste_dict);
-    }
-    build_rt(false)?.block_on(cmd_audit(repo, markdown, true, ste100, ste_dict, approx_long))
+    let mut scorer = hygiene::HygieneScorer::open_persistent(repo);
+    scorer.set_approx_long(approx_long);
+    let mut report = untangle::untangle_repo(repo, &scorer)?;
+    let dep_res = if do_research {
+        let (advisories, res) = build_rt(false)?
+            .block_on(research::WebClient::for_repo(repo, None).audit_deps_full(repo));
+        report.dep_advisories = advisories;
+        res
+    } else {
+        Vec::new()
+    };
+    platform::collect_os_memory();
+    emit_audit_output(&report, &dep_res, markdown, ste100, ste_dict)
 }
 
 fn cmd_sustain(repo: &Path, dry_run: bool, ste100: bool, ste_dict: Option<&Path>) -> Result<()> {

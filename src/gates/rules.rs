@@ -1,5 +1,5 @@
 use crate::lex::has_word;
-use crate::platform::find_secret;
+use crate::platform::{find_secret, parse_go_block_lines};
 use crate::source::ext_of;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use std::collections::BTreeMap;
@@ -66,39 +66,37 @@ fn parse_rules(text: &str) -> Vec<GuardRule> {
 }
 
 fn apply_field(rule: &mut GuardRule, line: &str) {
-    if let Some(rest) = line.strip_prefix("languages:") {
-        let items = parse_list(rest);
-        rule.languages = items.into_iter().map(|lang| lang.to_ascii_lowercase()).collect();
-    } else if let Some(rest) = line.strip_prefix("paths:") {
-        rule.paths = parse_list(rest);
-    } else if let Some(rest) = line.strip_prefix("forbid_import:") {
-        rule.forbid_import = Some(strip_val(rest));
-    } else if let Some(rest) = line.strip_prefix("forbid:") {
-        rule.forbid = Some(strip_val(rest));
-    } else if let Some(rest) = line.strip_prefix("require:") {
-        rule.require = Some(strip_val(rest));
-    } else if let Some(rest) = line.strip_prefix("message:") {
-        rule.message = strip_val(rest);
+    let Some((key, rest)) = line.split_once(':') else {
+        return;
+    };
+    match key.trim() {
+        "languages" => {
+            rule.languages = parse_list(rest)
+                .into_iter()
+                .map(|lang| lang.to_ascii_lowercase())
+                .collect();
+        }
+        "paths" => rule.paths = parse_list(rest),
+        "forbid_import" => rule.forbid_import = Some(strip_val(rest)),
+        "forbid" => rule.forbid = Some(strip_val(rest)),
+        "require" => rule.require = Some(strip_val(rest)),
+        "message" => rule.message = strip_val(rest),
+        _ => {}
     }
 }
 
 fn is_comment(trimmed: &str) -> bool {
     trimmed.is_empty()
-        || trimmed.starts_with("//")
-        || trimmed.starts_with('#')
-        || trimmed.starts_with("/*")
         || trimmed == "*"
-        || trimmed.starts_with("* ")
-        || trimmed.starts_with("--")
+        || ["//", "#", "/*", "* ", "--"]
+            .iter()
+            .any(|p| trimmed.starts_with(p))
 }
 
-fn is_import(trimmed: &str, in_go: bool) -> bool {
-    in_go
-        || trimmed.starts_with("import ")
-        || trimmed.starts_with("from ")
-        || trimmed.starts_with("use ")
-        || trimmed.starts_with("pub use ")
-        || trimmed.starts_with("pub(crate) use ")
+fn is_import(trimmed: &str) -> bool {
+    ["import ", "from ", "use ", "pub use ", "pub(crate) use "]
+        .iter()
+        .any(|p| trimmed.starts_with(p))
         || trimmed.contains("require(")
         || (trimmed.starts_with("export ") && trimmed.contains(" from "))
 }
@@ -175,7 +173,10 @@ fn check_rule(rel: &str, ext: &str, content: &str, rule: &GuardRule, out: &mut V
             let t = line.trim();
             if !is_comment(t) && t.contains(pat) {
                 let ln = idx + 1;
-                out.push(format!("Gate 3.5 invariant [{}] `{rel}` L{ln}: {}", rule.id, rule.message));
+                out.push(format!(
+                    "Gate 3.5 invariant [{}] `{rel}` L{ln}: {}",
+                    rule.id, rule.message
+                ));
             }
         }
     }
@@ -193,6 +194,12 @@ fn check_rule(rel: &str, ext: &str, content: &str, rule: &GuardRule, out: &mut V
     }
 }
 
+fn line_number_at(content: &str, slice: &str) -> usize {
+    let off = slice.as_ptr() as usize - content.as_ptr() as usize;
+    let prefix = &content[..off];
+    prefix.bytes().filter(|&b| b == b'\n').count() + 1
+}
+
 fn check_imports(
     rel: &str,
     ext: &str,
@@ -201,23 +208,25 @@ fn check_imports(
     rule: &GuardRule,
     out: &mut Vec<String>,
 ) {
-    let mut in_go = false;
-    for (idx, line) in content.lines().enumerate() {
-        let t = line.trim();
-        if ext == "go" && t.starts_with("import (") {
-            in_go = true;
-            continue;
+    let mut hits = Vec::new();
+    if ext == "go" {
+        for line in parse_go_block_lines(content, "import") {
+            if !is_comment(line) && has_word(line, imp) {
+                hits.push(line_number_at(content, line));
+            }
         }
-        if in_go && t.starts_with(')') {
-            in_go = false;
-            continue;
+    } else {
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if !is_comment(trimmed) && is_import(trimmed) && has_word(trimmed, imp) {
+                hits.push(idx + 1);
+            }
         }
-        if !is_comment(t) && is_import(t, in_go) && has_word(t, imp) {
-            let ln = idx + 1;
-            out.push(format!(
-                "Gate 3.5 import-boundary [{}] `{rel}` L{ln}: forbidden import `{imp}` ({})",
-                rule.id, rule.message
-            ));
-        }
+    }
+    for ln in hits {
+        out.push(format!(
+            "Gate 3.5 import-boundary [{}] `{rel}` L{ln}: forbidden import `{imp}` ({})",
+            rule.id, rule.message
+        ));
     }
 }

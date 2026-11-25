@@ -1,4 +1,4 @@
-use crate::platform::{SieveCache, now_ms};
+use crate::platform::{SieveCache, compress_file_zstd, now_ms};
 use crate::state::RunState;
 use crate::types::{ModuleUnit, RunSummary, TelemetryEvent};
 use anyhow::{Context, Result};
@@ -64,16 +64,11 @@ impl TelemetryHub {
             fs::create_dir_all(p)
                 .with_context(|| format!("create telemetry dir {}", p.display()))?;
         }
-
-        let mut opts = OpenOptions::new();
-        opts.create(true).write(true);
-        if append {
-            opts.append(true);
-        } else {
-            opts.truncate(true);
-        }
-
-        let file = opts
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
             .open(&jsonl_path)
             .with_context(|| format!("open telemetry {}", jsonl_path.display()))?;
         let (tx, _rx) = broadcast::channel(MAX_HISTORY);
@@ -118,20 +113,17 @@ impl TelemetryHub {
             return false;
         }
         let Some(id) = spec.module_id.as_deref() else { return false };
-
         let extra = spec
             .data
             .as_ref()
             .and_then(|d| d.get("attempt"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let tpm = spec.uncached_tpm.unwrap_or(0);
-        let sig = fast_sig(kind, tpm ^ extra.rotate_left(19));
+        let sig = fast_sig(kind, spec.uncached_tpm.unwrap_or(0) ^ extra.rotate_left(19));
         let weight = id.len().saturating_add(32);
         if self.inner.last_unit_sig.insert(id.to_string(), sig, weight) != Some(sig) {
             return false;
         }
-
         self.inner.dedup_skipped.fetch_add(1, Ordering::Relaxed);
         if let Some(st) = self.inner.shared_state.lock().as_ref() {
             st.count_dedup(1);
@@ -143,22 +135,13 @@ impl TelemetryHub {
         let Ok(raw) = serde_json::to_string(ev) else { return };
         let line = redact_secrets(raw);
         let mut w = self.inner.writer.lock();
-
         if w.write_all(line.as_bytes()).is_err() || w.write_all(b"\n").is_err() {
             return;
         }
-        self.inner
-            .bytes_written
-            .fetch_add((line.len() + 1) as u64, Ordering::Relaxed);
-
+        self.inner.bytes_written.fetch_add((line.len() + 1) as u64, Ordering::Relaxed);
         let sync = matches!(
             kind,
-            "run_start"
-                | "dag_ready"
-                | "mvcc_commit"
-                | "run_end"
-                | "circuit_state"
-                | "unit_blocked"
+            "run_start" | "dag_ready" | "mvcc_commit" | "run_end" | "circuit_state" | "unit_blocked"
         );
         if sync {
             let _ = w.flush();
@@ -169,7 +152,6 @@ impl TelemetryHub {
         if self.skip_dedup(kind, &spec) {
             return;
         }
-
         let ev = TelemetryEvent {
             seq: self.inner.seq.fetch_add(1, Ordering::Relaxed),
             ts_ms: now_ms(),
@@ -181,7 +163,6 @@ impl TelemetryHub {
             data: spec.data.map(redact_json),
             summary: spec.summary,
         };
-
         self.write_line(kind, &ev);
 
         let mut hist = self.inner.history.lock();
@@ -190,16 +171,14 @@ impl TelemetryHub {
         }
         hist.push_back(ev.clone());
         drop(hist);
-
         let _ = self.inner.tx.send(ev);
     }
 
     pub fn flush_zstd(&self) -> Result<(PathBuf, u64, u64)> {
         self.inner.writer.lock().flush()?;
         let path = self.inner.jsonl_path.with_extension("jsonl.zst");
-        let (raw_len, zst_len) =
-            crate::platform::compress_file_zstd(&self.inner.jsonl_path, &path, 3)
-                .with_context(|| format!("write compact zstd {}", path.display()))?;
+        let (raw_len, zst_len) = compress_file_zstd(&self.inner.jsonl_path, &path, 3)
+            .with_context(|| format!("write compact zstd {}", path.display()))?;
         Ok((path, raw_len, zst_len))
     }
 
@@ -217,11 +196,9 @@ fn redact_json(v: Value) -> Value {
     match v {
         Value::String(s) => Value::String(redact_secrets(s)),
         Value::Array(arr) => Value::Array(arr.into_iter().map(redact_json).collect()),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(k, val)| (k, redact_json(val)))
-                .collect(),
-        ),
+        Value::Object(map) => {
+            Value::Object(map.into_iter().map(|(k, val)| (k, redact_json(val))).collect())
+        }
         other => other,
     }
 }
@@ -229,8 +206,7 @@ fn redact_json(v: Value) -> Value {
 fn fast_sig(kind: &str, val: u64) -> u64 {
     let mut h = 0xcbf29ce484222325u64 ^ val;
     for b in kind.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+        h = (h ^ (*b as u64)).wrapping_mul(0x100000001b3);
     }
     h
 }
@@ -249,8 +225,11 @@ mod tests {
 
         for _ in 0..8 {
             hub.emit("llm_stream", EventSpec {
-                module_id: Some("mod_01".into()), layer: Some(0), wave: Some(0),
-                uncached_tpm: Some(24000), ..EventSpec::default()
+                module_id: Some("mod_01".into()),
+                layer: Some(0),
+                wave: Some(0),
+                uncached_tpm: Some(24000),
+                ..EventSpec::default()
             });
         }
         assert_eq!(hub.dedup_skipped(), 7);
@@ -262,8 +241,12 @@ mod tests {
         for i in 0..30 {
             let payload = json!({"head_rev": i + 1, "ruff_errors": 0, "ty_errors": 0});
             hub.emit("mvcc_commit", EventSpec {
-                module_id: Some(format!("mod_{i:02}")), layer: Some(i / 10), wave: Some(i / 10),
-                uncached_tpm: Some(32000), data: Some(payload), ..EventSpec::default()
+                module_id: Some(format!("mod_{i:02}")),
+                layer: Some(i / 10),
+                wave: Some(i / 10),
+                uncached_tpm: Some(32000),
+                data: Some(payload),
+                ..EventSpec::default()
             });
         }
 
@@ -283,15 +266,16 @@ mod tests {
 
     #[test]
     fn test_redact_multi_secrets() {
-        let line = format!(
-            "first={} mid={} second={} tail={}",
-            ["csk", "-", "aaa111222333"].concat(),
-            ["keen", "_", "bbb444555666"].concat(),
-            ["csk", "-", "ccc777888999"].concat(),
-            ["keen", "_", "ddd000111222"].concat()
-        );
+        let parts = [
+            ("first", ["csk", "-", "aaa111222333"].concat()),
+            ("mid", ["keen", "_", "bbb444555666"].concat()),
+            ("second", ["csk", "-", "ccc777888999"].concat()),
+            ("tail", ["keen", "_", "ddd000111222"].concat()),
+        ];
+        let line = parts.map(|(k, v)| format!("{k}={v}")).join(" ");
         let clean = redact_secrets(line);
         assert!(!clean.contains("csk-") && !clean.contains("keen_"));
-        assert_eq!((clean.matches("REDACTED_CSK_").count(), clean.matches("REDACTED_KEEN_").count()), (2, 2));
+        assert_eq!(clean.matches("REDACTED_CSK_").count(), 2);
+        assert_eq!(clean.matches("REDACTED_KEEN_").count(), 2);
     }
 }
