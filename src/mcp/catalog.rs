@@ -44,6 +44,12 @@ const TOOLS: &[ToolRow] = &[
         &[],
     ),
     (
+        "refit_rewind",
+        "Query SymbolGraph-backed rewind impact set and learned rules for a symbol token.",
+        &[("token", "string"), ("trigger", "string")],
+        &["token"],
+    ),
+    (
         "refit_scan",
         "Scan repository DAG and codehygiene scores (fast cached by default).",
         &[("fast", "boolean")],
@@ -225,7 +231,7 @@ mod tests {
     #[test]
     fn catalog_is_sorted_canonical_and_digest_frozen() {
         let arr = tool_catalog().as_array().expect("catalog array");
-        assert_eq!(arr.len(), 16);
+        assert_eq!(arr.len(), 17);
 
         let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
         let mut sorted = names.clone();

@@ -777,7 +777,7 @@ mod tests {
         assert!(resp.headers().get("mcp-session-id").is_none());
         let body: Value = resp.json().await.unwrap();
         assert_eq!((&body["result"]["protocolVersion"], &body["result"]["_meta"]["ttlMs"], &body["result"]["_meta"]["cacheScope"]), (&json!("2026-07-28"), &json!(3_600_000), &json!("server")));
-        assert_eq!((&body["result"]["_meta"]["catalogDigest"], body["result"]["tools"].as_array().unwrap().len()), (&json!(catalog_digest()), 16));
+        assert_eq!((&body["result"]["_meta"]["catalogDigest"], body["result"]["tools"].as_array().unwrap().len()), (&json!(catalog_digest()), 17));
 
         let list_resp: Value = client.post(&url).header("Mcp-Method", "tools/list").json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).send().await.unwrap().json().await.unwrap();
         assert_eq!((&list_resp["result"]["_meta"]["ttlMs"], &list_resp["result"]["_meta"]["cacheScope"]), (&json!(3_600_000), &json!("server")));

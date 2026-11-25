@@ -9,15 +9,14 @@ use crate::gates::{
 };
 use crate::graph::{critical_depths, deps_context, units_interfere};
 use crate::hygiene::HygieneScorer;
-use crate::learn::LearnStore;
+use crate::learn::{Durability, InvertedRewindIndex, LearnStore};
 use crate::mvcc::MvccStore;
-use crate::platform::{
-    Durability, InvertedRewindIndex, now_ms, os_tag, self_metrics, stream_http, walk_files,
-};
+use crate::platform::{now_ms, os_tag, self_metrics, stream_http, walk_files};
 use crate::proxy::{CacheMode, ProxyConfig, start_proxy};
 use crate::research::WebClient;
 use crate::source::{count_lines, ext_str, quantile, rel_norm, source_rel, supported_ext};
 use crate::state::RunState;
+use crate::stem::load_symbols;
 use crate::telemetry::{EventSpec, TelemetryHub};
 use crate::types::{BenchReport, ModuleUnit, RunSummary};
 use crate::worktree::{Worktree, diffstat, open_worktree};
@@ -380,9 +379,10 @@ fn build_rewind_index(
     gate_cfg: &GateConfig,
 ) -> (InvertedRewindIndex, HashMap<String, String>) {
     let total_files: usize = bundle.plan.units.iter().map(|u| u.files.len()).sum();
-    let mut index = InvertedRewindIndex::with_capacity(total_files);
     let mut file_to_unit = HashMap::with_capacity(total_files);
     let mut unit_files: HashMap<&str, &[String]> = HashMap::with_capacity(bundle.plan.units.len());
+    let mut dur_by_file: rustc_hash::FxHashMap<&str, Durability> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(total_files, Default::default());
 
     for unit in &bundle.plan.units {
         unit_files.insert(unit.id.as_str(), unit.files.as_slice());
@@ -397,13 +397,12 @@ fn build_rewind_index(
         };
         for rel in &unit.files {
             file_to_unit.insert(rel.clone(), unit.id.clone());
-            if let Ok(bytes) = fs::read(repo_root.join(rel)) {
-                index.index_file_bytes(rel, &bytes, durability);
-            } else {
-                index.register_file(rel, durability);
-            }
+            dur_by_file.insert(rel.as_str(), durability);
         }
     }
+
+    let snap = load_symbols(repo_root, None);
+    let mut index = InvertedRewindIndex::from_symbol_graph(&snap, &dur_by_file);
 
     for unit in &bundle.plan.units {
         let Some(src_file) = unit.files.first() else { continue };

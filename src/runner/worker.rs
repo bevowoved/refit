@@ -2,13 +2,12 @@ use super::prompts::{cold_verifier_hint, guess_lang, pick_effort};
 use crate::gates::{GateConfig, net_new_diagnostics, run_gates, stage_hardlinks};
 use crate::graph::{apply_patches, build_packet, parse_patches};
 use crate::hygiene::HygieneScorer;
-use crate::learn::LearnStore;
+use crate::learn::{
+    InvertedRewindIndex, LearnStore, MIN_KERNEL_COST_US, RewindEvent, should_use_index,
+};
 use crate::mvcc::{CommitOutcome, MvccStore};
 use crate::net::drain_sse;
-use crate::platform::{
-    InvertedRewindIndex, MIN_KERNEL_COST_US, RewindEvent, backoff_ms, char_prefix, now_ms,
-    should_use_index,
-};
+use crate::platform::{backoff_ms, char_prefix, now_ms};
 use crate::proxy::ProxyState;
 use crate::research::WebClient;
 use crate::source::{count_lines, dir_of};
@@ -419,7 +418,7 @@ async fn gate_fail(ctx: &WorkerCtx, r: &mut UnitRun, attempt: u32, verdict: Gate
 }
 
 fn dispatch_rewind(ctx: &WorkerCtx, unit: &ModuleUnit, event: RewindEvent) {
-    if !should_use_index(MIN_KERNEL_COST_US) {
+    if ctx.rewind_index.file_count() == 0 || !should_use_index(MIN_KERNEL_COST_US) {
         return;
     }
     let affected_paths = ctx.rewind_index.query_event_paths(&event, MIN_KERNEL_COST_US);

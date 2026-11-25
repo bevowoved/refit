@@ -163,6 +163,14 @@ enum Commands {
         #[arg(long, default_value_t = 600)]
         cache_max_mb: u64,
     },
+    /// Inspect persisted learned failure rules and run SymbolGraph-backed rewind impact queries.
+    Learn {
+        repo: PathBuf,
+        #[arg(long)]
+        rewind: Option<String>,
+        #[arg(long, default_value = "smell")]
+        trigger: String,
+    },
     /// Run parallel DAG refactoring with formatters, Gates 0 to 3.5, and MVCC WAL.
     Run {
         #[command(flatten)]
@@ -583,6 +591,11 @@ fn main() -> Result<()> {
                 "cache_max_mb": cache_max_mb,
                 "cache_gc": cache_gc
             }))
+        }
+        Commands::Learn { repo, rewind, trigger } => {
+            let trig = learn::RewindTrigger::parse(&trigger);
+            let out = learn::query_learn_and_rewind(&repo, rewind.as_deref(), trig)?;
+            print_json(&out)
         }
         Commands::Probe { upstream, model, api_key_file, openclaw_url, openclaw_token } => {
             init_tracing();

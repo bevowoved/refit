@@ -1,4 +1,4 @@
-use crate::platform::RewindEvent;
+use crate::learn::RewindEvent;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(st.blocked_count(), 1);
 
         let ev = RewindEvent::new(
-            crate::platform::RewindTrigger::AbiChanged,
+            crate::learn::RewindTrigger::AbiChanged,
             "verify_sig".into(),
             "abi_pin".into(),
         );

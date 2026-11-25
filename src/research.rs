@@ -1,6 +1,4 @@
 pub mod deps;
-#[cfg(any(feature = "ste100", test))]
-pub mod ste100;
 
 use crate::net::{backoff_ms, is_quota_exhausted, is_retryable, retry_hdr};
 use crate::platform::{SieveCache, ensure_cachedir_tag, new_http, now_ms, read_zstd, write_zstd};
@@ -757,7 +755,7 @@ impl WebClient {
 
     #[cfg(any(feature = "ste100", test))]
     pub fn format_snippets_ste100(results: &[SearchResult]) -> String {
-        ste100::normalize_clarity_verbs(&Self::format_snippets(results))
+        crate::untangle::ste100::normalize_clarity_verbs(&Self::format_snippets(results))
     }
 }
 

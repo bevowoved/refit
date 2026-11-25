@@ -1,20 +1,25 @@
 mod clones;
-mod drift;
 mod infra;
 mod simiflow;
+#[cfg(any(feature = "ste100", test))]
+pub mod ste100;
 
 use crate::graph::dag_from;
 use crate::hygiene::HygieneScorer;
+use crate::lex::blank_noise_sentinel;
 use crate::platform::{walk_tree, write_atomic};
-use crate::source::{count_lines, entrypoint, ext_of, rel_norm, source_rel, supported_ext};
-use crate::stem::{csr, genome, index_repo};
+use crate::source::{
+    count_lines, entrypoint, ext_of, rel_norm, source_rel, supported_ext, test_path,
+};
+use crate::stem::{SymbolGraph, csr, genome, index_repo};
 use crate::types::{
-    AuditReport, GodFileScore, InfraFinding, RoleCluster, SustainFiles, TriageEntry, UnusedDep,
+    AuditReport, DocDriftFinding, GodFileScore, InfraFinding, RoleCluster, SustainFiles,
+    TriageEntry, UnusedDep,
 };
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 pub fn scan_infra(repo_root: &Path) -> (usize, Vec<UnusedDep>, Vec<InfraFinding>) {
@@ -41,8 +46,7 @@ pub fn untangle_repo(repo_root: &Path, hygiene: &HygieneScorer) -> Result<AuditR
     let (god_files, orphan_files) = rank_files(&source_rels, &preloaded, &per_file_h, &snap);
     let capability_clusters = simiflow::find_capability_clusters(&source_rels, &preloaded);
     let doc_drift_findings = if cfg!(any(feature = "doc-drift", test)) {
-        let known_symbols = drift::collect_known_symbols(&snap, &preloaded);
-        drift::scan_doc_drift(repo_root, &source_rels, &preloaded, &known_symbols)
+        scan_doc_drift(repo_root, &source_rels, &preloaded, &snap)
     } else {
         Vec::new()
     };
@@ -410,15 +414,10 @@ pub fn write_sustain(
 pub fn render_audit_ste100(
     report: &AuditReport,
     dict_path: Option<&Path>,
-) -> Result<(String, crate::research::ste100::DocumentLintReport)> {
-    use crate::research::ste100::{SteDictionary, compile_audit_markdown, lint_markdown};
-
-    let dict = match dict_path {
-        Some(path) => Some(SteDictionary::load_from_file(path)?),
-        None => None,
-    };
-    let compiled = compile_audit_markdown(report);
-    let lint = lint_markdown(&compiled, dict.as_ref());
+) -> Result<(String, ste100::DocumentLintReport)> {
+    let dict = dict_path.map(ste100::SteDictionary::load_from_file).transpose()?;
+    let compiled = ste100::compile_audit_markdown(report);
+    let lint = ste100::lint_markdown(&compiled, dict.as_ref());
     Ok((compiled, lint))
 }
 
@@ -429,13 +428,8 @@ pub fn write_sustain_ste100(
     report: &AuditReport,
     dry_run: bool,
     dict_path: Option<&Path>,
-) -> Result<(SustainFiles, crate::research::ste100::DocumentLintReport)> {
-    use crate::research::ste100::{SteDictionary, lint_markdown, normalize_clarity_verbs};
-
-    let dict = match dict_path {
-        Some(path) => Some(SteDictionary::load_from_file(path)?),
-        None => None,
-    };
+) -> Result<(SustainFiles, ste100::DocumentLintReport)> {
+    let dict = dict_path.map(ste100::SteDictionary::load_from_file).transpose()?;
     let sustain = write_sustain(repo_root, report, dry_run)?;
     let agents_doc = format!(
         concat!(
@@ -448,12 +442,391 @@ pub fn write_sustain_ste100(
         ),
         report.scc_count
     );
-    let normalized = normalize_clarity_verbs(&agents_doc);
+    let normalized = ste100::normalize_clarity_verbs(&agents_doc);
     if !dry_run {
         write_atomic(&repo_root.join("AGENTS.md"), normalized.as_bytes())?;
     }
-    let lint = lint_markdown(&normalized, dict.as_ref());
+    let lint = ste100::lint_markdown(&normalized, dict.as_ref());
     Ok((sustain, lint))
+}
+
+// ---------------------------------------------------------------------------
+// Folded ReCite / DOCER documentation & comment drift scanner
+// ---------------------------------------------------------------------------
+
+const DOC_FILENAMES: &[&str] = &[
+    "readme.md", "claude.md", "agents.md", ".cursorrules", "contributing.md", "architecture.md",
+];
+const KNOWN_PATH_ROOTS: &[&str] = &[
+    "src", "lib", "app", "pkg", "packages", "crates", "cmd", "internal", "tests", "docs",
+    "scripts", "infra", ".github", "config", "migrations", "ui", "skills",
+];
+const KNOWN_FILE_EXTS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "md", "toml", "json", "yml",
+    "yaml", "sql", "sh", "html", "css", "tf", "dockerfile",
+];
+const RUNTIME_PREFIXES: &[&str] = &[
+    ".refit/", "target/", "dist/", "build/", "node_modules/", ".venv/", "venv/", "telemetry/",
+    "coverage/", "out/", "tmp/",
+];
+const PLACEHOLDER_SEGMENTS: &[&str] = &[
+    "example", "examples", "foo", "bar", "baz", "sample", "dummy", "placeholder", "your_",
+    "my_", "path/to/", "some/", "dir/", "mock_",
+];
+const IGNORED_SYMBOLS: &[&str] = &[
+    "main", "new", "default", "clone", "copy", "drop", "len", "is_empty", "push", "pop",
+    "get", "set", "insert", "remove", "contains", "iter", "into_iter", "collect", "unwrap",
+    "expect", "format", "println", "eprintln", "print", "write", "writeln", "read", "open",
+    "close", "flush", "parse", "to_string", "as_str", "as_bytes", "into", "from", "lock",
+    "join", "spawn", "sleep", "exit", "abort", "assert", "assert_eq", "range", "super",
+    "init", "fetch", "require", "resolve", "reject", "filter", "map", "reduce", "foreach",
+    "split", "trim", "slice", "replace", "starts_with", "ends_with", "sort", "dedup",
+    "clear", "extend", "find", "any", "all", "count", "take", "skip", "zip", "chain",
+    "example", "sample", "handler", "callback", "func", "ident", "method", "my_func",
+    "some_fn", "foo_bar", "do_work", "helper", "todo", "unimplemented", "panic", "error",
+    "typeof", "sizeof", "alignof", "nameof", "print_r", "printf", "sprintf", "console",
+];
+const BUILTIN_PKG_SCRIPTS: &[&str] = &[
+    "install", "add", "remove", "update", "up", "init", "test", "start", "stop", "restart",
+    "publish", "pack", "login", "logout", "audit", "outdated", "link", "unlink", "exec",
+    "dlx", "create", "why", "list", "ls", "prune", "dedupe", "ci", "help", "version", "run",
+];
+
+struct DriftCtx<'a> {
+    repo_root: &'a Path,
+    repo_files: &'a BTreeSet<String>,
+    repo_dirs: &'a BTreeSet<String>,
+    known_symbols: &'a BTreeSet<String>,
+    npm_scripts: Option<&'a BTreeSet<String>>,
+}
+
+/// Zero-LLM ReCite / DOCER scanner consuming `SymbolGraph.defs_by_file` + `refs_by_file`
+/// directly and skipping test-only paths and Rust `#[cfg(test)]` blocks.
+fn scan_doc_drift(
+    repo_root: &Path,
+    source_rels: &[String],
+    preloaded: &BTreeMap<String, Vec<u8>>,
+    snap: &SymbolGraph,
+) -> Vec<DocDriftFinding> {
+    let known_symbols: BTreeSet<String> = snap
+        .defs_by_file
+        .values()
+        .chain(snap.refs_by_file.values())
+        .flat_map(|syms| syms.iter().cloned())
+        .collect();
+    let (repo_files, repo_dirs, doc_files) = collect_repo_inventory(repo_root, source_rels, preloaded);
+    let npm_scripts = load_package_scripts(repo_root);
+    let ctx = DriftCtx {
+        repo_root,
+        repo_files: &repo_files,
+        repo_dirs: &repo_dirs,
+        known_symbols: &known_symbols,
+        npm_scripts: npm_scripts.as_ref(),
+    };
+
+    let mut findings = Vec::new();
+    for (rel, abs) in &doc_files {
+        if let Ok(content) = fs::read_to_string(abs) {
+            scan_markdown_doc(&ctx, rel, &content, &mut findings);
+        }
+    }
+    for rel in source_rels {
+        if test_path(rel) {
+            continue;
+        }
+        let Some(bytes) = preloaded.get(rel) else { continue };
+        let content = String::from_utf8_lossy(bytes);
+        scan_source_comments(&ctx, rel, &content, &mut findings);
+    }
+
+    findings.sort_by(|a, b| {
+        a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)).then_with(|| a.kind.cmp(&b.kind)).then_with(|| a.reference.cmp(&b.reference))
+    });
+    findings.dedup_by(|a, b| a.file == b.file && a.line == b.line && a.reference == b.reference);
+    findings
+}
+
+fn collect_repo_inventory(
+    repo_root: &Path,
+    source_rels: &[String],
+    preloaded: &BTreeMap<String, Vec<u8>>,
+) -> (BTreeSet<String>, BTreeSet<String>, Vec<(String, PathBuf)>) {
+    let (mut repo_files, mut repo_dirs, mut doc_files, mut seen_docs) =
+        (BTreeSet::new(), BTreeSet::new(), Vec::new(), BTreeSet::new());
+
+    for rel in source_rels.iter().chain(preloaded.keys()) {
+        repo_files.insert(rel.clone());
+        if let Some((top, _)) = rel.split_once('/') {
+            repo_dirs.insert(top.to_string());
+        }
+    }
+    for abs in walk_tree(repo_root, None, true) {
+        let Some(rel) = rel_norm(repo_root, &abs) else { continue };
+        repo_files.insert(rel.clone());
+        if let Some((top, _)) = rel.split_once('/') {
+            repo_dirs.insert(top.to_string());
+        }
+        let lower = rel.to_ascii_lowercase();
+        let fname = lower.rsplit('/').next().unwrap_or(&lower);
+        let is_doc = DOC_FILENAMES.contains(&fname) || (lower.starts_with("docs/") && lower.ends_with(".md"));
+        if is_doc && seen_docs.insert(rel.clone()) {
+            doc_files.push((rel, abs));
+        }
+    }
+    let cursor_rules = repo_root.join(".cursorrules");
+    if cursor_rules.is_file() && seen_docs.insert(".cursorrules".into()) {
+        doc_files.push((".cursorrules".into(), cursor_rules));
+    }
+    doc_files.sort_by(|a, b| a.0.cmp(&b.0));
+    (repo_files, repo_dirs, doc_files)
+}
+
+fn load_package_scripts(repo_root: &Path) -> Option<BTreeSet<String>> {
+    let raw = fs::read_to_string(repo_root.join("package.json")).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    Some(val.get("scripts")?.as_object()?.keys().cloned().collect())
+}
+
+fn scan_markdown_doc(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec<DocDriftFinding>) {
+    let mut in_fence = false;
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || trimmed.is_empty() || contains_ignore_marker(trimmed) {
+            continue;
+        }
+        for span in extract_backtick_spans(line) {
+            check_doc_span(ctx, rel, idx + 1, span, out);
+        }
+    }
+}
+
+fn contains_ignore_marker(text: &str) -> bool {
+    let needle = b"refit: ignore";
+    text.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn extract_backtick_spans(line: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else { break };
+        let span = after[..close].trim();
+        if !span.is_empty() {
+            spans.push(span);
+        }
+        rest = &after[close + 1..];
+    }
+    spans
+}
+
+fn check_doc_span(ctx: &DriftCtx<'_>, doc_file: &str, ln: usize, span: &str, out: &mut Vec<DocDriftFinding>) {
+    if let Some(script) = extract_cli_script_ref(span) {
+        if let Some(scripts) = ctx.npm_scripts
+            && !scripts.contains(script)
+            && !is_placeholder_text(script)
+        {
+            out.push(DocDriftFinding {
+                file: doc_file.to_string(),
+                line: ln,
+                kind: "doc_stale_cli".into(),
+                reference: span.to_string(),
+                message: format!("Documented script `{script}` missing from package.json scripts"),
+            });
+        }
+        return;
+    }
+    if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs) {
+        if !ctx.repo_files.contains(clean_path) && !ctx.repo_root.join(clean_path).exists() {
+            out.push(DocDriftFinding {
+                file: doc_file.to_string(),
+                line: ln,
+                kind: "doc_stale_path".into(),
+                reference: clean_path.to_string(),
+                message: format!("Referenced file path `{clean_path}` does not exist in repository"),
+            });
+        }
+        return;
+    }
+    if !ctx.known_symbols.is_empty()
+        && let Some(sym) = parse_backtick_call_symbol(span)
+        && !is_ignored_symbol(sym)
+        && !ctx.known_symbols.contains(sym)
+    {
+        out.push(DocDriftFinding {
+            file: doc_file.to_string(),
+            line: ln,
+            kind: "doc_stale_symbol".into(),
+            reference: format!("{sym}()"),
+            message: format!("Referenced symbol `{sym}()` not found in live codebase"),
+        });
+    }
+}
+
+fn extract_cli_script_ref(span: &str) -> Option<&str> {
+    let rest = span
+        .strip_prefix("npm run ")
+        .or_else(|| span.strip_prefix("pnpm run "))
+        .or_else(|| span.strip_prefix("yarn run "))?;
+    let name = rest.split_whitespace().next()?;
+    let ok = !name.is_empty()
+        && !name.starts_with('-')
+        && !has_placeholder_chars(name)
+        && !BUILTIN_PKG_SCRIPTS.contains(&name);
+    ok.then_some(name)
+}
+
+fn has_placeholder_chars(text: &str) -> bool {
+    text.bytes().any(|b| matches!(b, b'*' | b'?' | b'<' | b'>' | b'{' | b'}' | b'[' | b']' | b'$'))
+        || text.contains("...")
+}
+
+fn is_placeholder_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    PLACEHOLDER_SEGMENTS.iter().any(|seg| lower.contains(seg))
+}
+
+fn parse_repo_path_candidate<'a>(span: &'a str, repo_dirs: &BTreeSet<String>) -> Option<&'a str> {
+    if span.contains(char::is_whitespace)
+        || span.contains("://")
+        || span.starts_with(['/', '~', '@'])
+        || has_placeholder_chars(span)
+    {
+        return None;
+    }
+    let no_frag = span.split('#').next().unwrap_or(span);
+    let stripped = match no_frag.rsplit_once(':') {
+        Some((h, t)) if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || b == b'-') => h,
+        _ => no_frag,
+    };
+    let clean = stripped.trim_start_matches("./");
+    if !clean.contains('/') || clean.contains("..") || is_placeholder_text(clean)
+        || RUNTIME_PREFIXES.iter().any(|p| clean.starts_with(p))
+    {
+        return None;
+    }
+    let (top, _) = clean.split_once('/')?;
+    if !KNOWN_PATH_ROOTS.contains(&top) && !repo_dirs.contains(top) {
+        return None;
+    }
+    let (_, ext) = clean.rsplit_once('.')?;
+    KNOWN_FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str()).then_some(clean)
+}
+
+fn parse_backtick_call_symbol(span: &str) -> Option<&str> {
+    if span.contains(char::is_whitespace) || has_placeholder_chars(span) {
+        return None;
+    }
+    let head = span.strip_suffix("()")?;
+    let sym = head.rsplit("::").next().unwrap_or(head);
+    if sym.contains(['.', '/']) || sym.len() < 4 || is_placeholder_text(sym) {
+        return None;
+    }
+    let valid = sym.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && sym.as_bytes()[0].is_ascii_alphabetic();
+    valid.then_some(sym)
+}
+
+fn is_ignored_symbol(sym: &str) -> bool {
+    IGNORED_SYMBOLS.contains(&sym.to_ascii_lowercase().as_str())
+}
+
+fn extract_comment_body<'a>(ext: &str, line: &'a str) -> Option<&'a str> {
+    let t = line.trim();
+    if ext == "py" {
+        return t.strip_prefix('#').map(str::trim);
+    }
+    t.strip_prefix("///")
+        .or_else(|| t.strip_prefix("//!"))
+        .or_else(|| t.strip_prefix("//"))
+        .or_else(|| t.strip_prefix("/**").map(|r| r.trim_end_matches("*/")))
+        .or_else(|| t.strip_prefix("/*").map(|r| r.trim_end_matches("*/")))
+        .or_else(|| t.strip_prefix("* "))
+        .map(str::trim)
+}
+
+fn scan_source_comments(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec<DocDriftFinding>) {
+    let ext = ext_of(rel);
+    let test_spans = if ext == "rs" && content.contains("cfg(test)") {
+        blank_noise_sentinel("rs", content).test_spans
+    } else {
+        Vec::new()
+    };
+    let base_ptr = content.as_ptr() as usize;
+
+    for (idx, line) in content.lines().enumerate() {
+        let offset = (line.as_ptr() as usize).saturating_sub(base_ptr);
+        if test_spans.iter().any(|&(s, e)| offset >= s && offset < e) {
+            continue;
+        }
+        let Some(comment) = extract_comment_body(&ext, line) else { continue };
+        if comment.is_empty() || contains_ignore_marker(comment) {
+            continue;
+        }
+        let ln = idx + 1;
+        for span in extract_backtick_spans(comment) {
+            if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs)
+                && !ctx.repo_files.contains(clean_path)
+                && !ctx.repo_root.join(clean_path).exists()
+            {
+                out.push(DocDriftFinding {
+                    file: rel.to_string(),
+                    line: ln,
+                    kind: "doc_stale_path".into(),
+                    reference: clean_path.to_string(),
+                    message: format!("Comment cites missing file `{clean_path}`"),
+                });
+            }
+        }
+        if !ctx.known_symbols.is_empty() {
+            scan_comment_call_refs(ctx, rel, ln, comment, out);
+        }
+    }
+}
+
+fn scan_comment_call_refs(
+    ctx: &DriftCtx<'_>,
+    rel: &str,
+    ln: usize,
+    comment: &str,
+    out: &mut Vec<DocDriftFinding>,
+) {
+    let bytes = comment.as_bytes();
+    let mut pos = 0usize;
+    while pos + 2 < bytes.len() {
+        if !(bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'_') {
+            pos += 1;
+            continue;
+        }
+        let start = pos;
+        pos += 1;
+        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+            pos += 1;
+        }
+        let is_call = pos + 1 < bytes.len() && bytes[pos] == b'(' && bytes[pos + 1] == b')';
+        let preceded_by_dot = start > 0 && bytes[start - 1] == b'.';
+        if !is_call || preceded_by_dot {
+            continue;
+        }
+        let sym = &comment[start..pos];
+        if sym.len() >= 5
+            && !is_ignored_symbol(sym)
+            && !is_placeholder_text(sym)
+            && !ctx.known_symbols.contains(sym)
+        {
+            out.push(DocDriftFinding {
+                file: rel.to_string(),
+                line: ln,
+                kind: "doc_stale_symbol".into(),
+                reference: format!("{sym}()"),
+                message: format!("Stale comment reference `{sym}()` not found in live codebase"),
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -525,5 +898,54 @@ mod tests {
         let (sus_ste, sus_lint) = write_sustain_ste100(dir.path(), &rep, true, None).unwrap();
         assert_eq!(sus_ste.files_written.len(), 4);
         assert!(sus_lint.compliant, "compiled STE100 sustain had violations: {:?}", sus_lint.issues);
+    }
+
+    #[test]
+    fn drift_skips_cfg_test_comments_catches_prod() {
+        let auth_rs = concat!(
+            "// Delegates to live_verify_token() safely\n",
+            "// Legacy note: previously called legacy_parse_wal() and `src/ghost_prod.rs`\n",
+            "pub fn live_verify_token(raw: &str) -> bool { !raw.is_empty() }\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    // Comment inside cfg(test) citing fake_test_only_fn() and `src/ghost_test.rs`\n",
+            "    #[test]\n",
+            "    fn ok() { assert!(super::live_verify_token(\"x\")); }\n",
+            "}\n",
+        );
+        let readme = concat!(
+            "# Demo\n",
+            "Live `src/auth.rs` calls `live_verify_token()`.\n",
+            "Dead `src/deleted_legacy.rs`, `old_broken_helper()`, `npm run ghost-task`.\n",
+            "Ignore `src/example/foo.rs`, `to_string()`, and live `npm run build`.\n",
+        );
+        let dir = TempRepo::with_files(
+            "doc_drift_cfg",
+            &[
+                ("src/auth.rs", auth_rs),
+                ("tests/smoke_test.rs", "// Mentions test_only_ghost_fn() in test path\n"),
+                ("README.md", readme),
+                ("package.json", r#"{"scripts":{"build":"vite build"}}"#),
+            ],
+        );
+
+        let rep = untangle_repo(dir.path(), &HygieneScorer::new()).unwrap();
+        let has = |file: &str, kind: &str, r: &str| {
+            rep.doc_drift_findings.iter().any(|f| f.file == file && f.kind == kind && f.reference == r)
+        };
+        assert!(has("src/auth.rs", "doc_stale_symbol", "legacy_parse_wal()"), "{:?}", rep.doc_drift_findings);
+        assert!(has("src/auth.rs", "doc_stale_path", "src/ghost_prod.rs"), "{:?}", rep.doc_drift_findings);
+        assert!(has("README.md", "doc_stale_path", "src/deleted_legacy.rs"), "{:?}", rep.doc_drift_findings);
+        assert!(has("README.md", "doc_stale_symbol", "old_broken_helper()"), "{:?}", rep.doc_drift_findings);
+        assert!(has("README.md", "doc_stale_cli", "npm run ghost-task"), "{:?}", rep.doc_drift_findings);
+
+        // Zero false positives on #[cfg(test)] block, test-only path, placeholders, or live symbols.
+        for bad in ["fake_test_only_fn", "ghost_test.rs", "test_only_ghost_fn", "live_verify_token", "example", "to_string", "npm run build"] {
+            assert!(
+                !rep.doc_drift_findings.iter().any(|f| f.reference.contains(bad)),
+                "false positive `{bad}` in {:?}",
+                rep.doc_drift_findings
+            );
+        }
     }
 }

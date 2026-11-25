@@ -1,7 +1,6 @@
 pub mod paths;
 mod proc;
 mod redact;
-pub mod rewind;
 
 pub use crate::net::backoff_ms;
 #[cfg(test)]
@@ -15,10 +14,6 @@ pub use proc::{
     under_memory_pressure,
 };
 pub use redact::{find_secret, redact_secrets};
-pub use rewind::{
-    Durability, InvertedRewindIndex, MIN_KERNEL_COST_US, RewindEvent, RewindTrigger,
-    should_use_index,
-};
 
 use crate::net::build_http;
 use anyhow::{Context, Result};

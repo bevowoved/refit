@@ -296,6 +296,7 @@ fn dispatch_tool(name: &str, args: &Value, ctx: &McpCtx) -> Value {
         "refit_symbols" => run_symbols(ctx, args),
         "refit_read" => run_read(ctx, args),
         "refit_resume" => run_resume(repo_root),
+        "refit_rewind" => run_rewind(ctx, args),
         "refit_verify" => run_verify(repo_root, &ctx.hygiene),
         "refit_tx_begin" => tx_begin(repo_root, args),
         "refit_tx_create" => tx_create(repo_root, args),
@@ -387,6 +388,41 @@ fn run_symbols(ctx: &McpCtx, args: &Value) -> Value {
         obj.insert("epoch".into(), json!(ep_after));
     }
     v
+}
+
+fn run_rewind(ctx: &McpCtx, args: &Value) -> Value {
+    let token = args["token"].as_str();
+    let trigger = crate::learn::RewindTrigger::parse(args["trigger"].as_str().unwrap_or("smell"));
+    let ep = ctx.epoch.global_epoch();
+    let sig = quick_repo_stat_sig(&ctx.repo_root);
+    let cached = ctx
+        .symbols_memo
+        .lock()
+        .as_ref()
+        .filter(|m| m.epoch == ep && m.stat_sig == sig)
+        .map(|m| m.value.clone());
+    let (snap, hit, ep_out) = match cached {
+        Some(g) => (g, true, ep),
+        None => {
+            let g = Arc::new(load_symbols(&ctx.repo_root, None));
+            let ep_now = ctx.epoch.global_epoch();
+            let sig_now = quick_repo_stat_sig(&ctx.repo_root);
+            *ctx.symbols_memo.lock() =
+                Some(EpochMemo { epoch: ep_now, stat_sig: sig_now, value: g.clone() });
+            (g, false, ep_now)
+        }
+    };
+    let mut val = ok_json(crate::learn::query_learn_and_rewind_with_graph(
+        &ctx.repo_root,
+        Some(&snap),
+        token,
+        trigger,
+    ));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("epoch_cache_hit".into(), json!(hit));
+        obj.insert("epoch".into(), json!(ep_out));
+    }
+    val
 }
 
 fn format_audit_value(rep: crate::types::AuditReport, args: &Value) -> Value {
@@ -627,6 +663,12 @@ mod tests {
         let live_p = asrf_edit("src/calc.ts", "  return a + b + 5;", "  const v = a + b + 6;\n  return v;");
         assert_eq!(h.apply("calc", &live_p, false)["committed"], json!(true));
         assert!(h.repo.read("src/calc.ts").contains("a + b + 6"));
+
+        let rw1 = h.call("refit_rewind", json!({"token": "add", "trigger": "advisory"}));
+        assert_eq!(rw1["epoch_cache_hit"], json!(false));
+        assert_eq!(rw1["rewind"]["affected_files"], json!(["src/calc.ts"]));
+        let rw2 = h.call("refit_rewind", json!({"token": "add", "trigger": "advisory"}));
+        assert_eq!(rw2["epoch_cache_hit"], json!(true));
     }
 
     #[test]
