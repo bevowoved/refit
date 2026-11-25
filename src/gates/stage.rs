@@ -318,7 +318,13 @@ impl CargoSlot {
         if !skipped.is_empty() { pool.lock().extend(skipped); }
         let (slot, pooled, lock) = match chosen {
             Some((s, lk)) => (s, true, Some(lk)),
-            None => (CARGO_EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed) as usize, false, None),
+            None => {
+                let s = CARGO_EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed) as usize;
+                let lk = SidecarLock::try_acquire(&slots_root.join(format!("slot-{s}.lock")))
+                    .ok()
+                    .flatten();
+                (s, false, lk)
+            }
         };
         let dir = slots_root.join(format!("slot-{slot}"));
         let _ = fs::create_dir_all(&dir);
@@ -337,6 +343,7 @@ impl Drop for CargoSlot {
             if let Some(pool) = CARGO_SLOT_POOL.get() { pool.lock().push(self.slot); }
         } else {
             let _ = fs::remove_dir_all(&self.dir);
+            let _ = fs::remove_file(self.dir.with_extension("lock"));
         }
     }
 }
