@@ -9,6 +9,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::str::FromStr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -102,9 +103,15 @@ unsafe extern "C" {
 
 #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
 fn purge_jemalloc_all_arenas() -> core::ffi::c_int {
-    // SAFETY: `arena.4096.purge\0` (`MALLCTL_ARENAS_ALL = 4096`) is a valid NUL-terminated void mallctl.
+    // SAFETY: `arena.4096.purge` (`MALLCTL_ARENAS_ALL = 4096`) is a valid NUL-terminated void mallctl.
     unsafe {
-        _rjem_mallctl(b"arena.4096.purge\0".as_ptr().cast(), core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(), 0)
+        _rjem_mallctl(
+            c"arena.4096.purge".as_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            0,
+        )
     }
 }
 
@@ -148,13 +155,36 @@ fn detect_budget() -> ResourceBudget {
     let (os_cpus, os_mem): (Option<usize>, Option<u64>) = (None, None);
     if let Some(c) = os_cpus { vcpus = vcpus.min(c.max(1)); }
     if let Some(m) = os_mem { mem_bytes = mem_bytes.min(m); }
-    if let Some(mb) = crate::platform::env_parse::<u64>("REFIT_BUDGET_MB").filter(|&m| m >= 64) {
+    if let Some(mb) = env_parse::<u64>("REFIT_BUDGET_MB").filter(|&m| m >= 64) {
         mem_bytes = mem_bytes.min(mb * MIB);
     }
-    if let Some(c) = crate::platform::env_parse::<usize>("REFIT_MAX_CPUS").filter(|&c| c >= 1) {
+    if let Some(c) = env_parse::<usize>("REFIT_MAX_CPUS").filter(|&c| c >= 1) {
         vcpus = vcpus.min(c);
     }
     ResourceBudget::from_limits(vcpus, mem_bytes)
+}
+
+/// Return trimmed non-empty env var value.
+pub fn env_trimmed(name: &str) -> Option<String> {
+    let raw = std::env::var(name).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Return `true` when env var `name` is set to a truthy literal (`1`, `true`, `yes`, `on`).
+pub fn env_truthy(name: &str) -> bool {
+    let Ok(raw) = std::env::var(name) else { return false };
+    let v = raw.trim();
+    v == "1"
+        || v.eq_ignore_ascii_case("true")
+        || v.eq_ignore_ascii_case("yes")
+        || v.eq_ignore_ascii_case("on")
+}
+
+/// Parse trimmed env var `name` into `T`.
+pub fn env_parse<T: FromStr>(name: &str) -> Option<T> {
+    let raw = std::env::var(name).ok()?;
+    raw.trim().parse::<T>().ok()
 }
 
 /// Map `items` serially when constrained (`1-vCPU` / low-RAM), else in parallel via Rayon.

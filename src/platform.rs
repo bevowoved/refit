@@ -9,8 +9,8 @@ pub use paths::{
     strip_utf8_bom, trim_crlf,
 };
 pub use proc::{
-    MemGate, allocator_name, budget, collect_os_memory, init_allocator, par_join2, par_join3,
-    par_map, run_cmd, self_metrics, under_memory_pressure,
+    MemGate, allocator_name, budget, collect_os_memory, env_parse, env_trimmed, env_truthy,
+    init_allocator, par_join2, par_join3, par_map, run_cmd, self_metrics, under_memory_pressure,
 };
 
 use crate::lex::left_bound;
@@ -29,7 +29,6 @@ use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{LazyLock, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -775,29 +774,6 @@ impl EpochRegistry {
 
 impl Default for EpochRegistry {
     fn default() -> Self { Self::new() }
-}
-
-/// Return trimmed non-empty env var value.
-pub fn env_trimmed(name: &str) -> Option<String> {
-    let raw = std::env::var(name).ok()?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-/// Return `true` when env var `name` is set to a truthy literal (`1`, `true`, `yes`, `on`).
-pub fn env_truthy(name: &str) -> bool {
-    let Ok(raw) = std::env::var(name) else { return false };
-    let v = raw.trim();
-    v == "1"
-        || v.eq_ignore_ascii_case("true")
-        || v.eq_ignore_ascii_case("yes")
-        || v.eq_ignore_ascii_case("on")
-}
-
-/// Parse trimmed env var `name` into `T`.
-pub fn env_parse<T: FromStr>(name: &str) -> Option<T> {
-    let raw = std::env::var(name).ok()?;
-    raw.trim().parse::<T>().ok()
 }
 
 /// Extract trimmed body lines from Go `keyword ( ... )` blocks and single-line `keyword ...` entries.
