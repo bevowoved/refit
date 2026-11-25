@@ -417,7 +417,8 @@ pub async fn start_proxy(
     cfg: ProxyConfig, telemetry: TelemetryHub,
 ) -> Result<(Arc<ProxyState>, tokio::task::JoinHandle<()>)> {
     let pool_max = crate::platform::budget().http_pool_max;
-    let client = stream_http("cerebras-cloud-sdk/1.91.0 (refit/0.5.0)", 15, 600, pool_max)?;
+    let ua = concat!("refit/", env!("CARGO_PKG_VERSION"));
+    let client = stream_http(ua, 15, 600, pool_max)?;
     let state = Arc::new(ProxyState::new(cfg.clone(), client, telemetry, std::env::current_dir().ok()));
 
     if cfg.keep_warm && cfg.static_prefix_override.is_some() {
@@ -1103,16 +1104,18 @@ mod tests {
         json!({"messages": [{"role": "system", "content": content.into()}]})
     }
 
+    fn chat_body(stream: bool) -> Value {
+        json!({"messages": [{"role": "user", "content": "hi"}], "stream": stream})
+    }
+
     async fn get_origin(prx: &TestProxy, tok: Option<&str>, origin: &str) -> reqwest::Response {
         let mut req = prx.client.get(prx.url("/api/timeline")).header("origin", origin);
-        if let Some(t) = tok {
-            req = req.bearer_auth(t);
-        }
+        if let Some(t) = tok { req = req.bearer_auth(t); }
         req.send().await.unwrap()
     }
 
     #[test]
-    fn test_payload_guard_and_routing() {
+    fn proxy_guard_and_routing() {
         let mut cfg = test_cfg(CB_URL, CacheMode::Short);
         cfg.preserve_tools = false;
         let mut p = json!({
@@ -1124,29 +1127,27 @@ mod tests {
         assert_eq!(p["model"], "moonshotai-kimi-k3.1-pro-trial");
         assert_eq!((&p["reasoning_effort"], &p["reasoning_format"]), (&json!("low"), &json!("parsed")));
         assert_eq!((&p["temperature"], &p["max_completion_tokens"]), (&json!(1.0), &json!(1000)));
-        let sys_str = p["messages"][0]["content"].as_str().unwrap();
         assert!(p.get("disable_reasoning").is_none() && p.get("top_p").is_none());
-        assert!(p.get("tools").is_none() && sys_str.len() == 160);
+        let sys_s = p["messages"][0]["content"].as_str().unwrap();
+        assert!(p.get("tools").is_none() && sys_s.len() == 160);
 
-        for (attempt, want) in [(1, None), (2, Some(MAX_KEY_LEN))] {
-            let mut body = json!({"prompt_cache_key": "k".repeat(2000)});
-            guard_lang(&mut body, &cfg, "m1", attempt, None);
-            let len = body.get("prompt_cache_key").and_then(Value::as_str).map(str::len);
-            assert_eq!(len, want, "attempt={attempt}");
+        for (att, want) in [(1, None), (2, Some(MAX_KEY_LEN))] {
+            let mut b = json!({"prompt_cache_key": "k".repeat(2000)});
+            guard_lang(&mut b, &cfg, "m1", att, None);
+            assert_eq!(b.get("prompt_cache_key").and_then(Value::as_str).map(str::len), want);
         }
-
         for (url, ttl, ret) in [
             (CB_URL, None, None),
             ("https://api.moonshot.ai/v1", Some("1h"), None),
             ("https://api.openai.com/v1", None, Some("24h")),
         ] {
-            let mut body = json!({});
-            guard_lang(&mut body, &test_cfg(url, CacheMode::Long), "m", 2, None);
-            assert_eq!(body["prompt_cache_options"]["ttl"].as_str(), ttl, "{url}");
-            assert_eq!(body["prompt_cache_retention"].as_str(), ret, "{url}");
+            let mut b = json!({});
+            guard_lang(&mut b, &test_cfg(url, CacheMode::Long), "m", 2, None);
+            assert_eq!((b["prompt_cache_options"]["ttl"].as_str(), b["prompt_cache_retention"].as_str()),
+                (ttl, ret));
         }
 
-        let mut tools_p = json!({
+        let mut tp = json!({
             "reasoning_effort": "medium", "prompt_cache_key": "refit:r1:m:m1",
             "tools": [
                 {"type": "function", "function": {"name": "z_tool"}},
@@ -1157,16 +1158,15 @@ mod tests {
                 {"role": "assistant", "content": "bad"}, {"role": "user", "content": "[attempt=3] retry"}
             ]
         });
-        let inf = infer_attempt(&tools_p);
+        let inf = infer_attempt(&tp);
         assert_eq!(inf, 3);
-        guard_lang(&mut tools_p, &test_cfg(CB_URL, CacheMode::Short), "m1", inf, None);
-        assert_eq!(tools_p["reasoning_effort"], "medium");
-        assert_eq!(tools_p["tools"][0]["function"]["name"], "a_tool");
-        assert_eq!(tools_p["prompt_cache_key"], "refit:r1:m:m1");
+        guard_lang(&mut tp, &test_cfg(CB_URL, CacheMode::Short), "m1", inf, None);
+        assert_eq!((&tp["reasoning_effort"], &tp["tools"][0]["function"]["name"], &tp["prompt_cache_key"]),
+            (&json!("medium"), &json!("a_tool"), &json!("refit:r1:m:m1")));
     }
 
     #[test]
-    fn test_keepwarm_policy() {
+    fn proxy_keepwarm_policy() {
         for (ms, inflight, sent, open, want) in [
             (100_000, 0, 0, false, false), (250_000, 0, 0, false, true),
             (295_000, 0, 0, false, false), (400_000, 0, 0, false, false),
@@ -1178,7 +1178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pacer_drift_circuit_and_cors() {
+    async fn proxy_pacer_and_cors() {
         let tmp = TempRepo::new("pac");
         let tel = TelemetryHub::new(tmp.join("run.jsonl")).unwrap();
         let st = ProxyState::new(test_cfg(CB_URL, CacheMode::Short), reqwest::Client::new(), tel, None);
@@ -1190,14 +1190,13 @@ mod tests {
             (sys_msg("P".repeat(150)), "python", false), (sys_msg("R".repeat(150)), "rust", false),
             (sys_msg("P".repeat(150)), "python", false),
         ] {
-            assert_eq!(check_drift(&st, &msg, lang), drifted, "lang={lang}");
+            assert_eq!(check_drift(&st, &msg, lang), drifted);
         }
         assert_eq!(st.snapshot().prefix_drift_events, 1);
 
         let empty = reqwest::header::HeaderMap::new();
         st.apply_headers(503, &empty);
-        let snap = st.snapshot();
-        assert_eq!((snap.circuit_state.as_str(), snap.circuit_pauses), ("OPEN", 1));
+        assert_eq!((st.snapshot().circuit_state.as_str(), st.snapshot().circuit_pauses), ("OPEN", 1));
         st.apply_headers(200, &empty);
         assert_eq!(st.snapshot().circuit_state, "CLOSED");
 
@@ -1211,10 +1210,8 @@ mod tests {
         let mut p = PacerState::new();
         assert!(p.apply_status(429, None, None, Some(2)).is_none());
         assert_eq!((p.snapshot().circuit_state.as_str(), p.snapshot().http_429_count), ("CLOSED", 1));
-        let ev432 = p.apply_status(432, None, None, None).unwrap();
-        assert_eq!((&ev432["state"], &ev432["reason"]), (&json!("PERMANENT_OPEN"), &json!("quota_exhausted")));
-        assert_eq!((p.snapshot().circuit_state.as_str(), p.snapshot().circuit_pauses), ("PERMANENT_OPEN", 1));
-
+        let ev = p.apply_status(432, None, None, None).unwrap();
+        assert_eq!((&ev["state"], &ev["reason"]), (&json!("PERMANENT_OPEN"), &json!("quota_exhausted")));
         p.requests_sent = 50;
         assert_eq!((0..30).filter(|_| p.allow_retry()).count(), 10);
 
@@ -1222,27 +1219,25 @@ mod tests {
             ("http://127.0.0.1:18790", true), ("http://127.0.0.2:65535", true),
             ("http://localhost", true), ("http://localhost:3000", true),
             ("https://[::1]:8443", true), ("http://127.0.0.1:65536", false),
-            ("http://127.0.0.1:999999", false), ("http://127.0.0.1:0", false),
-            ("http://127.0.0.1:", false), ("http://user@127.0.0.1:3000", false),
-            ("http://127.0.0.1:3000/api", false), ("http://127.0.0.1:3000?x=1", false),
-            ("http://127.0.0.1:3000#h", false), ("ftp://127.0.0.1:21", false),
-            ("http://0.0.0.0:3000", false), ("http://192.168.1.1:3000", false),
-            ("http://localhost.evil.com", false), ("https://127.0.0.1.attacker.io", false),
-            ("http://127.0.0.1@evil.com", false),
+            ("http://127.0.0.1:0", false), ("http://127.0.0.1:", false),
+            ("http://user@127.0.0.1:3000", false), ("http://127.0.0.1:3000/api", false),
+            ("http://127.0.0.1:3000?x=1", false), ("http://127.0.0.1:3000#h", false),
+            ("ftp://127.0.0.1:21", false), ("http://0.0.0.0:3000", false),
+            ("http://192.168.1.1:3000", false), ("http://localhost.evil.com", false),
+            ("https://127.0.0.1.attacker.io", false), ("http://127.0.0.1@evil.com", false),
         ] {
             assert_eq!(localip(&HeaderValue::from_static(orig)), want, "origin={orig}");
         }
     }
 
     #[tokio::test]
-    async fn test_proxy_upstream_retry_policy() {
+    async fn proxy_retry_policy() {
         let ok = r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#;
-        let cases = [
+        let body = chat_body(false);
+        for (resps, want_code, want_calls) in [
             (vec![http_res("503 Service Unavailable", "Retry-After: 0.02\r\n", "down"), http_res("200 OK", "", ok)], 200, 2),
             (vec![http_res("404 Not Found", "", r#"{"error":"not_found"}"#)], 404, 1),
-        ];
-        let body = json!({"messages": [{"role": "user", "content": "hi"}], "stream": false});
-        for (resps, want_code, want_calls) in cases {
+        ] {
             let up = MockHttp::spawn(resps).await;
             let prx = TestProxy::spawn(&up.url("/v1"), CacheMode::Short, None).await;
             let (code, _) = prx.post_json("/v1/chat/completions", &body).await;
@@ -1251,56 +1246,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sse_stall_watchdog() {
+    async fn proxy_sse_stall_watchdog() {
         let up_addr = mock_sse(vec![sse_delta("hi")], 0, 10).await;
         let prx = TestProxy::spawn(&format!("http://{up_addr}/v1"), CacheMode::Short, None).await;
-        let (started, body) = (Instant::now(), json!({"messages": [{"role": "user", "content": "hi"}], "stream": true}));
+        let started = Instant::now();
         let req = prx.client.post(prx.url("/v1/chat/completions")).header("x-refit-sse-stall-ms", "120");
-        let resp = req.json(&body).send().await.unwrap();
+        let resp = req.json(&chat_body(true)).send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 200);
         let (mut s, mut saw_err) = (resp.bytes_stream(), false);
         while let Some(item) = s.next().await {
-            if item.is_err() {
-                saw_err = true;
-                break;
-            }
+            if item.is_err() { saw_err = true; break; }
         }
         assert!(saw_err && started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]
-    async fn test_proxy_api_auth_timeline_and_steer() {
+    async fn proxy_auth_and_steer() {
         let tmp = TempRepo::with_files("prx_api", &[("app.py", "def f():\n    return 1\n")]);
         let store = MvccStore::open(tmp.path(), "prx_api").unwrap();
         let (_, tx_id, _) = commit_file(&store, tmp.path(), "app", "app.py", "def f():\n    return 42\n");
         let up = MockHttp::spawn(vec![
             http_res("503 Service Unavailable", "Retry-After: 0.01\r\n", "busy"),
             http_res("200 OK", "", r#"{"data":[{"id":"kimi"}]}"#),
-        ])
-        .await;
+        ]).await;
         let tok = "secret-run-token";
         let prx = TestProxy::spawn(&up.url("/v1"), CacheMode::Short, Some(tok)).await;
         let shared = RunState::new(100);
         prx.state.bind_repo(tmp.path().to_path_buf());
         prx.state.attach_state(shared.clone());
 
+        let acao = |r: &reqwest::Response| -> Option<String> {
+            let val = r.headers().get("access-control-allow-origin")?;
+            val.to_str().ok().map(str::to_string)
+        };
         let unauth = get_origin(&prx, None, "https://evil.example").await;
-        assert_eq!(unauth.status().as_u16(), 401);
-        assert!(unauth.headers().get("access-control-allow-origin").is_none());
-
+        assert_eq!((unauth.status().as_u16(), acao(&unauth)), (401, None));
         let authed = get_origin(&prx, Some(tok), "http://127.0.0.1:18790").await;
         assert_eq!(authed.status().as_u16(), 200);
-        let acao = authed.headers().get("access-control-allow-origin");
-        assert_eq!(acao.and_then(|v| v.to_str().ok()), Some("http://127.0.0.1:18790"));
+        assert_eq!(acao(&authed).as_deref(), Some("http://127.0.0.1:18790"));
 
         let (_, tl) = prx.get_json("/api/timeline").await;
         assert_eq!(tl["entries"][0]["tx_id"], json!(tx_id));
         let (code, dj) = prx.get_json(&format!("/api/diff/{tx_id}")).await;
         let diff_txt = dj["files"][0]["unified_diff"].as_str().unwrap();
         assert!(code == 200 && diff_txt.contains("+    return 42"));
-        assert_eq!(prx.get_json("/api/diff/tx-none").await.0, 404);
+        assert_eq!(
+            (prx.get_json("/api/diff/tx-none").await.0, prx.get_json("/v1/models").await.0, up.calls()),
+            (404, 200, 2)
+        );
 
-        assert_eq!((prx.get_json("/v1/models").await.0, up.calls()), (200, 2));
         let (_, s1) = prx.post_json("/api/steer", &json!({"action": "set_k", "k": 8})).await;
         assert_eq!((&s1["steering"]["k_override"], shared.k_override()), (&json!(8), Some(8)));
         let _ = prx.post_json("/api/steer", &json!({"action": "prioritize", "unit_id": "core_u"})).await;

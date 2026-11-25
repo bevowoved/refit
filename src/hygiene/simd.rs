@@ -1,13 +1,13 @@
 use super::weights::{CompactConv, CompactCsr, PadTap, PartRange};
 
-/// Empirical L1D width gate: 8-line AVX2 tiling wins when `out_cols <= 128`.
+/// Use 8-line AVX2 tiling when output width is at most 128.
 #[cfg(target_arch = "x86_64")]
 pub(super) const WIDE_OUT_GATE: usize = 128;
 pub(super) const MAX_SPAN_LEN: usize = 256;
 pub(super) const BK_ANTI_ALIAS: usize = 252;
 pub(super) const STRIDE_ANTI_ALIAS: usize = 264;
 
-/// Architecture-neutral scratch holder for 8-line AVX2 vertical tiling (`0` bytes off x86_64).
+/// Scratch buffers for 8-line AVX2 tiling.
 #[derive(Default)]
 pub(super) struct TileScratch {
     #[cfg(target_arch = "x86_64")]
@@ -55,7 +55,7 @@ pub(super) struct DenseQkArgs<'a> {
     pub(super) all_zero_rel: bool,
 }
 
-/// Monomorphized scalar / AVX2 execution kernel eliminating all mirrored loops in `ops`/`model`.
+/// Kernel interface for scalar and AVX2 evaluation.
 pub(super) trait HygieneKernel {
     // SAFETY: Caller guarantees AVX2 when invoking `Avx2Kernel`.
     unsafe fn linear_sparse(
@@ -133,7 +133,7 @@ impl HygieneKernel for Avx2Kernel {
         op: CsOp<'_>, out: &mut [f32], tile: &mut TileScratch,
     ) {
         // SAFETY: AVX2 active in caller boundary.
-        unsafe { linear_sparse_width_gated_avx2(inp, num_rows, in_cols, op, out, tile); }
+        unsafe { sparse_linear_avx2(inp, num_rows, in_cols, op, out, tile); }
     }
     // SAFETY: Caller guarantees AVX2 via enclosing `#[target_feature(enable = "avx2")]`.
     #[inline(always)]
@@ -142,7 +142,7 @@ impl HygieneKernel for Avx2Kernel {
         op: CsOp<'_>, out: &mut [f32], tile: &mut TileScratch,
     ) {
         // SAFETY: AVX2 active in caller boundary.
-        unsafe { sparse_parts_width_gated_avx2(parts, ranges, num_rows, op, out, tile); }
+        unsafe { sparse_parts_avx2(parts, ranges, num_rows, op, out, tile); }
     }
     // SAFETY: Caller guarantees AVX2 and `MAX_SPAN_LEN`-strided SoA buffers.
     #[inline(always)]
@@ -175,7 +175,7 @@ impl HygieneKernel for Avx2Kernel {
     }
 }
 
-/// Pure scalar direct compact-CSR matrix multiply (`out_cols` arbitrary, zero transpose).
+/// Run scalar sparse matrix multiplication.
 #[inline]
 pub(super) fn linear_sparse_direct_csr(
     inp: &[f32], num_rows: usize, in_cols: usize, op: CsOp<'_>, out: &mut [f32],
@@ -291,20 +291,30 @@ fn apply_pad_cols(acc_soa: &mut [f32], pad: &PadTap, lo: usize, hi: usize) {
 }
 
 #[inline]
+fn sum_positive(slice: &[f32]) -> f32 {
+    let mut total = 0.0f32;
+    for &val in slice {
+        if val > 0.0 {
+            total += val;
+        }
+    }
+    total
+}
+
+#[inline]
 fn reduce_span_relu(acc_soa: &[f32], out_dim: usize, span: &RibbonSpan<'_>, out: &mut [f32]) {
-    let sum_pos = |s: &[f32]| s.iter().copied().filter(|&v| v > 0.0).sum::<f32>();
     if let Some((len0, row0, row1)) = span.split_at {
         let (d0, d1) = (row0 * out_dim, row1 * out_dim);
         for oc in 0..out_dim {
             let row_acc = &acc_soa[oc * MAX_SPAN_LEN..oc * MAX_SPAN_LEN + span.span_len];
-            out[d0 + oc] = sum_pos(&row_acc[..len0]);
-            out[d1 + oc] = sum_pos(&row_acc[len0..span.span_len]);
+            out[d0 + oc] = sum_positive(&row_acc[..len0]);
+            out[d1 + oc] = sum_positive(&row_acc[len0..span.span_len]);
         }
     } else {
         let d0 = span.single_row * out_dim;
         for oc in 0..out_dim {
             let row_acc = &acc_soa[oc * MAX_SPAN_LEN..oc * MAX_SPAN_LEN + span.span_len];
-            out[d0 + oc] = sum_pos(row_acc);
+            out[d0 + oc] = sum_positive(row_acc);
         }
     }
 }
@@ -362,21 +372,30 @@ fn dense_qk_head_impl<D, S>(
     }
 }
 
-fn dot_bq4_scalar(args: &DenseQkArgs<'_>, q_pack: &[[f64; 4]], k_tile: &[f64], rg: TileRange, logits_4: &mut [f64]) {
+fn dot_bq4_scalar(
+    args: &DenseQkArgs<'_>,
+    q_pack: &[[f64; 4]],
+    k_tile: &[f64],
+    rg: TileRange,
+    logits_4: &mut [f64],
+) {
     for local_k in 0..rg.blen {
         let k_row = rg.k_start + local_k;
         let mut acc = [0.0f64; 4];
         for (d, q_slot) in q_pack.iter().enumerate().take(args.h_dim) {
             let kv = k_tile[d * STRIDE_ANTI_ALIAS + local_k];
-            for lane in 0..rg.bq { acc[lane] += q_slot[lane] * kv; }
+            for lane in 0..rg.bq {
+                acc[lane] += q_slot[lane] * kv;
+            }
         }
-        for (lane, &a) in acc.iter().enumerate().take(rg.bq) {
-            logits_4[lane * args.num_lines + k_row] = rel_bias_for(args, rg.q_row + lane, k_row) + a * args.inv_s;
+        for (lane, &dot) in acc.iter().enumerate().take(rg.bq) {
+            let bias = rel_bias_for(args, rg.q_row + lane, k_row);
+            logits_4[lane * args.num_lines + k_row] = bias + dot * args.inv_s;
         }
     }
 }
 
-/// Pure-AVX2 non-FMA Estrin degree-12 `exp(x)` on 4x `f64` with `x < -708.0 => 0.0` underflow mask.
+/// Compute 4-lane AVX2 exp(x) with underflow clamp at -708.0.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 // SAFETY: Caller guarantees AVX2 is available on the executing x86_64 CPU.
@@ -440,7 +459,11 @@ unsafe fn axpy_pair_avx2(src_ptr: *const f32, d0_ptr: *mut f32, d1_ptr: *mut f32
     }
     while i < len {
         // SAFETY: `i < len`; pointers disjoint and in bounds.
-        unsafe { let sv = *src_ptr.add(i); *d0_ptr.add(i) += sv * wv0; *d1_ptr.add(i) += sv * wv1; }
+        unsafe {
+            let sv = *src_ptr.add(i);
+            *d0_ptr.add(i) += sv * wv0;
+            *d1_ptr.add(i) += sv * wv1;
+        }
         i += 1;
     }
 }
@@ -522,8 +545,16 @@ unsafe fn run_csr_tile8_avx2(op: CsOp<'_>, tile: &mut TileScratch, out: &mut [f3
     use std::arch::x86_64::*;
     let out_cols = op.weight.cols as usize;
     match op.bias {
-        Some(b) => for (s, &bv) in tile.tile_acc.iter_mut().zip(b.iter()).take(out_cols) { *s = [bv; 8]; },
-        None => for s in tile.tile_acc.iter_mut().take(out_cols) { *s = [0.0; 8]; },
+        Some(b) => {
+            for (slot, &bv) in tile.tile_acc.iter_mut().zip(b.iter()).take(out_cols) {
+                *slot = [bv; 8];
+            }
+        }
+        None => {
+            for slot in tile.tile_acc.iter_mut().take(out_cols) {
+                *slot = [0.0; 8];
+            }
+        }
     }
     for &in_u16 in &op.weight.active_rows {
         let in_idx = in_u16 as usize;
@@ -550,14 +581,16 @@ unsafe fn run_csr_tile8_avx2(op: CsOp<'_>, tile: &mut TileScratch, out: &mut [f3
     }
     for lane in 0..8 {
         let dst = (row + lane) * out_cols;
-        for (col, slot) in tile.tile_acc.iter().enumerate().take(out_cols) { out[dst + col] = slot[lane]; }
+        for (col, slot) in tile.tile_acc.iter().enumerate().take(out_cols) {
+            out[dst + col] = slot[lane];
+        }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 // SAFETY: Caller guarantees AVX2 is available on the executing x86_64 CPU.
-unsafe fn linear_sparse_width_gated_avx2(
+unsafe fn sparse_linear_avx2(
     inp: &[f32], num_rows: usize, in_cols: usize, op: CsOp<'_>, out: &mut [f32], tile: &mut TileScratch,
 ) {
     let out_cols = op.weight.cols as usize;
@@ -571,7 +604,9 @@ unsafe fn linear_sparse_width_gated_avx2(
         for &in_u16 in &op.weight.active_rows {
             let col = in_u16 as usize;
             let mut lanes = [0.0f32; 8];
-            for (lane, slot) in lanes.iter_mut().enumerate() { *slot = inp[(row + lane) * in_cols + col]; }
+            for (lane, slot) in lanes.iter_mut().enumerate() {
+                *slot = inp[(row + lane) * in_cols + col];
+            }
             tile.tile_in[col] = lanes;
         }
         // SAFETY: AVX2 active and tile buffers sized above.
@@ -589,7 +624,7 @@ unsafe fn linear_sparse_width_gated_avx2(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 // SAFETY: Caller guarantees AVX2 is available on the executing x86_64 CPU.
-unsafe fn sparse_parts_width_gated_avx2(
+unsafe fn sparse_parts_avx2(
     parts: &[&[f32]], ranges: &[PartRange], num_rows: usize, op: CsOp<'_>, out: &mut [f32], tile: &mut TileScratch,
 ) {
     let (out_cols, in_cols) = (op.weight.cols as usize, op.weight.rows as usize);
@@ -605,7 +640,9 @@ unsafe fn sparse_parts_width_gated_avx2(
             for &in_u16 in &op.weight.active_rows[rg.start..rg.end] {
                 let (in_idx, local) = (in_u16 as usize, in_u16 as usize - rg.in_off);
                 let mut lanes = [0.0f32; 8];
-                for (lane, slot) in lanes.iter_mut().enumerate() { *slot = src[(row + lane) * rg.dim + local]; }
+                for (lane, slot) in lanes.iter_mut().enumerate() {
+                    *slot = src[(row + lane) * rg.dim + local];
+                }
                 tile.tile_in[in_idx] = lanes;
             }
         }
@@ -641,7 +678,10 @@ unsafe fn softmax_exp_slice_avx2(row_l: &mut [f64], max_l: f64) -> f64 {
     // SAFETY: `lanes` is a stack `[f64; 4]` array.
     unsafe { _mm256_storeu_pd(lanes.as_mut_ptr(), vsum); }
     let mut sum = lanes[0] + lanes[1] + lanes[2] + lanes[3];
-    for lv in &mut row_l[i..] { *lv = (*lv - max_l).exp(); sum += *lv; }
+    for lv in &mut row_l[i..] {
+        *lv = (*lv - max_l).exp();
+        sum += *lv;
+    }
     sum
 }
 

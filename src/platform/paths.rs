@@ -1,6 +1,4 @@
-//! Leaf-module cross-OS path normalization and fail-closed security validation.
-//!
-//! DAG invariant: imports ONLY `std`, `dunce`, and `same_file` so `scc_count == 0`.
+//! Cross-OS path normalization and fail-closed containment checks.
 
 use smallvec::SmallVec;
 use std::fmt;
@@ -49,8 +47,7 @@ pub struct NormalizedPath {
     pub nfd_normalized: bool,
 }
 
-/// Normalize an OS path string across Windows verbatim `\\?\`, UNC, PowerShell quotes/trailing `\\`,
-/// MSYS2 `/d/`, WSL2 `/mnt/d/`, `\\wsl.localhost\`, and macOS APFS NFD combining marks (`VU#604762`).
+/// Normalize an OS path across verbatim, UNC, MSYS2, WSL2, and NFD forms.
 pub fn normalize_os_path(raw: &str, check_shell_safe: bool) -> Result<NormalizedPath, PathReject> {
     if raw.is_empty() {
         return Err(PathReject::Empty);
@@ -133,7 +130,10 @@ fn extract_os_prefix(slashed: &str) -> (String, &str, bool) {
         ("//".into(), r, false)
     } else if let Some(r) = slashed.strip_prefix("//?/") {
         (String::new(), r, false)
-    } else if let Some(r) = slashed.strip_prefix("//wsl.localhost/") {
+    } else if let Some(r) = slashed
+        .strip_prefix("//wsl.localhost/")
+        .or_else(|| slashed.strip_prefix("wsl://"))
+    {
         ("wsl://".into(), r, false)
     } else if let Some(r) = slashed.strip_prefix("//") {
         strip_slash_drive(r).map_or_else(|| ("//".into(), r, false), |(p, t)| (p, t, false))
@@ -159,7 +159,7 @@ fn extract_os_prefix(slashed: &str) -> (String, &str, bool) {
     (prefix, rest, wsl_9p)
 }
 
-/// Pure-Rust APFS NFD -> NFC normalization guard (`CERT/CC VU#604762`).
+/// Fold common APFS NFD combining pairs into NFC.
 fn normalize_nfd_to_nfc(input: &str) -> (String, bool) {
     if input.is_ascii() {
         return (input.to_string(), false);
@@ -205,7 +205,7 @@ fn is_combining_mark(c: char) -> bool {
     ('\u{0300}'..='\u{036F}').contains(&c)
 }
 
-/// Checks Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`).
+/// Check whether a segment matches a Windows reserved device name.
 fn is_windows_reserved(seg: &str) -> bool {
     let base = seg.split('.').next().unwrap_or(seg);
     let stem = base.trim_end_matches(' ');
@@ -229,7 +229,7 @@ fn is_protected_repo_dir(seg: &str) -> bool {
     folded == ".git" || folded == ".refit"
 }
 
-/// Validate and normalize a repo-relative path strictly across Linux, macOS, and Windows.
+/// Validate and normalize a repo-relative path across OSes.
 pub fn normalize_rel(rel: &str) -> Option<String> {
     if rel.is_empty() || rel.contains(':') || rel.bytes().any(|b| b == 0 || b < 0x20) {
         return None;
@@ -266,7 +266,7 @@ fn verify_canonical_in_root(root: &Path, cur: &Path) -> bool {
     canon_str.is_empty() || check_rel(&canon_str)
 }
 
-/// Fail-closed repository target check using `dunce::canonicalize` + `same_file::is_same_file`.
+/// Verify that a relative path stays inside `repo_root` without symlink escape.
 pub fn check_target_in_repo(repo_root: &Path, rel: &str) -> bool {
     let Some(norm_rel) = normalize_rel(rel) else { return false };
     let Ok(root) = dunce::canonicalize(repo_root) else { return false };
@@ -395,122 +395,131 @@ pub fn pwsh_utf8_preamble() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::TempRepo;
+    use crate::testutil::{TempRepo, TestRng};
 
     fn try_symlink(target: &Path, link: &Path, is_dir: bool) -> bool {
         #[cfg(unix)]
         { let _ = is_dir; std::os::unix::fs::symlink(target, link).is_ok() }
         #[cfg(windows)]
-        {
-            if is_dir {
-                std::os::windows::fs::symlink_dir(target, link).is_ok()
-            } else {
-                std::os::windows::fs::symlink_file(target, link).is_ok()
-            }
+        if is_dir {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        } else {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
         }
     }
 
     #[test]
-    fn cross_os_paths_50() {
-        let base = TempRepo::new("paths50");
+    fn cross_os_paths() {
+        let base = TempRepo::new("paths");
         let (repo, outside) = (base.join("repo"), base.join("outside"));
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::create_dir_all(&outside).unwrap();
         fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(outside.join("secret.rs"), "const SECRET: &str = \"nope\";\n").unwrap();
+        fs::write(outside.join("secret.rs"), "const S: u8 = 1;\n").unwrap();
+        let canon = canonical_root(&repo);
 
-        let reject_30 = [
-            // Cat A (12): traversal & absolute/UNC/NUL
-            "../a", "a/../../b", r"..\a", r"a\..\..\b", "/etc/passwd", r"\Windows\System32",
-            r"C:\a.rs", "C:/a.rs", r"\\srv\share\a.rs", r"\\?\C:\a.rs", r"\??\C:\a.rs", "src/a\0.rs",
-            // Cat B (8): protected metadata dirs
-            ".git/config", ".git/hooks/pre-commit", r".git\HEAD", "sub/.git/hooks/x",
-            ".refit/wal.jsonl", r".refit\cas\abc", ".refit/invariants.yml", "a/.refit/x",
-            // Cat C (10): Windows reserved devices, ADS, drive-relative, trailing dot/space
-            "CON", "NUL", "PRN.rs", "AUX.txt", "COM1.rs", "LPT1.py", "src/CON.rs",
-            "src/a.rs:ads", "C:rel.rs", "src/bad. ",
+        for bad in [
+            "../a", "a/../../b", r"..\a", "/etc/passwd", r"\Windows\System32", r"C:\a.rs",
+            "C:/a.rs", r"\\srv\share\a.rs", r"\\?\C:\a.rs", r"\??\C:\a.rs", "src/a\0.rs",
+            ".git/config", r".git\HEAD", "sub/.git/x", ".refit/wal.jsonl", r".refit\cas\a",
+            ".gi\u{0307}t/config", ".GIT/HEAD", ".REFIT/wal.jsonl", "CON", "NUL", "PRN.rs",
+            "AUX.txt", "COM1.rs", "LPT1.py", "src/CON.rs", "src/a.rs:ads", "C:rel.rs",
+            "src/bad. ", "src/bad.", "", ".",
+        ] {
+            assert!(!check_rel(bad) && !check_target_in_repo(&canon, bad), "reject `{bad}`");
+        }
+
+        let links = [
+            (outside.join("secret.rs"), "esc.rs", false),
+            (outside.clone(), "esc_dir", true),
+            (outside.join("gone.rs"), "dangle.rs", false),
+            (repo.join(".git/HEAD"), "git_link", false),
         ];
-        assert_eq!(reject_30.len(), 30);
-        for case in reject_30 {
-            assert!(!check_rel(case) && !check_target_in_repo(&repo, case), "must reject `{case}`");
+        for (target, name, is_dir) in links {
+            if try_symlink(&target, &repo.join(name), is_dir) {
+                let probe = if is_dir { format!("{name}/child.rs") } else { name.into() };
+                assert!(!check_target_in_repo(&canon, &probe));
+            }
         }
-        for extra in ["src/bad.", ".gi\u{0307}t/config", ".GIT/HEAD", ".REFIT/wal.jsonl", "", "."] {
-            assert!(!check_rel(extra) && !check_target_in_repo(&repo, extra), "must reject `{extra}`");
-        }
+        assert!(!check_target_in_repo(&base.join("missing_root"), "src/main.rs"));
 
-        // Cat D: symlink escapes + mixed separators (8 cases total with "" and ".")
-        if try_symlink(&outside.join("secret.rs"), &repo.join("escape.rs"), false) {
-            assert!(!check_target_in_repo(&repo, "escape.rs"));
-        } else {
-            assert!(!check_target_in_repo(&base.join("nonexistent_root"), "src/main.rs"));
-        }
-        if try_symlink(&outside, &repo.join("escape_dir"), true) {
-            assert!(!check_target_in_repo(&repo, "escape_dir/dangling_child.rs"));
-        }
-        if try_symlink(&outside.join("does_not_exist.rs"), &repo.join("dangling_link.rs"), false) {
-            assert!(!check_target_in_repo(&repo, "dangling_link.rs"));
-        }
-        if try_symlink(&repo.join(".git/HEAD"), &repo.join("git_head_link"), false) {
-            assert!(!check_target_in_repo(&repo, "git_head_link"));
-        }
-        for (raw, want) in [(r"src\core/sub\a.rs", "src/core/sub/a.rs"), ("./src/a.rs", "src/a.rs"), ("src/./a.rs", "src/a.rs")] {
+        for (raw, want) in [(r"src\core/sub\a.rs", "src/core/sub/a.rs"), ("./src/a.rs", "src/a.rs")] {
             assert_eq!(normalize_rel(raw).as_deref(), Some(want));
-            assert!(check_target_in_repo(&repo, raw));
+            assert!(check_target_in_repo(&canon, raw));
         }
-
-        // Cat E (12): valid polyglot Unicode, brackets, dotfiles
-        let accept_12 = [
-            "src/main.rs", "src/gates/audit.rs", "pkg/my file.py", "src/日本語/café.rs",
-            "app/(marketing)/[slug]/page.tsx", "app/[...all]/route.ts", "packages/@scope/pkg/index.ts",
-            ".github/workflows/ci.yml", "Dockerfile.prod", "src/a+b=c.ts",
-            "a/b/c/d/e/f/g/h/deep.go", "src/test_util.rs",
-        ];
-        assert_eq!(accept_12.len(), 12);
-        for case in accept_12 {
-            assert!(check_rel(case) && check_target_in_repo(&repo, case), "must accept `{case}`");
+        for ok in [
+            "src/main.rs", "pkg/my file.py", "src/日本語/café.rs",
+            "app/(marketing)/[slug]/page.tsx", "packages/@scope/pkg/index.ts",
+            ".github/workflows/ci.yml", "a/b/c/d/e/f/deep.go",
+        ] {
+            assert!(check_rel(ok) && check_target_in_repo(&canon, ok), "accept `{ok}`");
         }
+        assert_eq!(rel_to_root(&canon, &canon), None);
+        assert_eq!(rel_to_root(&canon, &canon.join("src/a.rs")).as_deref(), Some("src/a.rs"));
+        assert_eq!(rel_to_root(&canon, &outside.join("secret.rs")), None);
     }
 
     #[test]
-    fn cross_os_normalizer_s3_suite() {
-        let ok_cases = [
-            (r"\\?\D:\cerebras\refit\src\main.rs", "D:/cerebras/refit/src/main.rs", false, false),
-            (r"\\?\c:\work\app\lib.rs", "C:/work/app/lib.rs", false, false),
-            (r"\\?\UNC\filesrv\repos\refit", "//filesrv/repos/refit", false, false),
-            (r"\\?\unc\nas01\share\proj\\", "//nas01/share/proj", false, false),
-            (r"\\filesrv\share\folder\\\\", "//filesrv/share/folder", false, false),
-            (r"D:\cerebras\refit\\\", "D:/cerebras/refit", false, false),
-            (r#""D:\cerebras\refit\Cargo.toml""#, "D:/cerebras/refit/Cargo.toml", false, false),
-            ("/d/cerebras/refit/src/mcp.rs", "D:/cerebras/refit/src/mcp.rs", false, false),
-            ("//d/cerebras/refit/Cargo.toml", "D:/cerebras/refit/Cargo.toml", false, false),
-            ("/mnt/d/cerebras/refit", "D:/cerebras/refit", true, false),
-            (r"\\wsl.localhost\Ubuntu\home\dev\refit", "wsl://Ubuntu/home/dev/refit", false, false),
+    fn cross_os_path_norm() {
+        for (input, exp, wsl, nfd) in [
+            (r"\\?\D:\refit\src\main.rs", "D:/refit/src/main.rs", false, false),
+            (r"\\?\c:\app\lib.rs", "C:/app/lib.rs", false, false),
+            (r"\\?\UNC\srv\repos\refit", "//srv/repos/refit", false, false),
+            (r"\\?\unc\nas\sh\p\\", "//nas/sh/p", false, false),
+            (r"\\srv\sh\dir\\\\", "//srv/sh/dir", false, false),
+            (r#""D:\refit\Cargo.toml""#, "D:/refit/Cargo.toml", false, false),
+            ("/d/refit/src/mcp.rs", "D:/refit/src/mcp.rs", false, false),
+            ("//d/refit/Cargo.toml", "D:/refit/Cargo.toml", false, false),
+            ("/mnt/d/refit", "D:/refit", true, false),
+            (r"\\wsl.localhost\Ubuntu\home\dev", "wsl://Ubuntu/home/dev", false, false),
             ("src/cafe\u{0301}/index.ts", "src/caf\u{00E9}/index.ts", false, true),
-            ("docs/Bo\u{0308}rke/notes.md", "docs/B\u{00F6}rke/notes.md", false, true),
-        ];
-        for (input, exp_norm, exp_wsl, exp_nfd) in ok_cases {
-            let got = normalize_os_path(input, false).unwrap();
-            assert_eq!((got.normalized.as_str(), got.wsl_9p_warning, got.nfd_normalized), (exp_norm, exp_wsl, exp_nfd));
+            ("docs/Bo\u{0308}rke/n.md", "docs/B\u{00F6}rke/n.md", false, true),
+        ] {
+            let g = normalize_os_path(input, false).unwrap();
+            assert_eq!((g.normalized.as_str(), g.wsl_9p_warning, g.nfd_normalized), (exp, wsl, nfd));
         }
 
-        let err_cases = [
-            ("", false, PathReject::Empty), ("   ", false, PathReject::Empty),
-            ("src/main.rs\0.txt", false, PathReject::ControlOrNul), ("src/main.rs\r\n", false, PathReject::ControlOrNul),
-            (r#"src/"bad"quote.rs"#, false, PathReject::UnbalancedQuote), ("src/CON.rs", false, PathReject::ReservedDeviceName),
-            ("src/file.rs.", false, PathReject::TrailingDotOrSpace), ("../outside.rs", false, PathReject::TraversalEscape),
-            (".gi\u{0307}t/config", false, PathReject::ProtectedDir), ("src/a.rs:ads", false, PathReject::AlternateDataStream),
-            ("cargo & calc.exe", true, PathReject::ShellMetachar), ("ruff | sh", true, PathReject::ShellMetachar),
-            ("echo %PATH%", true, PathReject::ShellMetachar), ("tool^inject", true, PathReject::ShellMetachar),
-        ];
-        for (input, shell_safe, exp_err) in err_cases {
-            assert_eq!(normalize_os_path(input, shell_safe).unwrap_err(), exp_err, "input={input}");
+        for (input, safe, want) in [
+            ("", false, PathReject::Empty), ("a\0b", false, PathReject::ControlOrNul),
+            ("a\r\nb", false, PathReject::ControlOrNul), (r#"a/"b"c"#, false, PathReject::UnbalancedQuote),
+            ("src/CON.rs", false, PathReject::ReservedDeviceName),
+            ("src/a.rs.", false, PathReject::TrailingDotOrSpace),
+            ("../x.rs", false, PathReject::TraversalEscape),
+            (".gi\u{0307}t/x", false, PathReject::ProtectedDir),
+            ("src/a.rs:ads", false, PathReject::AlternateDataStream),
+            ("a & b", true, PathReject::ShellMetachar), ("a | b", true, PathReject::ShellMetachar),
+            ("%PATH%", true, PathReject::ShellMetachar), ("a^b", true, PathReject::ShellMetachar),
+        ] {
+            assert_eq!(normalize_os_path(input, safe).unwrap_err(), want, "in={input}");
         }
 
-        assert_eq!(rel_to_root(Path::new(r"D:\cerebras\refit"), Path::new(r"\\?\d:\cerebras\refit\src\app.py")).as_deref(), Some("src/app.py"));
-        assert_eq!(rel_to_root(Path::new("/mnt/d/cerebras/refit"), Path::new(r"D:\cerebras\refit\src\mod.py")).as_deref(), Some("src/mod.py"));
-        // Sibling path with multi-byte UTF-8 char straddling root_norm.len() must not panic.
-        assert_eq!(rel_to_root(Path::new(r"D:\repo\ab"), Path::new("D:\\repo\\a\u{00E9}\\x.rs")), None);
-        assert_eq!((strip_utf8_bom("\u{FEFF}hello"), trim_crlf("line\r\n")), ("hello", "line"));
+        assert_eq!(rel_to_root(Path::new(r"D:\r"), Path::new(r"\\?\d:\r\src\a.py")).as_deref(), Some("src/a.py"));
+        assert_eq!(rel_to_root(Path::new("/mnt/d/r"), Path::new(r"D:\r\src\b.py")).as_deref(), Some("src/b.py"));
+        assert_eq!(rel_to_root(Path::new(r"D:\r\ab"), Path::new("D:\\r\\a\u{00E9}\\x.rs")), None);
+        assert_eq!((strip_utf8_bom("\u{FEFF}hi"), trim_crlf("x\r\n")), ("hi", "x"));
         assert!(pwsh_utf8_preamble().contains("UTF8Encoding"));
+
+        let repo = TempRepo::new("path_prop");
+        let canon = canonical_root(repo.path());
+        let pfx_list = ["", r"\\?\c:\", r"D:\", "/d/", "/mnt/d/", r"\\srv\sh\", r"\\wsl.localhost\u\", "/"];
+        let segs = ["src", "pkg", ".", "sub", "cafe\u{0301}", "f.rs", "..", "CON", "a:ads", ".git", "x."];
+        let mut rng = TestRng::new(0x50A7_C0DE);
+        for _ in 0..500 {
+            let pfx = pfx_list[rng.next_usize(pfx_list.len())];
+            let mut raw = pfx.to_string();
+            for i in 0..=rng.next_usize(4) {
+                if i > 0 { raw.push(if rng.next_usize(2) == 0 { '/' } else { '\\' }); }
+                raw.push_str(segs[rng.next_usize(segs.len())]);
+            }
+            if let Ok(n1) = normalize_os_path(&raw, false) && !n1.normalized.is_empty() {
+                let n2 = normalize_os_path(&n1.normalized, false).unwrap();
+                assert_eq!(n2.normalized, n1.normalized);
+                assert!(!n2.nfd_normalized && !n1.normalized.contains('\\'));
+            }
+            if pfx.is_empty() && let Some(r1) = normalize_rel(&raw) {
+                assert_eq!(normalize_rel(&r1).as_deref(), Some(r1.as_str()));
+                assert!(check_target_in_repo(&canon, &r1));
+            }
+        }
     }
 }

@@ -1,5 +1,5 @@
 use super::ops::{
-    EvalOptions, EvalScratch, MAX_COLS, PEAK_WINDOW, RIBBON_GUARD, SparseAttnTelemetry,
+    EvalOptions, EvalScratch, MAX_COLS, PEAK_WINDOW, RIBBON_GUARD, SparseStats,
     axis_conv_row, encode_grid_into, eval_span_block01_with, norm_sketch, sigmoid_f64,
     sink_attention_with,
 };
@@ -51,24 +51,24 @@ fn with_scratch<R>(
     })
 }
 
-pub(super) fn score_v07_with_opts(
+pub(super) fn score_opts(
     content: &str,
     w: &ResolvedWeights,
     opts: EvalOptions,
-) -> (HygieneResult, Option<SparseAttnTelemetry>) {
+) -> (HygieneResult, Option<SparseStats>) {
     with_scratch(content, w, false, |n, sc| dispatch_eval(w, n, opts, sc))
 }
 
 #[cfg(test)]
-pub(super) fn score_v07_scalar_only(content: &str, w: &ResolvedWeights) -> HygieneResult {
+pub(super) fn score_scalar(content: &str, w: &ResolvedWeights) -> HygieneResult {
     with_scratch(content, w, false, |n, sc| {
-        // SAFETY: `ScalarKernel` has no target-feature requirements.
+        // SAFETY: `ScalarKernel` requires no CPU target features.
         unsafe { eval_file_with::<ScalarKernel>(w, n, EvalOptions::default(), sc).0 }
     })
 }
 
 #[cfg(test)]
-pub(super) fn reset_and_check_sparse_alloc_on_default(
+pub(super) fn check_default_no_sparse(
     content: &str,
     w: &ResolvedWeights,
 ) -> (HygieneResult, bool) {
@@ -83,13 +83,13 @@ fn dispatch_eval(
     num_lines: usize,
     opts: EvalOptions,
     sc: &mut EvalScratch,
-) -> (HygieneResult, Option<SparseAttnTelemetry>) {
+) -> (HygieneResult, Option<SparseStats>) {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx2") {
-        // SAFETY: `is_x86_feature_detected!("avx2")` confirmed AVX2 support on this CPU.
+        // SAFETY: CPU feature detection confirmed AVX2 support.
         return unsafe { eval_file_avx2(w, num_lines, opts, sc) };
     }
-    // SAFETY: `ScalarKernel` has no target-feature requirements.
+    // SAFETY: `ScalarKernel` requires no CPU target features.
     unsafe { eval_file_with::<ScalarKernel>(w, num_lines, opts, sc) }
 }
 
@@ -111,7 +111,7 @@ fn resize_zero(buf: &mut Vec<f32>, needed: usize) {
     buf[..needed].fill(0.0);
 }
 
-// SAFETY: Caller must guarantee AVX2 is available on the executing x86_64 CPU.
+// SAFETY: Caller guarantees AVX2 support on this x86_64 CPU.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn eval_file_avx2(
@@ -119,19 +119,19 @@ unsafe fn eval_file_avx2(
     n: usize,
     opts: EvalOptions,
     sc: &mut EvalScratch,
-) -> (HygieneResult, Option<SparseAttnTelemetry>) {
-    // SAFETY: AVX2 is active in this function and propagates into `#[inline(always)]` `eval_file_with`.
+) -> (HygieneResult, Option<SparseStats>) {
+    // SAFETY: AVX2 is enabled here and propagates into `eval_file_with`.
     unsafe { eval_file_with::<Avx2Kernel>(w, n, opts, sc) }
 }
 
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+// SAFETY: Caller guarantees `K` target features are active on this CPU.
 #[inline(always)]
 unsafe fn eval_file_with<K: HygieneKernel>(
     w: &ResolvedWeights,
     n: usize,
     opts: EvalOptions,
     sc: &mut EvalScratch,
-) -> (HygieneResult, Option<SparseAttnTelemetry>) {
+) -> (HygieneResult, Option<SparseStats>) {
     prepare_file_buffers(w, n, sc);
 
     let mut first_nb: Option<(usize, usize)> = None;
@@ -142,32 +142,35 @@ unsafe fn eval_file_with<K: HygieneKernel>(
             continue;
         }
         let slen = (raw_len + RIBBON_GUARD).min(MAX_COLS);
-        if !paired_done {
+        let span_call = if !paired_done {
             if let Some((row0, slen0)) = first_nb {
-                // SAFETY: Enclosing caller guarantees `K` invariants.
-                unsafe { eval_span_block01_with::<K>(w, row0, slen0, Some((row, slen)), true, sc) };
                 paired_done = true;
+                Some((row0, slen0, Some((row, slen)), true))
             } else {
                 first_nb = Some((row, slen));
+                None
             }
         } else {
-            // SAFETY: Enclosing caller guarantees `K` invariants.
-            unsafe { eval_span_block01_with::<K>(w, row, slen, None, false, sc) };
+            Some((row, slen, None, false))
+        };
+        if let Some((row0, slen0, paired, first)) = span_call {
+            // SAFETY: Caller verified `K` features and `ensure_span_buffers` sized scratch.
+            unsafe { eval_span_block01_with::<K>(w, row0, slen0, paired, first, sc) };
         }
     }
     if !paired_done
         && let Some((row0, slen0)) = first_nb
     {
-        // SAFETY: Enclosing caller guarantees `K` invariants.
+        // SAFETY: Caller verified `K` features for the trailing single span.
         unsafe { eval_span_block01_with::<K>(w, row0, slen0, None, true, sc) };
     }
 
-    // SAFETY: Enclosing caller guarantees `K` invariants.
-    let telemetry = unsafe {
+    // SAFETY: Caller verified `K` features and `prepare_file_buffers` sized `n` rows.
+    let stats = unsafe {
         build_state_with::<K>(w, n, sc);
         run_context_with::<K>(w, n, opts, sc)
     };
-    (finish_heads(w, n, sc), telemetry)
+    (finish_heads(w, n, sc), stats)
 }
 
 fn fill_ml_tile(w: &ResolvedWeights, n: usize, row_start: usize, b: usize, sc: &mut EvalScratch) {
@@ -215,7 +218,7 @@ fn copy_tile_into_state(w: &ResolvedWeights, row_start: usize, b: usize, sc: &mu
     }
 }
 
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+// SAFETY: Caller guarantees `K` target features and `n`-row feature buffers.
 #[inline(always)]
 unsafe fn build_state_with<K: HygieneKernel>(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) {
     let cc = w.col_sum_proj.cols as usize;
@@ -228,7 +231,7 @@ unsafe fn build_state_with<K: HygieneKernel>(w: &ResolvedWeights, n: usize, sc: 
     let ls_cols = w.lmlp2_w.cols as usize;
 
     norm_sketch(&mut sc.sketch, n, w.sketch_w.cols);
-    // SAFETY: Enclosing caller guarantees `K` invariants.
+    // SAFETY: Caller verified `K` features; line feature slices cover `n` rows.
     unsafe {
         K::sparse_parts(
             &[&sc.col_sums[..n * cc], &sc.conv3[..n * c3c], &sc.conv7[..n * c7c]],
@@ -246,7 +249,7 @@ unsafe fn build_state_with<K: HygieneKernel>(w: &ResolvedWeights, n: usize, sc: 
         let b = (n - row_start).min(8);
         fill_ml_tile(w, n, row_start, b, sc);
         let row_end = row_start + b;
-        // SAFETY: Enclosing caller guarantees `K` invariants.
+        // SAFETY: Caller verified `K` features; tile slices cover `b <= 8` rows.
         unsafe {
             K::sparse_parts(
                 &[
@@ -276,21 +279,21 @@ unsafe fn build_state_with<K: HygieneKernel>(w: &ResolvedWeights, n: usize, sc: 
     }
 }
 
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+// SAFETY: Caller guarantees `K` target features and `n`-row state buffers.
 #[inline(always)]
 unsafe fn run_context_with<K: HygieneKernel>(
     w: &ResolvedWeights,
     n: usize,
     opts: EvalOptions,
     sc: &mut EvalScratch,
-) -> Option<SparseAttnTelemetry> {
+) -> Option<SparseStats> {
     let dim = w.state_dim;
-    let mut telemetry = (opts.approx_long && n > opts.approx_threshold).then(SparseAttnTelemetry::default);
+    let mut stats = (opts.approx_long && n > opts.approx_threshold).then(SparseStats::default);
 
     for (layer_idx, layer) in w.ctx_layers.iter().enumerate() {
-        // SAFETY: Enclosing caller guarantees `K` invariants.
+        // SAFETY: Caller verified `K` features; state and attention buffers hold `n` rows.
         unsafe {
-            sink_attention_with::<K>(&layer.attn, layer_idx, n, dim, sc, telemetry.as_mut());
+            sink_attention_with::<K>(&layer.attn, layer_idx, n, dim, sc, stats.as_mut());
         }
         for idx in 0..n * dim {
             sc.state[idx] += sc.attn_out[idx];
@@ -301,7 +304,7 @@ unsafe fn run_context_with<K: HygieneKernel>(
             let b = (n - row_start).min(8);
             let lo = row_start * dim;
             let hi = (row_start + b) * dim;
-            // SAFETY: Enclosing caller guarantees `K` invariants.
+            // SAFETY: Caller verified `K` features; context MLP tiles hold `b <= 8` rows.
             unsafe {
                 K::linear_sparse(
                     &sc.state[lo..hi],
@@ -326,7 +329,7 @@ unsafe fn run_context_with<K: HygieneKernel>(
             row_start += b;
         }
     }
-    telemetry
+    stats
 }
 
 fn finish_heads(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneResult {
@@ -437,7 +440,7 @@ fn finish_heads(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneR
     }
 }
 
-/// 33-row L1-resident circular ring-buffer `pool_doc` (bit-exact with full `(n + 1) * dim` prefix).
+/// Pool document features using a 33-row circular buffer.
 fn pool_doc_ring(n: usize, dim: usize, sc: &mut EvalScratch) -> Vec<f32> {
     const RING_LEN: usize = PEAK_WINDOW + 1;
     let mut doc = vec![0.0f32; dim * 2];

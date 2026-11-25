@@ -853,7 +853,7 @@ fn resolve_stem(imp: &str, src_dir: &str, src_ext: &str, tbl: &LookupTables) -> 
 }
 
 // ============================================================================
-// Folded Zstd Front-Coded (`k = 8`) SST Index (`RFST0004`)
+// Zstd front-coded SST index (`k = 8`)
 // ============================================================================
 
 #[cfg(test)]
@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_symbol_index_polyglot_and_cache() {
+    fn symbol_index_polyglot_cache() {
         let leaf = concat!(
             "pub fn base_fn() -> i32 { 1 }\n#[cfg(test)]\nmod tests {\n",
             "    use crate::top::top_fn;\n    #[test] fn t() { assert_eq!(top_fn(), 1); }\n}\n",
@@ -1243,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_t1_t4_boundaries_recursive_self_call_and_monorepo_resolution() {
+    fn dead_symbol_tiers_monorepo() {
         let web_a = concat!(
             "import type { UserDto } from '@shared/types';\n",
             "import { liveShared } from '@shared/types';\n",
@@ -1303,7 +1303,9 @@ mod tests {
     }
 
     #[test]
-    fn sst_zstd_lazy_lookup_and_threshold_gate() {
+    fn sst_zstd_lazy_and_threshold() {
+        assert!(!should_use_sst(499, 4096));
+        assert_eq!(should_use_sst(500, 4096), cfg!(feature = "sst-storage"));
         assert_eq!(pkg_id_for_rel("packages/core/src/lib.rs"), "packages/core");
         assert_eq!(pkg_id_for_rel("src/lib.rs"), "src");
         assert_eq!(pkg_id_for_rel("lib.rs"), "root");

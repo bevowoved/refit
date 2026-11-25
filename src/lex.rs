@@ -1220,7 +1220,7 @@ pub fn blank_noise_sentinel(ext: &str, content: &str) -> SentinelLex {
 pub fn check_balanced_syntax(rel_path: &str, source: &str) -> Result<(), String> {
     let ext = Path::new(rel_path)
         .extension()
-        .and_then(|s| s.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("");
     let lang = LangKind::from_ext(ext);
     if !matches!(lang, LangKind::Rust | LangKind::Go | LangKind::Js | LangKind::Jsx) {
@@ -1266,9 +1266,21 @@ fn pop_delim(b: u8, line: u32, stack: &mut Vec<(u8, u32)>) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TestRng;
+
+    fn count_nl(bytes: &[u8]) -> usize {
+        bytes.iter().filter(|&&b| b == b'\n').count()
+    }
+
+    fn assert_sentinel_ok(ext: &str, src: &str) -> SentinelLex {
+        let lexed = blank_noise_sentinel(ext, src);
+        assert_eq!(lexed.bytes.len(), src.len(), "byte len drift on {ext}");
+        assert_eq!(count_nl(&lexed.bytes), count_nl(src.as_bytes()), "newline drift on {ext}");
+        lexed
+    }
 
     #[test]
-    fn test_sentinel_preserves_offsets_and_rust_array_semicolon_in_cfg_test() {
+    fn sentinel_offsets_and_cfg_test() {
         let src = concat!(
             "pub fn live_fn() -> usize { 1 }\n",
             "#[cfg(test)]\n",
@@ -1278,41 +1290,43 @@ mod tests {
             "}\n",
             "pub fn after_test() -> usize { 2 }\n",
         );
-        let lexed = blank_noise_sentinel("rs", src);
-        assert_eq!(lexed.bytes.len(), src.len());
-        let lex_nl = lexed.bytes.iter().filter(|&&b| b == b'\n').count();
-        let src_nl = src.as_bytes().iter().filter(|&&b| b == b'\n').count();
-        assert_eq!(lex_nl, src_nl);
+        let lexed = assert_sentinel_ok("rs", src);
         let cleaned = lexed.to_clean_string(src);
-        assert!(cleaned.contains("pub fn live_fn"));
-        assert!(cleaned.contains("pub fn after_test"));
+        assert!(cleaned.contains("pub fn live_fn") && cleaned.contains("pub fn after_test"));
         assert!(!cleaned.contains("arr"), "cfg(test) body leaked past [u8; 16]: {cleaned}");
-        assert!(!lexed.test_spans.is_empty());
-        let test_text: String = lexed
-            .test_spans
-            .iter()
-            .map(|&(a, b)| &src[a..b])
-            .collect();
-        assert!(test_text.contains("live_fn"));
+        assert_eq!(lexed.test_spans.len(), 1);
+        let (a, b) = lexed.test_spans[0];
+        assert!(src[a..b].contains("live_fn") && src[a..b].contains("arr"));
     }
 
     #[test]
-    fn test_py_fstring_and_jsx_apostrophe_sentinel() {
+    fn sentinel_fuzz_offset_invariants() {
+        let mut rng = TestRng::new(0x1E45_F022);
+        let pieces = [
+            "pub fn f() { ", "let s = \"hi \\\" // x\"; ", "r#\"raw\"# ", "// cmt\n",
+            "/* blk\n* cmt */ ", "# py cmt\n", "f\"v={x}\" ", "`tpl ${y}` ", "'a' ",
+            "#[cfg(test)] mod t { fn g() {} }\n", "日本語🚀 ", "}\n",
+        ];
+        for ext in ["rs", "py", "ts", "tsx", "go"] {
+            for _ in 0..60 {
+                let mut doc = String::new();
+                for _ in 0..10 {
+                    doc.push_str(pieces[rng.next_usize(pieces.len())]);
+                }
+                let _ = assert_sentinel_ok(ext, &doc);
+            }
+        }
+
         let py = "def greet(user_name):\n    # comment ignore_me\n    return f\"hi {user_name}\"\n";
-        let lexed = blank_noise_sentinel("py", py);
-        assert_eq!(lexed.bytes.len(), py.len());
-        let cleaned = lexed.to_clean_string(py);
-        assert!(cleaned.contains("user_name"));
-        assert!(!cleaned.contains("ignore_me"));
-
+        let py_clean = blank_noise_sentinel("py", py).to_clean_string(py);
+        assert!(py_clean.contains("user_name") && !py_clean.contains("ignore_me"));
         let tsx = "export const V = () => <div>Don't stop {runAction()}</div>;\n";
-        assert!(check_balanced_syntax("src/V.tsx", tsx).is_ok());
-        let lexed_tsx = blank_noise_sentinel("tsx", tsx);
-        assert!(lexed_tsx.to_clean_string(tsx).contains("runAction"));
+        assert_eq!(check_balanced_syntax("src/V.tsx", tsx), Ok(()));
+        assert!(blank_noise_sentinel("tsx", tsx).to_clean_string(tsx).contains("runAction"));
     }
 
     #[test]
-    fn test_lex_cursor_flags_and_shared_helpers() {
+    fn lex_cursor_flags_and_helpers() {
         let rs = concat!(
             "/// Doc comment\n",
             "// SAFETY: verified\n",
@@ -1322,11 +1336,8 @@ mod tests {
             "mod tests { fn inner() {} }\n",
         );
         let mut cursor = LexCursor::new(LangKind::Rust, rs.as_bytes());
-        let mut saw_doc = false;
-        let mut saw_safety = false;
-        let mut saw_os = false;
-        let mut saw_test = false;
-        let mut saw_char = false;
+        let (mut saw_doc, mut saw_safety, mut saw_os, mut saw_test, mut saw_char) =
+            (false, false, false, false, false);
         while let Some(tok) = cursor.next_token() {
             saw_doc |= tok.kind == LexKind::LineComment && tok.flags.is_doc_comment();
             saw_safety |= tok.kind == LexKind::LineComment && tok.flags.has(TokFlags::SAFETY_COMMENT);
@@ -1346,7 +1357,7 @@ mod tests {
             vec![b"let".as_slice(), b"foo_1", b"bar2"]
         );
         assert_eq!(extract_comment_body("rs", "  /// hello world"), Some("hello world"));
-        let rs_any = "#[cfg(any(feature = \"mcp-v2\", test))]\npub fn prod_feat() {}\n#[cfg(all(unix, test))]\nfn unix_test() {}\n";
+        let rs_any = "#[cfg(any(feature = \"ste100\", test))]\npub fn prod_feat() {}\n#[cfg(all(unix, test))]\nfn unix_test() {}\n";
         let (mut prod_in_test, mut all_in_test) = (false, false);
         let mut c2 = LexCursor::new(LangKind::Rust, rs_any.as_bytes());
         while let Some(tok) = c2.next_token() {

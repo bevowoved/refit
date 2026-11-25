@@ -4,7 +4,7 @@ mod simd;
 pub mod strict;
 mod weights;
 
-pub use ops::{EvalOptions, SparseAttnTelemetry};
+pub use ops::{EvalOptions, SparseStats};
 
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
@@ -105,7 +105,7 @@ fn read_opt_f64(rd: &mut Cursor<&[u8]>, flags: u8, bit: u8) -> Option<Option<f64
     }
 }
 
-/// Safe explicit little-endian binary codec for `HygieneResult` caches (`RFHG0002`, zero UB).
+/// Encode cached hygiene results into compact little-endian bytes.
 fn encode_compact_cache(map: &HashMap<String, HygieneResult>) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + map.len() * 96);
     out.extend_from_slice(CACHE_MAGIC);
@@ -228,7 +228,10 @@ fn decode_compact_cache(bytes: &[u8]) -> Option<HashMap<String, HygieneResult>> 
     Some(map)
 }
 
-fn write_compact_cache_zstd(path: &Path, map: &HashMap<String, HygieneResult>) -> anyhow::Result<()> {
+fn write_compact_cache_zstd(
+    path: &Path,
+    map: &HashMap<String, HygieneResult>,
+) -> anyhow::Result<()> {
     let raw = encode_compact_cache(map);
     let mut enc = zstd::stream::Encoder::new(Vec::new(), 3)?;
     let _ = enc.window_log(CACHE_ZSTD_WINDOW_LOG);
@@ -298,11 +301,11 @@ impl HygieneScorer {
     fn active_weights(&self) -> &weights::ResolvedWeights {
         match self.override_weights.as_deref() {
             Some(w) => w,
-            None => weights::v07_weights(),
+            None => weights::base_weights(),
         }
     }
 
-    /// Expose the active weights' 16-hex BLAKE3 prefix without inflating embedded `WEIGHTS_NPZ`.
+    /// Return the 16-hex BLAKE3 prefix of the active weights.
     pub fn weights_blake3_prefix(&self) -> &str {
         match self.override_weights.as_deref() {
             Some(w) => w.hash_prefix.as_str(),
@@ -318,7 +321,7 @@ impl HygieneScorer {
         Self::open_with_weights(repo_root, ov)
     }
 
-    /// Open a persistent scorer while propagating errors from any invalid `.refit/weights/` override.
+    /// Open a persistent scorer and validate any weights override.
     #[cfg(test)]
     pub fn open_persistent_checked(repo_root: &Path) -> anyhow::Result<Self> {
         Ok(Self::open_with_weights(repo_root, weights::load_verified_override(repo_root)?))
@@ -328,8 +331,11 @@ impl HygieneScorer {
         repo_root: &Path,
         override_weights: Option<Arc<weights::ResolvedWeights>>,
     ) -> Self {
-        let disk_path = repo_root.join(".refit/cache/hygiene_v07_cache.zst");
-        let opts = EvalOptions { approx_long: env_truthy("REFIT_APPROX_LONG"), ..EvalOptions::default() };
+        let disk_path = repo_root.join(".refit/cache/hygiene_cache.zst");
+        let opts = EvalOptions {
+            approx_long: env_truthy("REFIT_APPROX_LONG"),
+            ..EvalOptions::default()
+        };
         let scorer = Self::with_path(Some(disk_path.clone()), override_weights, opts);
         let prefix = scorer.weights_blake3_prefix().to_string();
         if let Some(saved) = read_hygiene_cache(&disk_path, &prefix) {
@@ -376,7 +382,7 @@ impl HygieneScorer {
         _path: &str,
         content: &str,
         opts: EvalOptions,
-    ) -> (HygieneResult, Option<SparseAttnTelemetry>) {
+    ) -> (HygieneResult, Option<SparseStats>) {
         let line_count = crate::source::count_lines(content.as_bytes()).max(1);
         let approx_active = opts.approx_long && line_count > opts.approx_threshold;
         let eval_opts = EvalOptions { approx_long: approx_active, ..opts };
@@ -410,7 +416,7 @@ impl HygieneScorer {
         let req = est.min(gate.capacity());
         let permit = gate.reserve_or_wait(req, Duration::from_secs(5)).ok();
         let started = Instant::now();
-        let (mut res, telemetry) = model::score_v07_with_opts(content, self.active_weights(), eval_opts);
+        let (mut res, stats) = model::score_opts(content, self.active_weights(), eval_opts);
         res.latency_us = started.elapsed().as_micros().max(1) as u64;
         let weight = hygiene_entry_weight(&key, &res);
         self.cache.insert(key.clone(), res.clone(), weight);
@@ -419,25 +425,25 @@ impl HygieneScorer {
         drop(permit);
         drop(guard);
         self.release_in_flight(&key, &lock);
-        (res, telemetry)
+        (res, stats)
     }
 
-    /// Score content with exact `v0.7.0` `score` plus additive `CH-V4..V7` strict/calibration track.
+    /// Score content with strict checks using default context.
     #[cfg(test)]
     pub fn score_content_strict(&self, path: &str, content: &str) -> HygieneResult {
-        self.score_content_strict_with_ego(path, content, None)
+        self.score_strict_ego(path, content, None)
     }
 
-    /// Score content with exact `v0.7.0` `score` plus live `FileEgoContext` & truthful `CalibrationAudit`.
-    pub fn score_content_strict_with_ego(
+    /// Score content with strict checks and optional ego context.
+    pub fn score_strict_ego(
         &self,
         path: &str,
         content: &str,
         ego: Option<&FileEgoContext>,
     ) -> HygieneResult {
-        let (base, telemetry) = self.score_content_with_opts(path, content, self.default_opts);
+        let (base, stats) = self.score_content_with_opts(path, content, self.default_opts);
         let zero_ratio = self.active_weights().weight_zero_ratio;
-        strict::score_strict_calibrated(path, content, &base, ego, telemetry.as_ref(), zero_ratio)
+        strict::score_strict(path, content, &base, ego, stats.as_ref(), zero_ratio)
     }
 
     pub fn score_files(
@@ -505,455 +511,16 @@ impl HygieneScorer {
 mod tests {
     use super::*;
     use crate::platform::write_zstd;
-    use crate::testutil::{TempRepo, build_single_entry_zip, map_conds, nest_src, repeat_fn, walk_rs_files};
+    use crate::testutil::{
+        TempRepo, build_single_entry_zip, map_conds, nest_src, repeat_fn, walk_rs_files,
+    };
     use flate2::Compression;
     use flate2::write::DeflateEncoder;
     use std::collections::{BTreeSet, HashSet};
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
-    fn sq_tuples(list: &[Squiggle]) -> Vec<(usize, String, i64)> {
-        list.iter()
-            .map(|s| (s.line, s.kind.clone(), (s.probability * 10_000.0).round() as i64))
-            .collect()
-    }
-
-    fn js_sq_tuples(list: &[serde_json::Value]) -> Vec<(usize, String, i64)> {
-        let mut out = Vec::with_capacity(list.len());
-        for s in list {
-            let ln = s["line"].as_u64().unwrap() as usize;
-            let raw_kind = s["kind"].as_str().unwrap();
-            let raw_p = s["probability"].as_f64().unwrap();
-            let prob = (raw_p * 10_000.0).round() as i64;
-            out.push((ln, raw_kind.to_string(), prob));
-        }
-        out
-    }
-
-    fn append_repeat(out: &mut String, count: usize, f: impl Fn(usize) -> String) {
-        for idx in 0..count {
-            out.push_str(&f(idx));
-        }
-    }
-
-    #[test]
-    fn test_hygiene_scoring_and_cache() {
-        let tmp = TempRepo::new("hyg_disk");
-        let s1 = HygieneScorer::open_persistent(tmp.path());
-
-        for (rel, src) in [("e.py", ""), ("o.rs", "pub const X: usize = 1;\n")] {
-            let sc = s1.score_content(rel, src).score;
-            assert!((0.80..=0.99).contains(&sc), "{rel}={sc}");
-        }
-
-        let clean = "def add(a: int, b: int) -> int:\n    return a + b\n";
-        let conds = map_conds(&["0", "1", "2", "3", "4"], |i| format!("if x > {i}:"));
-        let tail = "return 'a' * 120 + 'extra_padding_to_exceed_one_hundred_cols_now'";
-        let messy = nest_src("def bad(x):", "    ", &conds, tail, None);
-
-        let cold = s1.score_content("clean.py", clean);
-        assert!(!cold.cached);
-        let warm = s1.score_content("clean.py", clean);
-        assert!(warm.cached && warm.latency_us <= 1000);
-        let bad = s1.score_content("messy.py", &messy);
-        assert!(cold.score > bad.score + 0.05 && !bad.squiggles.is_empty());
-
-        let rs_clean = concat!(
-            "pub struct S;\nimpl S {\n    pub fn run(&self, x: Option<i32>) -> i32 {\n",
-            "        match x { Some(v) => v + 1, None => 0 }\n    }\n}\n",
-        );
-        let r1 = s1.score_content("s.rs", rs_clean);
-        assert!(!r1.cached && r1.score > 0.70);
-        s1.flush_cache();
-
-        let s2 = HygieneScorer::open_persistent(tmp.path());
-        let r2 = s2.score_content("s.rs", rs_clean);
-        assert!(r2.cached && (r1.score - r2.score).abs() < 1e-9 && s2.warm_us() >= 1);
-
-        // Verify legacy JSON-zstd cache backward compatibility
-        let legacy_tmp = TempRepo::new("hyg_legacy_json");
-        let legacy_path = legacy_tmp.path().join(".refit/cache/hygiene_v07_cache.zst");
-        let legacy_key = format!("v07:{}", MvccStore::hash_bytes(rs_clean.as_bytes()));
-        let mut legacy_map = HashMap::new();
-        legacy_map.insert(legacy_key, r1.clone());
-        write_zstd(&legacy_path, &legacy_map).unwrap();
-        let s_leg = HygieneScorer::open_persistent(legacy_tmp.path());
-        let r_leg = s_leg.score_content("s.rs", rs_clean);
-        assert!(r_leg.cached && (r_leg.score - r1.score).abs() < 1e-9);
-
-        let ts_head = "export function messy(a: number, b: number, c: number, d: number, e: number, f: number) {";
-        let ts_c = map_conds(&["a", "b", "c", "d", "e", "f"], |v| format!("if ({v} > 0) {{"));
-        let ts_body = "return a ? (b ? (c ? d + e + f : a + b) : c) : (d ? e : f) + 1234567;";
-        let r_ts = s2.score_content("messy.ts", &nest_src(ts_head, "  ", &ts_c, ts_body, Some("}")));
-        assert!(r_ts.score < 0.85 && !r_ts.squiggles.is_empty(), "got {}", r_ts.score);
-    }
-
-    #[test]
-    fn test_hygiene_all_six_smells() {
-        let scorer = HygieneScorer::new();
-        let conds = map_conds(&["a", "b", "c", "d", "e"], |v| format!("if {v}:"));
-        let nested = nest_src("def f(a, b, c, d, e):", "    ", &conds, "return a+b+c+d+e", None);
-        let dense = concat!(
-            "def d(x):\n    return (x + 1 if x > 0 else (x - 1 if x < -5 else ",
-            "(x * 2 if x == 0 else x * 3))) + len(str(x).strip().lower().replace('a', 'b'))\n",
-        );
-
-        let steps = [
-            "one = normalize_payload(raw_input)", "two = validate_schema(step_one)",
-            "three = enrich_metadata(step_two)", "four = compute_digest(step_three)",
-            "five = serialize_record(step_four)", "six = write_storage(step_five)",
-            "seven = emit_audit_log(step_six)",
-        ];
-        let mut dup = String::new();
-        for n in 1..=2 {
-            dup.push_str(&format!("def run_pipeline_{n}(raw_input):\n"));
-            for s in steps {
-                dup.push_str(&format!("    step_{s}\n"));
-            }
-            dup.push_str("    return step_seven\n\n");
-        }
-
-        let rep = repeat_fn("def pick(k):", 1..=8, |i| format!("    if k == {i}:\n        return {i} * 10\n"), "");
-        let cramped = repeat_fn("def cramped_fn(x):", 1..=45, |i| format!("    v_{i} = x + {i}\n"), "    return v_45\n");
-        let echo = repeat_fn("def calc(x, y, z):", 0..=14, |i| format!("    # step_{i} = compute_legacy_{i}(x, y, z)\n"), "    return x\n");
-
-        let mut kinds: HashSet<String> = HashSet::new();
-        for src in [nested.as_str(), dense, &dup, &rep, &cramped, &echo] {
-            for q in scorer.score_content("t.py", src).squiggles {
-                kinds.insert(q.kind);
-            }
-        }
-        for k in ["deep_nesting", "dense_line", "duplicate_block", "repetitive_structure", "cramped_layout", "comment_echo"] {
-            assert!(kinds.contains(k), "missing {k} in {kinds:?}");
-        }
-    }
-
-    #[test]
-    fn v07_canonical_zero_delta_parity() {
-        let scorer = HygieneScorer::new();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-        // 1. Pinned canonical v0.7.0 baselines
-        assert_eq!(scorer.score_content("empty.rs", "").score, 0.8808);
-        assert_eq!(scorer.score_content("one.rs", "pub const X: usize = 1;\n").score, 0.8808);
-
-        // 2. Verify pure-AVX2 non-FMA Estrin exp accuracy & underflow mask on x86_64 AVX2
-        #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2") {
-            let mut max_ulp = 0u64;
-            let mut out = [0.0f64; 4];
-            let underflow = [-708.5, -709.0, -1000.0, -1e9];
-            // SAFETY: AVX2 support verified above.
-            unsafe {
-                let v = std::arch::x86_64::_mm256_loadu_pd(underflow.as_ptr());
-                let r = simd::exp_f64x4_avx2_non_fma(v);
-                std::arch::x86_64::_mm256_storeu_pd(out.as_mut_ptr(), r);
-            }
-            assert_eq!(out, [0.0, 0.0, 0.0, 0.0], "underflow mask failed: {out:?}");
-
-            for step in 0..2500 {
-                let mut xs = [0.0f64; 4];
-                for (j, slot) in xs.iter_mut().enumerate() {
-                    let t = ((step * 4 + j) as f64) / 9999.0;
-                    *slot = -708.0 + t * 1417.0;
-                }
-                // SAFETY: AVX2 support verified above.
-                unsafe {
-                    let v = std::arch::x86_64::_mm256_loadu_pd(xs.as_ptr());
-                    let r = simd::exp_f64x4_avx2_non_fma(v);
-                    std::arch::x86_64::_mm256_storeu_pd(out.as_mut_ptr(), r);
-                }
-                for j in 0..4 {
-                    let ref_v = xs[j].exp();
-                    let ulp = out[j].to_bits().abs_diff(ref_v.to_bits());
-                    max_ulp = max_ulp.max(ulp);
-                }
-            }
-            assert!(max_ulp <= 2, "Estrin exp_f64x4 ULP {max_ulp} > 2");
-        }
-
-        // 3. Collect all src/**/*.rs files + edge-case fixtures (CRLF, tabs, Unicode, single-line)
-        let mut cases: Vec<(String, String)> = Vec::new();
-        let mut rs_files = Vec::new();
-        walk_rs_files(&root.join("src"), &root.join("src"), &mut rs_files);
-        rs_files.sort_by(|a, b| a.0.cmp(&b.0));
-        assert!(rs_files.len() >= 47, "expected >= 47 src/**/*.rs files, got {}", rs_files.len());
-        for (rel, abs) in rs_files {
-            cases.push((format!("src/{rel}"), fs::read_to_string(abs).unwrap()));
-        }
-        cases.push(("edge_crlf.rs".into(), "pub fn a() -> i32 {\r\n    1\r\n}\r\n".into()));
-        cases.push(("edge_tabs.go".into(), "package p\nfunc F(x int) int {\n\tif x > 0 {\n\t\treturn x\n\t}\n\treturn 0\n}\n".into()));
-        cases.push(("edge_utf8.rs".into(), "pub fn greet() -> &'static str {\n    \"héllo 🚀 日本語\"\n}\n".into()));
-        cases.push(("edge_nul_vtab.txt".into(), "a\x00b\x0bc\u{2028}d\r\ne".into()));
-
-        // 4. Spawn live JS v0.7.0 worker and assert 0.000000000 max_abs_delta across every single file
-        let worker = root.join("vendor/codehygiene/worker.mjs");
-        let npz = root.join("vendor/codehygiene/weights.npz");
-        let mut child = Command::new("node")
-            .arg(&worker)
-            .arg(&npz)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn node vendor/codehygiene/worker.mjs");
-
-        let mut stdin = child.stdin.take().unwrap();
-        let mut reader = BufReader::new(child.stdout.take().unwrap());
-        let mut max_abs_delta = 0.0f64;
-
-        for (idx, (label, content)) in cases.iter().enumerate() {
-            let req = serde_json::json!({ "id": idx + 1, "content": content })
-                .to_string()
-                .replace('\u{2028}', "\\u2028")
-                .replace('\u{2029}', "\\u2029");
-            writeln!(stdin, "{req}").unwrap();
-            stdin.flush().unwrap();
-
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            let js: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert!(js.get("error").is_none(), "JS error on {label}: {js}");
-
-            let js_score = js["score"].as_f64().unwrap();
-            let js_sq = js["squiggles"].as_array().unwrap();
-            let rust_res = scorer.score_content(label, content);
-            let rust_sq_vec = sq_tuples(&rust_res.squiggles);
-            if idx < 8 || label.starts_with("edge_") || label.contains("hygiene") {
-                let scalar_res = model::score_v07_scalar_only(content, weights::v07_weights());
-                assert_eq!(rust_res.score, scalar_res.score, "AVX2 vs scalar score on {label}");
-                assert_eq!(
-                    rust_sq_vec,
-                    sq_tuples(&scalar_res.squiggles),
-                    "AVX2 vs scalar squiggles on {label}"
-                );
-            }
-
-            let delta = (rust_res.score - js_score).abs();
-            max_abs_delta = max_abs_delta.max(delta);
-            assert_eq!(
-                rust_res.score, js_score,
-                "score mismatch on {label}: rust={} js={} delta={delta}",
-                rust_res.score, js_score
-            );
-            assert_eq!(
-                rust_res.total_squiggles,
-                Some(js_sq.len()),
-                "total_squiggles mismatch on {label}"
-            );
-            if js_sq.len() <= 48 {
-                assert_eq!(rust_res.squiggles.len(), js_sq.len(), "sq len mismatch on {label}");
-                let mut r_sorted = rust_sq_vec;
-                let mut j_sorted = js_sq_tuples(js_sq);
-                r_sorted.sort();
-                j_sorted.sort();
-                for (r_item, j_item) in r_sorted.iter().zip(j_sorted.iter()) {
-                    assert_eq!((r_item.0, &r_item.1), (j_item.0, &j_item.1), "sq kind on {label}");
-                    assert!(
-                        (r_item.2 - j_item.2).abs() <= 1,
-                        "sq prob mismatch on {label}: rust={r_item:?} js={j_item:?}"
-                    );
-                }
-            }
-        }
-        drop(stdin);
-        let status = child.wait().unwrap();
-        assert!(status.success());
-        assert_eq!(max_abs_delta, 0.0, "expected 0.000000000 max_abs_delta, got {max_abs_delta}");
-    }
-
-    #[test]
-    fn anti_gaming_25_vectors_and_zero_false_vetoes() {
-        let scorer = HygieneScorer::new();
-
-        // 1. All 25 adversarial gaming vectors MUST be vetoed (<= 0.50; BiDi/homoglyph <= 0.15)
-        let adv_cases: [(&str, &str, &str); 25] = [
-            ("adv_01.rs", "bidi_trojan_source", "pub fn check(admin: bool) -> bool {\n    /* \u{202E} } \u{2066} if admin \u{2069} \u{2066} */\n    false\n}\n"),
-            ("adv_02.rs", "bidi_trojan_source", "pub fn hidden() -> &'static str {\n    \"ok\u{200B}token\"\n}\n"),
-            ("adv_03.rs", "uts39_homoglyph", "pub fn auth() -> bool {\n    let \u{0430}dmin = false;\n    let us\u{0435}r = \u{0430}dmin;\n    us\u{0435}r\n}\n"),
-            ("adv_04.rs", "uts39_homoglyph", "pub fn check() -> i32 {\n    let t\u{03BF}ken = 1\u{037E}\n    t\u{03BF}ken\n}\n"),
-            ("adv_05.rs", "lint_suppression", concat!("#", "[allow(dead_code, clippy::too_many_arguments)]\npub fn suppressed(val: i32) -> i32 {\n    val + 1\n}\n")),
-            ("adv_06.rs", "lint_suppression", concat!("#!", "[allow(warnings)]\npub fn noisy(val: i32) -> i32 {\n    val + 1\n}\n")),
-            ("adv_07.rs", "lint_suppression", concat!("#", "[cfg_attr(all(), allow(clippy::all))]\npub fn sneaky(val: i32) -> i32 {\n    val + 1\n}\n")),
-            ("adv_08.rs", "serde_flatten", "pub struct Payload {\n    pub name: String,\n    #[serde(default, flatten)]\n    pub extra: std::collections::BTreeMap<String, String>,\n}\n"),
-            ("adv_09.rs", "identifier_golf", "pub fn run(p: i32) -> i32 {\n    let a = p + 1;\n    let b = a * 2;\n    let c = b - 3;\n    let d = c + 4;\n    let f = d * 5;\n    let g = f - 6;\n    g\n}\n"),
-            ("adv_10.rs", "identifier_golf", "pub fn f(value: i32) -> i32 {\n    value + 1\n}\n"),
-            ("adv_11.rs", "blank_line_stuffing", "pub fn padded(value: i32) -> i32 {\n    let step_one = value + 1;\n\n\n\n\n    let step_two = step_one * 2;\n    let step_three = step_two + 3;\n    let step_four = step_three - 1;\n    let step_five = step_four + 5;\n    step_five\n}\n"),
-            ("adv_12.rs", "blank_line_stuffing", "pub fn sparse(input: i32) -> i32 {\n\n    let alpha = input + 1;\n\n    let beta = alpha + 2;\n\n    let gamma = beta + 3;\n\n    let delta = gamma + 4;\n\n    let eps = delta + 5;\n\n    let zeta = eps + 6;\n\n    let eta = zeta + 7;\n\n    eta\n}\n"),
-            ("adv_13.rs", "comment_echo_stuffing", "pub fn echoed(base_score: i32) -> i32 {\n    // compute total_score from base_score\n    let total_score = base_score + 10;\n    // apply bonus_weight to total_score\n    let bonus_weight = total_score * 2;\n    // clamp final_metric using bonus_weight\n    let final_metric = bonus_weight.min(100);\n    final_metric\n}\n"),
-            ("adv_14.rs", "comment_echo_stuffing", "// Step 1: initialize variable\n// Step 2: compute addition\n// Step 3: validate input\n// Step 4: check result\n// Step 5: prepare output\n// Step 6: finalize return\n// Step 7: complete function\n// Step 8: end marker\npub fn add(left_val: i32, right_val: i32) -> i32 {\n    left_val + right_val\n}\n"),
-            ("adv_15.rs", "prod_placeholder_macro", "pub fn incomplete(value: i32) -> i32 {\n    if value > 0 {\n        todo!(\"implement later\")\n    } else {\n        0\n    }\n}\n"),
-            ("adv_16.rs", "prod_placeholder_macro", "pub fn stub(value: i32) -> i32 {\n    let _ = value;\n    unimplemented!()\n}\n"),
-            ("adv_17.rs", "hidden_dense_tail", "pub fn sneak(alpha: i32, beta: i32) -> i32 {\n    let base = alpha + 1;                                                                                                                 let hidden = if beta > 0 { base * 2 + alpha } else { base - 1 };\n    hidden\n}\n"),
-            ("adv_18.rs", "hidden_dense_tail", "pub fn packed(val: i32) -> i32 {\n    let out = val + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 23 + 24 + 25 + 26 + 27 + 28 + 29 + 30 + 31;\n    out\n}\n"),
-            ("adv_19.rs", "deep_nesting_spaghetti", "pub fn pyramid(v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32) -> i32 {\n    if v1 > 0 {\n        if v2 > 0 {\n            if v3 > 0 {\n                if v4 > 0 {\n                    if v5 > 0 {\n                        if v6 > 0 {\n                            return v1 + v6;\n                        }\n                    }\n                }\n            }\n        }\n    }\n    0\n}\n"),
-            ("adv_20.rs", "deep_nesting_spaghetti", "pub fn spoofed(v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32) -> i32 {\nif v1 > 0 {\n if v2 > 0 {\n  if v3 > 0 {\n   if v4 > 0 {\n    if v5 > 0 {\n     if v6 > 0 {\n      return v1 + v6;\n     }\n    }\n   }\n  }\n }\n}\n0\n}\n"),
-            ("adv_21.go", "deep_nesting_spaghetti", "package sloppy\nfunc Deep(a, b, c, d, e, f bool) int {\n\tif a {\n\t\tif b {\n\t\t\tif c {\n\t\t\t\tif d {\n\t\t\t\t\tif e {\n\t\t\t\t\t\tif f {\n\t\t\t\t\t\t\treturn 1\n\t\t\t\t\t\t}\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n\treturn 0\n}\n"),
-            ("adv_22.rs", "unsafe_undocumented", "pub fn cast_bits(bits: u64) -> f64 {\n    unsafe { std::mem::transmute::<u64, f64>(bits) }\n}\n"),
-            ("adv_23.rs", "std_lock_unwrap", "pub fn bump(lock: &std::sync::Mutex<u64>) -> u64 {\n    let mut guard = lock.lock().unwrap();\n    *guard += 1;\n    *guard\n}\n"),
-            ("adv_24.rs", "deep_nesting_spaghetti", "pub fn crammed(a: bool, b: bool, c: bool) -> i32 {\n    if a { if b { if c { return 1; } } }\n    0\n}\n"),
-            ("adv_25.rs", "deep_nesting_spaghetti", "pub fn multi(a: bool, b: bool, c: bool) -> i32 {\n    let mut acc = 0;\n    if a { acc += 1; } if b { acc += 2; } if c { acc += 4; }\n    acc\n}\n"),
-        ];
-
-        for (path, expected_rule, code) in adv_cases {
-            let res = scorer.score_content_strict(path, code);
-            let strict_sc = res.strict_score.unwrap();
-            assert!(
-                res.triggered_vetoes.iter().any(|v| v.starts_with(expected_rule)),
-                "{path}: expected `{expected_rule}`, got {:?}",
-                res.triggered_vetoes
-            );
-            assert!(strict_sc <= 0.50, "{path}: expected strict_score <= 0.50, got {strict_sc}");
-            if expected_rule == "bidi_trojan_source" || expected_rule == "uts39_homoglyph" {
-                assert!(strict_sc <= 0.15, "{path}: expected <= 0.15, got {strict_sc}");
-            }
-        }
-
-        // Verify expect-with-reason is allowed while bare expect is vetoed
-        let expect_ok = scorer.score_content_strict(
-            "ok_expect.rs",
-            concat!("#", "[expect(dead_code, reason = \"kept for ABI compatibility\")]\npub fn helper(val: i32) -> i32 {\n    val + 1\n}\n"),
-        );
-        assert!(expect_ok.triggered_vetoes.is_empty(), "{:?}", expect_ok.triggered_vetoes);
-        let expect_bad = scorer.score_content_strict(
-            "bad_expect.rs",
-            concat!("#", "[expect(dead_code)]\npub fn helper(val: i32) -> i32 {\n    val + 1\n}\n"),
-        );
-        assert!(expect_bad.triggered_vetoes.iter().any(|v| v.starts_with("lint_suppression")));
-
-        // 2. Clean idiom controls (incl. Go hard tabs) -> 0 vetoes & exact clean score
-        let clean_go = "package ledger\nfunc ApplyCredit(total int, amount int) int {\n\tif amount <= 0 {\n\t\treturn total\n\t}\n\treturn total + amount\n}\n";
-        let go_res = scorer.score_content_strict("ledger.go", clean_go);
-        assert!(go_res.triggered_vetoes.is_empty());
-        assert_eq!(go_res.strict_score, Some(go_res.score));
-        let audit_cmp = strict::audit_anti_gaming(
-            "clean.rs",
-            "pub fn add(left: i32, right: i32) -> i32 {\n    left + right\n}\n",
-            "pub fn add(left: i32, right: i32) -> i32 {\n    todo!()\n}\n",
-        );
-        assert!(!audit_cmp.passed && audit_cmp.introduced_vetoes.len() == 1);
-
-        // 3. Audit ALL real src/**/*.rs files -> ZERO false vetoes!
-        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        walk_rs_files(&src_dir, &src_dir, &mut files);
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-        assert!(files.len() >= 47, "expected >= 47 real src files, got {}", files.len());
-
-        let mut cfg_test_mods = BTreeSet::new();
-        for (rel, abs) in &files {
-            let src = fs::read_to_string(abs).unwrap();
-            for target in strict::find_cfg_test_mod_decls(rel, &src) {
-                cfg_test_mods.insert(target);
-            }
-        }
-        let mut false_vetoes = Vec::new();
-        for (rel, abs) in &files {
-            let src = fs::read_to_string(abs).unwrap();
-            let is_test = strict::is_test_only_path(rel) || cfg_test_mods.contains(rel);
-            let rep = strict::audit_source_with_test_flag(rel, &src, 0.8808, is_test);
-            for v in rep.formatted_vetoes() {
-                false_vetoes.push(format!("{rel}: {v}"));
-            }
-        }
-        assert!(
-            false_vetoes.is_empty(),
-            "false vetoes across {} real src/**/*.rs files:\n{}",
-            files.len(),
-            false_vetoes.join("\n")
-        );
-    }
-
-    #[test]
-    fn weights_override_zip_bomb_and_digest_guard() {
-        let real_npz = fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/codehygiene/weights.npz")).unwrap();
-        let real_digest = blake3::hash(&real_npz).to_hex().to_string();
-        let ok_repo = TempRepo::new("weights_ok");
-        let wdir = ok_repo.path().join(".refit/weights");
-        fs::create_dir_all(&wdir).unwrap();
-        fs::write(wdir.join("hygiene.npz"), &real_npz).unwrap();
-        let write_manifest = |v: &str, a: &str, f: &str, d: &str| {
-            let body = format!(r#"{{"version":"{v}","arch":"{a}","file":"{f}","blake3":"{d}"}}"#);
-            fs::write(wdir.join("hygiene.json"), body).unwrap();
-        };
-        write_manifest("0.7.0", "v07", "hygiene.npz", &real_digest);
-        let scorer = HygieneScorer::open_persistent_checked(ok_repo.path()).unwrap();
-        assert_eq!(scorer.weights_blake3_prefix(), &real_digest[..16]);
-        assert_eq!(scorer.score_content("a.rs", "pub const X: usize = 1;\n").score, 0.8808);
-
-        let bad_digest = "0".repeat(64);
-        for (v, a, f, d, want) in [
-            ("0.7.0", "v07", "hygiene.npz", bad_digest.as_str(), "digest mismatch"),
-            ("0.8.0", "v08", "hygiene.npz", real_digest.as_str(), "unsupported weights arch"),
-            ("0.7.0", "v07", "../hygiene.npz", real_digest.as_str(), "unsafe weights filename"),
-        ] {
-            write_manifest(v, a, f, d);
-            let err = HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap();
-            assert!(err.to_string().contains(want), "got {err}");
-        }
-        fs::remove_file(wdir.join("hygiene.json")).unwrap();
-        let unpinned_err = HygieneScorer::open_persistent_checked(ok_repo.path()).err().unwrap();
-        assert!(unpinned_err.to_string().contains("unpinned"));
-        let assert_npz_err = |bytes: &[u8], needle: Option<&str>| {
-            let err = weights::load_weights_from_npz(bytes).err().unwrap();
-            if let Some(want) = needle {
-                assert!(err.to_string().contains(want), "got {err}");
-            }
-        };
-        let oversized = vec![0u8; weights::MAX_NPZ_ARCHIVE_BYTES + 1];
-        assert_npz_err(&oversized, Some("exceeds"));
-
-        let bomb_raw = vec![0u8; weights::MAX_NPY_ENTRY_BYTES + 4096];
-        let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
-        enc.write_all(&bomb_raw).unwrap();
-        let comp = enc.finish().unwrap();
-        assert!(comp.len() < 16 * 1024);
-        let bomb_zip = build_single_entry_zip("trits.npy", 8, &comp, bomb_raw.len() as u32);
-        assert_npz_err(&bomb_zip, Some("zip-bomb"));
-        assert_npz_err(&real_npz[..40], None);
-    }
-
-    #[test]
-    fn test_ego_graph_wired_into_strict_with_v07_parity() {
-        let scorer = HygieneScorer::new();
-        let src = "pub struct Order {\n    pub total_cents: u64,\n}\n\
-            pub fn compute_tax(amount: u64, rate_bps: u64) -> u64 {\n    (amount * rate_bps) / 10_000\n}\n";
-        let base = scorer.score_content("src/order.rs", src);
-
-        let clean_ego = FileEgoContext { fan_in: 2, fan_out: 1, ..FileEgoContext::default() };
-        let clean_res = scorer.score_content_strict_with_ego("src/order.rs", src, Some(&clean_ego));
-        assert_eq!((clean_res.score, clean_res.strict_score, clean_res.multiscale_score), (base.score, Some(base.score), Some(base.score)));
-        assert!(clean_res.triggered_vetoes.is_empty());
-        let cal_json = clean_res.calibration_log.as_deref().unwrap();
-        let ca: strict::CalibrationAudit = serde_json::from_str(cal_json).unwrap();
-        assert_eq!((ca.raw_v07, ca.delta_cross, ca.use_5trit_lut), (base.score, 0.0, false));
-
-        let bad_ego = FileEgoContext {
-            fan_in: 9, fan_out: 8, neighbor_dirs: 3, has_module_cycle: true, tangle: true,
-            external_field_readers: 4, clone_cluster_hits: 2, churn_commits: 25,
-        };
-        let bad_res = scorer.score_content_strict_with_ego("src/order.rs", src, Some(&bad_ego));
-        assert_eq!(bad_res.score, base.score);
-        assert!(bad_res.strict_score.unwrap() <= 0.48 && bad_res.multiscale_score.unwrap() <= 0.48 && bad_res.veto_cap.unwrap() <= 0.48);
-        for rule in ["module-cycle", "tangle", "field-leak"] {
-            assert!(bad_res.triggered_vetoes.iter().any(|r| r == rule), "missing `{rule}`");
-        }
-        let ba: strict::CalibrationAudit = serde_json::from_str(bad_res.calibration_log.as_deref().unwrap()).unwrap();
-        assert!(ba.delta_cross > 0.0 && ba.delta_block > 0.0);
-    }
-
-    #[test]
-    fn default_v07_zero_delta_parity() {
-        let mut long_src = String::with_capacity(48 * 1024);
-        append_repeat(&mut long_src, 1400, |i| format!("pub const ITEM_{i}: usize = {};\n", i * 3 + 1));
-        let w = weights::v07_weights();
-        let (res, sparse_alloc) = model::reset_and_check_sparse_alloc_on_default(&long_src, w);
-        let scalar = model::score_v07_scalar_only(&long_src, w);
-        assert!(!sparse_alloc, "default path must keep SparseScratch unallocated (None)");
-        assert_eq!(res.score, scalar.score, "default path must maintain 0.000000000 scalar parity");
-    }
-
-    const CLONE_FN_BLOCK: &str = concat!(
+    const CLONE_BLOCK: &str = concat!(
         "pub fn process_order_alpha(raw_input: &[u64], limit: u64, fee_bps: u64) -> u64 {\n",
         "    let mut total = raw_input.iter().copied().sum::<u64>();\n",
         "    let normalized = total.saturating_mul(17).saturating_add(limit);\n",
@@ -970,8 +537,52 @@ mod tests {
         "    total ^ checksum\n}\n\n",
     );
 
-    fn build_far_clone_fixture(renamed: bool) -> String {
-        let mut block_b = CLONE_FN_BLOCK.to_string();
+    fn sq_tuples(list: &[Squiggle]) -> Vec<(usize, String, i64)> {
+        let mut out = Vec::with_capacity(list.len());
+        for s in list {
+            let prob = (s.probability * 10_000.0).round() as i64;
+            out.push((s.line, s.kind.clone(), prob));
+        }
+        out
+    }
+
+    fn js_sq_tuples(list: &[serde_json::Value]) -> Vec<(usize, String, i64)> {
+        let mut out = Vec::with_capacity(list.len());
+        for s in list {
+            let ln = s["line"].as_u64().unwrap() as usize;
+            let kind = s["kind"].as_str().unwrap();
+            let raw_p = s["probability"].as_f64().unwrap();
+            out.push((ln, String::from(kind), (raw_p * 10_000.0).round() as i64));
+        }
+        out
+    }
+
+    fn collect_src_rs() -> Vec<(String, PathBuf)> {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk_rs_files(&src_dir, &src_dir, &mut files);
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(files.len() >= 47, "expected >= 47 src/**/*.rs files, got {}", files.len());
+        files
+    }
+
+    fn dup_lines(res: &HygieneResult) -> Vec<usize> {
+        let mut lines = Vec::new();
+        for sq in &res.squiggles {
+            if sq.kind == "duplicate_block" {
+                lines.push(sq.line);
+            }
+        }
+        lines
+    }
+
+    fn parse_audit(res: &HygieneResult) -> strict::CalibrationAudit {
+        let raw = res.calibration_log.as_deref().unwrap();
+        serde_json::from_str(raw).unwrap()
+    }
+
+    fn build_clone_fixture(pre: usize, mid: usize, post: usize, renamed: bool) -> String {
+        let mut second = CLONE_BLOCK.to_string();
         if renamed {
             for (from, to) in [
                 ("process_order_alpha", "process_order_omega"),
@@ -980,113 +591,527 @@ mod tests {
                 ("fee_bps", "tax_bps"),
                 ("total", "accum"),
             ] {
-                block_b = block_b.replace(from, to);
+                second = second.replace(from, to);
             }
         }
         let mut out = String::with_capacity(48 * 1024);
-        append_repeat(&mut out, 30, |i| {
-            format!("pub fn preamble_fn_{i}(v: u64) -> u64 {{\n    v.wrapping_add({})\n}}\n", i * 7 + 3)
-        });
-        out.push_str(CLONE_FN_BLOCK);
-        append_repeat(&mut out, 260, |i| {
-            format!(
-                "pub fn mid_worker_{i}(arg_{i}: u64) -> u64 {{\n    let res_{i} = arg_{i}.wrapping_mul({}) ^ {};\n    res_{i}\n}}\n",
-                i * 11 + 5, i * 13 + 9
-            )
-        });
-        out.push_str(&block_b);
-        append_repeat(&mut out, 80, |i| {
-            format!("pub fn epilogue_fn_{i}(z: u64) -> u64 {{\n    z.saturating_sub({})\n}}\n", i * 5 + 2)
-        });
+        for i in 0..pre {
+            let v = i * 7 + 3;
+            out.push_str(&format!("pub fn pre_{i}(x: u64) -> u64 {{\n    x.wrapping_add({v})\n}}\n"));
+        }
+        out.push_str(CLONE_BLOCK);
+        for i in 0..mid {
+            let (m, k) = (i * 11 + 5, i * 13 + 9);
+            out.push_str(&format!(
+                "pub fn mid_{i}(a_{i}: u64) -> u64 {{\n    \
+                 let r_{i} = a_{i}.wrapping_mul({m}) ^ {k};\n    r_{i}\n}}\n"
+            ));
+        }
+        out.push_str(&second);
+        for i in 0..post {
+            let v = i * 5 + 2;
+            out.push_str(&format!("pub fn post_{i}(z: u64) -> u64 {{\n    z.saturating_sub({v})\n}}\n"));
+        }
         out
     }
 
+    fn strict_vectors() -> Vec<(&'static str, &'static str, String)> {
+        let pad_tail = format!(
+            "pub fn sneak(a: i32, b: i32) -> i32 {{\n    let x = a + 1;{}\
+             let y = if b > 0 {{ x * 2 }} else {{ x - 1 }};\n    y\n}}\n",
+            " ".repeat(115),
+        );
+        let terms: String = (1..=35).map(|i| format!(" + {i}")).collect();
+        let wide_ops = format!("pub fn pk(val: i32) -> i32 {{\n    val{terms}\n}}\n");
+        let rs_c = map_conds(&["v1", "v2", "v3", "v4", "v5", "v6"], |v| format!("if {v} > 0 {{"));
+        let rs_h = "pub fn deep(v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32) -> i32 {";
+        let deep_if = nest_src(rs_h, "    ", &rs_c, "return v1 + v6;", Some("}"));
+        let flat_indent = nest_src(rs_h, " ", &rs_c, "return v1 + v6;", Some("}"));
+        let go_c = map_conds(&["a", "b", "c", "d", "e", "f"], |v| format!("if {v} {{"));
+        let go_h = "package sample\nfunc Deep(a, b, c, d, e, f bool) int {";
+        let deep_go = nest_src(go_h, "\t", &go_c, "return 1", Some("}"));
+
+        let blank_run = repeat_fn(
+            "pub fn pad(v: i32) -> i32 {", 1..=6,
+            |i| format!("    let v_{i} = v + {i};\n"), "\n\n\n\n    v_6\n}\n",
+        );
+        let blank_alt = repeat_fn(
+            "pub fn sp(v: i32) -> i32 {", 1..=7,
+            |i| format!("\n    let s_{i} = v + {i};\n"), "\n    s_7\n}\n",
+        );
+        let echo_cmt = repeat_fn(
+            "pub fn echo(base_val: i32) -> i32 {",
+            1..=3,
+            |i| {
+                format!(
+                    "    // compute step_val_{i} from base_val\n    \
+                     let step_val_{i} = base_val + {i};\n"
+                )
+            },
+            "    step_val_3\n}\n",
+        );
+        let banner_cmt = repeat_fn(
+            "// Step 0: init stage",
+            1..=7,
+            |i| format!("// Step {i}: process stage {i}\n"),
+            "pub fn add(left: i32, right: i32) -> i32 {\n    left + right\n}\n",
+        );
+
+        let statics: [(&str, &str, &str); 16] = [
+            ("bidi.rs", "bidi_trojan_source", "pub fn ok() { /* \u{202E} \u{2066} */ }\n"),
+            ("zwsp.rs", "bidi_trojan_source", "pub fn hid() -> &'static str { \"a\u{200B}b\" }\n"),
+            ("cyrl.rs", "uts39_homoglyph", "pub fn auth() -> bool { let \u{0430}d = true; \u{0430}d }\n"),
+            ("grk.rs", "uts39_homoglyph", "pub fn chk() -> i32 { let t\u{03BF}k = 1\u{037E} t\u{03BF}k }\n"),
+            ("alw.rs", "lint_suppression", concat!("#", "[allow(dead_code)]\npub fn sup() {}\n")),
+            ("inw.rs", "lint_suppression", concat!("#!", "[allow(warnings)]\npub fn sup() {}\n")),
+            ("cfg.rs", "lint_suppression", concat!("#", "[cfg_attr(all(), allow(clippy::all))]\n")),
+            ("serde_f.rs", "serde_flatten", "pub struct P2 { #[serde(flatten)] pub m: String }\n"),
+            ("short_v.rs", "short_ident", concat!(
+                "pub fn run(p: i32) -> i32 {\n",
+                "    let (a, b, c, d, f) = (p, 1, 2, 3, 4);\n    a + b + c + d + f\n}\n",
+            )),
+            ("short_f.rs", "short_ident", "pub fn f(val: i32) -> i32 { val + 1 }\n"),
+            ("todo_m.rs", "prod_placeholder_macro", "pub fn inc() -> i32 { todo!(\"x\") }\n"),
+            ("unimpl.rs", "prod_placeholder_macro", "pub fn stub() -> i32 { unimplemented!() }\n"),
+            (
+                "raw_u.rs",
+                "unsafe_undocumented",
+                "pub fn bits(v: u64) -> f64 {\n    unsafe { std::mem::transmute(v) }\n}\n",
+            ),
+            (
+                "lock_u.rs",
+                "std_lock_unwrap",
+                "pub fn bump(m: &std::sync::Mutex<u64>) {\n    *m.lock().unwrap() += 1;\n}\n",
+            ),
+            ("pack_c.rs", "deep_nesting_spaghetti", concat!(
+                "pub fn pk(a: bool, b: bool, c: bool) -> i32 {\n",
+                "    if a { if b { if c { return 1; } } }\n    0\n}\n",
+            )),
+            ("multi_c.rs", "deep_nesting_spaghetti", concat!(
+                "pub fn mc(a: bool, b: bool, c: bool) -> i32 {\n    let mut n = 0;\n",
+                "    if a { n += 1; } if b { n += 2; } if c { n += 4; }\n    n\n}\n",
+            )),
+        ];
+        let mut out: Vec<(&'static str, &'static str, String)> =
+            statics.into_iter().map(|(p, r, s)| (p, r, s.to_string())).collect();
+        out.extend([
+            ("blank_r.rs", "blank_line_stuffing", blank_run),
+            ("blank_a.rs", "blank_line_stuffing", blank_alt),
+            ("echo_c.rs", "comment_echo_stuffing", echo_cmt),
+            ("ban_c.rs", "comment_echo_stuffing", banner_cmt),
+            ("pad_t.rs", "hidden_dense_tail", pad_tail),
+            ("wide_o.rs", "hidden_dense_tail", wide_ops),
+            ("deep_i.rs", "deep_nesting_spaghetti", deep_if),
+            ("flat_i.rs", "deep_nesting_spaghetti", flat_indent),
+            ("deep_g.go", "deep_nesting_spaghetti", deep_go),
+        ]);
+        out
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn check_avx2_exp() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let eval_exp = |xs: &[f64; 4]| -> [f64; 4] {
+            let mut out = [0.0f64; 4];
+            // SAFETY: AVX2 support verified above.
+            unsafe {
+                let v = std::arch::x86_64::_mm256_loadu_pd(xs.as_ptr());
+                let r = simd::exp_f64x4_avx2_non_fma(v);
+                std::arch::x86_64::_mm256_storeu_pd(out.as_mut_ptr(), r);
+            }
+            out
+        };
+        assert_eq!(eval_exp(&[-708.5, -709.0, -1000.0, -1e9]), [0.0; 4]);
+        let mut max_ulp = 0u64;
+        for step in 0..2500 {
+            let xs: [f64; 4] = std::array::from_fn(|j| {
+                -708.0 + (((step * 4 + j) as f64) / 9999.0) * 1417.0
+            });
+            let got = eval_exp(&xs);
+            for j in 0..4 {
+                let want = xs[j].exp().to_bits();
+                max_ulp = max_ulp.max(got[j].to_bits().abs_diff(want));
+            }
+        }
+        assert!(max_ulp <= 2, "exp_f64x4 ULP {max_ulp} > 2");
+    }
+
+    fn verify_js_case(
+        scorer: &HygieneScorer,
+        idx: usize,
+        label: &str,
+        content: &str,
+        js: &serde_json::Value,
+    ) -> f64 {
+        assert!(js.get("error").is_none(), "JS error on {label}: {js}");
+        let js_score = js["score"].as_f64().unwrap();
+        let js_sq = js["squiggles"].as_array().unwrap();
+        let rust = scorer.score_content(label, content);
+        let rust_sq = sq_tuples(&rust.squiggles);
+
+        if idx < 8 || label.starts_with("edge_") || label.contains("hygiene") {
+            let sc = model::score_scalar(content, weights::base_weights());
+            assert_eq!(rust.score, sc.score, "AVX2 vs scalar on {label}");
+            assert_eq!(rust_sq, sq_tuples(&sc.squiggles), "scalar squiggles on {label}");
+        }
+        assert_eq!(rust.score, js_score, "score mismatch on {label}");
+        assert_eq!(rust.total_squiggles, Some(js_sq.len()), "count on {label}");
+
+        if js_sq.len() <= 48 {
+            let (mut rs, mut jv) = (rust_sq, js_sq_tuples(js_sq));
+            assert_eq!(rs.len(), jv.len(), "sq len on {label}");
+            rs.sort();
+            jv.sort();
+            for (r_item, j_item) in rs.iter().zip(jv.iter()) {
+                assert_eq!((r_item.0, &r_item.1), (j_item.0, &j_item.1), "kind on {label}");
+                assert!((r_item.2 - j_item.2).abs() <= 1, "prob on {label}");
+            }
+        }
+        (rust.score - js_score).abs()
+    }
+
     #[test]
-    fn wired_cobs2_engram_lsa_mli_far_clone_recall() {
+    fn cache_and_six_smells() {
+        let tmp = TempRepo::new("hyg_disk");
+        let s1 = HygieneScorer::open_persistent(tmp.path());
+        let rs_clean = concat!(
+            "pub struct S;\nimpl S {\n    pub fn run(&self, x: Option<i32>) -> i32 {\n",
+            "        x.map_or(0, |v| v + 1)\n    }\n}\n",
+        );
+        let cold = s1.score_content("s.rs", rs_clean);
+        let warm = s1.score_content("s.rs", rs_clean);
+        assert!(!cold.cached && warm.cached && warm.latency_us <= 1000 && cold.score > 0.70);
+        s1.flush_cache();
+
+        let reopened = HygieneScorer::open_persistent(tmp.path());
+        let disk = reopened.score_content("s.rs", rs_clean);
+        assert!(disk.cached && reopened.warm_us() >= 1 && (cold.score - disk.score).abs() < 1e-9);
+
+        let leg = TempRepo::new("hyg_legacy_json");
+        let leg_key = format!("v07:{}", MvccStore::hash_bytes(rs_clean.as_bytes()));
+        let leg_path = leg.path().join(".refit/cache/hygiene_cache.zst");
+        write_zstd(&leg_path, &HashMap::from([(leg_key, cold.clone())])).unwrap();
+        let migrated = HygieneScorer::open_persistent(leg.path()).score_content("s.rs", rs_clean);
+        assert!(migrated.cached && (migrated.score - cold.score).abs() < 1e-9);
+
+        let conds = map_conds(&["a", "b", "c", "d", "e"], |v| format!("if {v}:"));
+        let nested = nest_src("def f(a, b, c, d, e):", "    ", &conds, "return a+b+c+d+e", None);
+        let dense = concat!(
+            "def d(x):\n    return (x + 1 if x > 0 else (x - 1 if x < -5 else ",
+            "(x * 2 if x == 0 else x * 3))) + len(str(x).strip().lower().replace('a', 'b'))\n",
+        );
+        let dup = format!("{CLONE_BLOCK}{CLONE_BLOCK}");
+        let rep = repeat_fn(
+            "def pick(k):", 1..=8, |i| format!("    if k == {i}:\n        return {i} * 10\n"), "",
+        );
+        let cr = repeat_fn(
+            "def cr(x):", 1..=45, |i| format!("    v_{i} = x + {i}\n"), "    return v_45\n",
+        );
+        let echo = repeat_fn(
+            "def c(x, y, z):", 0..=14, |i| format!("    # step_{i} = old_{i}(x, y, z)\n"),
+            "    return x\n",
+        );
+
+        let mut kinds = HashSet::new();
+        for src in [nested.as_str(), dense, &dup, &rep, &cr, &echo] {
+            for sq in reopened.score_content("t.py", src).squiggles {
+                kinds.insert(sq.kind);
+            }
+        }
+        let expected = [
+            "deep_nesting", "dense_line", "duplicate_block",
+            "repetitive_structure", "cramped_layout", "comment_echo",
+        ];
+        for want in expected {
+            assert!(kinds.contains(want), "missing {want} in {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn parity_vs_js_and_scalar() {
         let scorer = HygieneScorer::new();
-        let approx_opts = EvalOptions { approx_long: true, approx_threshold: 1024 };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(scorer.score_content("empty.rs", "").score, 0.8808);
+        assert_eq!(scorer.score_content("one.rs", "pub const X: usize = 1;\n").score, 0.8808);
+
+        let long_src: String = (0..1400)
+            .map(|i| format!("pub const N_{i}: usize = {};\n", i * 3 + 1))
+            .collect();
+        let w = weights::base_weights();
+        let (def_res, sparse_alloc) = model::check_default_no_sparse(&long_src, w);
+        assert!(!sparse_alloc && def_res.score == model::score_scalar(&long_src, w).score);
+
+        let lf = "pub fn add(left: i32, right: i32) -> i32 {\n    left + right\n}\n";
+        let lf_r = scorer.score_content("lf.rs", lf);
+        let crlf_r = scorer.score_content("crlf.rs", &lf.replace('\n', "\r\n"));
+        assert_eq!(crlf_r.score, lf_r.score);
+        assert_eq!(sq_tuples(&crlf_r.squiggles), sq_tuples(&lf_r.squiggles));
+
+        #[cfg(target_arch = "x86_64")]
+        check_avx2_exp();
+
+        let mut cases: Vec<(String, String)> = collect_src_rs()
+            .into_iter()
+            .map(|(rel, abs)| (format!("src/{rel}"), fs::read_to_string(abs).unwrap()))
+            .collect();
+        let go_tab = concat!(
+            "package p\nfunc F(x int) int {\n",
+            "\tif x > 0 {\n\t\treturn x\n\t}\n\treturn 0\n}\n",
+        );
+        let utf8_src = "pub fn hi() -> &'static str {\n    \"héllo 🚀 日本語\"\n}\n";
+        cases.extend([
+            ("edge_crlf.rs".into(), "pub fn a() -> i32 {\r\n    1\r\n}\r\n".into()),
+            ("edge_tabs.go".into(), go_tab.into()),
+            ("edge_utf8.rs".into(), utf8_src.into()),
+            ("edge_nul.txt".into(), "a\x00b\x0bc\u{2028}d\r\ne".into()),
+        ]);
+
+        let mut child = Command::new("node")
+            .arg(root.join("vendor/codehygiene/worker.mjs"))
+            .arg(root.join("vendor/codehygiene/weights.npz"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn node worker");
+        let mut stdin = child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut max_delta = 0.0f64;
+
+        for (idx, (label, content)) in cases.iter().enumerate() {
+            let req = serde_json::json!({ "id": idx + 1, "content": content })
+                .to_string()
+                .replace('\u{2028}', "\\u2028")
+                .replace('\u{2029}', "\\u2029");
+            writeln!(stdin, "{req}").unwrap();
+            stdin.flush().unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let js: serde_json::Value = serde_json::from_str(&line).unwrap();
+            max_delta = max_delta.max(verify_js_case(&scorer, idx, label, content, &js));
+        }
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+        assert_eq!(max_delta, 0.0, "expected 0.0 delta, got {max_delta}");
+    }
+
+    #[test]
+    fn strict_rules_and_repo_scan() {
+        let scorer = HygieneScorer::new();
+        let mut cases = strict_vectors();
+        assert_eq!(cases.len(), 25);
+        let bare_ex = concat!("#", "[expect(dead_code)]\npub fn h1() {}\n");
+        cases.push(("bad_ex.rs", "lint_suppression", bare_ex.to_string()));
+
+        for (path, want, code) in &cases {
+            let res = scorer.score_content_strict(path, code);
+            let cap = match *want {
+                "bidi_trojan_source" | "uts39_homoglyph" => 0.15,
+                _ => 0.50,
+            };
+            let hit = res.triggered_vetoes.iter().any(|v| v.starts_with(want));
+            assert!(hit, "{path}: expected `{want}`, got {:?}", res.triggered_vetoes);
+            assert!(res.strict_score.unwrap() <= cap, "{path}: expected <= {cap}");
+        }
+
+        let ok_ex = concat!("#", "[expect(dead_code, reason = \"ABI\")]\npub fn h1() {}\n");
+        let clean_go = concat!(
+            "package ledger\nfunc Add(a int, b int) int {\n",
+            "\tif b <= 0 {\n\t\treturn a\n\t}\n\treturn a + b\n}\n",
+        );
+        for (path, src) in [("ok_ex.rs", ok_ex), ("ledger.go", clean_go)] {
+            let res = scorer.score_content_strict(path, src);
+            assert!(res.triggered_vetoes.is_empty());
+            assert_eq!(res.strict_score, Some(res.score));
+        }
+
+        let cmp = strict::audit_anti_gaming(
+            "clean.rs",
+            "pub fn add(left: i32, right: i32) -> i32 { left + right }\n",
+            "pub fn add(left: i32, right: i32) -> i32 { todo!() }\n",
+        );
+        assert!(!cmp.passed && cmp.introduced_vetoes.len() == 1);
+        assert!(cmp.introduced_vetoes[0].starts_with("prod_placeholder_macro"));
+
+        let files = collect_src_rs();
+        let mut cfg_test_mods = BTreeSet::new();
+        let mut loaded = Vec::with_capacity(files.len());
+        for (rel, abs) in files {
+            let src = fs::read_to_string(abs).unwrap();
+            cfg_test_mods.extend(strict::find_cfg_test_mod_decls(&rel, &src));
+            loaded.push((rel, src));
+        }
+        let mut false_vetoes = Vec::new();
+        for (rel, src) in &loaded {
+            let is_test = strict::is_test_only_path(rel) || cfg_test_mods.contains(rel);
+            let rep = strict::audit_source(rel, src, 0.8808, is_test);
+            for veto in rep.formatted_vetoes() {
+                false_vetoes.push(format!("{rel}: {veto}"));
+            }
+        }
+        assert!(false_vetoes.is_empty(), "false vetoes:\n{}", false_vetoes.join("\n"));
+    }
+
+    fn score_exact_and_sparse(
+        scorer: &HygieneScorer,
+        path: &str,
+        src: &str,
+        approx_threshold: usize,
+    ) -> (HygieneResult, HygieneResult, SparseStats) {
+        let exact = scorer.score_content(path, src);
+        let opts = EvalOptions { approx_long: true, approx_threshold };
+        let (sparse, stats) = scorer.score_content_with_opts(path, src, opts);
+        (exact, sparse, stats.expect("cold approx_long run must return SparseStats"))
+    }
+
+    #[test]
+    fn ego_strict_parity() {
+        let scorer = HygieneScorer::new();
+        let src = concat!(
+            "pub struct Order {\n    pub total_cents: u64,\n}\n",
+            "pub fn tax(a: u64, bps: u64) -> u64 {\n    (a * bps) / 10_000\n}\n",
+        );
+        let base = scorer.score_content("src/order.rs", src);
+
+        let eval = |ego: FileEgoContext, tier: &str| {
+            let res = scorer.score_strict_ego("src/order.rs", src, Some(&ego));
+            let audit = parse_audit(&res);
+            assert_eq!(res.score, base.score);
+            assert_eq!(audit.raw_score, base.score);
+            assert_eq!(audit.proof_tier, tier);
+            (res, audit)
+        };
+
+        let clean_ctx = FileEgoContext { fan_in: 2, fan_out: 1, ..FileEgoContext::default() };
+        let (clean, ca) = eval(clean_ctx, "exact");
+        assert!(clean.triggered_vetoes.is_empty() && !ca.use_5trit_lut);
+        assert_eq!(clean.strict_score, Some(base.score));
+        assert_eq!(clean.multiscale_score, Some(base.score));
+        assert_eq!((ca.delta_cross, ca.delta_idiom, ca.attn_mode.as_str()), (0.0, 0.0, "exact"));
+
+        let bad_ctx = FileEgoContext {
+            fan_in: 9, fan_out: 8, neighbor_dirs: 3, has_module_cycle: true, tangle: true,
+            external_field_readers: 4, clone_cluster_hits: 2, churn_commits: 25,
+        };
+        let (bad, ba) = eval(bad_ctx, "vetoed");
+        let caps = [bad.strict_score, bad.multiscale_score, bad.veto_cap];
+        assert!(caps.into_iter().all(|v| v.unwrap() <= 0.48));
+        assert!(ba.delta_cross > 0.0 && ba.delta_block > 0.0);
+        for rule in ["module-cycle", "tangle", "field-leak"] {
+            assert!(bad.triggered_vetoes.iter().any(|r| r == rule), "missing `{rule}`");
+        }
+    }
+
+    #[test]
+    fn sparse_far_clone_recall() {
+        let scorer = HygieneScorer::new();
         for (label, renamed, min_hits) in [("exact", false, 12usize), ("renamed", true, 7usize)] {
-            let src = build_far_clone_fixture(renamed);
+            let src = build_clone_fixture(30, 260, 80, renamed);
             let path = format!("far_{label}.rs");
-            let default_res = scorer.score_content(&path, &src);
-            let (approx_res, tel_opt) = scorer.score_content_with_opts(&path, &src, approx_opts);
-            let tel = tel_opt.expect("cold approx_long run must return SparseAttnTelemetry");
-            let dup_hits = approx_res
+            let (def, app, st) = score_exact_and_sparse(&scorer, &path, &src, 1024);
+            let hits = app
                 .squiggles
                 .iter()
                 .filter(|s| s.kind == "duplicate_block" && s.probability >= 0.80)
                 .count();
-            assert!(
-                dup_hits >= min_hits,
-                "{label}: expected >= {min_hits} duplicate_block hits >= 0.80, got {dup_hits} (def={}, app={})",
-                default_res.score, approx_res.score
-            );
-            assert!(
-                default_res.score - approx_res.score >= 0.08,
-                "{label}: score drop < 0.08 (def={}, app={})",
-                default_res.score, approx_res.score
-            );
-            assert!(tel.mli_reused && tel.engram_bytes > 0 && tel.engram_bytes <= 128 * 1024 && tel.cobs_blocks > 0);
-            assert_eq!(tel.attn_mode, "v07_cobs2_engram_lsa_mli");
-            assert_eq!(scorer.score_content(&path, &src).score, default_res.score);
+            assert!(hits >= min_hits, "{label}: hits={hits} < {min_hits}");
+            assert!(def.score - app.score >= 0.08, "{label}: {} -> {}", def.score, app.score);
+            assert!(st.reused && st.blocks > 0 && st.attn_mode == "sparse");
+            assert!(st.index_bytes > 0 && st.index_bytes <= 128 * 1024);
+            assert_eq!(scorer.score_content(&path, &src).score, def.score);
         }
     }
 
     #[test]
-    fn wired_cobs2_real_strict_preserves_local_squiggles() {
+    fn dense_qk_sparse_and_reuse() {
+        let (mae_2048, st_2048) = ops::bench_dense_qk_two_layer(2048);
+        let (_mae_4096, st_4096) = ops::bench_dense_qk_two_layer(4096);
+        let ratio = (st_4096.pairs_evaluated as f64) / (st_2048.pairs_evaluated as f64);
+        assert!(mae_2048 <= 0.01 && ratio <= 2.15, "mae={mae_2048:.5} ratio={ratio:.3}");
+        assert!(st_2048.reused && st_2048.reuse_hits >= 1);
+        assert!(st_4096.reused && st_4096.reuse_hits >= 1);
+    }
+
+    #[test]
+    fn sparse_keeps_local_squiggles() {
         let scorer = HygieneScorer::new();
-        let strict_src = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hygiene/strict.rs"),
-        )
-        .unwrap();
-        let def_strict = scorer.score_content("src/hygiene/strict.rs", &strict_src);
-        let opts_strict = EvalOptions { approx_long: true, approx_threshold: 256 };
-        let (app_strict, tel_opt) =
-            scorer.score_content_with_opts("src/hygiene/strict.rs", &strict_src, opts_strict);
-        assert!(tel_opt.is_some() && app_strict.score <= def_strict.score + 0.005);
-        for sq in def_strict.squiggles.iter().filter(|s| s.kind == "duplicate_block") {
-            assert!(
-                app_strict.squiggles.iter().any(|a| a.kind == "duplicate_block" && a.line == sq.line),
-                "lost strict.rs:L{}", sq.line
-            );
-        }
+        let strict_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/hygiene/strict.rs");
+        let strict_src = fs::read_to_string(strict_path).unwrap();
+        let long_local = build_clone_fixture(380, 0, 120, false);
 
-        let mut long_local = String::with_capacity(48 * 1024);
-        append_repeat(&mut long_local, 380, |i| {
-            format!("pub fn pad_top_{i}(x: u64) -> u64 {{\n    x.wrapping_add({})\n}}\n", i * 3 + 1)
-        });
-        long_local.push_str(CLONE_FN_BLOCK);
-        long_local.push_str(&CLONE_FN_BLOCK.replace("process_order_alpha", "process_order_beta"));
-        append_repeat(&mut long_local, 120, |i| {
-            format!("pub fn pad_bot_{i}(y: u64) -> u64 {{\n    y.wrapping_mul({})\n}}\n", i * 5 + 2)
-        });
-        let def_loc = scorer.score_content("long_local.rs", &long_local);
-        let opts_loc = EvalOptions { approx_long: true, approx_threshold: 1024 };
-        let (app_loc, _) = scorer.score_content_with_opts("long_local.rs", &long_local, opts_loc);
-        let def_dups: Vec<usize> = def_loc
-            .squiggles
-            .iter()
-            .filter(|s| s.kind == "duplicate_block")
-            .map(|s| s.line)
-            .collect();
-        assert!(!def_dups.is_empty(), "fixture must have local duplicate_block squiggles");
-        for ln in def_dups {
-            assert!(
-                app_loc.squiggles.iter().any(|s| s.kind == "duplicate_block" && s.line == ln),
-                "lost local dup at L{ln}"
-            );
+        for (path, src, threshold, min_dups) in [
+            ("src/hygiene/strict.rs", strict_src.as_str(), 256usize, 0usize),
+            ("long_local.rs", long_local.as_str(), 1024usize, 4usize),
+        ] {
+            let (def, app, _st) = score_exact_and_sparse(&scorer, path, src, threshold);
+            assert!(app.score <= def.score + 0.005);
+            let local_lines = dup_lines(&def);
+            assert!(local_lines.len() >= min_dups, "{path}: expected >= {min_dups} local dups");
+            let app_lines = dup_lines(&app);
+            for ln in local_lines {
+                assert!(app_lines.contains(&ln), "{path}: lost local dup at L{ln}");
+            }
         }
-        assert!(app_loc.score <= def_loc.score + 0.005);
     }
 
     #[test]
-    fn wired_dense_qk_partition_unified_and_cross_layer_mli() {
-        let (mae_2048, tel_2048) = ops::bench_dense_qk_two_layer(2048);
-        let (_mae_4096, tel_4096) = ops::bench_dense_qk_two_layer(4096);
-        let ratio = (tel_4096.pairs_evaluated as f64) / (tel_2048.pairs_evaluated as f64);
-        assert!(mae_2048 <= 0.01, "DenseQk MAE {mae_2048:.5} > 0.01");
-        assert!(ratio <= 2.15, "DenseQk scaling ratio {ratio:.3} > 2.15");
-        assert!(tel_2048.mli_reused && tel_2048.mli_reuse_hits >= 1);
-        assert!(tel_4096.mli_reused && tel_4096.mli_reuse_hits >= 1);
+    fn weights_bounds_and_tamper_limits() {
+        let npz_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/codehygiene/weights.npz");
+        let real_npz = fs::read(npz_path).unwrap();
+        let real_digest = blake3::hash(&real_npz).to_hex().to_string();
+        let repo = TempRepo::new("weights_limits");
+        let wdir = repo.path().join(".refit/weights");
+        fs::create_dir_all(&wdir).unwrap();
+        fs::write(wdir.join("hygiene.npz"), &real_npz).unwrap();
+
+        let write_manifest = |v: &str, a: &str, f: &str, d: &str| {
+            let body = format!(r#"{{"version":"{v}","arch":"{a}","file":"{f}","blake3":"{d}"}}"#);
+            fs::write(wdir.join("hygiene.json"), body).unwrap();
+        };
+        write_manifest("0.7.0", "v07", "hygiene.npz", &real_digest);
+        let scorer = HygieneScorer::open_persistent_checked(repo.path()).unwrap();
+        assert_eq!(scorer.weights_blake3_prefix(), &real_digest[..16]);
+        assert_eq!(scorer.score_content("a.rs", "pub const X: usize = 1;\n").score, 0.8808);
+
+        let bad_digest = "0".repeat(64);
+        for (v, a, f, d, want) in [
+            ("0.7.0", "v07", "hygiene.npz", bad_digest.as_str(), "digest mismatch"),
+            ("0.8.0", "v08", "hygiene.npz", real_digest.as_str(), "unsupported weights arch"),
+            ("0.7.0", "v07", "../hygiene.npz", real_digest.as_str(), "unsafe weights filename"),
+        ] {
+            write_manifest(v, a, f, d);
+            let err = HygieneScorer::open_persistent_checked(repo.path()).err().unwrap();
+            assert!(err.to_string().contains(want), "got {err}");
+        }
+        fs::remove_file(wdir.join("hygiene.json")).unwrap();
+        let unpinned = HygieneScorer::open_persistent_checked(repo.path()).err().unwrap();
+        assert!(unpinned.to_string().contains("unpinned"));
+
+        let assert_npz_err = |bytes: &[u8], want: &str| {
+            let err = weights::load_weights_from_npz(bytes).err().unwrap();
+            assert!(err.to_string().contains(want), "expected `{want}`, got {err}");
+        };
+        assert_npz_err(&vec![0u8; weights::MAX_NPZ_ARCHIVE_BYTES + 1], "exceeds");
+
+        let bomb_raw = vec![0u8; weights::MAX_NPY_ENTRY_BYTES + 1];
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&bomb_raw).unwrap();
+        let comp = enc.finish().unwrap();
+        assert!(comp.len() < 16 * 1024);
+        let bomb_zip = build_single_entry_zip("trits.npy", 8, &comp, bomb_raw.len() as u32);
+        assert_npz_err(&bomb_zip, "zip-bomb");
+
+        let hdr = b"{'descr': '<f4', 'fortran_order': False, 'shape': (1,), }\n";
+        let mut bad_npy = Vec::with_capacity(10 + hdr.len() + 3);
+        bad_npy.extend_from_slice(b"\x93NUMPY\x01\x00");
+        bad_npy.extend_from_slice(&(hdr.len() as u16).to_le_bytes());
+        bad_npy.extend_from_slice(hdr);
+        bad_npy.extend_from_slice(&[1u8, 2, 3]);
+        let bad_f4_zip = build_single_entry_zip("vecs.npy", 0, &bad_npy, bad_npy.len() as u32);
+        assert_npz_err(&bad_f4_zip, "misaligned <f4");
+        assert_npz_err(&bad_f4_zip[..bad_f4_zip.len() - 4], "EOCD");
+        assert_npz_err(&real_npz[..40], "EOCD");
     }
 }

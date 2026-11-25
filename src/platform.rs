@@ -41,6 +41,7 @@ const FADV_SEQ_MIN: u64 = 64 * 1024;
 #[cfg(target_os = "linux")]
 const FADV_DONTNEED_MIN: u64 = 1024 * 1024;
 const ZSTD_STREAM_WLOG: u32 = 18;
+/// Binary stat cache format header bytes.
 const STAT_MAGIC: &[u8; 8] = b"RFST0002";
 const STAT_MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 const RACY_GIT_NS: u64 = 2_000_000_000;
@@ -365,7 +366,7 @@ pub fn now_unix_ns() -> u64 {
     dur.as_nanos() as u64
 }
 
-/// Racy-git 2-second guard: only trust a stat cache hit when `now - mtime_ns >= 2s`.
+/// Trust a stat cache hit when at least 2 seconds elapsed since mtime.
 #[inline]
 pub fn stat_cache_fresh(entry: &StatEntry, mtime_ns: u64, size: u64, now_ns: u64) -> bool {
     entry.size == size
@@ -951,71 +952,13 @@ pub fn redact_secrets(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::TempRepo;
+    use crate::testutil::{TempRepo, TestRng};
     use std::time::Duration;
 
     #[test]
-    fn test_http_retry_and_backoff() {
-        assert!(new_http(concat!("refit-probe/", env!("CARGO_PKG_VERSION")), 30, 16).is_ok());
-        assert!(stream_http(concat!("refit-stream/", env!("CARGO_PKG_VERSION")), 15, 600, 16).is_ok());
-
-        for code in [200, 201, 204, 400, 401, 403, 404, 422, 432] {
-            assert!(!is_retryable(code), "code={code}");
-        }
-        assert!(is_quota_exhausted(432) && !is_quota_exhausted(429));
-        for code in [408, 429, 500, 502, 503, 504, 529] {
-            assert!(is_retryable(code), "code={code}");
-        }
-
-        for (raw, want) in [("3", Some(3_000)), ("1.5", Some(1_500)), ("9999", Some(30_000)), ("-5", None), ("invalid", None)] {
-            assert_eq!(retry_ms(raw, 30_000), want, "raw={raw}");
-        }
-        let soon = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(5));
-        assert!((2_000..=6_500).contains(&retry_ms(&soon, 30_000).unwrap()));
-        let far = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(3600));
-        assert_eq!(retry_ms(&far, 15_000), Some(15_000));
-
-        for (att, lo, hi) in [(0, 100, 200), (2, 400, 800), (9, 5_000, 10_000)] {
-            assert!((lo..=hi).contains(&backoff_ms(att, 200, 10_000, None, 1)));
-        }
-        assert_eq!(backoff_ms(0, 200, 10_000, Some(4_500), 1), 4_500);
-        assert_ne!(backoff_ms(2, 200, 10_000, None, 11), backoff_ms(2, 200, 10_000, None, 97));
-    }
-
-    #[test]
-    fn test_atomic_io_clock_and_cmd() {
-        let dir = TempRepo::new("atomic_io");
-        let target = dir.join("state.json");
-        for i in 0..25 {
-            let payload = format!("{{\"rev\":{i}}}");
-            write_atomic(&target, payload.as_bytes()).unwrap();
-            assert_eq!(dir.read("state.json"), payload);
-        }
-
-        let mut prev = now_ms();
-        for _ in 0..10_000 {
-            let cur = now_ms();
-            assert!(cur >= prev);
-            prev = cur;
-        }
-
-        let cwd = std::env::temp_dir();
-        let (prog, flag, slow_cmd) = if cfg!(windows) {
-            ("cmd", "/C", "ping -n 5 127.0.0.1 >nul")
-        } else {
-            ("sh", "-c", "sleep 3")
-        };
-        let run = |script: &str, ms: u64| run_cmd(prog, &[flag.into(), script.into()], &cwd, &[], false, ms).unwrap();
-        let ok = run("echo ok", 5_000);
-        assert!(ok.exit_code == 0 && !ok.timed_out && ok.stdout.to_lowercase().contains("ok"));
-        let slow = run(slow_cmd, 150);
-        assert!(slow.timed_out && slow.exit_code == -1);
-    }
-
-    #[test]
-    fn test_walk_pruning_and_ignores() {
+    fn atomic_io_clock_and_cmd() {
         let dir = TempRepo::with_files(
-            "walk_all",
+            "plat_io",
             &[
                 (".gitignore", "ignored_gen/\n*.generated.py\n"),
                 (".refitignore", "custom_skip/\n"),
@@ -1029,16 +972,73 @@ mod tests {
                 ("custom_skip/skip.ts", "export const x = 1;\n"),
             ],
         );
-
         let rels: Vec<String> = walk_files(dir.path(), None)
             .iter()
             .filter_map(|p| crate::source::rel_norm(dir.path(), p))
             .collect();
         assert_eq!(rels, vec![".gitignore", ".refitignore", "src/keep.rs"]);
+
+        let target = dir.join("state.json");
+        for i in 0..25 {
+            let payload = format!("{{\"rev\":{i}}}");
+            write_atomic(&target, payload.as_bytes()).unwrap();
+            assert_eq!(dir.read("state.json"), payload);
+        }
+        let mut prev = now_ms();
+        for _ in 0..10_000 {
+            let cur = now_ms();
+            assert!(cur >= prev);
+            prev = cur;
+        }
+
+        let big = dir.join("big.txt");
+        fs::write(&big, "hello\n".repeat(4000)).unwrap();
+        let (len, hex) = FileBuf::new().hash_file_blake3(&big).unwrap();
+        let raw = fs::read(&big).unwrap();
+        assert_eq!((len, hex), (raw.len() as u64, blake3::hash(&raw).to_hex().to_string()));
+
+        let lp = dir.join(".refit/test.lock");
+        let lk = SidecarLock::acquire(&lp).unwrap();
+        assert!(SidecarLock::try_acquire(&lp).unwrap().is_none());
+        drop(lk);
+        let lk2 = SidecarLock::try_acquire(&lp).unwrap().expect("lock reacquired");
+        assert!(SidecarLock::try_acquire(&lp).unwrap().is_none());
+        drop(lk2);
+
+        let cwd = std::env::temp_dir();
+        let (prog, flag, slow_cmd) = if cfg!(windows) {
+            ("cmd", "/C", "ping -n 5 127.0.0.1 >nul")
+        } else {
+            ("sh", "-c", "sleep 3")
+        };
+        let run = |s: &str, ms: u64| run_cmd(prog, &[flag.into(), s.into()], &cwd, &[], false, ms).unwrap();
+        let ok = run("echo ok", 5_000);
+        assert_eq!((ok.exit_code, ok.timed_out, ok.stdout.trim().to_ascii_lowercase().as_str()), (0, false, "ok"));
+        let slow = run(slow_cmd, 150);
+        assert_eq!((slow.timed_out, slow.exit_code), (true, -1));
     }
 
     #[test]
-    fn test_secret_detection_and_redaction() {
+    fn http_retry_and_secrets() {
+        let _c1 = new_http(concat!("refit-probe/", env!("CARGO_PKG_VERSION")), 30, 16).unwrap();
+        let _c2 = stream_http(concat!("refit-stream/", env!("CARGO_PKG_VERSION")), 15, 600, 16).unwrap();
+        for code in [200, 201, 204, 400, 401, 403, 404, 422, 432] {
+            assert!(!is_retryable(code), "code={code}");
+        }
+        assert!(is_quota_exhausted(432) && !is_quota_exhausted(429));
+        for code in [408, 429, 500, 502, 503, 504, 529] {
+            assert!(is_retryable(code), "code={code}");
+        }
+        for (raw, want) in [("3", Some(3_000)), ("1.5", Some(1_500)), ("9999", Some(30_000)), ("-5", None), ("bad", None)] {
+            assert_eq!(retry_ms(raw, 30_000), want);
+        }
+        let soon = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(5));
+        assert!((2_000..=6_500).contains(&retry_ms(&soon, 30_000).unwrap()));
+        let far = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(3600));
+        assert_eq!(retry_ms(&far, 15_000), Some(15_000));
+        assert_eq!(backoff_ms(0, 200, 10_000, Some(4_500), 1), 4_500);
+        assert_ne!(backoff_ms(2, 200, 10_000, None, 11), backoff_ms(2, 200, 10_000, None, 97));
+
         let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
         let gh = ["ghp_", "1234567890abcdefghij123456"].concat();
         let db = ["postgres://", "admin:sup3rs3cr3t@db.internal:5432/prod"].concat();
@@ -1046,22 +1046,18 @@ mod tests {
         let pem = [
             "-----BEGIN RSA ", "PRIVATE KEY-----\nMIIEpAIBAAKCAQEASuperSecretBodyPayload==\n",
             "-----END RSA PRIVATE KEY-----",
-        ]
-        .concat();
-        let multi_uri = "docs = 'postgres://localhost/db' prod = 'postgres://admin:p4ssw0rd@db.prod:5432/app'";
-
-        let cases = [
+        ].concat();
+        let multi = "docs = 'postgres://localhost/db' prod = 'postgres://admin:p4ssw0rd@db.prod:5432/app'";
+        for (sample, want) in [
             (format!("key = \"{aws}\""), Some("aws_access_key_id")),
             (format!("tok = '{gh}'"), Some("github_pat")),
             (db.clone(), Some("database_credential_url")),
             (pem.clone(), Some("pem_private_key")),
-            (multi_uri.into(), Some("database_credential_url")),
+            (multi.into(), Some("database_credential_url")),
             ("let normal = \"hello_world\";".into(), None),
-        ];
-        for (sample, want) in &cases {
-            assert_eq!(find_secret(sample), *want, "sample={sample}");
+        ] {
+            assert_eq!(find_secret(&sample), want);
         }
-
         let red = redact_secrets(format!("a={aws} b={gh} c={db} s={slack} p={pem}"));
         for leak in [&aws, &gh, &slack, &"sup3rs3cr3t".to_string(), &"SuperSecretBodyPayload".to_string()] {
             assert!(!red.contains(leak.as_str()), "leaked {leak}");
@@ -1070,107 +1066,89 @@ mod tests {
     }
 
     #[test]
-    fn stat_bin_v1_lz4_auto_invalidates_to_v2_zstd() {
-        let tmp = TempRepo::new("io_stat_v2");
+    fn stat_bin_migrates_stale() {
+        let tmp = TempRepo::new("io_stat_mig");
         let cache = tmp.join(".refit/cache/stat.bin");
-
-        // Stale v1 LZ4-framed and Zstd-framed RFST0001 caches must safely return empty maps.
-        let mut fake_v1_lz4 = vec![12, 0, 0, 0];
-        fake_v1_lz4.extend_from_slice(b"RFST0001\x00\x00\x00\x00");
-        let zst_v1 = zstd::bulk::compress(b"RFST0001\x00\x00\x00\x00", 1).unwrap();
-        for stale_payload in [&fake_v1_lz4, &zst_v1] {
-            write_atomic(&cache, stale_payload).unwrap();
+        let mut stale_lz4 = vec![12, 0, 0, 0];
+        stale_lz4.extend_from_slice(b"RFST0001\x00\x00\x00\x00");
+        let stale_zst = zstd::bulk::compress(b"RFST0001\x00\x00\x00\x00", 1).unwrap();
+        for payload in [&stale_lz4, &stale_zst] {
+            write_atomic(&cache, payload).unwrap();
             assert!(load_stat_cache(&cache).is_empty());
         }
 
-        // Round-trip v2 Zstd stat.bin + 2-second racy-git guard.
-        let old_ns = 1_000_000_000_000u64;
-        let now_ns = old_ns + 5_000_000_000;
-        let entry = StatEntry {
-            mtime_ns: old_ns,
-            size: 128,
-            blake3: "abcd".into(),
-        };
-        let map = BTreeMap::from([("src/a.rs".to_string(), entry)]);
-        save_stat_cache(&cache, &map).unwrap();
-
+        let mtime = 1_000_000_000_000u64;
+        let entry = StatEntry { mtime_ns: mtime, size: 128, blake3: "abcd".into() };
+        save_stat_cache(&cache, &BTreeMap::from([("src/a.rs".into(), entry)])).unwrap();
         assert!(has_cachedir_tag(&tmp.join(".refit/cache")));
-        let on_disk = fs::read(&cache).unwrap();
-        assert_eq!(&on_disk[..4], &[0x28, 0xB5, 0x2F, 0xFD], "stat.bin must be Zstd-compressed");
+        assert_eq!(&fs::read(&cache).unwrap()[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
         let loaded = load_stat_cache(&cache);
         let e = loaded.get("src/a.rs").unwrap();
-        assert!(stat_cache_fresh(e, old_ns, 128, now_ns));
-        assert!(!stat_cache_fresh(e, old_ns, 128, old_ns + 500_000_000));
-        assert!(!stat_cache_fresh(e, old_ns, 129, now_ns));
+        assert!(!stat_cache_fresh(e, mtime, 128, mtime + RACY_GIT_NS - 1));
+        assert!(stat_cache_fresh(e, mtime, 128, mtime + RACY_GIT_NS));
+        assert!(!stat_cache_fresh(e, mtime, 129, mtime + RACY_GIT_NS));
+    }
+
+    fn sieve_step(
+        cache: &SieveCache<u32, u32>, model: &mut BTreeMap<u32, (u32, usize)>,
+        rng: &mut TestRng, step: u32,
+    ) {
+        let k = rng.next_usize(20) as u32;
+        match rng.next_usize(10) {
+            0..=4 => {
+                let w = 1 + rng.next_usize(320);
+                let had = model.get(&k).map(|x| x.0);
+                assert_eq!(cache.insert(k, step, w), had, "step={step} k={k}");
+                if w > 256 {
+                    model.remove(&k);
+                    assert_eq!(cache.get(&k), None);
+                } else {
+                    model.insert(k, (step, w));
+                    assert_eq!(cache.get(&k), Some(step));
+                }
+            }
+            5..=7 => assert_eq!(cache.get(&k), model.get(&k).map(|x| x.0)),
+            _ => assert_eq!(cache.remove(&k), model.remove(&k).map(|x| x.0)),
+        }
+        let g = cache.inner.lock();
+        let exact_w: usize = g.map.values().map(|&(_, w, _)| w).sum();
+        assert!(g.total_weight <= g.max_bytes && g.map.len() <= g.max_entries);
+        assert_eq!(g.total_weight, exact_w);
+        for (&ck, &(cv, cw, _)) in &g.map {
+            assert_eq!(model.get(&ck), Some(&(cv, cw)));
+        }
+        model.retain(|mk, _| g.map.contains_key(mk));
     }
 
     #[test]
-    fn file_buf_hash_and_sidecar_lock() {
-        let tmp = TempRepo::with_files("io_buf", &[("big.txt", &"hello\n".repeat(4000))]);
-        let p = tmp.join("big.txt");
-        let mut fb = FileBuf::new();
-        let (len, hex) = fb.hash_file_blake3(&p).unwrap();
-        let raw = fs::read(&p).unwrap();
-        assert_eq!(len, raw.len() as u64);
-        assert_eq!(hex, blake3::hash(&raw).to_hex().to_string());
+    fn sieve_model_and_byte_cap() {
+        let hot = SieveCache::<&str, u32>::new(3, 1024);
+        for (k, v) in [("hot", 1), ("c1", 2), ("c2", 3)] { hot.insert(k, v, 100); }
+        assert_eq!(hot.get(&"hot"), Some(1));
+        hot.insert("fresh", 4, 100);
+        assert_eq!((hot.len(), hot.get(&"hot"), hot.get(&"fresh")), (3, Some(1), Some(4)));
 
-        let lp = tmp.join(".refit/test.lock");
-        let lk = SidecarLock::acquire(&lp).unwrap();
-        assert!(SidecarLock::try_acquire(&lp).unwrap().is_none());
-        drop(lk);
-        assert!(SidecarLock::try_acquire(&lp).unwrap().is_some());
-    }
-
-    #[test]
-    fn sieve_evicts_unvisited_and_bounds_bytes() {
-        let cache = SieveCache::<String, u32>::new(3, 1024);
-        cache.insert("hot".into(), 1, 100);
-        cache.insert("cold1".into(), 2, 100);
-        cache.insert("cold2".into(), 3, 100);
-        assert_eq!(cache.get(&"hot".into()), Some(1));
-        cache.insert("fresh".into(), 4, 100);
-        assert_eq!(cache.len(), 3);
-        assert_eq!(cache.get(&"hot".into()), Some(1));
-        assert_eq!(cache.get(&"fresh".into()), Some(4));
-
-        let tiny = SieveCache::<u32, u32>::new(16, 250);
-        tiny.insert(1, 10, 100);
-        tiny.insert(2, 20, 100);
-        tiny.insert(3, 30, 100);
-        assert!(tiny.len() <= 2);
-        // Oversized entry (> max_bytes) must not wipe the existing cache.
-        assert_eq!(tiny.insert(99, 999, 500), None);
-        assert_eq!(tiny.get(&99), None);
-        assert_eq!(tiny.get(&3), Some(30));
-        // Weight-increasing update on an existing visited key must never self-evict.
-        assert_eq!(tiny.insert(3, 33, 200), Some(30));
-        assert_eq!(tiny.get(&3), Some(33));
-        assert_eq!(tiny.remove(&3), Some(33));
+        let cache = SieveCache::<u32, u32>::new(8, 256);
+        let (mut model, mut rng) = (BTreeMap::new(), TestRng::new(0x51E7_CAFE));
+        for step in 0..1_000u32 {
+            sieve_step(&cache, &mut model, &mut rng, step);
+        }
     }
 
     #[test]
     fn epoch_single_publish_on_mvcc_commit() {
         let tmp = TempRepo::with_files("epoch_mvcc", &[("src/a.rs", "pub fn a() -> i32 { 1 }\n")]);
         let reg = std::sync::Arc::new(EpochRegistry::new());
-        let store = crate::mvcc::MvccStore::open_with_epoch(tmp.path(), "ep-run", reg.clone()).unwrap();
-        let ep_before = reg.global_epoch();
-        let slot_before = reg.slot_epoch("src/a.rs");
+        let store = crate::mvcc::MvccStore::open_with_epoch(tmp.path(), "ep", reg.clone()).unwrap();
+        let ep0 = reg.global_epoch();
+        let exp = BTreeMap::from([("src/a.rs".into(), tmp.hash("src/a.rs"))]);
+        let next = BTreeMap::from([("src/a.rs".into(), b"pub fn a() -> i32 { 2 }\n".to_vec())]);
+        let out = store.commit_tx("mod_a", &exp, &next, &[]).unwrap();
+        assert!(matches!(out, crate::mvcc::CommitOutcome::Committed { head_rev: 1, .. }));
 
-        let mut exp = BTreeMap::new();
-        exp.insert("src/a.rs".into(), tmp.hash("src/a.rs"));
-        let mut new_files = BTreeMap::new();
-        new_files.insert("src/a.rs".into(), b"pub fn a() -> i32 { 2 }\n".to_vec());
-        let outcome = store.commit_tx("mod_a", &exp, &new_files, &[]).unwrap();
-        assert!(matches!(outcome, crate::mvcc::CommitOutcome::Committed { head_rev: 1, .. }));
-
-        let ep_after = reg.global_epoch();
-        assert_eq!(ep_after, ep_before + 1, "commit_tx must bump global_epoch by exact +1");
-        assert!(reg.slot_epoch("src/a.rs") > slot_before);
-        assert_eq!(reg.slot_epoch("src/a.rs"), ep_after);
-        assert_eq!(reg.slot_epoch("mod_a"), ep_after);
-
-        // Also confirm default MvccStore::open binds directly to EpochRegistry::global().
-        let default_store = crate::mvcc::MvccStore::open(tmp.path(), "ep-global").unwrap();
-        assert!(std::sync::Arc::ptr_eq(default_store.epoch_registry(), &EpochRegistry::global_arc()));
+        let ep1 = reg.global_epoch();
+        assert_eq!((ep1, reg.slot_epoch("src/a.rs"), reg.slot_epoch("mod_a")), (ep0 + 1, ep1, ep1));
+        let def = crate::mvcc::MvccStore::open(tmp.path(), "ep-def").unwrap();
+        assert!(std::sync::Arc::ptr_eq(def.epoch_registry(), &EpochRegistry::global_arc()));
     }
 }

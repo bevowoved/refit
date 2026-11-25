@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-/// Embedded 8 KB ternary weights from `brianbell-x/codehygiene v0.7.0`.
+/// Embedded ternary weights archive.
 static WEIGHTS_NPZ: &[u8] = include_bytes!("../../vendor/codehygiene/weights.npz");
 static WEIGHTS_CACHE: OnceLock<ResolvedWeights> = OnceLock::new();
 static DEFAULT_WEIGHTS_HASH_PREFIX: OnceLock<String> = OnceLock::new();
@@ -48,7 +48,7 @@ impl CompactCsr {
     }
 }
 
-/// Choose 5-trit LUT packing when density exceeds the sparse CSR crossover (`zero_ratio < 0.85`).
+/// Select 5-trit lookup packing when zero ratio drops below 0.85.
 #[inline]
 pub(super) fn should_use_5trit_lut(weight_zero_ratio: f64) -> bool {
     weight_zero_ratio < 0.85
@@ -185,9 +185,9 @@ pub(super) struct WeightsManifest {
     pub(super) blake3: String,
 }
 
-pub(super) fn v07_weights() -> &'static ResolvedWeights {
+pub(super) fn base_weights() -> &'static ResolvedWeights {
     WEIGHTS_CACHE.get_or_init(|| {
-        load_weights_from_npz(WEIGHTS_NPZ).expect("embedded v0.7.0 weights.npz must be valid")
+        load_weights_from_npz(WEIGHTS_NPZ).expect("embedded weights.npz must be valid")
     })
 }
 
@@ -278,17 +278,30 @@ fn le_u32(buf: &[u8], off: usize) -> Result<u32> {
 enum NpyData { U8(Vec<u8>), F32(Vec<f32>), Str(String) }
 
 fn parse_npy(bytes: &[u8]) -> Result<NpyData> {
-    if bytes.get(0..6) != Some(b"\x93NUMPY".as_slice()) { bail!("invalid .npy magic header"); }
+    if bytes.get(0..6) != Some(b"\x93NUMPY".as_slice()) {
+        bail!("invalid .npy magic header");
+    }
     let major = *bytes.get(6).ok_or_else(|| anyhow!("truncated .npy version"))?;
     let (hdr_len, prefix_len) = match major {
         1 => (le_u16(bytes, 8)? as usize, 10usize),
         2 | 3 => (le_u32(bytes, 8)? as usize, 12usize),
         other => bail!("unsupported .npy version {other}"),
     };
-    let data_off = prefix_len.checked_add(hdr_len).ok_or_else(|| anyhow!(".npy header overflow"))?;
-    let hdr = String::from_utf8_lossy(bytes.get(8..data_off).ok_or_else(|| anyhow!("truncated .npy hdr"))?);
-    let descr = hdr.split("'descr':").nth(1).and_then(|s| s.split('\'').nth(1)).unwrap_or("");
-    let body = bytes.get(data_off..).ok_or_else(|| anyhow!("truncated .npy body"))?;
+    let data_off = prefix_len
+        .checked_add(hdr_len)
+        .ok_or_else(|| anyhow!(".npy header overflow"))?;
+    let hdr_bytes = bytes
+        .get(8..data_off)
+        .ok_or_else(|| anyhow!("truncated .npy hdr"))?;
+    let hdr = String::from_utf8_lossy(hdr_bytes);
+    let descr = hdr
+        .split("'descr':")
+        .nth(1)
+        .and_then(|s| s.split('\'').nth(1))
+        .unwrap_or("");
+    let body = bytes
+        .get(data_off..)
+        .ok_or_else(|| anyhow!("truncated .npy body"))?;
 
     if descr.ends_with("u1") {
         Ok(NpyData::U8(body.to_vec()))
@@ -300,9 +313,16 @@ fn parse_npy(bytes: &[u8]) -> Result<NpyData> {
         let vals = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
         Ok(NpyData::F32(vals))
     } else if descr.starts_with("<U") {
-        if !body.len().is_multiple_of(4) { bail!("misaligned <U .npy ({} bytes)", body.len()); }
-        let text = body.as_chunks::<4>().0.iter()
-            .filter_map(|c| char::from_u32(u32::from_le_bytes(*c))).filter(|&c| c != '\0').collect();
+        if !body.len().is_multiple_of(4) {
+            bail!("misaligned <U .npy ({} bytes)", body.len());
+        }
+        let text = body
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter_map(|c| char::from_u32(u32::from_le_bytes(*c)))
+            .filter(|&c| c != '\0')
+            .collect();
         Ok(NpyData::Str(text))
     } else {
         bail!("unsupported .npy descr `{descr}`")
@@ -319,8 +339,10 @@ fn inflate_entry_capped(method: u16, raw: &[u8]) -> Result<Vec<u8>> {
         }
         8 => {
             let mut out = Vec::new();
-            DeflateDecoder::new(raw).take((MAX_NPY_ENTRY_BYTES + 1) as u64)
-                .read_to_end(&mut out).context("inflate NPZ entry")?;
+            DeflateDecoder::new(raw)
+                .take((MAX_NPY_ENTRY_BYTES + 1) as u64)
+                .read_to_end(&mut out)
+                .context("inflate NPZ entry")?;
             if out.len() > MAX_NPY_ENTRY_BYTES {
                 bail!("deflated NPZ entry exceeds {MAX_NPY_ENTRY_BYTES} byte zip-bomb cap");
             }
@@ -330,49 +352,78 @@ fn inflate_entry_capped(method: u16, raw: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+fn add_checked(base: usize, delta: usize, label: &str) -> Result<usize> {
+    base.checked_add(delta).ok_or_else(|| anyhow!("{label}"))
+}
+
+fn read_zip_entry(bytes: &[u8], dir: usize) -> Result<(String, Vec<u8>, usize)> {
+    if le_u32(bytes, dir)? != 0x0201_4b50 {
+        bail!("invalid ZIP central dir at {dir}");
+    }
+    let method = le_u16(bytes, dir + 10)?;
+    let comp = le_u32(bytes, dir + 20)? as usize;
+    let nlen = le_u16(bytes, dir + 28)? as usize;
+    let extra = le_u16(bytes, dir + 30)? as usize;
+    let comment = le_u16(bytes, dir + 32)? as usize;
+    let local = le_u32(bytes, dir + 42)? as usize;
+
+    let name_start = add_checked(dir, 46, "ZIP name offset overflow")?;
+    let name_end = add_checked(name_start, nlen, "ZIP name offset overflow")?;
+    let name_bytes = bytes
+        .get(name_start..name_end)
+        .ok_or_else(|| anyhow!("truncated ZIP name"))?;
+    let name = String::from_utf8_lossy(name_bytes).into_owned();
+
+    if le_u32(bytes, local)? != 0x0403_4b50 {
+        bail!("invalid ZIP local header at {local}");
+    }
+    let lnlen = le_u16(bytes, local + 26)? as usize;
+    let lextra = le_u16(bytes, local + 28)? as usize;
+    let base_local = add_checked(local, 30, "ZIP local offset overflow")?;
+    let hdr_end = add_checked(base_local, lnlen, "ZIP local offset overflow")?;
+    let data_start = add_checked(hdr_end, lextra, "ZIP local offset overflow")?;
+
+    let data_end = add_checked(data_start, comp, "ZIP size overflow")?;
+    let comp_slice = bytes
+        .get(data_start..data_end)
+        .ok_or_else(|| anyhow!("truncated ZIP payload"))?;
+    let unzipped = inflate_entry_capped(method, comp_slice)?;
+
+    let after_extra = add_checked(name_end, extra, "ZIP dir advance overflow")?;
+    let next_dir = add_checked(after_extra, comment, "ZIP dir advance overflow")?;
+    Ok((name, unzipped, next_dir))
+}
+
 pub(super) fn load_weights_from_npz(bytes: &[u8]) -> Result<ResolvedWeights> {
     if bytes.len() > MAX_NPZ_ARCHIVE_BYTES {
         bail!("weights archive size {} exceeds {MAX_NPZ_ARCHIVE_BYTES} byte cap", bytes.len());
     }
-    if bytes.len() < 22 { bail!("weights archive too small ({} bytes)", bytes.len()); }
+    if bytes.len() < 22 {
+        bail!("weights archive too small ({} bytes)", bytes.len());
+    }
     let hash_prefix = blake3::hash(bytes).to_hex()[..16].to_string();
-    let eocd = (bytes.len().saturating_sub(65557)..=bytes.len() - 22).rev()
+    let eocd_lo = bytes.len().saturating_sub(65557);
+    let eocd = (eocd_lo..=bytes.len() - 22)
+        .rev()
         .find(|&pos| le_u32(bytes, pos).ok() == Some(0x0605_4b50))
         .ok_or_else(|| anyhow!("missing ZIP EOCD in weights.npz"))?;
     let count = le_u16(bytes, eocd + 10)? as usize;
-    if count == 0 || count > MAX_ZIP_ENTRIES { bail!("invalid NPZ entry count {count}"); }
+    if count == 0 || count > MAX_ZIP_ENTRIES {
+        bail!("invalid NPZ entry count {count}");
+    }
     let mut dir = le_u32(bytes, eocd + 16)? as usize;
     let (mut trits, mut vec_buf, mut meta) = (None, None, None);
 
     for _ in 0..count {
-        if le_u32(bytes, dir)? != 0x0201_4b50 { bail!("invalid ZIP central dir at {dir}"); }
-        let (method, comp) = (le_u16(bytes, dir + 10)?, le_u32(bytes, dir + 20)? as usize);
-        let (nlen, extra, comment) = (
-            le_u16(bytes, dir + 28)? as usize, le_u16(bytes, dir + 30)? as usize,
-            le_u16(bytes, dir + 32)? as usize,
-        );
-        let local = le_u32(bytes, dir + 42)? as usize;
-        let name_end = dir.checked_add(46).and_then(|v| v.checked_add(nlen))
-            .ok_or_else(|| anyhow!("ZIP name offset overflow"))?;
-        let name = String::from_utf8_lossy(
-            bytes.get(dir + 46..name_end).ok_or_else(|| anyhow!("truncated ZIP name"))?,
-        );
-        if le_u32(bytes, local)? != 0x0403_4b50 { bail!("invalid ZIP local header at {local}"); }
-        let (lnlen, lextra) = (le_u16(bytes, local + 26)? as usize, le_u16(bytes, local + 28)? as usize);
-        let data_start = local.checked_add(30).and_then(|v| v.checked_add(lnlen))
-            .and_then(|v| v.checked_add(lextra)).ok_or_else(|| anyhow!("ZIP local offset overflow"))?;
-        let data_end = data_start.checked_add(comp).ok_or_else(|| anyhow!("ZIP size overflow"))?;
-        let comp_slice = bytes.get(data_start..data_end).ok_or_else(|| anyhow!("truncated ZIP payload"))?;
-
-        let unzipped = inflate_entry_capped(method, comp_slice)?;
-        match (name.strip_suffix(".npy").unwrap_or(&name), parse_npy(&unzipped)?) {
+        let (name, unzipped, next_dir) = read_zip_entry(bytes, dir)?;
+        let stem = name.strip_suffix(".npy").unwrap_or(&name);
+        match (stem, parse_npy(&unzipped)?) {
             ("trits", NpyData::U8(v)) => trits = Some(v),
             ("vecs", NpyData::F32(v)) => vec_buf = Some(v),
             ("meta", NpyData::Str(s)) => meta = Some(s),
             _ => {}
         }
-        dir = name_end.checked_add(extra).and_then(|v| v.checked_add(comment))
-            .ok_or_else(|| anyhow!("ZIP dir advance overflow"))?;
+        dir = next_dir;
     }
     let (Some(trits), Some(vec_buf), Some(meta)) = (trits, vec_buf, meta) else {
         bail!("missing required `trits.npy`/`vecs.npy`/`meta.npy` in weights archive");
@@ -812,20 +863,31 @@ fn build_context_layer(
     Ok(ContextLayerWeights { attn, cmlp_w, cmlp_b, cmlp2_w, cmlp2_b })
 }
 
+fn take_proj_checked(raw: &mut RawUnpacked, key: &str, expected_rows: usize) -> Result<CompactCsr> {
+    let mat = raw.take_mat(key)?;
+    check_len(&format!("{key}.rows"), mat.rows as usize, expected_rows)?;
+    Ok(mat)
+}
+
+fn take_bias(raw: &mut RawUnpacked, prefix: &str, cols: usize) -> Result<Vec<f32>> {
+    let key = format!("{prefix}_b");
+    let bias = raw.take_vec(&key)?;
+    check_len(&key, bias.len(), cols)?;
+    Ok(bias)
+}
+
 fn take_linear(
     raw: &mut RawUnpacked,
     prefix: &str,
     expected_rows: usize,
     expected_cols: Option<usize>,
 ) -> Result<(CompactCsr, Vec<f32>)> {
-    let (w_key, b_key) = (format!("{prefix}_w"), format!("{prefix}_b"));
-    let mat = raw.take_mat(&w_key)?;
-    let bias = raw.take_vec(&b_key)?;
-    check_len(&format!("{w_key}.rows"), mat.rows as usize, expected_rows)?;
+    let w_key = format!("{prefix}_w");
+    let mat = take_proj_checked(raw, &w_key, expected_rows)?;
     if let Some(cols) = expected_cols {
         check_len(&format!("{w_key}.cols"), mat.cols as usize, cols)?;
     }
-    check_len(&b_key, bias.len(), mat.cols as usize)?;
+    let bias = take_bias(raw, prefix, mat.cols as usize)?;
     Ok((mat, bias))
 }
 
@@ -837,22 +899,25 @@ fn take_conv_checked(
     odd_max_k: bool,
 ) -> Result<(CompactConv, Vec<f32>)> {
     let conv = raw.take_conv(&format!("{prefix}_w"))?;
-    let bias = raw.take_vec(&format!("{prefix}_b"))?;
-    check_len(&format!("{prefix}_w.rows"), conv.rows, expected_rows)?;
-    check_len(&format!("{prefix}_b"), bias.len(), conv.cols)?;
-    if let Some(k) = expected_k {
-        check_len(&format!("{prefix}_w.k_size"), conv.k_size, k)?;
+    if conv.rows != expected_rows {
+        bail!(
+            "tensor `{prefix}_w.rows` shape mismatch: got {}, expected {expected_rows}",
+            conv.rows,
+        );
+    }
+    if let Some(k) = expected_k
+        && conv.k_size != k
+    {
+        bail!(
+            "tensor `{prefix}_w.k_size` shape mismatch: got {}, expected {k}",
+            conv.k_size,
+        );
     }
     if odd_max_k && (conv.k_size == 0 || conv.k_size.is_multiple_of(2) || conv.k_size > 13) {
         bail!("{prefix}_w invalid k_size={}", conv.k_size);
     }
+    let bias = take_bias(raw, prefix, conv.cols)?;
     Ok((conv, bias))
-}
-
-fn take_proj_checked(raw: &mut RawUnpacked, key: &str, expected_rows: usize) -> Result<CompactCsr> {
-    let mat = raw.take_mat(key)?;
-    check_len(&format!("{key}.rows"), mat.rows as usize, expected_rows)?;
-    Ok(mat)
 }
 
 fn take_part_proj(

@@ -8,14 +8,14 @@ pub(super) const SKETCH_DIM: usize = 40;
 pub(super) const RIBBON_GUARD: usize = 6;
 pub(super) const PEAK_WINDOW: usize = 32;
 
-const COBS_BLOCK_SIZE: usize = 32;
+const BLOCK_SIZE: usize = 32;
 const MAX_LANDMARKS: usize = 64;
-const LSA_TOP_K: usize = 4;
-const LSA_SLAB_CAP: usize = 128;
-const ENGRAM_SLOTS: usize = 1024;
-const ENGRAM_WAY: usize = 4;
-pub(super) const ROW_ENGRAM_BYTES: usize =
-    ENGRAM_SLOTS * ENGRAM_WAY * std::mem::size_of::<(u16, u16)>() + ENGRAM_SLOTS;
+const TOP_BLOCKS: usize = 4;
+const SLAB_CAP: usize = 128;
+const INDEX_SLOTS: usize = 1024;
+const INDEX_WAYS: usize = 4;
+pub(super) const FAR_INDEX_BYTES: usize =
+    INDEX_SLOTS * INDEX_WAYS * std::mem::size_of::<(u16, u16)>() + INDEX_SLOTS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvalOptions {
@@ -28,15 +28,15 @@ impl Default for EvalOptions {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct SparseAttnTelemetry {
+pub struct SparseStats {
     pub attn_mode: &'static str,
     pub pairs_evaluated: usize,
-    pub cobs_blocks: usize,
-    pub engram_far_hits: usize,
-    pub engram_bytes: usize,
-    pub mli_reused: bool,
-    pub mli_reuse_hits: usize,
-    pub lsa_slab_reuses: usize,
+    pub blocks: usize,
+    pub far_hits: usize,
+    pub index_bytes: usize,
+    pub reused: bool,
+    pub reuse_hits: usize,
+    pub slab_reuses: usize,
 }
 
 pub(super) struct RingGate([f32; PEAK_WINDOW + 1]);
@@ -62,14 +62,16 @@ const fn build_byte_lut() -> ByteLut {
     ByteLut { map, fast_mask, _pad: [0u8; 3584] }
 }
 
-/// `17.0 KiB` L1-resident signed-ternary LSH index mapping key vectors to far block IDs in `O(1)`.
-pub(super) struct RowEngramIndex {
-    slots: [[(u16, u16); ENGRAM_WAY]; ENGRAM_SLOTS],
-    counts: [u8; ENGRAM_SLOTS],
+/// Map key vectors to far block indices via ternary hashing.
+pub(super) struct FarIndex {
+    slots: [[(u16, u16); INDEX_WAYS]; INDEX_SLOTS],
+    counts: [u8; INDEX_SLOTS],
 }
 
-impl RowEngramIndex {
-    fn new() -> Self { Self { slots: [[(0, 0); ENGRAM_WAY]; ENGRAM_SLOTS], counts: [0; ENGRAM_SLOTS] } }
+impl FarIndex {
+    fn new() -> Self {
+        Self { slots: [[(0, 0); INDEX_WAYS]; INDEX_SLOTS], counts: [0; INDEX_SLOTS] }
+    }
     fn reset(&mut self) { self.counts.fill(0); }
 
     fn hash_row_lsh(vec: &[f32]) -> Option<(usize, u16)> {
@@ -90,13 +92,15 @@ impl RowEngramIndex {
         if !active { return None; }
         h1 ^= h1 >> 33;
         h2 ^= h2 >> 29;
-        Some((((h1 ^ (h1 >> 17)) as usize) & (ENGRAM_SLOTS - 1), ((h2 ^ (h2 >> 16)) as u16).max(1)))
+        let slot = ((h1 ^ (h1 >> 17)) as usize) & (INDEX_SLOTS - 1);
+        let tag = ((h2 ^ (h2 >> 16)) as u16).max(1);
+        Some((slot, tag))
     }
 
     fn insert(&mut self, kv: &[f32], blk: u16) {
         let Some((slot, tag)) = Self::hash_row_lsh(kv) else { return };
         let cnt = self.counts[slot] as usize;
-        if cnt < ENGRAM_WAY && !self.slots[slot][..cnt].iter().any(|&(b, t)| b == blk && t == tag) {
+        if cnt < INDEX_WAYS && !self.slots[slot][..cnt].iter().any(|&(b, t)| b == blk && t == tag) {
             self.slots[slot][cnt] = (blk, tag);
             self.counts[slot] = (cnt + 1) as u8;
         }
@@ -119,19 +123,22 @@ impl RowEngramIndex {
 
 #[derive(Default)]
 pub(super) struct IndexCache {
-    blocks: Vec<[u16; LSA_TOP_K]>,
+    blocks: Vec<[u16; TOP_BLOCKS]>,
     lens: Vec<u8>,
     n_rows: usize,
 }
 
 impl IndexCache {
     fn reset_for(&mut self, n: usize) {
-        if self.blocks.len() < n { self.blocks.resize(n, [0; LSA_TOP_K]); self.lens.resize(n, 0); }
+        if self.blocks.len() < n {
+            self.blocks.resize(n, [0; TOP_BLOCKS]);
+            self.lens.resize(n, 0);
+        }
         self.lens[..n].fill(0);
         self.n_rows = n;
     }
     fn store(&mut self, q: usize, sel: &[u16], len: usize) {
-        let take = len.min(LSA_TOP_K);
+        let take = len.min(TOP_BLOCKS);
         self.blocks[q][..take].copy_from_slice(&sel[..take]);
         self.lens[q] = take as u8;
     }
@@ -140,13 +147,13 @@ impl IndexCache {
     }
 }
 
-/// Lazily-allocated Option-C sparse attention workspace (`8 B` option in default `EvalScratch`).
+/// Scratch workspace allocated on demand for sparse attention.
 pub(super) struct SparseScratch {
     mu_k: Vec<f32>, var_k: Vec<f32>, mu_v: Vec<f32>,
     blk_cnt: Vec<u32>, blk_scores: Vec<(f64, u16)>,
-    engram: RowEngramIndex, banded_mli: IndexCache, dense_mli: Vec<IndexCache>,
-    lsa_k: Vec<f32>, lsa_v: Vec<f32>, lsa_rows: [u32; LSA_SLAB_CAP], lsa_len: usize,
-    last_slab_blocks: [u16; LSA_TOP_K], last_slab_cnt: usize,
+    far_index: FarIndex, banded_cache: IndexCache, dense_cache: Vec<IndexCache>,
+    slab_k: Vec<f32>, slab_v: Vec<f32>, slab_rows: [u32; SLAB_CAP], slab_len: usize,
+    last_slab_blocks: [u16; TOP_BLOCKS], last_slab_cnt: usize,
     prefix_v: Vec<f64>, v_pos: Vec<bool>,
 }
 
@@ -155,16 +162,17 @@ impl SparseScratch {
         Self {
             mu_k: Vec::new(), var_k: Vec::new(), mu_v: Vec::new(),
             blk_cnt: Vec::new(), blk_scores: Vec::new(),
-            engram: RowEngramIndex::new(), banded_mli: IndexCache::default(), dense_mli: Vec::new(),
-            lsa_k: Vec::new(), lsa_v: Vec::new(), lsa_rows: [0; LSA_SLAB_CAP], lsa_len: 0,
-            last_slab_blocks: [0; LSA_TOP_K], last_slab_cnt: 0,
+            far_index: FarIndex::new(), banded_cache: IndexCache::default(),
+            dense_cache: Vec::new(),
+            slab_k: Vec::new(), slab_v: Vec::new(), slab_rows: [0; SLAB_CAP], slab_len: 0,
+            last_slab_blocks: [0; TOP_BLOCKS], last_slab_cnt: 0,
             prefix_v: Vec::new(), v_pos: Vec::new(),
         }
     }
     fn reset_slab(&mut self, h_dim: usize, v_dim: usize) {
-        ensure_len(&mut self.lsa_k, LSA_SLAB_CAP * h_dim);
-        ensure_len(&mut self.lsa_v, LSA_SLAB_CAP * v_dim);
-        self.lsa_len = 0;
+        ensure_len(&mut self.slab_k, SLAB_CAP * h_dim);
+        ensure_len(&mut self.slab_v, SLAB_CAP * v_dim);
+        self.slab_len = 0;
         self.last_slab_cnt = 0;
     }
 }
@@ -527,7 +535,7 @@ fn scatter_fused_to_soa(
     active
 }
 
-// SAFETY: Caller guarantees `K`'s target-feature preconditions (AVX2 for `Avx2Kernel`).
+// SAFETY: Caller guarantees `K` target features and initialized span buffers.
 #[inline(always)]
 pub(super) unsafe fn eval_span_block01_with<K: HygieneKernel>(
     w: &ResolvedWeights,
@@ -546,7 +554,7 @@ pub(super) unsafe fn eval_span_block01_with<K: HygieneKernel>(
     let p2 = w.pref2_proj.cols as usize;
     let lex_s = &sc.lex[..span_len * pre_cols];
 
-    // SAFETY: Enclosing caller guarantees `K` invariants.
+    // SAFETY: Caller verified `K` features; `emb`, `lex_s`, and `proj1` cover `span_len`.
     unsafe {
         K::sparse_parts(
             &[emb, lex_s], &w.pref1_ranges, span_len,
@@ -562,7 +570,7 @@ pub(super) unsafe fn eval_span_block01_with<K: HygieneKernel>(
         stream_line_prefix(&sc.proj1, &mut sc.pref1, cfg_p1_b, &mut sc.csum_p1, &mut sc.base_p1);
     }
     let pref1_s = &sc.pref1[..span_len * p1];
-    // SAFETY: Enclosing caller guarantees `K` invariants.
+    // SAFETY: Caller verified `K` features; gate and prefix buffers cover `span_len`.
     unsafe {
         K::sparse_parts(
             &[emb, lex_s, pref1_s], &w.gate1_ranges, span_len,
@@ -584,7 +592,7 @@ pub(super) unsafe fn eval_span_block01_with<K: HygieneKernel>(
     }
     let gates_s = &sc.gates[..span_len * g1];
     let pref2_s = &sc.pref2[..span_len * p2];
-    // SAFETY: Enclosing caller guarantees `K` invariants.
+    // SAFETY: Caller verified `K` features; `fused` output holds `span_len * hc_dim`.
     unsafe {
         K::sparse_parts(
             &[emb, lex_s, gates_s, pref2_s], &w.col_fuse_ranges, span_len,
@@ -597,7 +605,7 @@ pub(super) unsafe fn eval_span_block01_with<K: HygieneKernel>(
         cells_soa: &sc.cells_soa, active_mask, span_len,
         split_at: paired_row1.map(|(r1, _)| (slen0, row0, r1)), single_row: row0,
     };
-    // SAFETY: Enclosing caller guarantees `K` invariants and SoA buffer sizing.
+    // SAFETY: Caller verified `K` features; SoA scratch uses `MAX_SPAN_LEN` stride.
     unsafe {
         K::ribbon_conv_span(
             &span, &w.conv3_w, &w.conv3_b, &w.conv3_pads, &mut sc.acc_soa, &mut sc.conv3,
@@ -761,9 +769,9 @@ fn attend_general_static_exact(hr: HeadRef<'_>, rel: &[f64; 65], n: usize, sc: &
     }
 }
 
-/// Exact `O(N)` prefix-sum `GeneralStatic` head (`0.000000000` math error, used under `--approx-long`).
-fn attend_general_static_prefix(
-    hr: HeadRef<'_>, rel: &[f64; 65], n: usize, sc: &mut EvalScratch, tel: &mut SparseAttnTelemetry,
+/// Evaluate a static attention head with linear prefix sums.
+fn attend_prefix(
+    hr: HeadRef<'_>, rel: &[f64; 65], n: usize, sc: &mut EvalScratch, stats: &mut SparseStats,
 ) {
     let v_dim = hr.layer.v_dim;
     let sp = sc.sparse.get_or_insert_with(|| Box::new(SparseScratch::new()));
@@ -806,7 +814,7 @@ fn attend_general_static_prefix(
             let aw = sc.logits[i] / exp_sum;
             accum_weighted_v(&mut sc.merged[dst..dst + v_dim], &sc.v_buf[vb..vb + v_dim], aw);
         }
-        tel.pairs_evaluated += band_len + usize::from(left_cnt > 0) + usize::from(right_cnt > 0);
+        stats.pairs_evaluated += band_len + usize::from(left_cnt > 0) + usize::from(right_cnt > 0);
     }
 }
 
@@ -820,7 +828,7 @@ fn fill_qk_nonzero_flags(hr: HeadRef<'_>, n: usize, sc: &mut EvalScratch) {
     }
 }
 
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+// SAFETY: Caller guarantees `K` target features and sized Q/K scratch slices.
 #[inline(always)]
 unsafe fn eval_banded_local_row<K: HygieneKernel>(
     hr: HeadRef<'_>, band: (&[i8], &[f64]), q: usize, n: usize, sc: &mut EvalScratch,
@@ -834,7 +842,7 @@ unsafe fn eval_banded_local_row<K: HygieneKernel>(
         let k = k_i as usize;
         let qk = if q_active && sc.k_nz[k] {
             let kb = k * hr.layer.qk_tot + hr.head.qk_off;
-            // SAFETY: Enclosing caller guarantees `K` invariants.
+            // SAFETY: Caller verified `K` features; query and key slices have `h_dim` elements.
             unsafe { K::dot_f32_as_f64(q_slice, &sc.k_buf[kb..kb + hr.layer.h_dim]) * hr.layer.inv_s }
         } else { 0.0 };
         let logit = rv + qk;
@@ -846,24 +854,26 @@ unsafe fn eval_banded_local_row<K: HygieneKernel>(
     (count, max_l)
 }
 
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+// SAFETY: Caller guarantees `K` target features and `n`-row attention buffers.
 #[inline(always)]
 unsafe fn attend_banded_qk_with<K: HygieneKernel>(
     hr: HeadRef<'_>, band: (&[i8], &[f64]), n: usize, sc: &mut EvalScratch,
 ) {
     fill_qk_nonzero_flags(hr, n, sc);
     for q in 0..n {
-        // SAFETY: Enclosing caller guarantees `K` invariants.
-        let (count, max_l) = unsafe { eval_banded_local_row::<K>(hr, band, q, n, sc) };
-        // SAFETY: Enclosing caller guarantees `K` invariants.
-        let exp_sum = (hr.head.sink - max_l).exp()
-            + unsafe { K::softmax_exp_slice(&mut sc.logits[..count], max_l) };
+        // SAFETY: Caller verified `K` features; scratch logits cover the local band.
+        let (count, exp_sum) = unsafe {
+            let (count, max_l) = eval_banded_local_row::<K>(hr, band, q, n, sc);
+            let sum = (hr.head.sink - max_l).exp()
+                + K::softmax_exp_slice(&mut sc.logits[..count], max_l);
+            (count, sum)
+        };
         accum_exact_v(hr, q, &sc.keys[..count], &sc.logits[..count], exp_sum, &sc.v_buf, &mut sc.merged);
     }
 }
 
 #[inline]
-fn cobs_cumulant_score(q_slice: &[f32], mu_k: &[f32], var_k: &[f32], inv_s: f64) -> f64 {
+fn block_cumulant_score(q_slice: &[f32], mu_k: &[f32], var_k: &[f32], inv_s: f64) -> f64 {
     let (mut first, mut second) = (0.0f64, 0.0f64);
     for dim in 0..q_slice.len() {
         let qv = q_slice[dim] as f64;
@@ -873,7 +883,7 @@ fn cobs_cumulant_score(q_slice: &[f32], mu_k: &[f32], var_k: &[f32], inv_s: f64)
     first * inv_s + 0.5 * second * inv_s * inv_s
 }
 
-fn build_cobs_blocks_into(
+fn build_blocks_into(
     hr: HeadRef<'_>, n: usize, blk_span: usize, active_only: bool, sc: &mut EvalScratch,
 ) -> usize {
     let (num_blocks, h_dim, v_dim) = (n.div_ceil(blk_span), hr.layer.h_dim, hr.layer.v_dim);
@@ -916,18 +926,18 @@ fn build_cobs_blocks_into(
     num_blocks
 }
 
-fn populate_engram_index(hr: HeadRef<'_>, n: usize, blk_span: usize, active_v_pos: bool, sc: &mut EvalScratch) {
+fn populate_far_index(hr: HeadRef<'_>, n: usize, blk_span: usize, active_v_pos: bool, sc: &mut EvalScratch) {
     let sp = sc.sparse.get_or_insert_with(|| Box::new(SparseScratch::new()));
-    sp.engram.reset();
+    sp.far_index.reset();
     for row in 0..n {
         if !sc.k_nz[row] || (active_v_pos && !sp.v_pos[row]) { continue; }
         let kb = row * hr.layer.qk_tot + hr.head.qk_off;
-        sp.engram.insert(&sc.k_buf[kb..kb + hr.layer.h_dim], (row / blk_span) as u16);
+        sp.far_index.insert(&sc.k_buf[kb..kb + hr.layer.h_dim], (row / blk_span) as u16);
     }
 }
 
-fn select_top_blocks(scores: &[(f64, u16)], k_sel: usize, out: &mut [u16; LSA_TOP_K]) -> usize {
-    let (mut picked, lim) = (0usize, k_sel.min(LSA_TOP_K).min(scores.len()));
+fn select_top_blocks(scores: &[(f64, u16)], k_sel: usize, out: &mut [u16; TOP_BLOCKS]) -> usize {
+    let (mut picked, lim) = (0usize, k_sel.min(TOP_BLOCKS).min(scores.len()));
     for _ in 0..lim {
         let (mut best_blk, mut best_sc) = (u16::MAX, f64::NEG_INFINITY);
         for &(sc, blk) in scores {
@@ -943,17 +953,17 @@ fn select_top_blocks(scores: &[(f64, u16)], k_sel: usize, out: &mut [u16; LSA_TO
     picked
 }
 
-fn merge_engram_blocks(sel: &mut [u16; LSA_TOP_K], mut sel_cnt: usize, k_sel: usize, eng: &[u16]) -> usize {
-    let cap = k_sel.min(LSA_TOP_K);
+fn merge_far_blocks(sel: &mut [u16; TOP_BLOCKS], mut sel_cnt: usize, k_sel: usize, far: &[u16]) -> usize {
+    let cap = k_sel.min(TOP_BLOCKS);
     let mut overwrite = cap;
-    for &eb in eng {
-        if sel[..sel_cnt].contains(&eb) { continue; }
+    for &fb in far {
+        if sel[..sel_cnt].contains(&fb) { continue; }
         if sel_cnt < cap {
-            sel[sel_cnt] = eb;
+            sel[sel_cnt] = fb;
             sel_cnt += 1;
         } else if overwrite > 0 {
             overwrite -= 1;
-            sel[overwrite] = eb;
+            sel[overwrite] = fb;
         }
     }
     sel_cnt
@@ -961,13 +971,13 @@ fn merge_engram_blocks(sel: &mut [u16; LSA_TOP_K], mut sel_cnt: usize, k_sel: us
 
 struct SlabCfg<'a> { hr: HeadRef<'a>, n: usize, blk_span: usize, active_only: bool }
 
-fn pack_lsa_slab_cached(
+fn pack_slab_cached(
     cfg: &SlabCfg<'_>, sel: &[u16], bufs: (&[f32], &[f32], &[bool]),
-    sp: &mut SparseScratch, tel: &mut SparseAttnTelemetry,
+    sp: &mut SparseScratch, stats: &mut SparseStats,
 ) {
-    let cnt = sel.len().min(LSA_TOP_K);
+    let cnt = sel.len().min(TOP_BLOCKS);
     if cnt == sp.last_slab_cnt && sp.last_slab_blocks[..cnt] == sel[..cnt] {
-        tel.lsa_slab_reuses += 1;
+        stats.slab_reuses += 1;
         return;
     }
     sp.last_slab_blocks[..cnt].copy_from_slice(&sel[..cnt]);
@@ -976,67 +986,67 @@ fn pack_lsa_slab_cached(
     for &blk_u16 in &sel[..cnt] {
         let (lo, hi) = ((blk_u16 as usize) * cfg.blk_span, (((blk_u16 as usize) + 1) * cfg.blk_span).min(cfg.n));
         for row in lo..hi {
-            if dst_row >= LSA_SLAB_CAP { break; }
+            if dst_row >= SLAB_CAP { break; }
             if cfg.active_only && !(bufs.2[row] && sp.v_pos[row]) { continue; }
             let kb = row * cfg.hr.layer.qk_tot + cfg.hr.head.qk_off;
             let vb = row * cfg.hr.layer.v_tot + cfg.hr.head.v_off;
-            sp.lsa_k[dst_row * h_dim..(dst_row + 1) * h_dim].copy_from_slice(&bufs.0[kb..kb + h_dim]);
-            sp.lsa_v[dst_row * v_dim..(dst_row + 1) * v_dim].copy_from_slice(&bufs.1[vb..vb + v_dim]);
-            sp.lsa_rows[dst_row] = row as u32;
+            sp.slab_k[dst_row * h_dim..(dst_row + 1) * h_dim].copy_from_slice(&bufs.0[kb..kb + h_dim]);
+            sp.slab_v[dst_row * v_dim..(dst_row + 1) * v_dim].copy_from_slice(&bufs.1[vb..vb + v_dim]);
+            sp.slab_rows[dst_row] = row as u32;
             dst_row += 1;
         }
     }
-    sp.lsa_len = dst_row;
+    sp.slab_len = dst_row;
 }
 
-struct BandedFarCtx { q: usize, blk_span: usize, num_blocks: usize, reuse_mli: bool }
+struct BandedFarCtx { q: usize, blk_span: usize, num_blocks: usize, reuse_cache: bool }
 
 fn select_banded_far_blocks(
     q_slice: &[f32], layer: &AttnLayerWeights, ctx: BandedFarCtx,
-    sp: &mut SparseScratch, tel: &mut SparseAttnTelemetry, sel: &mut [u16; LSA_TOP_K],
+    sp: &mut SparseScratch, stats: &mut SparseStats, sel: &mut [u16; TOP_BLOCKS],
 ) -> usize {
-    let mut eng_blks = [0u16; 2];
-    let eng_cnt = sp.engram.lookup_far_blocks(q_slice, ctx.q, ctx.blk_span, &mut eng_blks);
-    tel.engram_far_hits += eng_cnt;
-    if ctx.reuse_mli {
-        let cached = sp.banded_mli.get(ctx.q);
+    let mut far_blks = [0u16; 2];
+    let far_cnt = sp.far_index.lookup_far_blocks(q_slice, ctx.q, ctx.blk_span, &mut far_blks);
+    stats.far_hits += far_cnt;
+    if ctx.reuse_cache {
+        let cached = sp.banded_cache.get(ctx.q);
         let take = cached.len().min(2);
         sel[..take].copy_from_slice(&cached[..take]);
-        if take > 0 { tel.mli_reused = true; tel.mli_reuse_hits += 1; }
-        return merge_engram_blocks(sel, take, LSA_TOP_K, &eng_blks[..eng_cnt]);
+        if take > 0 { stats.reused = true; stats.reuse_hits += 1; }
+        return merge_far_blocks(sel, take, TOP_BLOCKS, &far_blks[..far_cnt]);
     }
     let (q_blk, h_dim, mut valid) = ((ctx.q / ctx.blk_span) as u16, layer.h_dim, 0usize);
     for blk in 0..ctx.num_blocks {
         if sp.blk_cnt[blk] == 0 || blk as u16 == q_blk { continue; }
         let (mu, var) = (&sp.mu_k[blk * h_dim..(blk + 1) * h_dim], &sp.var_k[blk * h_dim..(blk + 1) * h_dim]);
-        sp.blk_scores[valid] = (cobs_cumulant_score(q_slice, mu, var, layer.inv_s), blk as u16);
+        sp.blk_scores[valid] = (block_cumulant_score(q_slice, mu, var, layer.inv_s), blk as u16);
         valid += 1;
     }
-    tel.pairs_evaluated += valid;
-    let top_n = select_top_blocks(&sp.blk_scores[..valid], LSA_TOP_K, sel);
-    let merged_n = merge_engram_blocks(sel, top_n, LSA_TOP_K, &eng_blks[..eng_cnt]);
-    sp.banded_mli.store(ctx.q, sel, merged_n);
+    stats.pairs_evaluated += valid;
+    let top_n = select_top_blocks(&sp.blk_scores[..valid], TOP_BLOCKS, sel);
+    let merged_n = merge_far_blocks(sel, top_n, TOP_BLOCKS, &far_blks[..far_cnt]);
+    sp.banded_cache.store(ctx.q, sel, merged_n);
     merged_n
 }
 
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+// SAFETY: Caller guarantees `K` target features and packed slab keys with stride `h_dim`.
 #[inline(always)]
-unsafe fn score_lsa_slab_banded<K: HygieneKernel>(
+unsafe fn score_slab_banded<K: HygieneKernel>(
     q_slice: &[f32],
     q: usize,
     hr: HeadRef<'_>,
     sp: &SparseScratch,
     sm: &mut SoftmaxBuf<'_>,
-    tel: &mut SparseAttnTelemetry,
+    stats: &mut SparseStats,
 ) {
     let h_dim = hr.layer.h_dim;
-    for s_idx in 0..sp.lsa_len {
-        let k = sp.lsa_rows[s_idx] as usize;
+    for s_idx in 0..sp.slab_len {
+        let k = sp.slab_rows[s_idx] as usize;
         if k.abs_diff(q) <= 31 { continue; }
-        let k_slice = &sp.lsa_k[s_idx * h_dim..(s_idx + 1) * h_dim];
-        // SAFETY: Enclosing caller guarantees `K` invariants.
+        let k_slice = &sp.slab_k[s_idx * h_dim..(s_idx + 1) * h_dim];
+        // SAFETY: Caller verified `K` features; query and slab key slices have `h_dim` elements.
         let qk_far = unsafe { K::dot_f32_as_f64(q_slice, k_slice) * hr.layer.inv_s };
-        tel.pairs_evaluated += 1;
+        stats.pairs_evaluated += 1;
         if qk_far > hr.head.sink && sm.count < sm.keys.len() {
             sm.keys[sm.count] = k;
             sm.logits[sm.count] = qk_far;
@@ -1046,53 +1056,53 @@ unsafe fn score_lsa_slab_banded<K: HygieneKernel>(
     }
 }
 
-/// Embedded `v0.7.0` far-horizon `BandedQk` (`h5`, `h7`) Option-C head.
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+/// Evaluate a far-horizon banded head with sparse block lookup.
+// SAFETY: Caller guarantees `K` target features and sized attention scratch buffers.
 #[inline(always)]
-unsafe fn attend_banded_far_cobs<K: HygieneKernel>(
-    hr: HeadRef<'_>, band: (&[i8], &[f64]), n: usize, reuse_mli: bool,
-    sc: &mut EvalScratch, tel: &mut SparseAttnTelemetry,
+unsafe fn attend_banded_sparse<K: HygieneKernel>(
+    hr: HeadRef<'_>, band: (&[i8], &[f64]), n: usize, reuse_cache: bool,
+    sc: &mut EvalScratch, stats: &mut SparseStats,
 ) {
     fill_qk_nonzero_flags(hr, n, sc);
-    let blk_span = n.div_ceil(MAX_LANDMARKS).max(COBS_BLOCK_SIZE);
+    let blk_span = n.div_ceil(MAX_LANDMARKS).max(BLOCK_SIZE);
     {
         let sp = sc.sparse.get_or_insert_with(|| Box::new(SparseScratch::new()));
         sp.v_pos.resize(n, false);
         for row in 0..n { sp.v_pos[row] = sc.v_buf[row * hr.layer.v_tot + hr.head.v_off] > 0.0; }
         sp.reset_slab(hr.layer.h_dim, hr.layer.v_dim);
     }
-    let num_blocks = if reuse_mli {
+    let num_blocks = if reuse_cache {
         n.div_ceil(blk_span)
     } else {
-        let nb = build_cobs_blocks_into(hr, n, blk_span, true, sc);
-        tel.cobs_blocks += nb;
-        if let Some(sp) = sc.sparse.as_mut() { sp.banded_mli.reset_for(n); }
+        let nb = build_blocks_into(hr, n, blk_span, true, sc);
+        stats.blocks += nb;
+        if let Some(sp) = sc.sparse.as_mut() { sp.banded_cache.reset_for(n); }
         nb
     };
-    populate_engram_index(hr, n, blk_span, true, sc);
-    tel.engram_bytes = ROW_ENGRAM_BYTES;
+    populate_far_index(hr, n, blk_span, true, sc);
+    stats.index_bytes = FAR_INDEX_BYTES;
 
     let slab_cfg = SlabCfg { hr, n, blk_span, active_only: true };
     let Some(mut sp) = sc.sparse.take() else { return };
     for q in 0..n {
-        // SAFETY: Enclosing caller guarantees `K` invariants.
+        // SAFETY: Caller verified `K` features; local band fits inside scratch logits.
         let (count, max_l) = unsafe { eval_banded_local_row::<K>(hr, band, q, n, sc) };
-        tel.pairs_evaluated += count;
+        stats.pairs_evaluated += count;
         let mut sm = SoftmaxBuf { keys: &mut sc.keys, logits: &mut sc.logits, count, max_l };
         if sc.q_nz[q] {
             let q_base = q * hr.layer.qk_tot + hr.head.qk_off;
             let q_slice = &sc.q_buf[q_base..q_base + hr.layer.h_dim];
-            let mut sel = [0u16; LSA_TOP_K];
-            let ctx = BandedFarCtx { q, blk_span, num_blocks, reuse_mli };
-            let sel_cnt = select_banded_far_blocks(q_slice, hr.layer, ctx, &mut sp, tel, &mut sel);
+            let mut sel = [0u16; TOP_BLOCKS];
+            let ctx = BandedFarCtx { q, blk_span, num_blocks, reuse_cache };
+            let sel_cnt = select_banded_far_blocks(q_slice, hr.layer, ctx, &mut sp, stats, &mut sel);
             if sel_cnt > 0 {
-                pack_lsa_slab_cached(&slab_cfg, &sel[..sel_cnt], (&sc.k_buf, &sc.v_buf, &sc.k_nz), &mut sp, tel);
-                // SAFETY: Enclosing caller guarantees `K` invariants.
-                unsafe { score_lsa_slab_banded::<K>(q_slice, q, hr, &sp, &mut sm, tel); }
+                pack_slab_cached(&slab_cfg, &sel[..sel_cnt], (&sc.k_buf, &sc.v_buf, &sc.k_nz), &mut sp, stats);
+                // SAFETY: Caller verified `K` features; `pack_slab_cached` packed `h_dim` rows.
+                unsafe { score_slab_banded::<K>(q_slice, q, hr, &sp, &mut sm, stats); }
             }
         }
         let (cnt, ml) = (sm.count, sm.max_l);
-        // SAFETY: Enclosing caller guarantees `K` invariants.
+        // SAFETY: Caller verified `K` features; `logits[..cnt]` holds all evaluated entries.
         let exp_sum = (hr.head.sink - ml).exp() + unsafe { K::softmax_exp_slice(&mut sc.logits[..cnt], ml) };
         accum_exact_v(hr, q, &sc.keys[..cnt], &sc.logits[..cnt], exp_sum, &sc.v_buf, &mut sc.merged);
     }
@@ -1116,34 +1126,34 @@ struct DenseBlockCtx<'a> {
 
 fn select_dense_far_blocks(
     q_slice: &[f32], q: usize, layer: &AttnLayerWeights, ctx: &DenseBlockCtx<'_>,
-    sp: &mut SparseScratch, tel: &mut SparseAttnTelemetry, sel: &mut [u16; LSA_TOP_K],
+    sp: &mut SparseScratch, stats: &mut SparseStats, sel: &mut [u16; TOP_BLOCKS],
 ) -> usize {
     if ctx.reuse_cross {
-        let cached = sp.dense_mli[ctx.head_idx].get(q);
+        let cached = sp.dense_cache[ctx.head_idx].get(q);
         let take = cached.len().min(ctx.k_sel);
         sel[..take].copy_from_slice(&cached[..take]);
-        if take > 0 { tel.mli_reused = true; tel.mli_reuse_hits += 1; }
+        if take > 0 { stats.reused = true; stats.reuse_hits += 1; }
         return take;
     }
     let (k_lo, k_hi, mut valid) = (q.saturating_sub(32), (q + 33).min(ctx.n), 0usize);
     for blk in 0..ctx.num_blocks {
-        let Some(score) = cobs_block_far_logit(q_slice, blk, (k_lo, k_hi), layer, ctx, sp) else {
+        let Some(score) = block_far_logit(q_slice, blk, (k_lo, k_hi), layer, ctx, sp) else {
             continue;
         };
         sp.blk_scores[valid] = (score, blk as u16);
         valid += 1;
     }
-    tel.pairs_evaluated += valid;
+    stats.pairs_evaluated += valid;
     let top_n = select_top_blocks(&sp.blk_scores[..valid], ctx.k_sel, sel);
-    let mut eng_blks = [0u16; 2];
-    let eng_cnt = sp.engram.lookup_far_blocks(q_slice, q, ctx.blk_span, &mut eng_blks);
-    tel.engram_far_hits += eng_cnt;
-    let merged_n = merge_engram_blocks(sel, top_n, ctx.k_sel, &eng_blks[..eng_cnt]);
-    sp.dense_mli[ctx.head_idx].store(q, sel, merged_n);
+    let mut far_blks = [0u16; 2];
+    let far_cnt = sp.far_index.lookup_far_blocks(q_slice, q, ctx.blk_span, &mut far_blks);
+    stats.far_hits += far_cnt;
+    let merged_n = merge_far_blocks(sel, top_n, ctx.k_sel, &far_blks[..far_cnt]);
+    sp.dense_cache[ctx.head_idx].store(q, sel, merged_n);
     merged_n
 }
 
-fn cobs_block_far_logit(
+fn block_far_logit(
     q_slice: &[f32], blk: usize, local: (usize, usize),
     layer: &AttnLayerWeights, ctx: &DenseBlockCtx<'_>, sp: &SparseScratch,
 ) -> Option<f64> {
@@ -1157,10 +1167,10 @@ fn cobs_block_far_logit(
     let mu = &sp.mu_k[blk * h_dim..(blk + 1) * h_dim];
     let var = &sp.var_k[blk * h_dim..(blk + 1) * h_dim];
     let rb = dense_far_rel_bias(ctx.rel, ctx.all_zero, b_lo, b_hi, local.0);
-    Some((rem as f64).ln() + cobs_cumulant_score(q_slice, mu, var, layer.inv_s) + rb)
+    Some((rem as f64).ln() + block_cumulant_score(q_slice, mu, var, layer.inv_s) + rb)
 }
 
-fn append_unselected_cobs_coarse(
+fn append_coarse_blocks(
     q_slice: &[f32], q: usize, layer: &AttnLayerWeights, ctx: &DenseBlockCtx<'_>,
     sel: &[u16], sp: &SparseScratch, sm: &mut SoftmaxBuf<'_>,
 ) -> usize {
@@ -1169,7 +1179,7 @@ fn append_unselected_cobs_coarse(
         if sel.contains(&(blk as u16)) || sm.count >= sm.keys.len() {
             continue;
         }
-        let Some(logit) = cobs_block_far_logit(q_slice, blk, (k_lo, k_hi), layer, ctx, sp) else {
+        let Some(logit) = block_far_logit(q_slice, blk, (k_lo, k_hi), layer, ctx, sp) else {
             continue;
         };
         sm.push(blk, logit);
@@ -1178,27 +1188,27 @@ fn append_unselected_cobs_coarse(
     added
 }
 
-/// Override `DenseQk` Option-C head: COBS-2nd + Engram + Cross-Layer MLI + Partition-Exact Softmax.
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+/// Evaluate a dense head with block summaries and exact local window.
+// SAFETY: Caller guarantees `K` target features and sized attention scratch buffers.
 #[inline(always)]
-unsafe fn attend_dense_qk_cobs<K: HygieneKernel>(
+unsafe fn attend_dense_sparse<K: HygieneKernel>(
     hr: HeadRef<'_>, rel_cfg: (&[f64; 65], bool), ids: (usize, usize), n: usize,
-    sc: &mut EvalScratch, tel: &mut SparseAttnTelemetry,
+    sc: &mut EvalScratch, stats: &mut SparseStats,
 ) {
     fill_qk_nonzero_flags(hr, n, sc);
-    let blk_span = n.div_ceil(MAX_LANDMARKS).max(COBS_BLOCK_SIZE);
-    let k_sel = (LSA_SLAB_CAP / blk_span).clamp(1, LSA_TOP_K);
-    let num_blocks = build_cobs_blocks_into(hr, n, blk_span, false, sc);
-    tel.cobs_blocks += num_blocks;
-    populate_engram_index(hr, n, blk_span, false, sc);
-    tel.engram_bytes = ROW_ENGRAM_BYTES;
+    let blk_span = n.div_ceil(MAX_LANDMARKS).max(BLOCK_SIZE);
+    let k_sel = (SLAB_CAP / blk_span).clamp(1, TOP_BLOCKS);
+    let num_blocks = build_blocks_into(hr, n, blk_span, false, sc);
+    stats.blocks += num_blocks;
+    populate_far_index(hr, n, blk_span, false, sc);
+    stats.index_bytes = FAR_INDEX_BYTES;
 
     let (h_dim, v_dim, (layer_idx, head_idx)) = (hr.layer.h_dim, hr.layer.v_dim, ids);
     let Some(mut sp) = sc.sparse.take() else { return };
     sp.reset_slab(h_dim, v_dim);
-    if sp.dense_mli.len() <= head_idx { sp.dense_mli.resize_with(head_idx + 1, IndexCache::default); }
-    let reuse_cross = layer_idx > 0 && sp.dense_mli[head_idx].n_rows == n;
-    if !reuse_cross { sp.dense_mli[head_idx].reset_for(n); }
+    if sp.dense_cache.len() <= head_idx { sp.dense_cache.resize_with(head_idx + 1, IndexCache::default); }
+    let reuse_cross = layer_idx > 0 && sp.dense_cache[head_idx].n_rows == n;
+    if !reuse_cross { sp.dense_cache[head_idx].reset_for(n); }
     let ctx = DenseBlockCtx {
         rel: rel_cfg.0, all_zero: rel_cfg.1, head_idx, n, blk_span, num_blocks, k_sel, reuse_cross,
     };
@@ -1208,37 +1218,37 @@ unsafe fn attend_dense_qk_cobs<K: HygieneKernel>(
         let q_base = q * hr.layer.qk_tot + hr.head.qk_off;
         let q_slice = &sc.q_buf[q_base..q_base + h_dim];
         let (k_lo, k_hi) = (q.saturating_sub(32), (q + 33).min(n));
-        let mut sel = [0u16; LSA_TOP_K];
-        let sel_cnt = select_dense_far_blocks(q_slice, q, hr.layer, &ctx, &mut sp, tel, &mut sel);
+        let mut sel = [0u16; TOP_BLOCKS];
+        let sel_cnt = select_dense_far_blocks(q_slice, q, hr.layer, &ctx, &mut sp, stats, &mut sel);
         let mut sm = SoftmaxBuf { keys: &mut sc.keys, logits: &mut sc.logits, count: 0, max_l: hr.head.sink };
 
         for k in k_lo..k_hi {
             let kb = k * hr.layer.qk_tot + hr.head.qk_off;
-            // SAFETY: Enclosing caller guarantees `K` invariants.
+            // SAFETY: Caller verified `K` features; local Q/K slices have `h_dim` elements.
             let dot = unsafe { K::dot_f32_as_f64(q_slice, &sc.k_buf[kb..kb + h_dim]) };
             let logit = dense_rel_bias(rel_cfg.0, rel_cfg.1, q, k) + dot * hr.layer.inv_s;
             sm.push(k, logit);
         }
-        tel.pairs_evaluated += k_hi - k_lo;
+        stats.pairs_evaluated += k_hi - k_lo;
         if sel_cnt > 0 {
-            pack_lsa_slab_cached(&slab_cfg, &sel[..sel_cnt], (&sc.k_buf, &sc.v_buf, &sc.k_nz), &mut sp, tel);
-            for s_idx in 0..sp.lsa_len {
-                let k = sp.lsa_rows[s_idx] as usize;
+            pack_slab_cached(&slab_cfg, &sel[..sel_cnt], (&sc.k_buf, &sc.v_buf, &sc.k_nz), &mut sp, stats);
+            for s_idx in 0..sp.slab_len {
+                let k = sp.slab_rows[s_idx] as usize;
                 if k >= k_lo && k < k_hi { continue; }
-                let key_vec = &sp.lsa_k[s_idx * h_dim..(s_idx + 1) * h_dim];
-                // SAFETY: Enclosing caller guarantees `K` invariants.
+                let key_vec = &sp.slab_k[s_idx * h_dim..(s_idx + 1) * h_dim];
+                // SAFETY: Caller verified `K` features; slab key slice has `h_dim` elements.
                 let dot = unsafe { K::dot_f32_as_f64(q_slice, key_vec) };
                 let logit = dense_rel_bias(rel_cfg.0, rel_cfg.1, q, k) + dot * hr.layer.inv_s;
                 sm.push(k, logit);
-                tel.pairs_evaluated += 1;
+                stats.pairs_evaluated += 1;
             }
         }
         let exact_cnt = sm.count;
-        let coarse_added = append_unselected_cobs_coarse(q_slice, q, hr.layer, &ctx, &sel[..sel_cnt], &sp, &mut sm);
-        if reuse_cross { tel.pairs_evaluated += coarse_added; }
+        let coarse_added = append_coarse_blocks(q_slice, q, hr.layer, &ctx, &sel[..sel_cnt], &sp, &mut sm);
+        if reuse_cross { stats.pairs_evaluated += coarse_added; }
 
         let (cnt, ml) = (sm.count, sm.max_l);
-        // SAFETY: Enclosing caller guarantees `K` invariants.
+        // SAFETY: Caller verified `K` features; `logits[..cnt]` holds all partition terms.
         let exp_sum = (hr.head.sink - ml).exp() + unsafe { K::softmax_exp_slice(&mut sc.logits[..cnt], ml) };
         accum_exact_v(hr, q, &sc.keys[..exact_cnt], &sc.logits[..exact_cnt], exp_sum, &sc.v_buf, &mut sc.merged);
         let dst = q * hr.layer.v_tot + hr.head.v_off;
@@ -1250,18 +1260,18 @@ unsafe fn attend_dense_qk_cobs<K: HygieneKernel>(
     sc.sparse = Some(sp);
 }
 
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+// SAFETY: Caller guarantees `K` target features and `n`-row state buffers.
 #[inline(always)]
 pub(super) unsafe fn sink_attention_with<K: HygieneKernel>(
     layer: &AttnLayerWeights, layer_idx: usize, n: usize, state_dim: usize,
-    sc: &mut EvalScratch, mut telemetry: Option<&mut SparseAttnTelemetry>,
+    sc: &mut EvalScratch, mut stats: Option<&mut SparseStats>,
 ) {
-    let approx_active = telemetry.is_some();
+    let approx_active = stats.is_some();
     if layer.has_qk {
         ensure_len(&mut sc.q_buf, n * layer.qk_tot);
         ensure_len(&mut sc.k_buf, n * layer.qk_tot);
         if let (Some(wq), Some(wk)) = (&layer.wq, &layer.wk) {
-            // SAFETY: Enclosing caller guarantees `K` invariants.
+            // SAFETY: Caller verified `K` features; `q_buf` and `k_buf` hold `n * qk_tot`.
             unsafe {
                 let qk_len = n * layer.qk_tot;
                 K::linear_sparse(
@@ -1283,7 +1293,7 @@ pub(super) unsafe fn sink_attention_with<K: HygieneKernel>(
     if sc.logits.len() < slot_cap { sc.logits.resize(slot_cap, 0.0); }
     if sc.keys.len() < slot_cap { sc.keys.resize(slot_cap, 0); }
 
-    // SAFETY: Enclosing caller guarantees `K` invariants.
+    // SAFETY: Caller verified `K` features; `v_buf` holds `n * v_tot` elements.
     unsafe {
         K::linear_sparse(
             &sc.state, n, state_dim, CsOp::new(&layer.wv, None, false),
@@ -1292,20 +1302,20 @@ pub(super) unsafe fn sink_attention_with<K: HygieneKernel>(
     }
 
     if layer_idx == 0 && let Some(sp) = sc.sparse.as_mut() {
-        for cache in &mut sp.dense_mli { cache.n_rows = 0; }
+        for cache in &mut sp.dense_cache { cache.n_rows = 0; }
     }
-    let mut banded_mli_ready = false;
+    let mut banded_cache_ready = false;
     for (head_idx, head) in layer.heads.iter().enumerate() {
         let hr = HeadRef { layer, head };
-        // SAFETY: Enclosing caller guarantees `K` invariants.
+        // SAFETY: Caller verified `K` features; projection buffers hold `n` rows.
         unsafe {
             dispatch_attn_head::<K>(
-                hr, (layer_idx, head_idx), n, &mut banded_mli_ready, sc, telemetry.as_deref_mut(),
+                hr, (layer_idx, head_idx), n, &mut banded_cache_ready, sc, stats.as_deref_mut(),
             );
         }
     }
 
-    // SAFETY: Enclosing caller guarantees `K` invariants.
+    // SAFETY: Caller verified `K` features; `merged` and `attn_out` match layer dims.
     unsafe {
         K::linear_sparse(
             &sc.merged[..n * layer.v_tot], n, layer.v_tot,
@@ -1314,15 +1324,15 @@ pub(super) unsafe fn sink_attention_with<K: HygieneKernel>(
     }
 }
 
-// SAFETY: Caller guarantees `K`'s target-feature preconditions.
+// SAFETY: Caller guarantees `K` target features and sized projection buffers.
 #[inline(always)]
 unsafe fn dispatch_attn_head<K: HygieneKernel>(
     hr: HeadRef<'_>,
     ids: (usize, usize),
     n: usize,
-    banded_mli_ready: &mut bool,
+    banded_cache_ready: &mut bool,
     sc: &mut EvalScratch,
-    telemetry: Option<&mut SparseAttnTelemetry>,
+    stats: Option<&mut SparseStats>,
 ) {
     match &hr.head.kind {
         HeadKind::UniformGlobal => attend_uniform_global(hr, n, sc),
@@ -1335,26 +1345,26 @@ unsafe fn dispatch_attn_head<K: HygieneKernel>(
         }
         HeadKind::BandedQk { offsets, rel_vals } => {
             let is_far_banded = offsets.iter().any(|&o| o.unsigned_abs() >= 31);
-            if is_far_banded && let Some(tel) = telemetry {
-                tel.attn_mode = "v07_cobs2_engram_lsa_mli";
-                // SAFETY: Enclosing caller guarantees `K` invariants.
+            if is_far_banded && let Some(st) = stats {
+                st.attn_mode = "sparse";
+                // SAFETY: Caller verified `K` features for sparse far-banded attention.
                 unsafe {
-                    attend_banded_far_cobs::<K>(
-                        hr, (offsets, rel_vals), n, *banded_mli_ready, sc, tel,
+                    attend_banded_sparse::<K>(
+                        hr, (offsets, rel_vals), n, *banded_cache_ready, sc, st,
                     );
                 }
-                *banded_mli_ready = true;
+                *banded_cache_ready = true;
             } else {
-                // SAFETY: Enclosing caller guarantees `K` invariants.
+                // SAFETY: Caller verified `K` features for exact banded attention.
                 unsafe { attend_banded_qk_with::<K>(hr, (offsets, rel_vals), n, sc); }
             }
         }
         HeadKind::DenseQk { rel, all_zero_rel } => {
-            if let Some(tel) = telemetry {
-                tel.attn_mode = "v07_cobs2_engram_lsa_mli";
-                // SAFETY: Enclosing caller guarantees `K` invariants.
+            if let Some(st) = stats {
+                st.attn_mode = "sparse";
+                // SAFETY: Caller verified `K` features for sparse dense-QK attention.
                 unsafe {
-                    attend_dense_qk_cobs::<K>(hr, (rel, *all_zero_rel), ids, n, sc, tel);
+                    attend_dense_sparse::<K>(hr, (rel, *all_zero_rel), ids, n, sc, st);
                 }
                 return;
             }
@@ -1364,15 +1374,15 @@ unsafe fn dispatch_attn_head<K: HygieneKernel>(
                 v_tot: hr.layer.v_tot, v_off: hr.head.v_off, v_dim: hr.layer.v_dim,
                 inv_s: hr.layer.inv_s, sink: hr.head.sink, rel, all_zero_rel: *all_zero_rel,
             };
-            // SAFETY: Enclosing caller guarantees `K` invariants.
+            // SAFETY: Caller verified `K` features; `DenseQkArgs` slices cover `n` rows.
             unsafe { K::dense_qk_head(&args, &mut sc.k_tile, &mut sc.logits_4, &mut sc.merged); }
         }
         HeadKind::GeneralStatic { rel } => {
-            if let Some(tel) = telemetry {
-                if tel.attn_mode.is_empty() {
-                    tel.attn_mode = "v07_static_prefix";
+            if let Some(st) = stats {
+                if st.attn_mode.is_empty() {
+                    st.attn_mode = "prefix";
                 }
-                attend_general_static_prefix(hr, rel, n, sc, tel);
+                attend_prefix(hr, rel, n, sc, st);
             } else {
                 attend_general_static_exact(hr, rel, n, sc);
             }
@@ -1384,7 +1394,7 @@ unsafe fn dispatch_attn_head<K: HygieneKernel>(
 pub(super) fn sigmoid_f64(val: f64) -> f64 { 1.0 / (1.0 + (-val.clamp(-30.0, 30.0)).exp()) }
 
 #[cfg(test)]
-pub(super) fn bench_dense_qk_two_layer(n: usize) -> (f64, SparseAttnTelemetry) {
+pub(super) fn bench_dense_qk_two_layer(n: usize) -> (f64, SparseStats) {
     use super::simd::ScalarKernel;
     use crate::testutil::TestRng;
     let dim = 16usize;
@@ -1414,19 +1424,19 @@ pub(super) fn bench_dense_qk_two_layer(n: usize) -> (f64, SparseAttnTelemetry) {
             }
         }
     }
-    let run_2l = |init: Vec<f32>, mut tel: Option<&mut SparseAttnTelemetry>| -> Vec<f32> {
+    let run_2l = |init: Vec<f32>, mut stats: Option<&mut SparseStats>| -> Vec<f32> {
         let mut sc = EvalScratch::new();
         sc.state = init;
         // SAFETY: `ScalarKernel` requires no CPU features.
         unsafe {
-            sink_attention_with::<ScalarKernel>(&l1, 0, n, dim, &mut sc, tel.as_deref_mut());
+            sink_attention_with::<ScalarKernel>(&l1, 0, n, dim, &mut sc, stats.as_deref_mut());
             for i in 0..n * dim { sc.state[i] = 0.5 * sc.state[i] + 0.5 * sc.attn_out[i]; }
-            sink_attention_with::<ScalarKernel>(&l2, 1, n, dim, &mut sc, tel);
+            sink_attention_with::<ScalarKernel>(&l2, 1, n, dim, &mut sc, stats);
         }
         sc.attn_out[..n * dim].to_vec()
     };
-    let mut tel = SparseAttnTelemetry::default();
-    let approx = run_2l(base.clone(), Some(&mut tel));
+    let mut stats = SparseStats::default();
+    let approx = run_2l(base.clone(), Some(&mut stats));
     let mae = if n <= 2048 {
         let exact = run_2l(base, None);
         let diff_sum: f64 = approx
@@ -1438,5 +1448,5 @@ pub(super) fn bench_dense_qk_two_layer(n: usize) -> (f64, SparseAttnTelemetry) {
     } else {
         0.0
     };
-    (mae, tel)
+    (mae, stats)
 }

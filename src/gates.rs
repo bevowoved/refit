@@ -440,7 +440,7 @@ fn score_gate2(
     };
     for (rel, txt) in working {
         let h = if strict {
-            hygiene.score_content_strict_with_ego(rel, txt, Some(&unit_ego))
+            hygiene.score_strict_ego(rel, txt, Some(&unit_ego))
         } else {
             hygiene.score_content(rel, txt)
         };

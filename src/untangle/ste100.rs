@@ -1,7 +1,6 @@
-//! Pure-Rust ASD-STE100 Issue 9 structural linter and report compiler.
+//! Structural prose linter and report compiler for simplified technical English.
 //!
-//! Legal gate: ZERO copyrighted ASD-STE100 dictionary words are bundled in this crate.
-//! Users who hold a licensed ASD-STE100 dictionary may pass `--ste-dict <path>` at runtime.
+//! No dictionary ships with this crate; pass `--ste-dict <path>` at runtime to load one.
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{Context, Result};
@@ -12,8 +11,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::LazyLock;
 
-const MAX_PROCEDURAL_WORDS: usize = 20;
-const MAX_DESCRIPTIVE_WORDS: usize = 25;
+const MAX_PROC_WORDS: usize = 20;
+const MAX_DESC_WORDS: usize = 25;
 const MAX_NOUN_CLUSTER: usize = 3;
 
 const LATIN_ABBREVS: &[&str] = &["e.g.", "i.e.", "etc.", "vs.", "cf."];
@@ -21,7 +20,7 @@ const CONTRACTIONS: &[&str] = &[
     "don't", "doesn't", "can't", "won't", "isn't", "aren't", "it's", "we're", "you're",
     "shouldn't", "couldn't", "haven't", "hasn't", "didn't", "wasn't", "weren't",
 ];
-const CLARITY_VERB_SWAPS: &[(&str, &str)] = &[
+const VERB_SWAPS: &[(&str, &str)] = &[
     ("utilize", "use"), ("utilizes", "uses"), ("utilized", "used"),
     ("commence", "start"), ("commences", "starts"),
     ("terminate", "stop"), ("terminates", "stops"),
@@ -33,12 +32,12 @@ const CLARITY_VERB_SWAPS: &[(&str, &str)] = &[
     ("attempt", "try"), ("attempts", "tries"),
 ];
 
-static CLARITY_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
+static VERB_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
     AhoCorasick::builder()
         .ascii_case_insensitive(true)
         .match_kind(MatchKind::LeftmostLongest)
-        .build(CLARITY_VERB_SWAPS.iter().map(|(bad, _)| *bad))
-        .expect("valid static clarity-verb patterns")
+        .build(VERB_SWAPS.iter().map(|(bad, _)| *bad))
+        .expect("valid static verb swap patterns")
 });
 
 const PASSIVE_AUX: &[&str] = &["is", "are", "was", "were", "be", "been"];
@@ -46,12 +45,12 @@ const IRREG_PARTICIPLES: &[&str] = &[
     "written", "built", "sent", "drawn", "driven", "chosen", "given", "taken", "broken",
     "found", "held", "kept", "made", "paid", "read", "run", "set", "shown",
 ];
-const BAD_PROCEDURAL_OPENERS: &[&str] = &["you", "please", "it", "we", "developers", "users"];
+const BAD_OPENERS: &[&str] = &["you", "please", "it", "we", "developers", "users"];
 const DETERMINERS: &[&str] = &[
     "a", "an", "the", "this", "that", "these", "those", "each", "every",
     "one", "my", "our", "its", "their", "your",
 ];
-const NON_VERB_ING_WORDS: &[&str] = &["string", "thing", "spring", "ceiling", "morning", "warning"];
+const NOUN_ING_WORDS: &[&str] = &["string", "thing", "spring", "ceiling", "morning", "warning"];
 const NON_NOUN_WORDS: &[&str] = &[
     "the", "and", "for", "with", "from", "that", "this", "these", "those", "into", "onto", "not",
     "are", "was", "were", "been", "has", "have", "had", "can", "will", "must", "may", "should",
@@ -87,7 +86,7 @@ pub enum SentenceKind { Procedural, Descriptive }
 pub struct LintIssue { pub line: usize, pub rule: String, pub detail: String, pub sentence: String }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentLintReport {
+pub struct ProseReport {
     pub total_sentences: usize,
     pub compliant_sentences: usize,
     pub violation_count: usize,
@@ -97,15 +96,15 @@ pub struct DocumentLintReport {
     pub issues: Vec<LintIssue>,
 }
 
-/// Optional user-supplied local dictionary loaded via `--ste-dict <path>` at runtime.
+/// Optional user-supplied wordlist loaded via `--ste-dict <path>`.
 #[derive(Debug, Clone, Default)]
-pub struct SteDictionary {
+pub struct WordList {
     approved: FxHashSet<String>,
     unapproved: FxHashMap<String, Option<String>>,
     technical_nouns: FxHashSet<String>,
 }
 
-impl SteDictionary {
+impl WordList {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("read --ste-dict file {}", path.display()))?;
@@ -142,14 +141,14 @@ impl SteDictionary {
         self.approved.len() + self.unapproved.len() + self.technical_nouns.len()
     }
 
-    fn is_technical_noun(&self, word: &str) -> bool { self.technical_nouns.contains(word) }
-    fn is_explicit_approved(&self, word: &str) -> bool {
+    fn is_tech_noun(&self, word: &str) -> bool { self.technical_nouns.contains(word) }
+    fn is_approved(&self, word: &str) -> bool {
         self.approved.contains(word) || self.technical_nouns.contains(word)
     }
 }
 
-/// Technical-Noun anti-bypass classifier for inline backtick code spans.
-pub fn is_technical_code_token(span: &str) -> bool {
+/// Classify whether a backtick span is a technical code token.
+pub fn is_code_token(span: &str) -> bool {
     let trimmed = span.trim();
     if trimmed.is_empty() { return true; }
     let count = trimmed.split_whitespace().count();
@@ -164,13 +163,13 @@ pub fn is_technical_code_token(span: &str) -> bool {
         })
 }
 
-/// Mask valid backticked Technical Nouns as `CODETOK` and unwrap disguised prose spans.
+/// Mask code spans as `CODETOK` and unwrap prose disguised inside backticks.
 pub fn mask_code_spans(input: &str) -> (String, bool) {
     let (mut out, mut last, mut disguised) = (String::with_capacity(input.len()), 0usize, false);
     for (open, close) in crate::lex::iter_backtick_ranges(input) {
         out.push_str(&input[last..open]);
         let span = &input[open + 1..close];
-        if is_technical_code_token(span) {
+        if is_code_token(span) {
             out.push_str(" CODETOK ");
         } else {
             disguised = true;
@@ -191,22 +190,22 @@ fn push_unique(errs: &mut Vec<&'static str>, rule: &'static str) {
     if !errs.contains(&rule) { errs.push(rule); }
 }
 
-/// Lint a single sentence under ASD-STE100 Issue 9 structural rules + optional user dictionary.
-pub fn lint_sentence(sentence: &str, kind: SentenceKind, dict: Option<&SteDictionary>) -> Vec<&'static str> {
+/// Lint one sentence under structural prose rules and an optional wordlist.
+pub fn lint_sentence(sentence: &str, kind: SentenceKind, dict: Option<&WordList>) -> Vec<&'static str> {
     let mut errs = Vec::new();
     let (masked, disguised_prose) = mask_code_spans(sentence);
     if disguised_prose { push_unique(&mut errs, "disguised_prose_in_code_span"); }
     if masked.contains(';') { push_unique(&mut errs, "semicolon_banned"); }
 
     let raw_words: Vec<&str> = masked.split_whitespace().collect();
-    let limit = if kind == SentenceKind::Procedural { MAX_PROCEDURAL_WORDS } else { MAX_DESCRIPTIVE_WORDS };
+    let limit = if kind == SentenceKind::Procedural { MAX_PROC_WORDS } else { MAX_DESC_WORDS };
     if raw_words.len() > limit { push_unique(&mut errs, "word_limit_exceeded"); }
 
     let lowered_clean = scan_lexical_rules(&raw_words, dict, &mut errs);
-    check_passive_and_progressive(&lowered_clean, dict, &mut errs);
+    check_voice(&lowered_clean, dict, &mut errs);
     check_noun_clusters(&raw_words, dict, &mut errs);
     if kind == SentenceKind::Procedural
-        && lowered_clean.first().is_some_and(|first| BAD_PROCEDURAL_OPENERS.contains(&first.as_str()))
+        && lowered_clean.first().is_some_and(|first| BAD_OPENERS.contains(&first.as_str()))
     {
         push_unique(&mut errs, "non_imperative_procedural");
     }
@@ -214,7 +213,7 @@ pub fn lint_sentence(sentence: &str, kind: SentenceKind, dict: Option<&SteDictio
 }
 
 fn scan_lexical_rules(
-    raw_words: &[&str], dict: Option<&SteDictionary>, errs: &mut Vec<&'static str>,
+    raw_words: &[&str], dict: Option<&WordList>, errs: &mut Vec<&'static str>,
 ) -> Vec<String> {
     let mut cleaned = Vec::with_capacity(raw_words.len());
     for word in raw_words {
@@ -230,10 +229,10 @@ fn scan_lexical_rules(
     cleaned
 }
 
-fn check_verb_and_dict(clean: &str, dict: Option<&SteDictionary>, errs: &mut Vec<&'static str>) {
+fn check_verb_and_dict(clean: &str, dict: Option<&WordList>, errs: &mut Vec<&'static str>) {
     if clean.is_empty() || clean == "codetok" { return; }
-    if !dict.is_some_and(|d| d.is_explicit_approved(clean))
-        && CLARITY_VERB_SWAPS.iter().any(|(b, _)| *b == clean)
+    if !dict.is_some_and(|d| d.is_approved(clean))
+        && VERB_SWAPS.iter().any(|(b, _)| *b == clean)
     {
         push_unique(errs, "unapproved_verb");
     }
@@ -243,15 +242,13 @@ fn check_verb_and_dict(clean: &str, dict: Option<&SteDictionary>, errs: &mut Vec
     } else if !user_dict.approved.is_empty()
         && clean.len() >= 2
         && clean.bytes().all(|b| b.is_ascii_alphabetic())
-        && !user_dict.is_explicit_approved(clean)
+        && !user_dict.is_approved(clean)
     {
         push_unique(errs, "dict_not_in_wordlist");
     }
 }
 
-fn check_passive_and_progressive(
-    tokens: &[String], dict: Option<&SteDictionary>, errs: &mut Vec<&'static str>,
-) {
+fn check_voice(tokens: &[String], dict: Option<&WordList>, errs: &mut Vec<&'static str>) {
     for (aux_idx, word) in tokens.iter().enumerate() {
         if !PASSIVE_AUX.contains(&word.as_str()) { continue; }
         let end = (aux_idx + 3).min(tokens.len());
@@ -268,7 +265,7 @@ fn check_passive_and_progressive(
                 break;
             }
             if s.len() >= 5 && s.ends_with("ing")
-                && !dict.is_some_and(|d| d.is_technical_noun(s)) && !NON_VERB_ING_WORDS.contains(&s)
+                && !dict.is_some_and(|d| d.is_tech_noun(s)) && !NOUN_ING_WORDS.contains(&s)
             {
                 push_unique(errs, "progressive_ing");
                 break;
@@ -277,11 +274,11 @@ fn check_passive_and_progressive(
     }
 }
 
-fn check_noun_clusters(raw_words: &[&str], dict: Option<&SteDictionary>, errs: &mut Vec<&'static str>) {
+fn check_noun_clusters(raw_words: &[&str], dict: Option<&WordList>, errs: &mut Vec<&'static str>) {
     let mut run = 0usize;
     for raw in raw_words {
         if raw.starts_with(['(', '[']) { run = 0; }
-        if is_general_noun_candidate(raw, dict) {
+        if is_noun_word(raw, dict) {
             run += 1;
             if run > MAX_NOUN_CLUSTER {
                 push_unique(errs, "noun_cluster_exceeded");
@@ -294,7 +291,7 @@ fn check_noun_clusters(raw_words: &[&str], dict: Option<&SteDictionary>, errs: &
     }
 }
 
-fn is_general_noun_candidate(raw: &str, dict: Option<&SteDictionary>) -> bool {
+fn is_noun_word(raw: &str, dict: Option<&WordList>) -> bool {
     let trimmed = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
     if trimmed.len() <= 2
         || trimmed == "CODETOK"
@@ -305,11 +302,11 @@ fn is_general_noun_candidate(raw: &str, dict: Option<&SteDictionary>) -> bool {
     !lower.ends_with("ly")
         && !lower.ends_with("ed")
         && !NON_NOUN_WORDS.contains(&lower.as_str())
-        && !dict.is_some_and(|d| d.is_technical_noun(&lower))
+        && !dict.is_some_and(|d| d.is_tech_noun(&lower))
 }
 
-/// Apply deterministic single-pass `aho-corasick` clarity verb swaps outside backticked code spans.
-pub fn normalize_clarity_verbs(text: &str) -> String {
+/// Replace verbose verbs outside backtick code spans.
+pub fn simplify_verbs(text: &str) -> String {
     let (mut out, mut rest) = (String::with_capacity(text.len()), text);
     while let Some(open) = rest.find('`') {
         rewrite_plain_segment(&rest[..open], &mut out);
@@ -329,12 +326,12 @@ pub fn normalize_clarity_verbs(text: &str) -> String {
 fn rewrite_plain_segment(segment: &str, out: &mut String) {
     let (bytes, mut cursor) = (segment.as_bytes(), 0usize);
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    for m in CLARITY_AC.find_iter(segment) {
+    for m in VERB_AC.find_iter(segment) {
         let before_ok = m.start() == 0 || !is_word(bytes[m.start() - 1]);
         let after_ok = m.end() == bytes.len() || !is_word(bytes[m.end()]);
         if !before_ok || !after_ok { continue; }
         out.push_str(&segment[cursor..m.start()]);
-        let swap = CLARITY_VERB_SWAPS[m.pattern().as_usize()].1;
+        let swap = VERB_SWAPS[m.pattern().as_usize()].1;
         if bytes[m.start()].is_ascii_uppercase() {
             let mut chars = swap.chars();
             if let Some(first) = chars.next() {
@@ -349,8 +346,8 @@ fn rewrite_plain_segment(segment: &str, out: &mut String) {
     out.push_str(&segment[cursor..]);
 }
 
-/// Lint a Markdown audit or sustain document, skipping fenced code blocks and headings.
-pub fn lint_markdown(markdown: &str, dict: Option<&SteDictionary>) -> DocumentLintReport {
+/// Lint a Markdown document, skipping fenced code blocks and headings.
+pub fn lint_md(markdown: &str, dict: Option<&WordList>) -> ProseReport {
     let (mut in_fence, mut in_untrusted) = (false, false);
     let (mut total_sentences, mut compliant_sentences, mut issues) = (0usize, 0usize, Vec::new());
 
@@ -374,7 +371,7 @@ pub fn lint_markdown(markdown: &str, dict: Option<&SteDictionary>) -> DocumentLi
             continue;
         }
         let (kind, body) = classify_md_line(t);
-        for sentence in split_prose_sentences(body) {
+        for sentence in split_sentences(body) {
             total_sentences += 1;
             let rules = lint_sentence(&sentence, kind, dict);
             if rules.is_empty() {
@@ -383,7 +380,7 @@ pub fn lint_markdown(markdown: &str, dict: Option<&SteDictionary>) -> DocumentLi
                 for rule in rules {
                     issues.push(LintIssue {
                         line: idx + 1, rule: rule.to_string(),
-                        detail: format!("ASD-STE100 Issue 9 rule `{rule}` violated"),
+                        detail: format!("Prose rule `{rule}` violated"),
                         sentence: sentence.clone(),
                     });
                 }
@@ -391,10 +388,10 @@ pub fn lint_markdown(markdown: &str, dict: Option<&SteDictionary>) -> DocumentLi
         }
     }
 
-    DocumentLintReport {
+    ProseReport {
         total_sentences, compliant_sentences, violation_count: issues.len(),
         compliant: issues.is_empty(), custom_dict_loaded: dict.is_some(),
-        custom_dict_entries: dict.map_or(0, SteDictionary::entry_count), issues,
+        custom_dict_entries: dict.map_or(0, WordList::entry_count), issues,
     }
 }
 
@@ -409,7 +406,7 @@ fn classify_md_line(trimmed: &str) -> (SentenceKind, &str) {
     (SentenceKind::Descriptive, trimmed)
 }
 
-fn split_prose_sentences(line: &str) -> Vec<String> {
+fn split_sentences(line: &str) -> Vec<String> {
     let (mut out, mut cur, mut in_code) = (Vec::new(), String::new(), false);
     let chars: Vec<char> = line.chars().collect();
     for (idx, &ch) in chars.iter().enumerate() {
@@ -425,11 +422,11 @@ fn split_prose_sentences(line: &str) -> Vec<String> {
     out
 }
 
-/// Compile a deterministic ASD-STE100 Issue 9 compliant audit summary from an `AuditReport`.
-pub fn compile_audit_markdown(report: &crate::types::AuditReport) -> String {
+/// Compile a simplified technical English audit report from an `AuditReport`.
+pub fn audit_md(report: &crate::types::AuditReport) -> String {
     let mut md = format!(
         concat!(
-            "# refit STE100 Issue 9 Audit Report\n\n",
+            "# refit Audit Report\n\n",
             "- Repository `{}` has {} source files and {} infra files.\n",
             "- Maintainability median is `{:.3}` with p10 at `{:.3}`.\n",
             "- Scan found {} cycles, {} dead symbols, {} clones, and {} infra findings.\n\n",
@@ -460,7 +457,7 @@ pub fn compile_audit_markdown(report: &crate::types::AuditReport) -> String {
         }
         md.push('\n');
     }
-    normalize_clarity_verbs(&md)
+    simplify_verbs(&md)
 }
 
 #[cfg(test)]
@@ -470,7 +467,7 @@ mod tests {
     use SentenceKind::{Descriptive as D, Procedural as P};
 
     #[test]
-    fn ste100_structural_rules_code_exemptions_and_aho_corasick_swaps() {
+    fn ste100_rules_and_swaps() {
         for &(kind, sent) in &[
             (P, "Remove `fs2` from `Cargo.toml` and call `std::fs::File::lock`."),
             (P, "Set `MIMALLOC_PURGE_DELAY=0` before you start the container."),
@@ -509,17 +506,16 @@ mod tests {
         ] {
             assert!(lint_sentence(sent, kind, None).contains(&expected), "missed `{expected}` on `{sent}`");
         }
-        assert_eq!(
-            normalize_clarity_verbs("Utilize `utilize_fn()` and reutilize to obtain results."),
-            "Use `utilize_fn()` and reutilize to get results."
-        );
+        let rewritten = simplify_verbs("Utilize `utilize_fn()` and utilize_id and reutilize to obtain results.");
+        assert_eq!(rewritten, "Use `utilize_fn()` and utilize_id and reutilize to get results.");
+        assert_eq!(simplify_verbs(&rewritten), rewritten);
     }
 
     #[test]
-    fn ste100_user_dict_loader_and_markdown_linter() {
+    fn ste100_dict_and_markdown() {
         let dict_txt = "# User wordlist\ndeploy: unapproved -> install\nblazing: technical\ninstall\nremove\nfile\n";
         let tmp = TempRepo::with_files("ste_dict", &[("local_dict.txt", dict_txt)]);
-        let dict = SteDictionary::load_from_file(&tmp.join("local_dict.txt")).unwrap();
+        let dict = WordList::load_from_file(&tmp.join("local_dict.txt")).unwrap();
         assert_eq!(dict.entry_count(), 5);
         for (kind, sent, expected) in [
             (P, "Deploy `app.bin`.", Some("dict_unapproved_word")),
@@ -539,7 +535,7 @@ mod tests {
             "1. Remove `fs2` from `Cargo.toml`.\n",
             "- Rust 1.89 provides native OS file locking in `std::fs::File::lock`.\n",
         );
-        let rep = lint_markdown(md, None);
+        let rep = lint_md(md, None);
         assert!(rep.compliant && rep.total_sentences == 2 && rep.violation_count == 0);
     }
 }

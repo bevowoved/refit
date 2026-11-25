@@ -1,5 +1,4 @@
-//! Protocol-agnostic MCP engine supporting legacy `2024-11-05` (stdio) and stateless
-//! `2026-07-28` (stdio + Streamable HTTP `POST /mcp`, SEP-2243/2322/2549/2663).
+//! Protocol-agnostic MCP engine supporting stdio and stateless Streamable HTTP.
 
 mod tx;
 
@@ -41,8 +40,8 @@ use tx::{
     tx_create, tx_delete, tx_move, tx_stage, verify_commit,
 };
 
-const PROTOCOL_V2: &str = "2026-07-28";
-const PROTOCOL_LEGACY: &str = "2024-11-05";
+const PROTO_STATELESS: &str = "2026-07-28";
+const PROTO_BASE: &str = "2024-11-05";
 const ERR_PARSE: i64 = -32700;
 const ERR_INVALID_REQUEST: i64 = -32600;
 const ERR_METHOD_NOT_FOUND: i64 = -32601;
@@ -61,9 +60,7 @@ const EPOCH_MEMO_TTL: Duration = Duration::from_secs(5);
 static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
 static NONCE_SEQ: AtomicU64 = AtomicU64::new(1);
 
-// ============================================================================
-// 1. Canonical Deterministic Tool Catalog (SEP-2549)
-// ============================================================================
+// Tool catalog
 
 type ToolRow = (
     &'static str,
@@ -100,7 +97,7 @@ const TOOLS: &[ToolRow] = &[
         &[("fast", "boolean")], &[],
     ),
     (
-        "refit_search", "Run 10 req/s GCRA-paced KeenAble web search with repo-scoped BLAKE3 cache.",
+        "refit_search", "Run 10 req/s GCRA-paced web search with repo-scoped BLAKE3 cache.",
         &[("capability", "string"), ("language", "string")], &["capability", "language"],
     ),
     (
@@ -167,7 +164,7 @@ fn tool_catalog() -> &'static Value { &frozen_catalog().value }
 fn catalog_bytes() -> &'static [u8] { &frozen_catalog().bytes }
 fn catalog_digest() -> &'static str { &frozen_catalog().digest }
 
-fn sep2549_meta() -> Value {
+fn catalog_meta() -> Value {
     json!({
         "cacheScope": CATALOG_CACHE_SCOPE,
         "catalogDigest": catalog_digest(),
@@ -175,7 +172,7 @@ fn sep2549_meta() -> Value {
     })
 }
 
-fn encode_legacy_tools_list_rpc(id: Option<Value>) -> String {
+fn encode_base_tools(id: Option<Value>) -> String {
     let id_json = serde_json::to_string(&id).unwrap_or_else(|_| "null".into());
     let tools_str = std::str::from_utf8(catalog_bytes()).unwrap_or("[]");
     format!(r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"tools":{tools_str}}}}}"#)
@@ -195,9 +192,7 @@ fn encode_tool(&(name, desc, prop_list, req): &ToolRow) -> Value {
     json!({ "description": desc, "inputSchema": Value::Object(schema), "name": name })
 }
 
-// ============================================================================
-// 2. Pure-Rust RFC 4648 Section 5 Base64URL (No-Pad) & SEP-2322 MRTR Signer
-// ============================================================================
+// Base64URL and resume tokens
 
 const B64U: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -275,7 +270,7 @@ struct MrtrSigner { key: [u8; 32] }
 
 impl MrtrSigner {
     fn from_seed(seed: &[u8]) -> Self {
-        Self { key: blake3::derive_key("refit mcp-v2 sep-2322 mrtr key v1", seed) }
+        Self { key: blake3::derive_key("refit mcp token key", seed) }
     }
 
     fn for_repo(repo_root: &Path) -> Self {
@@ -292,7 +287,7 @@ impl MrtrSigner {
         }
         let key = crate::platform::os_random_bytes::<32>().unwrap_or_else(|_| {
             let fb = format!("ephemeral-{}-{}", std::process::id(), now_ms());
-            blake3::derive_key("refit mcp-v2 mrtr ephemeral fallback v1", fb.as_bytes())
+            blake3::derive_key("refit mcp token fallback", fb.as_bytes())
         });
         if let Some(parent) = key_path.parent() { let _ = fs::create_dir_all(parent); }
         let _ = write_atomic(&key_path, &key);
@@ -305,7 +300,7 @@ impl MrtrSigner {
     }
 
     fn sign(&self, payload: &ContinuationPayload) -> Result<String> {
-        let raw = serde_json::to_vec(payload).context("encode MRTR payload")?;
+        let raw = serde_json::to_vec(payload).context("encode resume payload")?;
         let mac = blake3::keyed_hash(&self.key, &raw);
         Ok(format!("{MRTR_TOKEN_PREFIX}{}.{}", b64url_encode(&raw), b64url_encode(mac.as_bytes())))
     }
@@ -327,9 +322,7 @@ impl MrtrSigner {
     }
 }
 
-// ============================================================================
-// 3. SEP-2663 Durable Atomic TaskStore
-// ============================================================================
+// Task store
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -469,9 +462,7 @@ impl TaskStore {
     }
 }
 
-// ============================================================================
-// 4. Unified McpCtx & Epoch Memoization
-// ============================================================================
+// Context and epoch memoization
 
 struct EpochMemo<T> { epoch: u64, stat_sig: u64, stored_at: Instant, value: T }
 
@@ -528,43 +519,44 @@ impl McpCtx {
     }
 }
 
-// ============================================================================
-// 5. Protocol-Agnostic JSON-RPC Core, SEP-2243, MRTR & Tool Execution
-// ============================================================================
+// JSON-RPC core
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProtocolMode { Legacy2024, V2_2026 }
+enum Proto { Base, Stateless }
 
-fn detect_protocol(req: &Value) -> ProtocolMode {
+fn detect_protocol(req: &Value) -> Proto {
     let top_v = req.get("_meta").and_then(|m| m.get("protocolVersion")).and_then(Value::as_str);
     let par_v = req.get("params").and_then(|p| p.get("_meta"))
         .and_then(|m| m.get("protocolVersion")).and_then(Value::as_str);
     let init_v = req.get("params").and_then(|p| p.get("protocolVersion")).and_then(Value::as_str);
     let method = req["method"].as_str().unwrap_or("");
-    let is_v2 = top_v == Some(PROTOCOL_V2) || par_v == Some(PROTOCOL_V2)
-        || init_v == Some(PROTOCOL_V2) || method == "server/discover" || method.starts_with("tasks/");
-    if is_v2 { ProtocolMode::V2_2026 } else { ProtocolMode::Legacy2024 }
+    let is_stateless = top_v == Some(PROTO_STATELESS) || par_v == Some(PROTO_STATELESS)
+        || init_v == Some(PROTO_STATELESS)
+        || method == "server/discover" || method.starts_with("tasks/");
+    if is_stateless { Proto::Stateless } else { Proto::Base }
 }
 
-fn batch_rejection_error() -> Value {
-    let msg = "Invalid Request: JSON-RPC batch arrays are forbidden in MCP 2026-07-28";
+fn batch_err() -> Value {
+    let msg = "Invalid Request: JSON-RPC batch arrays are forbidden";
     rpc_err(Value::Null, ERR_INVALID_REQUEST, msg)
 }
 
 fn discover_result() -> Value {
     json!({
-        "protocolVersion": PROTOCOL_V2,
-        "supportedProtocolVersions": [PROTOCOL_V2, PROTOCOL_LEGACY],
+        "protocolVersion": PROTO_STATELESS,
+        "supportedProtocolVersions": [PROTO_STATELESS, PROTO_BASE],
         "serverInfo": { "name": "refit", "version": env!("CARGO_PKG_VERSION") },
         "capabilities": {
             "tools": { "listChanged": false },
             "extensions": {
-                "io.modelcontextprotocol/tasks": { "methods": ["tasks/get", "tasks/update", "tasks/cancel"] },
+                "io.modelcontextprotocol/tasks": {
+                    "methods": ["tasks/get", "tasks/update", "tasks/cancel"]
+                },
                 "io.modelcontextprotocol/mrtr": { "stateless": true }
             }
         },
         "tools": tool_catalog(),
-        "_meta": sep2549_meta(),
+        "_meta": catalog_meta(),
     })
 }
 
@@ -574,7 +566,7 @@ fn eq_param_key(a: &str, b: &str) -> bool {
     ia.eq(ib)
 }
 
-fn validate_sep2243_headers(headers: &HeaderMap, body: &Value) -> std::result::Result<(), String> {
+fn check_param_hdrs(headers: &HeaderMap, body: &Value) -> std::result::Result<(), String> {
     let hdr = |k: &str| headers.get(k)?.to_str().ok().map(str::trim);
     let body_method = body.get("method").and_then(Value::as_str)
         .ok_or_else(|| "missing JSON-RPC `method` field".to_string())?;
@@ -630,8 +622,8 @@ fn estimate_tool_bytes(name: &str) -> usize {
     }
 }
 
-async fn handle_rpc(ctx: &Arc<McpCtx>, req: &Value, mode: ProtocolMode) -> (StatusCode, Option<Value>) {
-    if req.is_array() { return (StatusCode::BAD_REQUEST, Some(batch_rejection_error())); }
+async fn handle_rpc(ctx: &Arc<McpCtx>, req: &Value, mode: Proto) -> (StatusCode, Option<Value>) {
+    if req.is_array() { return (StatusCode::BAD_REQUEST, Some(batch_err())); }
     let id = req.get("id").cloned();
     let method = req["method"].as_str().unwrap_or("");
     match method {
@@ -640,24 +632,24 @@ async fn handle_rpc(ctx: &Arc<McpCtx>, req: &Value, mode: ProtocolMode) -> (Stat
         "notifications/initialized" => (StatusCode::ACCEPTED, None),
         "initialize" => {
             let res = match mode {
-                ProtocolMode::Legacy2024 => json!({
-                    "protocolVersion": PROTOCOL_LEGACY,
+                Proto::Base => json!({
+                    "protocolVersion": PROTO_BASE,
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "refit", "version": env!("CARGO_PKG_VERSION") },
                 }),
-                ProtocolMode::V2_2026 => json!({
-                    "protocolVersion": PROTOCOL_V2,
+                Proto::Stateless => json!({
+                    "protocolVersion": PROTO_STATELESS,
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": "refit", "version": env!("CARGO_PKG_VERSION") },
-                    "_meta": sep2549_meta(),
+                    "_meta": catalog_meta(),
                 }),
             };
             (StatusCode::OK, Some(rpc_ok(id, res)))
         }
         "tools/list" => {
             let res = match mode {
-                ProtocolMode::Legacy2024 => json!({ "tools": tool_catalog() }),
-                ProtocolMode::V2_2026 => json!({ "tools": tool_catalog(), "_meta": sep2549_meta() }),
+                Proto::Base => json!({ "tools": tool_catalog() }),
+                Proto::Stateless => json!({ "tools": tool_catalog(), "_meta": catalog_meta() }),
             };
             (StatusCode::OK, Some(rpc_ok(id, res)))
         }
@@ -666,7 +658,7 @@ async fn handle_rpc(ctx: &Arc<McpCtx>, req: &Value, mode: ProtocolMode) -> (Stat
         "tasks/update" => (StatusCode::OK, Some(handle_tasks_update(ctx, id, &req["params"]))),
         "tasks/cancel" => (StatusCode::OK, Some(handle_tasks_cancel(ctx, id, &req["params"]))),
         "tasks/list" | "tasks/result" => {
-            let msg = format!("Method not found: `{method}` is explicitly omitted per SEP-2663");
+            let msg = format!("Method not found: `{method}` is not supported");
             (StatusCode::OK, Some(rpc_err(id.unwrap_or(Value::Null), ERR_METHOD_NOT_FOUND, msg)))
         }
         other => match id {
@@ -680,29 +672,29 @@ async fn handle_rpc(ctx: &Arc<McpCtx>, req: &Value, mode: ProtocolMode) -> (Stat
 }
 
 async fn handle_tool_call(
-    ctx: &Arc<McpCtx>, id: Option<Value>, params: &Value, mode: ProtocolMode,
+    ctx: &Arc<McpCtx>, id: Option<Value>, params: &Value, mode: Proto,
 ) -> (StatusCode, Option<Value>) {
-    if mode == ProtocolMode::V2_2026 {
+    if mode == Proto::Stateless {
         let raw_tok = params.get("continuationToken").or_else(|| params.get("requestState"))
             .and_then(Value::as_str).filter(|s| !s.is_empty());
         if let Some(tok) = raw_tok { return handle_mrtr_resume(ctx, id, params, tok).await; }
     }
     let (name, args) = (json_str(params, "name"), params["arguments"].clone());
-    if mode == ProtocolMode::V2_2026 {
+    if mode == Proto::Stateless {
         let needs_confirm = args["confirmed"].as_bool() != Some(true)
             && (args["require_confirmation"].as_bool() == Some(true)
                 || (name == "refit_apply" && args["allow_abi_change"].as_bool() == Some(true))
                 || name == "refit_tx_delete");
-        if needs_confirm { return build_mrtr_challenge(ctx, id, &name, args); }
+        if needs_confirm { return resume_challenge(ctx, id, &name, args); }
         let wants_task = params["task"].as_bool() == Some(true)
             || params["mode"].as_str() == Some("task")
             || args["async_task"].as_bool() == Some(true);
         if wants_task { return spawn_durable_task(ctx, id, name, args); }
     }
-    run_complete_tool_call(ctx, id, name, args, mode).await
+    run_tool(ctx, id, name, args, mode).await
 }
 
-fn build_mrtr_challenge(
+fn resume_challenge(
     ctx: &Arc<McpCtx>, id: Option<Value>, name: &str, args: Value,
 ) -> (StatusCode, Option<Value>) {
     let issued = now_ms();
@@ -742,10 +734,13 @@ async fn handle_mrtr_resume(
     };
     if let Some(req_tool) = params.get("name").and_then(Value::as_str) && req_tool != payload.tool {
         let msg = format!(
-            "HeaderMismatchError: params.name `{req_tool}` does not match continuation token tool `{}`",
+            "HeaderMismatchError: params.name `{req_tool}` mismatches token tool `{}`",
             payload.tool
         );
-        return (StatusCode::BAD_REQUEST, Some(rpc_err(id.unwrap_or(Value::Null), ERR_HEADER_MISMATCH, msg)));
+        return (
+            StatusCode::BAD_REQUEST,
+            Some(rpc_err(id.unwrap_or(Value::Null), ERR_HEADER_MISMATCH, msg)),
+        );
     }
     let resp = &params["inputResponses"];
     let confirmed = resp.get("confirm").and_then(Value::as_bool).or_else(|| {
@@ -754,16 +749,19 @@ async fn handle_mrtr_resume(
             .and_then(|it| it["value"].as_bool())
     });
     let Some(confirmed) = confirmed else {
-        let e = rpc_err(id.unwrap_or(Value::Null), ERR_INVALID_PARAMS, "missing boolean `confirm` inside `inputResponses`");
-        return (StatusCode::BAD_REQUEST, Some(e));
+        let msg = "missing boolean `confirm` inside `inputResponses`";
+        return (
+            StatusCode::BAD_REQUEST,
+            Some(rpc_err(id.unwrap_or(Value::Null), ERR_INVALID_PARAMS, msg)),
+        );
     };
     if !confirmed {
-        let declined = json!({ "cancelled": true, "reason": "user declined MRTR confirmation" });
-        return (StatusCode::OK, Some(wrap_tool_reply(id, &declined, ProtocolMode::V2_2026, 0, 0)));
+        let declined = json!({ "cancelled": true, "reason": "user declined confirmation" });
+        return (StatusCode::OK, Some(wrap_tool_reply(id, &declined, Proto::Stateless, 0, 0)));
     }
     let mut args = payload.arguments;
     if let Some(obj) = args.as_object_mut() { obj.insert("confirmed".into(), json!(true)); }
-    run_complete_tool_call(ctx, id, payload.tool, args, ProtocolMode::V2_2026).await
+    run_tool(ctx, id, payload.tool, args, Proto::Stateless).await
 }
 
 async fn execute_tool_async(
@@ -784,7 +782,7 @@ async fn execute_tool_async(
         return Ok(ok_json(ctx.research.check_library(lang, cap).await));
     }
     if name == "refit_audit" && args["research"].as_bool().unwrap_or(false) {
-        return Ok(run_audit_research_async(ctx, &args).await);
+        return Ok(run_audit_async(ctx, &args).await);
     }
     let _sem = ctx.blocking_sem.acquire().await.ok();
     if cancel.is_some_and(|f| f.load(Ordering::Acquire)) {
@@ -800,17 +798,17 @@ async fn execute_tool_async(
     .map_err(|e| format!("task join error: {e}"))
 }
 
-async fn run_complete_tool_call(
-    ctx: &Arc<McpCtx>, id: Option<Value>, name: String, args: Value, mode: ProtocolMode,
+async fn run_tool(
+    ctx: &Arc<McpCtx>, id: Option<Value>, name: String, args: Value, mode: Proto,
 ) -> (StatusCode, Option<Value>) {
     let gate = MemGate::global();
     let reserve = estimate_tool_bytes(&name).min(gate.capacity());
     let pre_permit = gate.try_admit(reserve).ok();
-    if mode == ProtocolMode::V2_2026 && pre_permit.is_none() {
+    if mode == Proto::Stateless && pre_permit.is_none() {
         let e = rpc_err(id.unwrap_or(Value::Null), ERR_OVERLOADED, "server busy: MemGate limit");
         return (StatusCode::SERVICE_UNAVAILABLE, Some(e));
     }
-    let wait_reserve = (mode == ProtocolMode::Legacy2024 && pre_permit.is_none()).then_some(reserve);
+    let wait_reserve = (mode == Proto::Base && pre_permit.is_none()).then_some(reserve);
     let (tool_ep, args_ep) = (name.clone(), args.clone());
     let payload = {
         let _held = pre_permit;
@@ -823,9 +821,9 @@ async fn run_complete_tool_call(
 }
 
 fn wrap_tool_reply(
-    id: Option<Value>, payload: &Value, mode: ProtocolMode, epoch: u64, slot_epoch: u64,
+    id: Option<Value>, payload: &Value, mode: Proto, epoch: u64, slot_epoch: u64,
 ) -> Value {
-    if mode == ProtocolMode::Legacy2024 { return rpc_text(id, payload); }
+    if mode == Proto::Base { return rpc_text(id, payload); }
     let text = serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".into());
     rpc_ok(id, json!({
         "resultType": "complete",
@@ -904,12 +902,9 @@ fn handle_tasks_cancel(ctx: &Arc<McpCtx>, id: Option<Value>, params: &Value) -> 
     task_reply(id, ctx.tasks.cancel(task_id_param(params)))
 }
 
-// ============================================================================
-// 6. Transports: Concurrent Stdio & Stateless Streamable HTTP (POST /mcp)
-// ============================================================================
+// Transports
 
-/// Run the concurrent JSON-RPC 2.0 MCP server over stdio with a serialized writer task.
-/// Supports both legacy `2024-11-05` and stateless `2026-07-28` framing unconditionally.
+/// Run the concurrent JSON-RPC 2.0 MCP server over stdio.
 pub async fn serve_mcp(repo_root: PathBuf) -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
@@ -928,7 +923,7 @@ pub async fn serve_mcp(repo_root: PathBuf) -> Result<()> {
     let mut last_scan: Option<oneshot::Receiver<()>> = None;
     while let Some(line) = lines.next_line().await? {
         let Ok(req) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        dispatch_stdio_value(&req, &ctx, &out_tx, &mut tasks, &mut last_scan).await?;
+        dispatch_stdio(&req, &ctx, &out_tx, &mut tasks, &mut last_scan).await?;
     }
     while tasks.join_next().await.is_some() {}
     drop(out_tx);
@@ -937,18 +932,18 @@ pub async fn serve_mcp(repo_root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn dispatch_stdio_value(
+async fn dispatch_stdio(
     req: &Value, ctx: &Arc<McpCtx>, out_tx: &mpsc::Sender<String>,
     tasks: &mut tokio::task::JoinSet<()>, last_scan: &mut Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
     if req.is_array() {
-        let _ = out_tx.send(serde_json::to_string(&batch_rejection_error())?).await;
+        let _ = out_tx.send(serde_json::to_string(&batch_err())?).await;
         return Ok(());
     }
     let mode = detect_protocol(req);
     let method = req["method"].as_str().unwrap_or("");
-    if method == "tools/list" && mode == ProtocolMode::Legacy2024 {
-        let _ = out_tx.send(encode_legacy_tools_list_rpc(req.get("id").cloned())).await;
+    if method == "tools/list" && mode == Proto::Base {
+        let _ = out_tx.send(encode_base_tools(req.get("id").cloned())).await;
         return Ok(());
     }
     if method == "tools/call" {
@@ -986,7 +981,7 @@ fn json_response(status: StatusCode, body: Value, retry_after: bool) -> Response
 
 async fn handle_health() -> Response {
     let body = json!({
-        "ok": true, "protocolVersion": PROTOCOL_V2,
+        "ok": true, "protocolVersion": PROTO_STATELESS,
         "stateless": true, "catalogDigest": catalog_digest(),
     });
     json_response(StatusCode::OK, body, false)
@@ -1003,9 +998,9 @@ async fn handle_http_mcp(
         }
     };
     if parsed.is_array() {
-        return json_response(StatusCode::BAD_REQUEST, batch_rejection_error(), false);
+        return json_response(StatusCode::BAD_REQUEST, batch_err(), false);
     }
-    if let Err(detail) = validate_sep2243_headers(&headers, &parsed) {
+    if let Err(detail) = check_param_hdrs(&headers, &parsed) {
         let err_body = json!({
             "jsonrpc": "2.0", "id": parsed.get("id").cloned().unwrap_or(Value::Null),
             "error": {
@@ -1016,7 +1011,7 @@ async fn handle_http_mcp(
         });
         return json_response(StatusCode::BAD_REQUEST, err_body, false);
     }
-    let (status, resp_opt) = handle_rpc(&ctx, &parsed, ProtocolMode::V2_2026).await;
+    let (status, resp_opt) = handle_rpc(&ctx, &parsed, Proto::Stateless).await;
     match resp_opt {
         Some(val) => json_response(status, val, status == StatusCode::SERVICE_UNAVAILABLE),
         None => StatusCode::ACCEPTED.into_response(),
@@ -1045,17 +1040,15 @@ async fn bind_http_server(
     Ok((bound, handle))
 }
 
-/// Serve stateless MCP `2026-07-28` Streamable HTTP (`POST /mcp`, `GET /health`).
+/// Serve stateless MCP over Streamable HTTP (`POST /mcp`, `GET /health`).
 pub async fn serve_http(repo_root: PathBuf, listen_addr: String) -> Result<()> {
     let (bound, handle) = bind_http_server(McpCtx::new(repo_root), &listen_addr).await?;
-    tracing::info!("refit MCP 2026-07-28 stateless HTTP listening on http://{bound}/mcp");
+    tracing::info!("refit MCP stateless HTTP listening on http://{bound}/mcp");
     handle.await.context("MCP HTTP server join")?;
     Ok(())
 }
 
-// ============================================================================
-// 7. Concrete Tool Handlers
-// ============================================================================
+// Tool handlers
 
 fn ok_json<T: serde::Serialize>(res: Result<T>) -> Value {
     match res {
@@ -1088,6 +1081,13 @@ fn dispatch_tool_sync(name: &str, args: &Value, ctx: &McpCtx) -> Value {
     }
 }
 
+fn attach_epoch_meta(val: &mut Value, hit: bool, epoch: u64) {
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("epoch_cache_hit".into(), json!(hit));
+        obj.insert("epoch".into(), json!(epoch));
+    }
+}
+
 fn run_scan(ctx: &McpCtx, args: &Value) -> Value {
     let fast = args["fast"].as_bool().unwrap_or(true);
     let (ep, sig) = (ctx.epoch.global_epoch(), quick_repo_stat_sig(&ctx.repo_root));
@@ -1096,11 +1096,8 @@ fn run_scan(ctx: &McpCtx, args: &Value) -> Value {
         && memo.stat_sig == sig && memo.stored_at.elapsed() < EPOCH_MEMO_TTL
     {
         let mut v = memo.value.clone();
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("scan_cache_hit".into(), json!(true));
-            obj.insert("epoch_cache_hit".into(), json!(true));
-            obj.insert("epoch".into(), json!(ep));
-        }
+        if let Some(obj) = v.as_object_mut() { obj.insert("scan_cache_hit".into(), json!(true)); }
+        attach_epoch_meta(&mut v, true, ep);
         return v;
     }
 
@@ -1110,12 +1107,11 @@ fn run_scan(ctx: &McpCtx, args: &Value) -> Value {
             let mut v = serde_json::to_value(&bundle.plan).unwrap_or_else(|_| json!({"ok": true}));
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("scan_cache_hit".into(), json!(hit));
-                obj.insert("epoch_cache_hit".into(), json!(false));
-                obj.insert("epoch".into(), json!(ep));
                 obj.insert("fast_mode".into(), json!(fast));
                 obj.insert("detected_languages".into(), json!(bundle.detected_languages));
                 obj.insert("polyglot_toolchains".into(), json!(bundle.polyglot_toolchains));
             }
+            attach_epoch_meta(&mut v, false, ep);
             if ep_after == ep {
                 let sig_after = quick_repo_stat_sig(&ctx.repo_root);
                 *ctx.scan_memo.lock() = Some((fast, EpochMemo {
@@ -1134,7 +1130,7 @@ fn peek_symbols_memo(ctx: &McpCtx, ep: u64, sig: u64) -> Option<Arc<SymbolGraph>
         .map(|m| m.value.clone())
 }
 
-fn load_symbols_memoized(ctx: &McpCtx) -> (Arc<SymbolGraph>, u64, bool) {
+fn cached_symbols(ctx: &McpCtx) -> (Arc<SymbolGraph>, u64, bool) {
     let (ep, sig) = (ctx.epoch.global_epoch(), quick_repo_stat_sig(&ctx.repo_root));
     if let Some(snap) = peek_symbols_memo(ctx, ep, sig) { return (snap, ep, true); }
     let snap = Arc::new(load_symbols(&ctx.repo_root, None));
@@ -1155,27 +1151,21 @@ fn run_symbols(ctx: &McpCtx, args: &Value) -> Value {
     } else if sym.is_none() && file.is_some() && ctx.repo_root.join(".refit/cache/sym.sst").is_file() {
         (query_symbols(&ctx.repo_root, None, file), false, ep)
     } else {
-        let (snap, ep_loaded, hit_loaded) = load_symbols_memoized(ctx);
+        let (snap, ep_loaded, hit_loaded) = cached_symbols(ctx);
         (query_symbol_graph(&snap, sym, file), hit_loaded, ep_loaded)
     };
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("epoch_cache_hit".into(), json!(hit));
-        obj.insert("epoch".into(), json!(epoch));
-    }
+    attach_epoch_meta(&mut v, hit, epoch);
     v
 }
 
 fn run_rewind(ctx: &McpCtx, args: &Value) -> Value {
     let token = args["token"].as_str();
     let trigger = crate::learn::RewindTrigger::parse(args["trigger"].as_str().unwrap_or("smell"));
-    let (snap, ep, hit) = load_symbols_memoized(ctx);
-    let mut val = ok_json(crate::learn::query_learn_and_rewind_with_graph(
+    let (snap, ep, hit) = cached_symbols(ctx);
+    let mut val = ok_json(crate::learn::query_rewind_graph(
         &ctx.repo_root, Some(&snap), token, trigger,
     ));
-    if let Some(obj) = val.as_object_mut() {
-        obj.insert("epoch_cache_hit".into(), json!(hit));
-        obj.insert("epoch".into(), json!(ep));
-    }
+    attach_epoch_meta(&mut val, hit, ep);
     val
 }
 
@@ -1194,7 +1184,7 @@ fn format_audit_value(rep: crate::types::AuditReport, args: &Value) -> Value {
     }
 }
 
-async fn run_audit_research_async(ctx: &McpCtx, args: &Value) -> Value {
+async fn run_audit_async(ctx: &McpCtx, args: &Value) -> Value {
     let (repo_root, hygiene) = (ctx.repo_root.clone(), ctx.hygiene.clone());
     let _sem_permit = ctx.blocking_sem.acquire().await.ok();
     let base = tokio::task::spawn_blocking(move || untangle_repo(&repo_root, &hygiene))
@@ -1214,7 +1204,7 @@ fn run_audit(repo_root: &Path, args: &Value, hygiene: &HygieneScorer) -> Value {
     match untangle_repo(repo_root, hygiene) {
         Ok(mut rep) => {
             if args["research"].as_bool().unwrap_or(false) {
-                let (advisories, _) = crate::research::deps::evaluate_repo_deps(
+                let (advisories, _) = crate::research::deps::audit_lockfiles(
                     repo_root, &rustc_hash::FxHashMap::default(),
                 );
                 rep.dep_advisories = advisories;
@@ -1328,42 +1318,38 @@ fn run_apply(ctx: &ToolCtx<'_>, args: &Value) -> Value {
     verify_commit(req, || {})
 }
 
-// ============================================================================
-// 8. Unified Test Suite (Real McpCtx, Zero MockBackend)
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::{TempRepo, asrf_edit};
     use tx::{TxMeta, txs_dir};
 
-    struct McpTestHarness { repo: TempRepo, ctx: Arc<McpCtx> }
+    struct Harness { repo: TempRepo, ctx: Arc<McpCtx> }
 
-    impl McpTestHarness {
+    impl Harness {
         fn new(tag: &str, files: &[(&str, &str)]) -> Self {
             let repo = TempRepo::nested_with(tag, "repo", files);
             let ctx = McpCtx::with_epoch(repo.path().to_path_buf(), Arc::new(EpochRegistry::new()));
             Self { repo, ctx }
         }
         fn call(&self, tool: &str, args: Value) -> Value { dispatch_tool_sync(tool, &args, &self.ctx) }
-        async fn rpc_v2(&self, req: Value) -> (StatusCode, Option<Value>) {
-            handle_rpc(&self.ctx, &req, ProtocolMode::V2_2026).await
+        async fn rpc(&self, req: Value) -> (StatusCode, Option<Value>) {
+            handle_rpc(&self.ctx, &req, Proto::Stateless).await
         }
         fn begin_tx(&self) -> String {
             let res = self.call("refit_tx_begin", json!({}));
-            let raw = res["tx_handle"].as_str().unwrap();
-            raw.to_string()
+            let handle = res["tx_handle"].as_str().unwrap();
+            handle.to_string()
         }
         fn set_delay_ms(&self, ms: u64) { self.ctx.test_delay_ms.store(ms, Ordering::Release); }
         fn stage(&self, id: &str, patch: &str) -> Value {
             self.call("refit_tx_stage", json!({"tx_handle": id, "patch_text": patch}))
         }
-        fn commit(&self, id: &str, dry_run: bool, allow_abi: bool) -> Value {
-            self.call("refit_tx_commit", json!({"tx_handle": id, "dry_run": dry_run, "allow_abi_change": allow_abi}))
+        fn commit(&self, id: &str, dry: bool, abi: bool) -> Value {
+            self.call("refit_tx_commit", json!({"tx_handle": id, "dry_run": dry, "allow_abi_change": abi}))
         }
-        fn apply(&self, mid: &str, patch: &str, dry_run: bool) -> Value {
-            self.call("refit_apply", json!({"module_id": mid, "patch_text": patch, "dry_run": dry_run}))
+        fn apply(&self, mid: &str, patch: &str, dry: bool) -> Value {
+            self.call("refit_apply", json!({"module_id": mid, "patch_text": patch, "dry_run": dry}))
         }
         fn check_dry(&self, res: &Value, rel: &str, orig: &str) {
             assert_eq!((&res["passed"], &res["committed"]), (&json!(true), &json!(false)));
@@ -1375,131 +1361,122 @@ mod tests {
         json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
     }
 
+    fn rpc_txt(v: &Value) -> &str {
+        v["result"]["content"][0]["text"].as_str().unwrap()
+    }
+
+    fn obj_keys(v: &Value) -> Vec<&str> {
+        let obj = v.as_object().unwrap();
+        obj.keys().map(String::as_str).collect()
+    }
+
     async fn post_mcp(
-        client: &reqwest::Client,
-        url: &str,
-        hdrs: &[(&str, &str)],
-        payload: &Value,
+        client: &reqwest::Client, url: &str, hdrs: &[(&str, &str)], payload: &Value,
     ) -> reqwest::Response {
         let mut req = client.post(url);
-        for &(k, v) in hdrs {
-            req = req.header(k, v);
-        }
+        for &(k, v) in hdrs { req = req.header(k, v); }
         req.json(payload).send().await.unwrap()
     }
 
-    #[test]
-    fn catalog_is_sorted_canonical_and_digest_frozen() {
-        let arr = tool_catalog().as_array().expect("catalog array");
-        assert_eq!(arr.len(), 17);
-        let names: Vec<&str> = arr
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        assert_eq!(names, sorted, "TOOLS must be sorted A->Z by name");
-
-        let bytes = catalog_bytes();
-        let expected_digest = format!("blake3:{}", blake3::hash(bytes).to_hex());
-        assert_eq!(catalog_digest(), expected_digest);
-        assert_eq!(bytes, serde_json::to_vec(tool_catalog()).unwrap().as_slice());
-
-        for tool in arr {
-            let obj = tool.as_object().unwrap();
-            let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-            assert_eq!(keys, vec!["description", "inputSchema", "name"]);
-            let props = tool["inputSchema"]["properties"].as_object().unwrap();
-            let prop_keys: Vec<&str> = props.keys().map(String::as_str).collect();
-            let mut prop_sorted = prop_keys.clone();
-            prop_sorted.sort_unstable();
-            assert_eq!(prop_keys, prop_sorted);
-        }
-
-        let meta = sep2549_meta();
-        assert_eq!((&meta["ttlMs"], &meta["cacheScope"]), (&json!(3_600_000), &json!("server")));
-        assert_eq!(meta["catalogDigest"], json!(expected_digest));
-
-        let parsed: Value = serde_json::from_str(&encode_legacy_tools_list_rpc(Some(json!(7)))).unwrap();
-        assert_eq!((&parsed["id"], &parsed["result"]["tools"]), (&json!(7), tool_catalog()));
-        assert!(parsed["result"].get("_meta").is_none());
+    async fn post_json(
+        client: &reqwest::Client, url: &str, hdrs: &[(&str, &str)], payload: &Value,
+    ) -> (u16, Value) {
+        let resp = post_mcp(client, url, hdrs, payload).await;
+        (resp.status().as_u16(), resp.json().await.unwrap())
     }
 
     #[test]
-    fn b64url_rejects_padding_invalid_chars_and_non_canonical_bits() {
+    fn catalog_sorted_and_hashed() {
+        let arr = tool_catalog().as_array().unwrap();
+        assert_eq!(arr.len(), 17);
+        let mut names = Vec::with_capacity(arr.len());
+        for tool in arr {
+            names.push(tool["name"].as_str().unwrap());
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+
+        let bytes = catalog_bytes();
+        let want = format!("blake3:{}", blake3::hash(bytes).to_hex());
+        let encoded = serde_json::to_vec(tool_catalog()).unwrap();
+        assert_eq!((catalog_digest(), bytes), (want.as_str(), encoded.as_slice()));
+        for tool in arr {
+            assert_eq!(obj_keys(tool), vec!["description", "inputSchema", "name"]);
+            let pkeys = obj_keys(&tool["inputSchema"]["properties"]);
+            let mut ps = pkeys.clone();
+            ps.sort_unstable();
+            assert_eq!(pkeys, ps);
+        }
+        let meta = catalog_meta();
+        assert_eq!(
+            (&meta["ttlMs"], &meta["cacheScope"], &meta["catalogDigest"]),
+            (&json!(3_600_000), &json!("server"), &json!(want))
+        );
+        let base: Value = serde_json::from_str(&encode_base_tools(Some(json!(7)))).unwrap();
+        let no_meta = base["result"].get("_meta").is_none();
+        assert_eq!((&base["id"], &base["result"]["tools"], no_meta), (&json!(7), tool_catalog(), true));
+    }
+
+    #[test]
+    fn b64url_strict_decode() {
         for raw in [b"".as_slice(), b"f", b"fo", b"foo", b"\xfb\xff\xfe\x00\x01"] {
             let enc = b64url_encode(raw);
-            assert!(!enc.contains('='), "no padding allowed: {enc}");
-            assert_eq!(b64url_decode(&enc).as_deref(), Some(raw));
+            assert!(!enc.contains('=') && b64url_decode(&enc).as_deref() == Some(raw));
         }
         assert_eq!(b64url_encode(b"\xfb\xff\xfe"), "-__-");
         for bad in ["Zg==", "a", "ab+c", "ab/c", "AB", "AAB"] {
-            assert!(b64url_decode(bad).is_none(), "must reject invalid b64url `{bad}`");
+            assert!(b64url_decode(bad).is_none(), "bad `{bad}`");
         }
     }
 
     #[test]
-    fn test_mcp_scan_and_apply() {
+    fn mcp_scan_apply_and_tx() {
         let orig = "export function add(a: number, b: number): number {\n  return a + b;\n}\n";
-        let h = McpTestHarness::new("mcp_app", &[("src/calc.ts", orig)]);
+        let b0 = "export function beta(y: number): number {\n  return y + 2;\n}\n";
+        let h = Harness::new("mcp_tx", &[("src/calc.ts", orig), ("src/b.ts", b0)]);
 
         assert_eq!(h.call("refit_scan", json!({}))["scan_cache_hit"], json!(false));
         assert_eq!(h.call("refit_scan", json!({}))["scan_cache_hit"], json!(true));
-
-        let dry_p = asrf_edit("src/calc.ts", "  return a + b;", "  const total = a + b;\n  return total;");
-        let dry = h.apply("calc", &dry_p, true);
-        assert_eq!(dry["dry_run"], json!(true));
-        h.check_dry(&dry, "src/calc.ts", orig);
+        let dry_p = asrf_edit("src/calc.ts", "  return a + b;", "  const s = a + b;\n  return s;");
+        h.check_dry(&h.apply("calc", &dry_p, true), "src/calc.ts", orig);
 
         h.repo.write("src/calc.ts", orig.replace("a + b;", "a + b + 5;"));
         let live_p = asrf_edit("src/calc.ts", "  return a + b + 5;", "  const v = a + b + 6;\n  return v;");
         assert_eq!(h.apply("calc", &live_p, false)["committed"], json!(true));
         assert!(h.repo.read("src/calc.ts").contains("a + b + 6"));
 
-        let rw1 = h.call("refit_rewind", json!({"token": "add", "trigger": "advisory"}));
-        assert_eq!((&rw1["epoch_cache_hit"], &rw1["rewind"]["affected_files"]), (&json!(false), &json!(["src/calc.ts"])));
-        assert_eq!(h.call("refit_rewind", json!({"token": "add", "trigger": "advisory"}))["epoch_cache_hit"], json!(true));
-    }
+        let rw = h.call("refit_rewind", json!({"token": "add", "trigger": "advisory"}));
+        assert_eq!(
+            (&rw["epoch_cache_hit"], &rw["rewind"]["affected_files"]),
+            (&json!(false), &json!(["src/calc.ts"]))
+        );
+        let rw2 = h.call("refit_rewind", json!({"token": "add", "trigger": "advisory"}));
+        assert_eq!(rw2["epoch_cache_hit"], json!(true));
 
-    #[test]
-    fn test_mcp_tx_orphan_gc() {
-        let h = McpTestHarness::new("mcp_gc", &[]);
         let root = txs_dir(h.repo.path());
-        let (stale, fresh) = (root.join("tx-stale-orphan"), root.join("tx-fresh-active"));
-        fs::create_dir_all(&stale).unwrap();
-        fs::create_dir_all(&fresh).unwrap();
-        let now = now_ms();
+        let (stale, fresh, now) = (root.join("tx-stale-1"), root.join("tx-fresh-1"), now_ms());
         for (dir, id, created, ttl) in [
-            (&stale, "tx-stale-orphan", now.saturating_sub(120_000), 1_000),
-            (&fresh, "tx-fresh-active", now, 600_000),
+            (&stale, "tx-stale-1", now.saturating_sub(120_000), 1_000),
+            (&fresh, "tx-fresh-1", now, 600_000),
         ] {
+            fs::create_dir_all(dir).unwrap();
             let meta = TxMeta { tx_handle: id.into(), created_ms: created, ttl_ms: ttl, staged: BTreeMap::new() };
             fs::write(dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
         }
         assert_eq!(h.call("refit_tx_begin", json!({}))["swept_orphans"], json!(1));
         assert!(!stale.exists() && fresh.exists());
-    }
 
-    #[test]
-    fn test_mcp_tx_lifecycle_and_ops() {
-        let a0 = "export function alpha(x: number): number {\n  return x + 1;\n}\n";
-        let b0 = "export function beta(y: number): number {\n  return y + 2;\n}\n";
-        let h = McpTestHarness::new("mcp_tx", &[("src/a.ts", a0), ("src/b.ts", b0)]);
-
-        let rd = h.call("refit_read", json!({"path": "src/a.ts", "start_line": 1, "end_line": 2}));
+        let rd = h.call("refit_read", json!({"path": "src/b.ts", "start_line": 1, "end_line": 2}));
         let rd_txt = rd["content"].as_str().unwrap();
-        assert!(rd_txt.contains("1: export function alpha"));
+        assert!(rd_txt.contains("1: export function beta"));
 
         let id = h.begin_tx();
-        let pa = asrf_edit("src/a.ts", "  return x + 1;", "  const next = x + 10;\n  return next;");
         let pb = asrf_edit("src/b.ts", "  return y + 2;", "  const next = y + 20;\n  return next;");
-        assert_eq!(h.stage(&id, &pa)["staged_files_count"], json!(1));
-        assert_eq!(h.stage(&id, &pb)["staged_files_count"], json!(2));
-        h.check_dry(&h.commit(&id, true, false), "src/a.ts", a0);
-
+        assert_eq!(h.stage(&id, &pb)["staged_files_count"], json!(1));
+        h.check_dry(&h.commit(&id, true, false), "src/b.ts", b0);
         let ok = h.commit(&id, false, false);
-        assert_eq!((&ok["committed"], &ok["files_committed"], &ok["head_rev"]), (&json!(true), &json!(2), &json!(1)));
-        assert!(h.repo.read("src/a.ts").contains("x + 10"));
+        assert_eq!((&ok["committed"], &ok["files_committed"]), (&json!(true), &json!(1)));
 
         let id2 = h.begin_tx();
         h.stage(&id2, &asrf_edit("src/b.ts", "  return next;\n}", "  return next;"));
@@ -1507,166 +1484,127 @@ mod tests {
         assert_eq!((&fail["passed"], &fail["failed_gate"]), (&json!(false), &json!("gate0_syntax")));
         assert_eq!(h.call("refit_tx_abort", json!({"tx_handle": id2}))["rolled_back"], json!(true));
 
-        let mv_id = h.begin_tx();
-        h.call("refit_tx_move", json!({"tx_handle": mv_id, "from_path": "src/a.ts", "to_path": "src/core/modern.ts"}));
-        let cm = h.commit(&mv_id, false, true);
-        assert_eq!((&cm["committed"], &cm["head_rev"]), (&json!(true), &json!(2)));
-        assert!(!h.repo.has("src/a.ts") && h.repo.has("src/core/modern.ts"));
+        let mv = h.begin_tx();
+        h.call("refit_tx_move", json!({"tx_handle": mv, "from_path": "src/b.ts", "to_path": "src/core/b.ts"}));
+        assert_eq!(h.commit(&mv, false, true)["committed"], json!(true));
+        assert!(!h.repo.has("src/b.ts") && h.repo.has("src/core/b.ts"));
 
-        let cr_id = h.begin_tx();
+        let cr = h.begin_tx();
         let body = "export function help(n: number): number {\n  return n + 1;\n}\n";
-        h.call("refit_tx_create", json!({"tx_handle": cr_id, "path": "src/core/helper.ts", "content": body}));
-        let cc = h.commit(&cr_id, false, false);
-        assert_eq!((&cc["committed"], &cc["head_rev"]), (&json!(true), &json!(3)));
+        h.call("refit_tx_create", json!({"tx_handle": cr, "path": "src/core/h.ts", "content": body}));
+        assert_eq!(h.commit(&cr, false, false)["committed"], json!(true));
     }
 
     #[tokio::test]
-    async fn test_legacy_2024_11_05_stdio_compat_and_v2_framing() {
-        let h = McpTestHarness::new("mcp_stdio_compat", &[("src/ok.ts", "export function ok(): number { return 1; }\n")]);
+    async fn stdio_and_http_framing() {
+        let h = Harness::new("mcp_stdio", &[("src/ok.ts", "export function ok(): number { return 1; }\n")]);
         let (out_tx, mut out_rx) = mpsc::channel::<String>(32);
         let (mut tasks, mut last_scan) = (tokio::task::JoinSet::new(), None);
-        macro_rules! stdio_roundtrip {
+        macro_rules! roundtrip {
             ($req:expr) => {{
-                dispatch_stdio_value(&$req, &h.ctx, &out_tx, &mut tasks, &mut last_scan).await.unwrap();
+                dispatch_stdio(&$req, &h.ctx, &out_tx, &mut tasks, &mut last_scan).await.unwrap();
                 while tasks.join_next().await.is_some() {}
                 serde_json::from_str::<Value>(&out_rx.recv().await.unwrap()).unwrap()
             }};
         }
 
-        let init_res = stdio_roundtrip!(rpc_req(1, "initialize", json!({"protocolVersion": "2024-11-05"})));
-        assert_eq!(init_res["result"]["protocolVersion"], json!("2024-11-05"));
+        let init = roundtrip!(rpc_req(1, "initialize", json!({"protocolVersion": PROTO_BASE})));
+        assert_eq!(init["result"]["protocolVersion"], json!(PROTO_BASE));
 
         let notif = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        dispatch_stdio_value(&notif, &h.ctx, &out_tx, &mut tasks, &mut last_scan).await.unwrap();
+        dispatch_stdio(&notif, &h.ctx, &out_tx, &mut tasks, &mut last_scan).await.unwrap();
         assert!(out_rx.try_recv().is_err());
 
-        let list_res = stdio_roundtrip!(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
-        assert!(list_res["result"].get("_meta").is_none());
-        assert_eq!(list_res["result"]["tools"][0]["name"], json!("refit_apply"));
+        let list = roundtrip!(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
+        assert!(list["result"].get("_meta").is_none());
+        assert_eq!(list["result"]["tools"][0]["name"], json!("refit_apply"));
 
-        let call_res = stdio_roundtrip!(rpc_req(3, "tools/call", json!({"name": "refit_read", "arguments": {"path": "src/ok.ts"}})));
-        assert!(call_res["result"].get("resultType").is_none());
-        let ok_txt = call_res["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(ok_txt.contains("export function ok"));
+        let call = roundtrip!(rpc_req(3, "tools/call", json!({"name": "refit_read", "arguments": {"path": "src/ok.ts"}})));
+        assert!(call["result"].get("resultType").is_none());
+        assert!(rpc_txt(&call).contains("export function ok"));
 
-        let disc_res = stdio_roundtrip!(json!({"jsonrpc": "2.0", "id": 4, "method": "server/discover", "_meta": {"protocolVersion": "2026-07-28"}}));
-        assert_eq!(disc_res["result"]["protocolVersion"], json!("2026-07-28"));
-        assert_eq!(disc_res["result"]["_meta"]["ttlMs"], json!(3_600_000));
-
-        let v2_res = stdio_roundtrip!(json!({
-            "jsonrpc": "2.0", "id": 6, "method": "tools/call", "_meta": {"protocolVersion": "2026-07-28"},
+        let disc = roundtrip!(json!({"jsonrpc": "2.0", "id": 4, "method": "server/discover", "_meta": {"protocolVersion": PROTO_STATELESS}}));
+        assert_eq!(
+            (&disc["result"]["protocolVersion"], &disc["result"]["_meta"]["ttlMs"]),
+            (&json!(PROTO_STATELESS), &json!(3_600_000))
+        );
+        let st = roundtrip!(json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "_meta": {"protocolVersion": PROTO_STATELESS},
             "params": {"name": "refit_read", "arguments": {"path": "src/ok.ts"}}
         }));
-        assert_eq!(v2_res["result"]["resultType"], json!("complete"));
+        assert_eq!(st["result"]["resultType"], json!("complete"));
 
-        let batch_res = stdio_roundtrip!(json!([{"jsonrpc": "2.0", "id": 5, "method": "ping"}]));
-        assert_eq!(batch_res["error"]["code"], json!(-32600));
-    }
-
-    #[test]
-    fn warm_epoch_short_circuit_and_commit_invalidation() {
-        let h = McpTestHarness::new("mcp_epoch_memo", &[("src/mod_a.rs", "pub fn initial_sym() -> i32 { 1 }\n")]);
-        let reg = h.ctx.epoch.clone();
-
-        assert_eq!(h.call("refit_scan", json!({}))["epoch_cache_hit"], json!(false));
-        let y1 = h.call("refit_symbols", json!({"symbol": "initial_sym"}));
-        assert_eq!((&y1["epoch_cache_hit"], &y1["definers"]), (&json!(false), &json!(["src/mod_a.rs"])));
-
-        let s2 = h.call("refit_scan", json!({}));
-        assert_eq!((&s2["epoch_cache_hit"], &s2["scan_cache_hit"]), (&json!(true), &json!(true)));
-        let y2 = h.call("refit_symbols", json!({"symbol": "initial_sym"}));
-        assert_eq!((&y2["epoch_cache_hit"], &y2["definers"]), (&json!(true), &json!(["src/mod_a.rs"])));
-
-        let rd = h.call("refit_read", json!({"path": "src/mod_a.rs"}));
-        let rd_ep = rd["epoch"].as_u64().unwrap_or(0);
-        let rd_fep = rd["file_epoch"].as_u64().unwrap_or(0);
-        assert!(rd_ep >= 1 && rd_fep >= 1);
-
-        let store = MvccStore::open_with_epoch(h.repo.path(), "memo-commit", reg).unwrap();
-        let exp = BTreeMap::from([("src/mod_a.rs".into(), h.repo.hash("src/mod_a.rs"))]);
-        let next = b"pub fn initial_sym() -> i32 { 1 }\npub fn freshly_committed_sym() -> i32 { 42 }\n".to_vec();
-        let outcome = store.commit_tx("mod_a", &exp, &BTreeMap::from([("src/mod_a.rs".into(), next)]), &[]).unwrap();
-        assert!(matches!(outcome, crate::mvcc::CommitOutcome::Committed { .. }));
-
-        assert_eq!(h.call("refit_scan", json!({}))["epoch_cache_hit"], json!(false));
-        let y3 = h.call("refit_symbols", json!({"symbol": "freshly_committed_sym"}));
-        assert_eq!((&y3["epoch_cache_hit"], &y3["definers"]), (&json!(false), &json!(["src/mod_a.rs"])));
+        let batch = roundtrip!(json!([{"jsonrpc": "2.0", "id": 5, "method": "ping"}]));
+        assert_eq!(batch["error"]["code"], json!(ERR_INVALID_REQUEST));
     }
 
     #[tokio::test]
-    async fn stateless_discover_sep2549_batch_rejection_and_http_sep2243() {
-        let h = McpTestHarness::new("mcp_v2_http", &[("src/demo.rs", "pub fn demo() -> i32 { 42 }\n")]);
+    async fn http_discover_and_headers() {
+        let h = Harness::new("mcp_http", &[("src/demo.rs", "pub fn demo() -> i32 { 42 }\n")]);
         let (addr, handle) = bind_http_server(h.ctx.clone(), "127.0.0.1:0").await.unwrap();
         let (url, client) = (format!("http://{addr}/mcp"), reqwest::Client::new());
 
-        let disc_req = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "_meta": {"protocolVersion": "2026-07-28"}});
+        let disc_req = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "_meta": {"protocolVersion": PROTO_STATELESS},
+        });
         let resp = post_mcp(&client, &url, &[("Mcp-Method", "server/discover")], &disc_req).await;
         assert_eq!(resp.status().as_u16(), 200);
         assert!(resp.headers().get("mcp-session-id").is_none());
         let body: Value = resp.json().await.unwrap();
-        assert_eq!(
-            (&body["result"]["protocolVersion"], &body["result"]["_meta"]["ttlMs"], &body["result"]["_meta"]["cacheScope"]),
-            (&json!("2026-07-28"), &json!(3_600_000), &json!("server"))
-        );
         let tools = body["result"]["tools"].as_array().unwrap();
-        assert_eq!((&body["result"]["_meta"]["catalogDigest"], tools.len()), (&json!(catalog_digest()), 17));
+        assert_eq!(
+            (&body["result"]["protocolVersion"], &body["result"]["_meta"]["catalogDigest"], tools.len()),
+            (&json!(PROTO_STATELESS), &json!(catalog_digest()), 17)
+        );
 
-        let list_body = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
-        let list_http = post_mcp(&client, &url, &[("Mcp-Method", "tools/list")], &list_body).await;
-        let list_resp: Value = list_http.json().await.unwrap();
-        assert_eq!((&list_resp["result"]["_meta"]["ttlMs"], &list_resp["result"]["_meta"]["cacheScope"]), (&json!(3_600_000), &json!("server")));
+        let list_req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        let (_, lr) = post_json(&client, &url, &[("Mcp-Method", "tools/list")], &list_req).await;
+        assert_eq!(
+            (&lr["result"]["_meta"]["ttlMs"], &lr["result"]["_meta"]["cacheScope"]),
+            (&json!(3_600_000), &json!("server"))
+        );
 
-        assert_eq!(detect_protocol(&rpc_req(0, "initialize", json!({"protocolVersion": "2026-07-28"}))), ProtocolMode::V2_2026);
+        assert_eq!(detect_protocol(&rpc_req(0, "initialize", json!({"protocolVersion": PROTO_STATELESS}))), Proto::Stateless);
         let call_req = rpc_req(3, "tools/call", json!({"name": "refit_read", "arguments": {"path": "src/demo.rs", "start_line": 1, "end_line": 3}}));
         let call_hdrs = [
-            ("Mcp-Method", "tools/call"),
-            ("Mcp-Name", "refit_read"),
-            ("Mcp-Param-Path", "src/demo.rs"),
-            ("Mcp-Param-Start-Line", "1"),
-            ("Mcp-Param-EndLine", "3"),
+            ("Mcp-Method", "tools/call"), ("Mcp-Name", "refit_read"),
+            ("Mcp-Param-Path", "src/demo.rs"), ("Mcp-Param-Start-Line", "1"), ("Mcp-Param-EndLine", "3"),
         ];
-        let call_val: Value = post_mcp(&client, &url, &call_hdrs, &call_req).await.json().await.unwrap();
-        assert_eq!(call_val["result"]["resultType"], json!("complete"));
-        let demo_txt = call_val["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(demo_txt.contains("pub fn demo"));
+        let (_, cv) = post_json(&client, &url, &call_hdrs, &call_req).await;
+        assert_eq!(cv["result"]["resultType"], json!("complete"));
+        assert!(rpc_txt(&cv).contains("pub fn demo"));
 
-        type HeaderCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, Value);
-        let bad_cases: Vec<HeaderCase<'_>> = vec![
-            ("missing Mcp-Method", vec![], disc_req.clone()),
-            ("wrong Mcp-Method", vec![("Mcp-Method", "tools/list")], disc_req.clone()),
-            ("missing Mcp-Name", vec![("Mcp-Method", "tools/call")], call_req.clone()),
-            ("wrong Mcp-Name", vec![("Mcp-Method", "tools/call"), ("Mcp-Name", "refit_scan")], call_req.clone()),
-            ("wrong Mcp-Param-Path", vec![("Mcp-Method", "tools/call"), ("Mcp-Name", "refit_read"), ("Mcp-Param-Path", "src/evil.rs")], call_req.clone()),
-            ("unknown Mcp-Param-Ghost", vec![("Mcp-Method", "tools/call"), ("Mcp-Name", "refit_read"), ("Mcp-Param-Ghost", "1")], call_req.clone()),
-        ];
-        for (label, hdrs, payload) in bad_cases {
-            let r = post_mcp(&client, &url, &hdrs, &payload).await;
-            assert_eq!(r.status().as_u16(), 400, "case `{label}`");
-            let v: Value = r.json().await.unwrap();
-            assert_eq!(v["error"]["code"], json!(-32020), "case `{label}`: {v}");
+        for (hdrs, payload) in [
+            (vec![], &disc_req),
+            (vec![("Mcp-Method", "tools/list")], &disc_req),
+            (vec![("Mcp-Method", "tools/call")], &call_req),
+            (vec![("Mcp-Method", "tools/call"), ("Mcp-Name", "refit_scan")], &call_req),
+            (vec![("Mcp-Method", "tools/call"), ("Mcp-Name", "refit_read"), ("Mcp-Param-Path", "src/evil.rs")], &call_req),
+            (vec![("Mcp-Method", "tools/call"), ("Mcp-Name", "refit_read"), ("Mcp-Param-Ghost", "1")], &call_req),
+        ] {
+            let (st, v) = post_json(&client, &url, &hdrs, payload).await;
             let msg = v["error"]["message"].as_str().unwrap();
+            assert_eq!((st, &v["error"]["code"]), (400, &json!(ERR_HEADER_MISMATCH)));
             assert!(msg.contains("HeaderMismatchError"));
         }
 
-        let batch = post_mcp(&client, &url, &[("Mcp-Method", "server/discover")], &json!([disc_req])).await;
-        assert_eq!(batch.status().as_u16(), 400);
-        let batch_val: Value = batch.json().await.unwrap();
-        assert_eq!(batch_val["error"]["code"], json!(-32600));
-
+        let (bst, bv) = post_json(&client, &url, &[("Mcp-Method", "server/discover")], &json!([disc_req])).await;
+        assert_eq!((bst, &bv["error"]["code"]), (400, &json!(ERR_INVALID_REQUEST)));
         for omitted in ["tasks/list", "tasks/result"] {
             let body = json!({"jsonrpc": "2.0", "id": 9, "method": omitted});
-            let resp = post_mcp(&client, &url, &[("Mcp-Method", omitted)], &body).await;
-            let r: Value = resp.json().await.unwrap();
-            assert_eq!(r["error"]["code"], json!(-32601), "{omitted}: {r}");
+            let (_, r) = post_json(&client, &url, &[("Mcp-Method", omitted)], &body).await;
+            assert_eq!(r["error"]["code"], json!(ERR_METHOD_NOT_FOUND));
         }
         handle.abort();
     }
 
     #[tokio::test]
-    async fn sep2322_mrtr_signed_token_tamper_expiry_and_stateless_resume() {
-        let h = McpTestHarness::new("mcp_v2_mrtr", &[("src/ok.rs", "pub fn ok() -> i32 { 1 }\n")]);
+    async fn resume_token_sign_and_expire() {
+        let h = Harness::new("mcp_tok", &[("src/ok.rs", "pub fn ok() -> i32 { 1 }\n")]);
         let req = rpc_req(10, "tools/call", json!({"name": "refit_read", "arguments": {"path": "src/ok.rs", "require_confirmation": true}}));
-        let (st, resp) = h.rpc_v2(req).await;
+        let (st, resp) = h.rpc(req).await;
         let body = resp.unwrap();
         assert_eq!((st, &body["result"]["resultType"]), (StatusCode::OK, &json!("input_required")));
         let raw_tok = body["result"]["continuationToken"].as_str().unwrap();
@@ -1684,57 +1622,20 @@ mod tests {
         };
         assert_eq!(h.ctx.signer.verify(&h.ctx.signer.sign(&exp).unwrap(), 201), Err(MrtrError::Expired));
 
+        let decl = rpc_req(12, "tools/call", json!({"name": "refit_read", "continuationToken": token, "inputResponses": {"confirm": false}}));
+        let decl_res = h.rpc(decl).await.1.unwrap();
+        assert!(rpc_txt(&decl_res).contains("\"cancelled\": true"));
+
         let resume = rpc_req(11, "tools/call", json!({"name": "refit_read", "continuationToken": token, "inputResponses": {"confirm": true}}));
-        let (st2, resp2) = h.rpc_v2(resume).await;
+        let (st2, resp2) = h.rpc(resume).await;
         let b2 = resp2.unwrap();
         assert_eq!((st2, &b2["result"]["resultType"]), (StatusCode::OK, &json!("complete")));
-        let ok_txt = b2["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(ok_txt.contains("pub fn ok"));
+        assert!(rpc_txt(&b2).contains("pub fn ok"));
     }
 
     #[tokio::test]
-    async fn sep2663_tasks_atomic_persistence_five_states_and_cooperative_cancel() {
-        let h = McpTestHarness::new("mcp_v2_tasks", &[("src/lib.rs", "pub fn hello() -> i32 { 7 }\n")]);
-        let start = rpc_req(20, "tools/call", json!({"name": "refit_read", "task": true, "arguments": {"path": "src/lib.rs"}}));
-        let (st, resp) = h.rpc_v2(start).await;
-        let val = resp.unwrap();
-        assert_eq!((st, &val["result"]["resultType"]), (StatusCode::OK, &json!("task")));
-        let raw_tid = val["result"]["taskId"].as_str().unwrap();
-        let task_id = raw_tid.to_owned();
-        assert!(h.repo.join(&format!(".refit/tasks/{task_id}.json")).exists());
-
-        let mut completed = false;
-        for _ in 0..50 {
-            let (_, g) = h.rpc_v2(rpc_req(21, "tasks/get", json!({"taskId": task_id}))).await;
-            if g.unwrap()["result"]["status"] == json!("completed") { completed = true; break; }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(completed, "durable task should reach `completed`");
-
-        h.set_delay_ms(250);
-        let slow = rpc_req(22, "tools/call", json!({"name": "refit_read", "mode": "task", "arguments": {"path": "src/lib.rs"}}));
-        let slow_val = h.rpc_v2(slow).await.1.unwrap();
-        let raw_slow = slow_val["result"]["taskId"].as_str().unwrap();
-        let slow_id = raw_slow.to_owned();
-        let (_, cancel_resp) = h.rpc_v2(rpc_req(23, "tasks/cancel", json!({"taskId": slow_id}))).await;
-        assert_eq!(cancel_resp.unwrap()["result"]["status"], json!("cancelled"));
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        h.set_delay_ms(0);
-        assert_eq!(h.ctx.tasks.load(&slow_id).unwrap().status, TaskState::Cancelled);
-
-        let (rec, _flag) = h.ctx.tasks.create("refit_audit", Some("running".into())).unwrap();
-        assert_eq!(rec.status, TaskState::Working);
-        let upd = rpc_req(24, "tasks/update", json!({"taskId": rec.task_id, "status": "input_required", "progress": 0.5, "statusMessage": "awaiting confirmation"}));
-        assert_eq!(h.rpc_v2(upd).await.1.unwrap()["result"]["status"], json!("input_required"));
-        let bad = rpc_req(25, "tasks/update", json!({"taskId": rec.task_id, "status": "bogus_state"}));
-        assert_eq!(h.rpc_v2(bad).await.1.unwrap()["error"]["code"], json!(ERR_INVALID_PARAMS));
-        h.ctx.tasks.finish(&rec.task_id, Err("simulated failure".into()));
-        assert_eq!(h.ctx.tasks.load(&rec.task_id).unwrap().status, TaskState::Failed);
-    }
-
-    #[tokio::test]
-    async fn mrtr_rejects_forged_repo_path_key_and_tool_confusion() {
-        let h = McpTestHarness::new("mcp_v2_sec", &[("src/lib.rs", "pub fn x() {}\n")]);
+    async fn resume_token_rejects_forgery() {
+        let h = Harness::new("mcp_sec", &[("src/lib.rs", "pub fn x() {}\n")]);
         assert!(h.repo.path().join(".refit/.mrtr.key").is_file());
         let seed = format!("refit-local-mrtr:{}", h.repo.path().display());
         let forged = MrtrSigner::from_seed(seed.as_bytes());
@@ -1743,20 +1644,107 @@ mod tests {
             tool: "refit_tx_delete".into(), arguments: json!({"path": "src/lib.rs"}),
             prompt: "confirm".into(), issued_ms: now, expires_ms: now + 60_000, nonce: 99,
         };
-        assert!(h.ctx.signer.verify(&forged.sign(&payload).unwrap(), now_ms()).is_err());
+        let forged_tok = forged.sign(&payload).unwrap();
+        assert_eq!(h.ctx.signer.verify(&forged_tok, now_ms()), Err(MrtrError::InvalidSignature));
 
-        let real_tok = h.ctx.signer.sign(&payload).unwrap();
-        let req = rpc_req(42, "tools/call", json!({"name": "refit_read", "continuationToken": real_tok, "inputResponses": {"confirm": true}}));
-        let (status, resp) = h.rpc_v2(req).await;
-        assert_eq!((status, &resp.unwrap()["error"]["code"]), (StatusCode::BAD_REQUEST, &json!(ERR_HEADER_MISMATCH)));
+        let real = h.ctx.signer.sign(&payload).unwrap();
+        let req = rpc_req(42, "tools/call", json!({"name": "refit_read", "continuationToken": real, "inputResponses": {"confirm": true}}));
+        let (st, resp) = h.rpc(req).await;
+        assert_eq!((st, &resp.unwrap()["error"]["code"]), (StatusCode::BAD_REQUEST, &json!(ERR_HEADER_MISMATCH)));
+    }
+
+    #[tokio::test]
+    async fn task_store_states_and_cancel() {
+        let h = Harness::new("mcp_tasks", &[("src/lib.rs", "pub fn hello() -> i32 { 7 }\n")]);
+        let task_id_of = |v: &Value| -> String {
+            let raw = v["result"]["taskId"].as_str().unwrap();
+            raw.to_owned()
+        };
+        let start = rpc_req(
+            20, "tools/call",
+            json!({"name": "refit_read", "task": true, "arguments": {"path": "src/lib.rs"}}),
+        );
+        let (st, resp) = h.rpc(start).await;
+        let val = resp.unwrap();
+        assert_eq!((st, &val["result"]["resultType"]), (StatusCode::OK, &json!("task")));
+        let tid = task_id_of(&val);
+        assert!(h.repo.join(&format!(".refit/tasks/{tid}.json")).exists());
+
+        let mut done = false;
+        for _ in 0..50 {
+            let poll = rpc_req(21, "tasks/get", json!({"taskId": tid}));
+            let g = h.rpc(poll).await.1.unwrap();
+            if g["result"]["status"] == json!("completed") { done = true; break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(done);
+
+        h.set_delay_ms(250);
+        let slow = rpc_req(
+            22, "tools/call",
+            json!({"name": "refit_read", "mode": "task", "arguments": {"path": "src/lib.rs"}}),
+        );
+        let sid = task_id_of(&h.rpc(slow).await.1.unwrap());
+        let cancel = rpc_req(23, "tasks/cancel", json!({"taskId": sid}));
+        let cr = h.rpc(cancel).await.1.unwrap();
+        h.set_delay_ms(0);
+        assert_eq!(cr["result"]["status"], json!("cancelled"));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(h.ctx.tasks.load(&sid).unwrap().status, TaskState::Cancelled);
+
+        let (rec, _) = h.ctx.tasks.create("refit_audit", Some("running".into())).unwrap();
+        assert_eq!(rec.status, TaskState::Working);
+        let upd = rpc_req(
+            24, "tasks/update",
+            json!({"taskId": rec.task_id, "status": "input_required", "progress": 0.5}),
+        );
+        assert_eq!(h.rpc(upd).await.1.unwrap()["result"]["status"], json!("input_required"));
+        let bad = rpc_req(25, "tasks/update", json!({"taskId": rec.task_id, "status": "bogus"}));
+        assert_eq!(h.rpc(bad).await.1.unwrap()["error"]["code"], json!(ERR_INVALID_PARAMS));
+        h.ctx.tasks.finish(&rec.task_id, Err("failed".into()));
+        assert_eq!(h.ctx.tasks.load(&rec.task_id).unwrap().status, TaskState::Failed);
     }
 
     #[test]
-    fn memgate_try_admit_blocks_over_capacity() {
-        let local_gate = MemGate::new(1024);
-        let permit = local_gate.try_admit(768).unwrap();
-        assert!(local_gate.try_admit(512).is_err());
+    fn epoch_memo_and_invalidation() {
+        let h = Harness::new("mcp_ep", &[("src/mod_a.rs", "pub fn initial_sym() -> i32 { 1 }\n")]);
+        assert_eq!(h.call("refit_scan", json!({}))["epoch_cache_hit"], json!(false));
+        let y1 = h.call("refit_symbols", json!({"symbol": "initial_sym"}));
+        assert_eq!((&y1["epoch_cache_hit"], &y1["definers"]), (&json!(false), &json!(["src/mod_a.rs"])));
+
+        let s2 = h.call("refit_scan", json!({}));
+        let y2 = h.call("refit_symbols", json!({"symbol": "initial_sym"}));
+        assert_eq!(
+            (&s2["epoch_cache_hit"], &s2["scan_cache_hit"], &y2["epoch_cache_hit"]),
+            (&json!(true), &json!(true), &json!(true))
+        );
+        let rd = h.call("refit_read", json!({"path": "src/mod_a.rs"}));
+        assert_eq!((&rd["epoch"], &rd["file_epoch"]), (&json!(1), &json!(1)));
+
+        let store = MvccStore::open_with_epoch(h.repo.path(), "memo", h.ctx.epoch.clone()).unwrap();
+        let exp = BTreeMap::from([("src/mod_a.rs".into(), h.repo.hash("src/mod_a.rs"))]);
+        let next = b"pub fn initial_sym() -> i32 { 1 }\npub fn fresh_sym() -> i32 { 42 }\n".to_vec();
+        let out = store.commit_tx("mod_a", &exp, &BTreeMap::from([("src/mod_a.rs".into(), next)]), &[]).unwrap();
+        assert!(matches!(out, crate::mvcc::CommitOutcome::Committed { head_rev: 1, .. }));
+
+        let s3 = h.call("refit_scan", json!({}));
+        let y3 = h.call("refit_symbols", json!({"symbol": "fresh_sym"}));
+        assert_eq!((&s3["epoch_cache_hit"], &s3["epoch"]), (&json!(false), &json!(2)));
+        assert_eq!((&y3["epoch_cache_hit"], &y3["definers"]), (&json!(false), &json!(["src/mod_a.rs"])));
+    }
+
+    #[test]
+    fn memgate_blocks_over_cap() {
+        let gate = MemGate::new(1024);
+        let e1 = gate.try_admit(2048).unwrap_err().to_string();
+        assert!(e1.contains("exceeds capacity"));
+        let permit = gate.try_admit(768).unwrap();
+        let e2 = gate.try_admit(512).unwrap_err().to_string();
+        assert!(e2.contains("busy"));
         drop(permit);
-        assert!(local_gate.try_admit(512).is_ok());
+        let p2 = gate.try_admit(512).unwrap();
+        assert_eq!(gate.used(), 512);
+        drop(p2);
+        assert_eq!(gate.used(), 0);
     }
 }

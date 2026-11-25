@@ -1,20 +1,20 @@
 ---
 name: refit
-description: Polyglot code refactoring contract for OpenClaw and MCP agents on Cerebras Kimi K3.1 Pro. Supports Python, Rust, TypeScript, JavaScript, Go, and infra files inside isolated MVCC worktrees.
+description: Polyglot code refactoring contract for MCP and agent workflows. Supports Python, Rust, TypeScript, JavaScript, Go, and infra files inside isolated MVCC worktrees.
 ---
 
-# refit Polyglot Refactoring Contract (v0.5.0)
+# refit Polyglot Refactoring Contract
 
 You refactor and untangle code inside `refit`. The engine checks every change in an isolated stage (`clear_env=true`) with formatters and Gates 0 to 3.5 before an atomic MVCC commit.
 
 ## 1. Workflow Rules
 
-1. **Inspect before you edit.** Call read-only tools (`refit_symbols`, `refit_read`, `refit_search`, `refit_audit`) to check callers, dead symbols, and library docs. Do not guess unseen code.
+1. **Inspect before you edit.** Call read-only tools (`refit_symbols`, `refit_read`, `refit_search`, `refit_audit`, `refit_rewind`, `refit_dep_audit`) to check callers, dead symbols, and library docs. Do not guess unseen code.
 2. **Untangle structure.** Edit in place, or use `create`, `delete`, and `rename` patches to split large files, merge duplicate modules, and remove dead files. Update all callers in one transaction.
-3. **Keep tests strong.** Do not delete or weaken tests. Add characterization tests before you split untested legacy code.
+3. **Keep tests strong.** Do not delete or weaken tests. Add falsifiable characterization tests before you split untested legacy code.
 4. **Rely on stage formatters.** The stage runs `ruff format`, `rustfmt`, `biome format`, and `gofmt` automatically. Spend tokens on logic, types, and module boundaries, not manual line wrapping.
 
-## 2. Patch Format (ASRF)
+## 2. Patch Format
 
 Write raw `<<<REFIT_PATCH ...>>>` blocks directly. Do not wrap blocks in JSON.
 
@@ -42,7 +42,7 @@ Patch constraints:
 - **Pre-pass:** Run deterministic formatters (`ruff format`, `rustfmt`, `biome format`, `gofmt`) in stage.
 - **Gate 0 (Syntax and ABI):** Run syntax check, typechecker (`ast.parse`, `cargo check`, `tsc --noEmit`, `node --check`, `go vet`), and exported ABI pin.
 - **Gate 1 (Tests):** Run impacted `pytest`, `cargo test`, `vitest`/`node --test`, or `go test` with `clear_env=true`.
-- **Gate 2 (Hygiene):** Run embedded `codehygiene v0.7.0` (`weights.npz`). Target `>= 0.85` and fix `deep_nesting`, `dense_line`, `cramped_layout`, `duplicate_block`, `repetitive_structure`, and `comment_echo`.
+- **Gate 2 (Hygiene):** Run embedded pure-Rust `codehygiene` (`weights.npz`). Target `>= 0.85` and fix `deep_nesting`, `dense_line`, `cramped_layout`, `duplicate_block`, `repetitive_structure`, and `comment_echo`.
 - **Gate 3 (Lint):** Run `ruff` and `ty --error-on-warning` (Python), `cargo clippy` (Rust), `biome` (TS/JS), and `go vet` (Go).
 - **Gate 3.5 (Security and Rules):** Block hardcoded credentials and enforce `.refit/invariants.yml` import boundaries.
 

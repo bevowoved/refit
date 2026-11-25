@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clones_type1_type2_and_zero_boilerplate_fp() {
+    fn clones_type1_type2_no_boilerplate() {
         const OPS: [&str; 6] = ["+", "-", "*", "^", "|", "&"];
         let mut owned: Vec<(String, String)> = Vec::new();
         for fid in 0..48usize {
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simiflow_idf_bmax32_and_zero_false_positives() {
+    fn simiflow_idf_bmax32_precision() {
         const DOMAINS: [(&str, &str); 25] = [
             ("AuthToken", "header bearer jwt signature expiry issuer audience claims decode parse slice trim"),
             ("DateEpoch", "timestamp millis timezone offset isoformat calendar leapyear weekday utc epoch parse clamp"),
@@ -937,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_simiflow_matches_identical_4line_auth_bodies() {
+    fn simiflow_matches_auth_bodies() {
         let block = concat!(
             "    const normalized = raw.trim().toLowerCase();\n",
             "    const parts = normalized.split(':');\n",

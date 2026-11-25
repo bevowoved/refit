@@ -384,7 +384,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ruff_map_normalizes_verbatim_and_drive_case() {
+    fn ruff_map_path_norm() {
         let mk = |f: &str, c: &str, m: &str, r: u64| {
             serde_json::json!({ "filename": f, "code": c, "message": m, "location": { "row": r } })
         };

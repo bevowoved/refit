@@ -284,7 +284,7 @@ fn find_unique_window(
     hits.next().is_none().then_some(first)
 }
 
-/// Zero-allocation line-window search using a borrowed predicate (`trim` or `eq_ws`).
+/// Line-window search with a custom line matcher.
 pub(crate) fn replace_window(
     doc: &str,
     search: &str,
@@ -349,9 +349,10 @@ fn replace_elided(doc: &str, search: &str, replace: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{TestRng, asrf_edit};
 
     #[test]
-    fn patch_cow_lf_fast_path_and_cross_os_path_guard() {
+    fn patch_lf_and_path_guard() {
         assert!(matches!(normalize_lf("let x = 1;\n"), Cow::Borrowed(_)));
         assert!(matches!(normalize_lf("let x = 1;\r\n"), Cow::Owned(_)));
 
@@ -368,5 +369,28 @@ mod tests {
         );
         let applied = apply_patches(&base, &ok_hunks).unwrap();
         assert_eq!(applied.updated["src/a.rs"], "pub fn a() -> u8 { 2 }\n");
+    }
+
+    #[test]
+    fn patch_roundtrip_and_ambiguity() {
+        let mut rng = TestRng::new(0x50A7_C110);
+        for case in 0..40 {
+            let lines: Vec<String> = (0..12)
+                .map(|i| format!("let v_{case}_{i} = {};", rng.next_u64() % 1000))
+                .collect();
+            let crlf = format!("{}\r\n", lines.join("\r\n"));
+            let lf = format!("{}\n", lines.join("\n"));
+            let idx = (rng.next_u64() as usize) % lines.len();
+            let old_l = &lines[idx];
+            let new_l = format!("let v_{case}_{idx} = {};", 1000 + case);
+
+            let base_crlf = BTreeMap::from([("src/m.rs".to_string(), crlf)]);
+            let fwd = apply_patches(&base_crlf, &parse_patches(&asrf_edit("src/m.rs", old_l, &new_l))).unwrap();
+            let rev_base = BTreeMap::from([("src/m.rs".to_string(), fwd.updated["src/m.rs"].clone())]);
+            let rev = apply_patches(&rev_base, &parse_patches(&asrf_edit("src/m.rs", &new_l, old_l))).unwrap();
+            assert_eq!(rev.updated["src/m.rs"], lf);
+        }
+        let dup = "let a = 1;\nlet a = 1;\n";
+        assert!(replace_window(dup, "let a = 1;", "let a = 2;", |x, y| x.trim() == y.trim()).is_none());
     }
 }

@@ -27,9 +27,9 @@ pub fn hash_abi(rel_path: &str, source: &str) -> String {
     }
 }
 
-/// Compute a deterministic Salsa-style package `interface_blake3` from precomputed `(rel, abi_hash)` pairs.
+/// Compute a package interface digest from precomputed `(rel, abi_hash)` pairs.
 #[cfg(test)]
-pub fn interface_blake3_from_digests(digests: &[(&str, &str)]) -> String {
+pub fn hash_digests(digests: &[(&str, &str)]) -> String {
     let mut items: Vec<(&str, &str)> = digests.to_vec();
     items.sort_by(|lhs, rhs| lhs.0.cmp(rhs.0));
 
@@ -43,8 +43,7 @@ pub fn interface_blake3_from_digests(digests: &[(&str, &str)]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Salsa early-cutoff helper over precomputed `(rel, abi_hash)` pairs wired to `EpochRegistry`.
-/// Preserves the current epoch with zero invalidations when `interface_blake3` is unchanged.
+/// Check package interface cutoff against `EpochRegistry` without bumping epoch on unchanged ABI.
 #[cfg(test)]
 pub fn check_interface_cutoff_digests(
     pkg_id: &str,
@@ -52,7 +51,7 @@ pub fn check_interface_cutoff_digests(
     prev_interface_blake3: Option<&str>,
     registry: &EpochRegistry,
 ) -> InterfaceCutoff {
-    let next_hash = interface_blake3_from_digests(digests);
+    let next_hash = hash_digests(digests);
     if prev_interface_blake3 == Some(next_hash.as_str()) {
         let epoch = registry.slot_epoch(pkg_id);
         return InterfaceCutoff {

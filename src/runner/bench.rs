@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn bench_shlex_direct_and_cve_2024_24576_guard() {
+    fn bench_cmd_parse_and_guard() {
         let repo = Path::new(r"D:\My Repos\proj");
 
         for (cmd, want_exe, want_args) in [

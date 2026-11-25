@@ -118,7 +118,7 @@ pub struct InvertedRewindIndex {
 }
 
 impl InvertedRewindIndex {
-    /// Zero-disk-read construction directly from `SymbolGraph` (`defs_by_file`, `refs_by_file`, `runtime_edges`).
+    /// Build index directly from an in-memory `SymbolGraph`.
     pub fn from_symbol_graph(
         snap: &SymbolGraph,
         durability_by_file: &FxHashMap<&str, Durability>,
@@ -234,17 +234,17 @@ impl InvertedRewindIndex {
     }
 }
 
-/// Shared CLI + MCP query helper returning learned rules + optional SymbolGraph rewind impact set.
-pub fn query_learn_and_rewind(
+/// Query learned rules and optional SymbolGraph rewind impact.
+pub fn query_rewind(
     repo_root: &Path,
     rewind_token: Option<&str>,
     trigger: RewindTrigger,
 ) -> Result<Value> {
-    query_learn_and_rewind_with_graph(repo_root, None, rewind_token, trigger)
+    query_rewind_graph(repo_root, None, rewind_token, trigger)
 }
 
-/// Warm-graph variant allowing MCP to reuse its epoch-cached `SymbolGraph` in `< 0.5 ms`.
-pub fn query_learn_and_rewind_with_graph(
+/// Query learned rules and rewind impact reusing a cached `SymbolGraph`.
+pub fn query_rewind_graph(
     repo_root: &Path,
     warm_graph: Option<&SymbolGraph>,
     rewind_token: Option<&str>,
@@ -557,7 +557,7 @@ mod tests {
         assert!(adv_paths.contains(&"src/vendor.rs".to_string()));
 
         LearnStore::open(repo.path()).unwrap().record_failure("gate3_ruff", "src", "B006 mutable default");
-        let val = query_learn_and_rewind(repo.path(), Some("legacy_parse"), RewindTrigger::NewDepAdvisory).unwrap();
+        let val = query_rewind(repo.path(), Some("legacy_parse"), RewindTrigger::NewDepAdvisory).unwrap();
         assert_eq!((&val["rules_count"], &val["rewind"]["trigger"]), (&json!(1), &json!("new_dep_advisory")));
         let raw_aff = val["rewind"]["affected_files"].as_array().unwrap();
         let affected: Vec<&str> = raw_aff.iter().filter_map(Value::as_str).collect();

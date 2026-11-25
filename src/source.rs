@@ -411,7 +411,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cargo_deps_toml_workspace_aliases_dev_and_target() {
+    fn cargo_deps_workspace_aliases_and_dev() {
         let member_toml = r#"
 [package]
 name = "my-crate"

@@ -370,25 +370,40 @@ pub fn walk_rs_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) 
         if p.is_dir() {
             walk_rs_files(base, &p, out);
         } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
-            let rel = p.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
+            let stripped = p.strip_prefix(base).unwrap();
+            let rel = stripped.to_string_lossy().replace('\\', "/");
             out.push((rel, p));
         }
+    }
+}
+
+fn push_parts(out: &mut Vec<u8>, parts: &[&[u8]]) {
+    for part in parts {
+        out.extend_from_slice(part);
     }
 }
 
 pub fn build_single_entry_zip(name: &str, method: u16, comp: &[u8], uncomp_len: u32) -> Vec<u8> {
     let (mut out, nb, clen) = (Vec::new(), name.as_bytes(), comp.len() as u32);
     let nlen = nb.len() as u16;
-    for b in [&0x0403_4b50u32.to_le_bytes()[..], &20u16.to_le_bytes(), &0u16.to_le_bytes(), &method.to_le_bytes(),
-        &0u32.to_le_bytes(), &0u32.to_le_bytes(), &clen.to_le_bytes(), &uncomp_len.to_le_bytes(), &nlen.to_le_bytes(),
-        &0u16.to_le_bytes(), nb, comp] { out.extend_from_slice(b); }
+    let (z16, z32) = (0u16.to_le_bytes(), 0u32.to_le_bytes());
+    let (v20, one) = (20u16.to_le_bytes(), 1u16.to_le_bytes());
+    let (m_b, cl_b, ul_b, nl_b) = (
+        method.to_le_bytes(), clen.to_le_bytes(), uncomp_len.to_le_bytes(), nlen.to_le_bytes(),
+    );
+    push_parts(&mut out, &[
+        &0x0403_4b50u32.to_le_bytes(), &v20, &z16, &m_b, &z32, &z32, &cl_b, &ul_b, &nl_b,
+        &z16, nb, comp,
+    ]);
     let cd_off = out.len() as u32;
-    for b in [&0x0201_4b50u32.to_le_bytes()[..], &20u16.to_le_bytes(), &20u16.to_le_bytes(), &0u16.to_le_bytes(),
-        &method.to_le_bytes(), &0u32.to_le_bytes(), &0u32.to_le_bytes(), &clen.to_le_bytes(), &uncomp_len.to_le_bytes(),
-        &nlen.to_le_bytes(), &0u16.to_le_bytes(), &0u16.to_le_bytes(), &0u16.to_le_bytes(), &0u16.to_le_bytes(),
-        &0u32.to_le_bytes(), &0u32.to_le_bytes(), nb] { out.extend_from_slice(b); }
+    push_parts(&mut out, &[
+        &0x0201_4b50u32.to_le_bytes(), &v20, &v20, &z16, &m_b, &z32, &z32, &cl_b, &ul_b, &nl_b,
+        &z16, &z16, &z16, &z16, &z32, &z32, nb,
+    ]);
     let cd_sz = (out.len() as u32) - cd_off;
-    for b in [&0x0605_4b50u32.to_le_bytes()[..], &0u16.to_le_bytes(), &0u16.to_le_bytes(), &1u16.to_le_bytes(),
-        &1u16.to_le_bytes(), &cd_sz.to_le_bytes(), &cd_off.to_le_bytes(), &0u16.to_le_bytes()] { out.extend_from_slice(b); }
+    push_parts(&mut out, &[
+        &0x0605_4b50u32.to_le_bytes(), &z16, &z16, &one, &one,
+        &cd_sz.to_le_bytes(), &cd_off.to_le_bytes(), &z16,
+    ]);
     out
 }

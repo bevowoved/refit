@@ -1,5 +1,4 @@
-//! Process execution, OS resource budgeting (cgroup v2 / Win32 Job Objects), allocator tuning,
-//! and Condvar-backed `MemGate` admission control.
+//! Process execution, OS resource budgeting, allocator tuning, and memory admission.
 
 use crate::types::{SandboxResult, SelfMetrics};
 use anyhow::{Context, Result};
@@ -15,8 +14,6 @@ use std::time::{Duration, Instant};
 
 const MIB: u64 = 1024 * 1024;
 const CONSTRAINED_MEM_BYTES: u64 = 384 * MIB;
-#[cfg(feature = "alloc-mimalloc")]
-const TIGHT_MEM_BYTES: u64 = 256 * MIB;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecMode { InlineConstrained, BoundedBalanced }
@@ -53,79 +50,87 @@ impl ResourceBudget {
 static BUDGET: OnceLock<ResourceBudget> = OnceLock::new();
 pub fn budget() -> &'static ResourceBudget { BUDGET.get_or_init(detect_budget) }
 
-pub fn allocator_name() -> &'static str {
-    #[cfg(feature = "alloc-mimalloc")]
-    { "mimalloc" }
-    #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
-    { "jemalloc" }
-    #[cfg(not(any(feature = "alloc-mimalloc", all(feature = "alloc-jemalloc", not(target_env = "msvc")))))]
-    { "system" }
-}
+#[cfg(feature = "alloc-mimalloc")]
+mod alloc_ops {
+    use super::{MIB, ResourceBudget};
 
-#[cfg(feature = "alloc-mimalloc")]
-unsafe extern "C" {
-    fn mi_collect(force: bool);
-    fn mi_option_set(option: core::ffi::c_int, value: core::ffi::c_long);
-}
+    const TIGHT_MEM_BYTES: u64 = 256 * MIB;
+    const MI_OPT_ARENA_EAGER_COMMIT: core::ffi::c_int = 4;
+    const MI_OPT_PURGE_DECOMMITS: core::ffi::c_int = 5;
+    const MI_OPT_PURGE_DELAY: core::ffi::c_int = 15;
+    const MI_OPT_ALLOW_THP: core::ffi::c_int = 43;
 
-#[cfg(feature = "alloc-mimalloc")]
-const MI_OPT_ARENA_EAGER_COMMIT: core::ffi::c_int = 4;
-#[cfg(feature = "alloc-mimalloc")]
-const MI_OPT_PURGE_DECOMMITS: core::ffi::c_int = 5;
-#[cfg(feature = "alloc-mimalloc")]
-const MI_OPT_PURGE_DELAY: core::ffi::c_int = 15;
-#[cfg(feature = "alloc-mimalloc")]
-const MI_OPT_ALLOW_THP: core::ffi::c_int = 43;
+    unsafe extern "C" {
+        fn mi_collect(force: bool);
+        fn mi_option_set(option: core::ffi::c_int, value: core::ffi::c_long);
+    }
 
-/// Tune the global allocator once at startup before any worker threads spawn.
-pub fn init_allocator(b: &ResourceBudget) {
-    #[cfg(feature = "alloc-mimalloc")]
-    // SAFETY: Called once from sync `fn main()` before spawning worker threads; option indices match mimalloc v3.
-    unsafe {
-        mi_option_set(MI_OPT_PURGE_DECOMMITS, 1);
-        mi_option_set(MI_OPT_PURGE_DELAY, 75);
-        if b.effective_mem_bytes <= TIGHT_MEM_BYTES {
-            mi_option_set(MI_OPT_ARENA_EAGER_COMMIT, 0);
-            mi_option_set(MI_OPT_ALLOW_THP, 0);
+    pub(super) fn name() -> &'static str { "mimalloc" }
+
+    pub(super) fn init(b: &ResourceBudget) {
+        // SAFETY: Runs once in main before spawning workers; indices match mimalloc v3.
+        unsafe {
+            mi_option_set(MI_OPT_PURGE_DECOMMITS, 1);
+            mi_option_set(MI_OPT_PURGE_DELAY, 75);
+            if b.effective_mem_bytes <= TIGHT_MEM_BYTES {
+                mi_option_set(MI_OPT_ARENA_EAGER_COMMIT, 0);
+                mi_option_set(MI_OPT_ALLOW_THP, 0);
+            }
         }
     }
-    #[cfg(not(feature = "alloc-mimalloc"))]
-    let _ = b.effective_mem_bytes;
-}
 
-#[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
-unsafe extern "C" {
-    fn _rjem_mallctl(
-        name: *const core::ffi::c_char, oldp: *mut core::ffi::c_void, oldlenp: *mut usize,
-        newp: *mut core::ffi::c_void, newlen: usize,
-    ) -> core::ffi::c_int;
-}
-
-#[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
-fn purge_jemalloc_all_arenas() -> core::ffi::c_int {
-    // SAFETY: `arena.4096.purge` (`MALLCTL_ARENAS_ALL = 4096`) is a valid NUL-terminated void mallctl.
-    unsafe {
-        _rjem_mallctl(
-            c"arena.4096.purge".as_ptr(),
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            0,
-        )
+    pub(super) fn collect() {
+        // SAFETY: `mi_collect(true)` is thread-safe and purges abandoned segments.
+        unsafe { mi_collect(true); }
     }
 }
 
-/// Release purged allocator pages back to the OS at coarse phase boundaries.
-pub fn collect_os_memory() {
-    #[cfg(feature = "alloc-mimalloc")]
-    // SAFETY: `mi_collect(true)` is thread-safe and purges abandoned segments back to the OS.
-    unsafe { mi_collect(true); }
-    #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
-    {
+#[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+mod alloc_ops {
+    use super::ResourceBudget;
+
+    unsafe extern "C" {
+        fn _rjem_mallctl(
+            name: *const core::ffi::c_char, oldp: *mut core::ffi::c_void,
+            oldlenp: *mut usize, newp: *mut core::ffi::c_void, newlen: usize,
+        ) -> core::ffi::c_int;
+    }
+
+    pub(super) fn name() -> &'static str { "jemalloc" }
+    pub(super) fn init(b: &ResourceBudget) { let _ = b.effective_mem_bytes; }
+
+    pub(super) fn purge_all() -> core::ffi::c_int {
+        // SAFETY: `arena.4096.purge` (MALLCTL_ARENAS_ALL) is a valid void mallctl.
+        unsafe {
+            _rjem_mallctl(
+                c"arena.4096.purge".as_ptr(), core::ptr::null_mut(),
+                core::ptr::null_mut(), core::ptr::null_mut(), 0,
+            )
+        }
+    }
+
+    pub(super) fn collect() {
         let _ = tikv_jemalloc_ctl::epoch::advance();
-        let _ = purge_jemalloc_all_arenas();
+        let _ = purge_all();
     }
 }
+
+#[cfg(not(any(feature = "alloc-mimalloc", all(feature = "alloc-jemalloc", not(target_env = "msvc")))))]
+mod alloc_ops {
+    use super::ResourceBudget;
+
+    pub(super) fn name() -> &'static str { "system" }
+    pub(super) fn init(b: &ResourceBudget) { let _ = b.effective_mem_bytes; }
+    pub(super) fn collect() {}
+}
+
+pub fn allocator_name() -> &'static str { alloc_ops::name() }
+
+/// Tune the global allocator once before spawning worker threads.
+pub fn init_allocator(b: &ResourceBudget) { alloc_ops::init(b); }
+
+/// Release purged allocator pages back to the OS.
+pub fn collect_os_memory() { alloc_ops::collect(); }
 
 /// Returns `true` if Linux PSI `memory.pressure` indicates direct-reclaim stall pressure.
 pub fn under_memory_pressure() -> bool {
@@ -731,9 +736,13 @@ mod tests {
         assert_eq!(gate.used(), 0);
     }
 
-    #[cfg(all(feature = "alloc-jemalloc", not(target_env = "msvc"), not(feature = "alloc-mimalloc")))]
+    #[cfg(all(
+        feature = "alloc-jemalloc",
+        not(target_env = "msvc"),
+        not(feature = "alloc-mimalloc")
+    ))]
     #[test]
-    fn jemalloc_all_arenas_purge_returns_zero() {
-        assert_eq!(purge_jemalloc_all_arenas(), 0);
+    fn jemalloc_purge_ok() {
+        assert_eq!(alloc_ops::purge_all(), 0);
     }
 }

@@ -175,7 +175,7 @@ pub fn scan_cached(
     let cache_dir = repo_root.join(".refit/cache");
     let cache_path = cache_dir.join("scan_cache.zst");
     let snap = read_tree(repo_root);
-    let prev = read_zstd::<ScanCache>(&cache_path).filter(|c| c.version == "0.5.0");
+    let prev = read_zstd::<ScanCache>(&cache_path).filter(|c| c.version == env!("CARGO_PKG_VERSION"));
     if use_cache
         && let Some(ref c) = prev
         && c.repo_fingerprint == snap.fingerprint
@@ -219,7 +219,7 @@ pub fn scan_cached(
     scorer.flush_cache();
     collect_os_memory();
     let bundle = ScanCache {
-        version: "0.5.0".into(), repo_fingerprint: snap.fingerprint, fast_mode: skip_tests,
+        version: env!("CARGO_PKG_VERSION").into(), repo_fingerprint: snap.fingerprint, fast_mode: skip_tests,
         per_file_hashes: snap.hashes, detected_languages: snap.langs, polyglot_toolchains,
         plan: plan_res?, audit: audit_res?,
     };

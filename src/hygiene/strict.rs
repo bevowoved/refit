@@ -1,4 +1,4 @@
-use super::ops::{SparseAttnTelemetry, sigmoid_f64};
+use super::ops::{SparseStats, sigmoid_f64};
 use super::weights::should_use_5trit_lut;
 use crate::lex::{LangKind, LexCursor, LexKind, LexTok};
 pub use crate::types::FileEgoContext;
@@ -14,7 +14,7 @@ const MAX_COGNITIVE_VETO: usize = 35;
 const WARN_CF_DEPTH: usize = 5;
 const WARN_COGNITIVE: usize = 25;
 
-/// Sorted ascending by `char as u32` for `O(log N)` binary search (49 UTS #39 confusables).
+/// Sorted UTS #39 confusable characters for binary search.
 const UTS39_CONFUSABLES: [(char, &str, char); 49] = [
     ('\u{037E}', "Greek question mark", ';'), ('\u{0391}', "Greek", 'A'), ('\u{0392}', "Greek", 'B'),
     ('\u{0395}', "Greek", 'E'), ('\u{0396}', "Greek", 'Z'), ('\u{0397}', "Greek", 'H'),
@@ -92,7 +92,7 @@ pub struct StrictMetrics {
     pub nondoc_comment_lines: usize, pub indent_mode: &'static str, pub indent_quantum: usize,
     pub max_logical_depth: usize, pub max_cf_depth: usize, pub max_cognitive: usize,
     pub max_col: usize, pub max_tail_code_chars: usize, pub prod_bindings: usize,
-    pub prod_golf_1char: usize, pub prod_unwraps: usize, pub unsafe_blocks: usize,
+    pub prod_short_1char: usize, pub prod_unwraps: usize, pub unsafe_blocks: usize,
 }
 
 impl Default for StrictMetrics {
@@ -101,7 +101,7 @@ impl Default for StrictMetrics {
             total_lines: 0, prod_lines: 0, blank_prod_lines: 0, nondoc_comment_lines: 0,
             indent_mode: "spaces", indent_quantum: 4, max_logical_depth: 0, max_cf_depth: 0,
             max_cognitive: 0, max_col: 0, max_tail_code_chars: 0, prod_bindings: 0,
-            prod_golf_1char: 0, prod_unwraps: 0, unsafe_blocks: 0,
+            prod_short_1char: 0, prod_unwraps: 0, unsafe_blocks: 0,
         }
     }
 }
@@ -118,9 +118,9 @@ pub struct BlockModuleMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalibrationAudit {
     pub proof_tier: String, pub attn_mode: String, pub block_score: f64, pub piir: f64,
-    pub pairs_evaluated: usize, pub cobs_blocks: usize, pub engram_far_hits: usize, pub engram_bytes: usize,
-    pub mli_reused: bool, pub mli_reuse_hits: usize, pub lsa_slab_reuses: usize, pub idiom_hits: usize,
-    pub raw_v07: f64, pub delta_block: f64, pub delta_cross: f64, pub delta_slop: f64,
+    pub pairs_evaluated: usize, pub blocks: usize, pub far_hits: usize, pub index_bytes: usize,
+    pub reused: bool, pub reuse_hits: usize, pub slab_reuses: usize, pub idiom_hits: usize,
+    pub raw_score: f64, pub delta_block: f64, pub delta_cross: f64, pub delta_idiom: f64,
     pub veto_cap: f64, pub final_score: f64, pub use_5trit_lut: bool, pub structural_rules: Vec<String>,
 }
 
@@ -155,17 +155,16 @@ pub struct AntiGamingAudit {
     pub after_vetoes: Vec<String>, pub introduced_vetoes: Vec<String>,
 }
 
-/// Apply strict CH-V4..V7 anti-gaming + live `FileEgoContext` + truthful `CalibrationAudit`.
-/// Leaves canonical `base.score` 100% untouched.
-pub fn score_strict_calibrated(
+/// Apply strict rules and ego calibration while preserving `base.score`.
+pub fn score_strict(
     path: &str, content: &str, base: &HygieneResult, ego: Option<&FileEgoContext>,
-    telemetry: Option<&SparseAttnTelemetry>, weight_zero_ratio: f64,
+    stats: Option<&SparseStats>, weight_zero_ratio: f64,
 ) -> HygieneResult {
     let report = audit_source_full(path, content, base.score, is_test_only_path(path), ego);
     let mut out = base.clone();
     let (mut veto_cap, mut triggered) = (report.veto_cap, report.formatted_vetoes());
     let (delta_block, delta_cross) = (report.block.delta_block, compute_delta_cross(ego));
-    let delta_slop = compute_delta_slop(base, report.idiom_hits, report.idiom_risk);
+    let delta_idiom = idiom_delta(base, report.idiom_hits, report.idiom_risk);
     if report.block.module_cycle || report.block.field_leaks > 0 || report.block.shallow_module {
         veto_cap = veto_cap.min(0.48);
         for rule in &report.block.structural_rules {
@@ -173,27 +172,27 @@ pub fn score_strict_calibrated(
         }
     }
     let strict_bound = report.strict_score.min(veto_cap);
-    let total_delta = delta_block + delta_cross + delta_slop;
+    let total_delta = delta_block + delta_cross + delta_idiom;
     let calibrated = if total_delta == 0.0 && veto_cap >= 1.0 {
         strict_bound
     } else {
         round4(sigmoid_f64(logit_f64(base.score) - total_delta).min(veto_cap).min(strict_bound))
     };
-    let t = telemetry.cloned().unwrap_or_default();
-    let attn_mode = if t.attn_mode.is_empty() { "v07_exact" } else { t.attn_mode };
+    let st = stats.cloned().unwrap_or_default();
+    let attn_mode = if st.attn_mode.is_empty() { "exact" } else { st.attn_mode };
     let proof_tier = if veto_cap < 1.0 {
-        "tier0_vetoed"
-    } else if telemetry.is_some() {
-        "tier2_cobs2_engram_lsa_mli"
+        "vetoed"
+    } else if stats.is_some() {
+        "sparse"
     } else {
-        "tier1_exact_v07"
+        "exact"
     };
     let audit = CalibrationAudit {
         proof_tier: proof_tier.into(), attn_mode: attn_mode.into(), block_score: report.block.block_score,
-        piir: report.block.piir, pairs_evaluated: t.pairs_evaluated, cobs_blocks: t.cobs_blocks,
-        engram_far_hits: t.engram_far_hits, engram_bytes: t.engram_bytes, mli_reused: t.mli_reused,
-        mli_reuse_hits: t.mli_reuse_hits, lsa_slab_reuses: t.lsa_slab_reuses, idiom_hits: report.idiom_hits,
-        raw_v07: base.score, delta_block, delta_cross, delta_slop, veto_cap, final_score: calibrated,
+        piir: report.block.piir, pairs_evaluated: st.pairs_evaluated, blocks: st.blocks,
+        far_hits: st.far_hits, index_bytes: st.index_bytes, reused: st.reused,
+        reuse_hits: st.reuse_hits, slab_reuses: st.slab_reuses, idiom_hits: report.idiom_hits,
+        raw_score: base.score, delta_block, delta_cross, delta_idiom, veto_cap, final_score: calibrated,
         use_5trit_lut: should_use_5trit_lut(weight_zero_ratio),
         structural_rules: report.block.structural_rules.clone(),
     };
@@ -225,7 +224,7 @@ pub fn audit_anti_gaming(path: &str, before: &str, after: &str) -> AntiGamingAud
 }
 
 #[cfg(test)]
-pub fn audit_source_with_test_flag(
+pub fn audit_source(
     path: &str,
     content: &str,
     base_score: f64,
@@ -475,7 +474,7 @@ fn audit_source_full(
     let mut metrics = StrictMetrics::default();
     let mut block = BlockModuleMetrics::default();
     let mut findings = Vec::new();
-    if !src.is_ascii() { check_bidi_and_invisibles(src, &mut findings); }
+    if !src.is_ascii() { check_bidi(src, &mut findings); }
     let (tokens, lines) = scan_with_lex_cursor(src, cursor_lang, file_is_test_only);
     if !src.is_ascii() { check_uts39_homoglyphs(&tokens, &lines, &mut findings); }
 
@@ -485,11 +484,11 @@ fn audit_source_full(
             check_attrs_and_macros(&tokens, &mut findings);
             check_unsafe_and_unwraps(&tokens, &lines, &mut metrics, &mut findings);
         } else if slang == StrictLang::Script {
-            check_polyglot_suppressions(&lines, &mut findings);
+            check_suppressions(&lines, &mut findings);
         }
-        check_line_tails_blanks_and_comments(&lines, &mut metrics, &mut findings);
+        check_lines(&lines, &mut metrics, &mut findings);
         let pub_fields = if slang != StrictLang::Script {
-            analyze_functions_and_blocks(&tokens, &lines, slang == StrictLang::Go, &mut metrics, &mut block, &mut findings)
+            scan_fns(&tokens, &lines, slang == StrictLang::Go, &mut metrics, &mut block, &mut findings)
         } else { 0 };
         block.impl_loc = metrics.prod_lines;
         finalize_block_metrics(&mut block, pub_fields, ego);
@@ -516,7 +515,7 @@ fn scan_prod_idioms(lines: &[LineScan<'_>]) -> (usize, f64) {
 fn logit_f64(prob: f64) -> f64 { let c = prob.clamp(1e-6, 1.0 - 1e-6); (c / (1.0 - c)).ln() }
 
 fn compute_calibration(base_score: f64, findings: &[StrictFinding]) -> (f64, f64) {
-    let (mut veto_cap, mut delta_slop, mut has_veto) = (1.0f64, 0.0f64, false);
+    let (mut veto_cap, mut penalty, mut has_veto) = (1.0f64, 0.0f64, false);
     for f in findings.iter().filter(|f| f.severity == Severity::Veto) {
         has_veto = true;
         let (cap, pen) = match f.rule {
@@ -526,12 +525,12 @@ fn compute_calibration(base_score: f64, findings: &[StrictFinding]) -> (f64, f64
             _ => (0.50, 1.6),
         };
         veto_cap = veto_cap.min(cap);
-        delta_slop += pen;
+        penalty += pen;
     }
     if !has_veto {
         return (1.0, base_score);
     }
-    (veto_cap, round4(sigmoid_f64(logit_f64(base_score) - delta_slop).min(veto_cap)))
+    (veto_cap, round4(sigmoid_f64(logit_f64(base_score) - penalty).min(veto_cap)))
 }
 
 fn compute_delta_cross(ego: Option<&FileEgoContext>) -> f64 {
@@ -545,7 +544,7 @@ fn compute_delta_cross(ego: Option<&FileEgoContext>) -> f64 {
     round4(raw)
 }
 
-fn compute_delta_slop(result: &HygieneResult, idiom_hits: usize, idiom_risk: f64) -> f64 {
+fn idiom_delta(result: &HygieneResult, idiom_hits: usize, idiom_risk: f64) -> f64 {
     let mut delta = result.event_load.filter(|&l| l > 1.5).map_or(0.0, |l| 0.15 * (l - 1.5));
     if idiom_hits >= 2 {
         delta += 0.25 * idiom_risk;
@@ -612,7 +611,7 @@ fn compute_block_delta(m: &BlockModuleMetrics) -> f64 {
     delta
 }
 
-fn check_bidi_and_invisibles(src: &str, findings: &mut Vec<StrictFinding>) {
+fn check_bidi(src: &str, findings: &mut Vec<StrictFinding>) {
     const BIDI: &[(char, &str)] = &[
         ('\u{202A}', "U+202A LRE"), ('\u{202B}', "U+202B RLE"), ('\u{202C}', "U+202C PDF"),
         ('\u{202D}', "U+202D LRO"), ('\u{202E}', "U+202E RLO (Trojan Source)"),
@@ -697,7 +696,7 @@ fn check_uts39_homoglyphs(tokens: &[StrictTok<'_>], lines: &[LineScan<'_>], find
     }
 }
 
-fn check_polyglot_suppressions(lines: &[LineScan<'_>], findings: &mut Vec<StrictFinding>) {
+fn check_suppressions(lines: &[LineScan<'_>], findings: &mut Vec<StrictFinding>) {
     const NEEDLES: &[&[u8]] = &[b"@ts-ignore", b"@ts-nocheck", b"eslint-disable", b"noqa"];
     for (ln, ls) in lines.iter().enumerate().skip(1) {
         if ls.in_test || ls.comment_slices.is_empty() {
@@ -939,7 +938,7 @@ impl BlankCommentAcc {
     }
 }
 
-fn check_line_tails_blanks_and_comments(
+fn check_lines(
     lines: &[LineScan<'_>], metrics: &mut StrictMetrics, findings: &mut Vec<StrictFinding>,
 ) {
     let (indent_mode, indent_quantum) = detect_dynamic_indent(lines);
@@ -997,7 +996,7 @@ fn check_line_tails_blanks_and_comments(
         }
     }
     metrics.nondoc_comment_lines = acc.nondoc_pure;
-    emit_blank_and_comment_vetoes(metrics, &acc, findings);
+    emit_layout_vetoes(metrics, &acc, findings);
 }
 
 fn is_comment_echo_pair(lines: &[LineScan<'_>], ln: usize, body: &str) -> bool {
@@ -1030,7 +1029,7 @@ fn is_comment_echo_pair(lines: &[LineScan<'_>], ln: usize, body: &str) -> bool {
     false
 }
 
-fn emit_blank_and_comment_vetoes(
+fn emit_layout_vetoes(
     metrics: &StrictMetrics,
     acc: &BlankCommentAcc,
     findings: &mut Vec<StrictFinding>,
@@ -1063,12 +1062,12 @@ struct BraceFrame { kind: BraceKind, line: usize, line_indent: usize }
 struct PendingCf { paren_depth: usize, bracket_depth: usize, kw_line: usize, line_indent: usize }
 struct PendingFn<'a> {
     name: &'a str, line: usize, paren_depth: usize, bracket_depth: usize,
-    total_params: usize, golf_params: usize, arity: usize, bool_params: usize, is_pub: bool,
+    total_params: usize, short_params: usize, arity: usize, bool_params: usize, is_pub: bool,
 }
 struct FnAcc<'a> {
     name: &'a str, line: usize, open_line: usize, open_tok_idx: usize, is_pub: bool,
     arity: usize, bool_params: usize, max_cf_depth: usize, cognitive: usize,
-    total_bindings: usize, golf_1char: usize, indent_compressed: usize,
+    total_bindings: usize, short_1char: usize, indent_compressed: usize,
     packed_cf_line: bool, cf_opens_by_line: BTreeMap<usize, usize>, last_bool_op: Option<LexKind>,
 }
 
@@ -1114,7 +1113,7 @@ fn skip_balanced(tokens: &[StrictTok<'_>], mut pos: usize, open: LexKind, close:
     pos
 }
 
-fn extract_pattern_idents(slice: &[StrictTok<'_>], total: &mut usize, golf: &mut usize) {
+fn extract_pattern_idents(slice: &[StrictTok<'_>], total: &mut usize, short_cnt: &mut usize) {
     for (idx, tok) in slice.iter().enumerate() {
         if tok.kind != LexKind::Ident { continue; }
         let name = tok.text;
@@ -1125,13 +1124,13 @@ fn extract_pattern_idents(slice: &[StrictTok<'_>], total: &mut usize, golf: &mut
         if !skip {
             *total += 1;
             let short_ok = matches!(name, "i" | "j" | "k" | "x" | "y" | "n" | "id" | "ok" | "err");
-            if name.chars().count() == 1 && !short_ok { *golf += 1; }
+            if name.chars().count() == 1 && !short_ok { *short_cnt += 1; }
         }
     }
 }
 
 fn count_fn_params(tokens: &[StrictTok<'_>], start: usize, end: usize, is_go: bool) -> (usize, usize, usize, usize) {
-    let (mut total, mut golf, mut arity, mut bools) = (0, 0, 0, 0);
+    let (mut total, mut short_cnt, mut arity, mut bools) = (0, 0, 0, 0);
     let (mut seg_start, mut d) = (start, Delims::default());
     for idx in start..=end {
         if idx == end || (tokens[idx].kind == LexKind::Comma && d.top_pbc() && d.a == 0) {
@@ -1147,12 +1146,12 @@ fn count_fn_params(tokens: &[StrictTok<'_>], start: usize, end: usize, is_go: bo
                     cd.step(t.kind);
                     hit
                 });
-                if let Some(cp) = cp { extract_pattern_idents(&seg[..cp], &mut total, &mut golf); }
+                if let Some(cp) = cp { extract_pattern_idents(&seg[..cp], &mut total, &mut short_cnt); }
             }
             seg_start = idx + 1;
         } else { d.step(tokens[idx].kind); }
     }
-    (total, golf, arity, bools)
+    (total, short_cnt, arity, bools)
 }
 
 fn is_pub_before(tokens: &[StrictTok<'_>], idx: usize) -> bool {
@@ -1172,7 +1171,7 @@ fn parse_fn_header<'a>(tokens: &[StrictTok<'a>], fn_idx: usize, is_go: bool) -> 
     if !tokens.get(pos).is_some_and(|t| t.kind == LexKind::LParen) { return None; }
     let p_start = pos + 1;
     pos = skip_balanced(tokens, pos, LexKind::LParen, LexKind::RParen);
-    let (total_params, golf_params, arity, bool_params) =
+    let (total_params, short_params, arity, bool_params) =
         count_fn_params(tokens, p_start, pos.saturating_sub(1), is_go);
     let has_body = tokens[pos..].iter().find_map(|t| match t.kind {
         LexKind::LBrace => Some(true),
@@ -1181,7 +1180,7 @@ fn parse_fn_header<'a>(tokens: &[StrictTok<'a>], fn_idx: usize, is_go: bool) -> 
     }).unwrap_or(false);
     let pfn = PendingFn {
         name: name_tok.text, line: name_tok.line, paren_depth: 0, bracket_depth: 0,
-        total_params, golf_params, arity, bool_params,
+        total_params, short_params, arity, bool_params,
         is_pub: !is_go && is_pub_before(tokens, fn_idx),
     };
     Some((pfn, has_body))
@@ -1241,7 +1240,7 @@ impl<'a> FnAnalyzer<'a> {
                     name: pfn.name, line: pfn.line, open_line: tok.line, open_tok_idx: tok_idx,
                     is_pub: pfn.is_pub, arity: pfn.arity, bool_params: pfn.bool_params,
                     max_cf_depth: 0, cognitive: 0, total_bindings: pfn.total_params,
-                    golf_1char: pfn.golf_params, indent_compressed: 0, packed_cf_line: false,
+                    short_1char: pfn.short_params, indent_compressed: 0, packed_cf_line: false,
                     cf_opens_by_line: BTreeMap::new(), last_bool_op: None,
                 });
                 return;
@@ -1369,18 +1368,22 @@ impl<'a> FnAnalyzer<'a> {
         let is_let_chain = prev.is_some_and(|p| {
             p.kind == LexKind::AndAnd || (p.kind == LexKind::Ident && matches!(p.text, "if" | "while"))
         });
-        if is_let_chain { return; }
-        let (mut pos, mut d) = (idx + 1, Delims::default());
-        while pos < tokens.len() {
-            if d.top_pbc() && matches!(tokens[pos].kind, LexKind::Eq | LexKind::Colon | LexKind::Semi) {
+        if is_let_chain {
+            return;
+        }
+        let Some(cur) = self.fn_stack.last_mut() else {
+            return;
+        };
+        let mut delims = Delims::default();
+        let mut end = idx + 1;
+        for tok in &tokens[idx + 1..] {
+            if delims.top_pbc() && matches!(tok.kind, LexKind::Eq | LexKind::Colon | LexKind::Semi) {
                 break;
             }
-            d.step(tokens[pos].kind);
-            pos += 1;
+            delims.step(tok.kind);
+            end += 1;
         }
-        if let Some(cur) = self.fn_stack.last_mut() {
-            extract_pattern_idents(&tokens[idx + 1..pos], &mut cur.total_bindings, &mut cur.golf_1char);
-        }
+        extract_pattern_idents(&tokens[idx + 1..end], &mut cur.total_bindings, &mut cur.short_1char);
     }
 }
 
@@ -1396,7 +1399,7 @@ fn count_pub_struct_fields(tokens: &[StrictTok<'_>], struct_idx: usize) -> usize
     }).count()
 }
 
-fn analyze_functions_and_blocks(
+fn scan_fns(
     tokens: &[StrictTok<'_>], lines: &[LineScan<'_>], is_go: bool, metrics: &mut StrictMetrics,
     block: &mut BlockModuleMetrics, findings: &mut Vec<StrictFinding>,
 ) -> usize {
@@ -1419,16 +1422,22 @@ fn analyze_functions_and_blocks(
     }
     if !is_go
         && metrics.prod_bindings >= 10
-        && (metrics.prod_golf_1char * 100) / metrics.prod_bindings >= 40
+        && (metrics.prod_short_1char * 100) / metrics.prod_bindings >= 40
     {
         veto_fmt(
             findings,
-            "identifier_golf",
+            "short_ident",
             1,
-            format!("file-wide 1-char identifier golf {}/{}", metrics.prod_golf_1char, metrics.prod_bindings),
+            format!("file-wide 1-char identifier ratio {}/{}", metrics.prod_short_1char, metrics.prod_bindings),
         );
     }
     pub_fields
+}
+
+fn flag_short_decl(findings: &mut Vec<StrictFinding>, kind: &str, name: &str, line: usize) {
+    if name.chars().count() == 1 {
+        veto_fmt(findings, "short_ident", line, format!("1-char {kind} name `{name}`"));
+    }
 }
 
 fn check_decl_and_surface<'a>(
@@ -1448,11 +1457,8 @@ fn check_decl_and_surface<'a>(
             if tok.text == "struct" {
                 pub_fields = count_pub_struct_fields(tokens, idx);
             }
-            let golf_name = tokens
-                .get(idx + 1)
-                .filter(|n| n.kind == LexKind::Ident && n.text.chars().count() == 1);
-            if let Some(nt) = golf_name {
-                veto_fmt(findings, "identifier_golf", nt.line, format!("1-char {} name `{}`", tok.text, nt.text));
+            if let Some(nt) = tokens.get(idx + 1).filter(|n| n.kind == LexKind::Ident) {
+                flag_short_decl(findings, tok.text, nt.text, nt.line);
             }
         } else if matches!(tok.text, "const" | "type")
             && state.fn_stack.is_empty()
@@ -1468,8 +1474,8 @@ fn check_decl_and_surface<'a>(
         if pfn.is_pub {
             block.pub_items += 1;
         }
-        if !is_go && pfn.name.chars().count() == 1 {
-            veto_fmt(findings, "identifier_golf", pfn.line, format!("1-char prod function name `{}`", pfn.name));
+        if !is_go {
+            flag_short_decl(findings, "prod function", pfn.name, pfn.line);
         }
         if has_body {
             pfn.paren_depth = state.paren_depth;
@@ -1541,7 +1547,7 @@ fn finalize_fn(
     metrics.max_cf_depth = metrics.max_cf_depth.max(acc.max_cf_depth);
     metrics.max_cognitive = metrics.max_cognitive.max(acc.cognitive);
     metrics.prod_bindings += acc.total_bindings;
-    metrics.prod_golf_1char += acc.golf_1char;
+    metrics.prod_short_1char += acc.short_1char;
 
     let too_deep = acc.max_cf_depth >= MAX_CF_DEPTH_VETO
         || acc.cognitive > MAX_COGNITIVE_VETO
@@ -1566,14 +1572,14 @@ fn finalize_fn(
         );
     }
     if acc.total_bindings >= 5
-        && acc.golf_1char >= 4
-        && (acc.golf_1char * 100) / acc.total_bindings >= 55
+        && acc.short_1char >= 4
+        && (acc.short_1char * 100) / acc.total_bindings >= 55
     {
         veto_fmt(
             findings,
-            "identifier_golf",
+            "short_ident",
             acc.line,
-            format!("fn `{}` 1-char variable golf {}/{}", acc.name, acc.golf_1char, acc.total_bindings),
+            format!("fn `{}` 1-char variable ratio {}/{}", acc.name, acc.short_1char, acc.total_bindings),
         );
     }
 }

@@ -1,6 +1,4 @@
-//! Lockfile extractors (`toml::from_str` + streaming pnpm/Go), RFC 2789 `index.crates.io`
-//! ETag `304` sparse-index client, SemVer breaking-hop planner, `std-replacement-data`
-//! (`MSRV <= 1.100`), `RustSec` unmaintained advisories, and counterexample keep-crate guards.
+//! Lockfile extractors, crates.io sparse-index client, SemVer hops, and advisories.
 
 use crate::platform::{ensure_cachedir_tag, now_ms, parse_go_block_lines, read_zstd, write_zstd};
 use crate::source::parse_deps;
@@ -20,7 +18,7 @@ pub const DEFAULT_CRATES_INDEX_URL: &str = "https://index.crates.io";
 const MAX_LOCKFILE_BYTES: u64 = 8 * 1024 * 1024;
 const LOCKFILE_BUF_BYTES: usize = 64 * 1024;
 const CRATES_INDEX_TTL_MS: u64 = 86_400_000;
-const MAX_CRATES_INDEX_CONCURRENCY: usize = 6;
+const INDEX_CONCURRENCY: usize = 6;
 const MAX_CRATES_INDEX_CRATES: usize = 12;
 const MAX_INDEX_BODY_BYTES: usize = 512 * 1024;
 
@@ -165,7 +163,7 @@ const KEEP_GUARDS: &[(&str, &str)] = &[
     ("mimalloc", "keeps RSS bounded with immediate purge vs glibc ptmalloc arenas"),
     ("memchr", "SIMD-vectorized byte search outperforms scalar loops"),
     ("similar", "patience/Myers diff outperforms naive line diffing"),
-    ("petgraph", "battle-tested graph algorithms with low overhead"),
+    ("petgraph", "standard graph algorithms with low overhead"),
     ("blake3", "SIMD cryptographic hashing beats sha2/handwritten digests"),
     ("zstd", "bounded windowLog streaming compression beats raw/gzip"),
     ("governor", "lock-free GCRA rate pacing avoids burst drift"),
@@ -191,8 +189,8 @@ pub fn rustsec_unmaintained(crate_name: &str) -> Option<(&'static str, &'static 
     RUSTSEC_UNMAINTAINED.iter().find(|&&(k, _, _)| k == crate_name).map(|&(_, adv, repl)| (adv, repl))
 }
 
-/// Counterexample keep-crate guard blocking naive "strip crate" false positives.
-pub fn counterexample_keep_guard(crate_name: &str) -> Option<&'static str> {
+/// Return keep-crate rationale that blocks naive removal advice.
+pub fn keep_guard(crate_name: &str) -> Option<&'static str> {
     KEEP_GUARDS.iter().find(|&&(k, _)| k == crate_name).map(|&(_, why)| why)
 }
 
@@ -220,7 +218,7 @@ pub fn plan_dep_hops(
         prev_ver = Some(v.clone());
     }
     let latest = hops.last().cloned().unwrap_or_else(|| installed.to_string());
-    let keep_guard = (eco == Ecosystem::Cargo).then(|| counterexample_keep_guard(name)).flatten();
+    let keep_guard = (eco == Ecosystem::Cargo).then(|| keep_guard(name)).flatten();
     let cargo_verdict = (eco == Ecosystem::Cargo).then(|| {
         std_replacement(name, project_msrv_minor)
             .map(|(since_minor, replacement)| ReuseVerdict::ReplaceWithStd { since_minor, replacement })
@@ -384,16 +382,21 @@ pub fn extract_go_mod_and_sum(
     out
 }
 
-/// Read project Rust MSRV minor version from `Cargo.toml` (`[package]` or `[workspace.package]`).
+/// Read Rust MSRV minor version from `[package]` or `[workspace.package]`.
 pub fn project_msrv_minor(repo_root: &Path) -> u32 {
     let Ok(txt) = fs::read_to_string(repo_root.join("Cargo.toml")) else { return 100 };
-    toml::from_str::<toml::Value>(&txt)
-        .ok()
-        .and_then(|v| {
-            let pkg = v.get("package").or_else(|| v.get("workspace")?.get("package"))?;
-            pkg.get("rust-version")?.as_str().and_then(parse_semver_lenient)
-        })
-        .map_or(100, |v| v.minor as u32)
+    let Ok(v) = toml::from_str::<toml::Value>(&txt) else { return 100 };
+    let ver = v
+        .get("package")
+        .and_then(|p| p.get("rust-version"))
+        .and_then(toml::Value::as_str)
+        .or_else(|| {
+            v.get("workspace")
+                .and_then(|w| w.get("package"))
+                .and_then(|p| p.get("rust-version"))
+                .and_then(toml::Value::as_str)
+        });
+    ver.and_then(parse_semver_lenient).map_or(100, |s| s.minor as u32)
 }
 
 fn direct_manifest_deps(repo_root: &Path, file: &str, skip_local: bool) -> FxHashSet<String> {
@@ -475,12 +478,13 @@ enum IndexFetchOutcome {
     Failed,
 }
 
-async fn fetch_single_crate_index(
+async fn fetch_crate(
     client: &reqwest::Client, base_url: &str, name: &str, prev_etag: Option<&str>,
 ) -> IndexFetchOutcome {
     let rel = crates_index_rel_path(name);
     if rel.is_empty() { return IndexFetchOutcome::Failed; }
-    let mut req = client.get(format!("{}/{rel}", base_url.trim_end_matches('/'))).timeout(Duration::from_secs(5));
+    let url = format!("{}/{rel}", base_url.trim_end_matches('/'));
+    let mut req = client.get(url).timeout(Duration::from_secs(5));
     if let Some(tag) = prev_etag { req = req.header(reqwest::header::IF_NONE_MATCH, tag); }
     let Ok(resp) = req.send().await else { return IndexFetchOutcome::Failed };
     let etag = resp
@@ -498,27 +502,37 @@ async fn fetch_single_crate_index(
     }
 }
 
-/// Fetch non-yanked crate versions with persistent ETag `304 Not Modified` cache.
-pub async fn fetch_crates_io_releases(
+/// Fetch non-yanked crate versions with persistent ETag `304` caching.
+pub async fn fetch_releases(
     client: &reqwest::Client, base_url: &str, cache_path: &Path, crate_names: &[&str],
 ) -> FxHashMap<String, Vec<ReleaseNoteRef>> {
     let mut cache = read_zstd::<CratesIndexCache>(cache_path).unwrap_or_default();
     let now = now_ms();
     let mut seen = FxHashSet::default();
-    let targets: Vec<String> = crate_names.iter().map(|s| s.trim().to_ascii_lowercase())
-        .filter(|k| !k.is_empty() && seen.insert(k.clone())).take(MAX_CRATES_INDEX_CRATES).collect();
-    let to_fetch: Vec<(String, Option<String>)> = targets.iter()
-        .filter(|n| !cache.entries.get(*n).is_some_and(|e| now.saturating_sub(e.fetched_ms) < CRATES_INDEX_TTL_MS))
-        .map(|n| (n.clone(), cache.entries.get(n).and_then(|e| e.etag.clone()))).collect();
+    let targets: Vec<String> = crate_names
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|k| !k.is_empty() && seen.insert(k.clone()))
+        .take(MAX_CRATES_INDEX_CRATES)
+        .collect();
+    let to_fetch: Vec<(String, Option<String>)> = targets
+        .iter()
+        .filter(|n| {
+            !cache.entries.get(*n).is_some_and(|e| {
+                now.saturating_sub(e.fetched_ms) < CRATES_INDEX_TTL_MS
+            })
+        })
+        .map(|n| (n.clone(), cache.entries.get(n).and_then(|e| e.etag.clone())))
+        .collect();
 
     let mut dirty = false;
     if !to_fetch.is_empty() {
         let fetched: Vec<(String, IndexFetchOutcome)> = stream::iter(to_fetch)
             .map(|(n, etag)| async move {
-                let res = fetch_single_crate_index(client, base_url, &n, etag.as_deref()).await;
+                let res = fetch_crate(client, base_url, &n, etag.as_deref()).await;
                 (n, res)
             })
-            .buffer_unordered(MAX_CRATES_INDEX_CONCURRENCY)
+            .buffer_unordered(INDEX_CONCURRENCY)
             .collect()
             .await;
         for (name, outcome) in fetched {
@@ -564,18 +578,23 @@ fn format_changelog_query(dep: &LockedDep, plan: &HopPlan) -> String {
     let hop = if plan.hops.is_empty() {
         String::new()
     } else {
-        format!(" latest={} hops={} brk={} sec={}", plan.latest, plan.hops.len(), plan.breaking_count, plan.security_count)
+        format!(
+            " latest={} hops={} brk={} sec={}",
+            plan.latest, plan.hops.len(), plan.breaking_count, plan.security_count
+        )
     };
-    format!("{} {} {}{marker}{sum}{hop} changelog breaking changes security advisories 2026",
-        plan.ecosystem.as_str(), plan.name, plan.installed)
+    format!(
+        "{} {} {}{marker}{sum}{hop} changelog breaking changes security advisories",
+        plan.ecosystem.as_str(), plan.name, plan.installed
+    )
 }
 
-fn plan_manifest_fallback_queries(repo_root: &Path) -> Vec<String> {
+fn manifest_queries(repo_root: &Path) -> Vec<String> {
     const SPECS: &[(&str, &str)] = &[
-        ("package.json", "npm package {p} deprecation security canonical replacement 2026"),
-        ("Cargo.toml", "rust crate {p} latest version security advisories 2026"),
-        ("pyproject.toml", "python package {p} deprecation security canonical replacement 2026"),
-        ("go.mod", "go module {p} deprecation security advisories 2026"),
+        ("package.json", "npm package {p} deprecation security canonical replacement"),
+        ("Cargo.toml", "rust crate {p} latest version security advisories"),
+        ("pyproject.toml", "python package {p} deprecation security canonical replacement"),
+        ("go.mod", "go module {p} deprecation security advisories"),
     ];
     let (mut queries, mut seen) = (Vec::new(), BTreeSet::new());
     for &(file, tpl) in SPECS {
@@ -592,38 +611,51 @@ fn plan_manifest_fallback_queries(repo_root: &Path) -> Vec<String> {
     queries
 }
 
-/// Evaluate lockfiles + sparse-index releases into `DepAdvisory` findings and changelog search queries.
-pub fn evaluate_repo_deps(
+/// Evaluate lockfiles and releases into advisories and search queries.
+pub fn audit_lockfiles(
     repo_root: &Path, releases_by_crate: &FxHashMap<String, Vec<ReleaseNoteRef>>,
 ) -> (Vec<DepAdvisory>, Vec<String>) {
     let locked = extract_repo_lockfiles(repo_root);
-    evaluate_repo_deps_from(repo_root, &locked, releases_by_crate)
+    audit_lockfiles_from(repo_root, &locked, releases_by_crate)
 }
 
-pub fn evaluate_repo_deps_from(
-    repo_root: &Path, locked: &[LockedDep], releases_by_crate: &FxHashMap<String, Vec<ReleaseNoteRef>>,
+pub fn audit_lockfiles_from(
+    repo_root: &Path,
+    locked: &[LockedDep],
+    releases_by_crate: &FxHashMap<String, Vec<ReleaseNoteRef>>,
 ) -> (Vec<DepAdvisory>, Vec<String>) {
     let msrv_minor = project_msrv_minor(repo_root);
     let (mut advisories, mut seen_adv) = (Vec::new(), FxHashSet::default());
     let (mut queries, mut seen_q) = (Vec::new(), BTreeSet::new());
 
     for dep in locked.iter().filter(|d| d.direct || rustsec_unmaintained(&d.name).is_some()) {
-        let rels = releases_by_crate.get(&dep.name.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or(&[]);
+        let key = dep.name.to_ascii_lowercase();
+        let rels = releases_by_crate.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         let plan = plan_dep_hops(dep.ecosystem, &dep.name, &dep.version, rels, msrv_minor);
         let adv = match plan.verdict {
             ReuseVerdict::ReplaceWithStd { since_minor, replacement } => Some((
-                "std_replacement", format!("Replace with {replacement} (stabilized in Rust 1.{since_minor})"), None,
+                "std_replacement",
+                format!("Replace with {replacement} (stabilized in Rust 1.{since_minor})"),
+                None,
             )),
             ReuseVerdict::ReplaceUnmaintained { advisory, replacement } => Some((
-                "rustsec_unmaintained", format!("{advisory}: replace unmaintained crate with {replacement}"),
-                Some(format!("{} {} {} {advisory} unmaintained canonical replacement {replacement} migration 2026",
-                    plan.ecosystem.as_str(), plan.name, plan.installed)),
+                "rustsec_unmaintained",
+                format!("{advisory}: replace unmaintained crate with {replacement}"),
+                Some(format!(
+                    "{} {} {} {advisory} unmaintained canonical replacement {replacement} migration",
+                    plan.ecosystem.as_str(), plan.name, plan.installed
+                )),
             )),
             ReuseVerdict::UpgradeWithChangelog => Some((
                 "major_upgrade_hops",
                 if plan.breaking_count > 0 {
-                    format!("Upgrade across {} breaking hop(s) to {}", plan.breaking_count, plan.latest)
-                } else { format!("Upgrade to {}", plan.latest) },
+                    format!(
+                        "Upgrade across {} breaking hop(s) to {}",
+                        plan.breaking_count, plan.latest
+                    )
+                } else {
+                    format!("Upgrade to {}", plan.latest)
+                },
                 Some(format_changelog_query(dep, &plan)),
             )),
             ReuseVerdict::KeepUpToDate => {
@@ -637,17 +669,25 @@ pub fn evaluate_repo_deps_from(
         if let Some((kind, recommendation, opt_q)) = adv {
             if seen_adv.insert((plan.ecosystem, plan.name.clone(), plan.installed.clone(), kind)) {
                 advisories.push(DepAdvisory {
-                    ecosystem: plan.ecosystem.as_str().to_string(), name: plan.name.clone(),
+                    ecosystem: plan.ecosystem.as_str().to_string(),
+                    name: plan.name.clone(),
                     installed: plan.installed.clone(),
                     latest: (plan.latest != plan.installed).then(|| plan.latest.clone()),
-                    kind: kind.to_string(), recommendation, hops: plan.hops.clone(),
-                    breaking_hops: plan.breaking_count, keep_guard: plan.keep_guard.map(String::from),
+                    kind: kind.to_string(),
+                    recommendation,
+                    hops: plan.hops.clone(),
+                    breaking_hops: plan.breaking_count,
+                    keep_guard: plan.keep_guard.map(String::from),
                 });
             }
-            if let Some(q) = opt_q && queries.len() < 8 && seen_q.insert(q.clone()) { queries.push(q); }
+            if let Some(q) = opt_q && queries.len() < 8 && seen_q.insert(q.clone()) {
+                queries.push(q);
+            }
         }
     }
-    if queries.is_empty() && locked.is_empty() { queries = plan_manifest_fallback_queries(repo_root); }
+    if queries.is_empty() && locked.is_empty() {
+        queries = manifest_queries(repo_root);
+    }
     (advisories, queries)
 }
 
@@ -666,90 +706,124 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn lockfile_extractors_and_rfc2789_paths() {
-        assert_eq!(
-            [crates_index_rel_path("a"), crates_index_rel_path("ab"), crates_index_rel_path("abc"), crates_index_rel_path("Reqwest")],
-            ["1/a", "2/ab", "3/a/abc", "re/qw/reqwest"]
+    fn lockfiles_and_size_limit() {
+        let paths = ["a", "ab", "abc", "Reqwest", "", "caf\u{00E9}"].map(crates_index_rel_path);
+        assert_eq!(paths, ["1/a", "2/ab", "3/a/abc", "re/qw/reqwest", "", ""]);
+
+        let cargo = concat!(
+            "version = 4\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+            "[[package]]\nname = \"serde\"\nversion = \"1.0.229\"\n",
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
         );
+        let direct: FxHashSet<String> = ["serde".into()].into_iter().collect();
+        let cdeps = extract_cargo_lock(Cursor::new(cargo), &direct);
+        assert_eq!((cdeps.len(), cdeps[0].direct, cdeps[0].name.as_str()), (1, true, "serde"));
 
-        let cargo = "version = 4\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n[[package]]\nname = \"serde\"\nversion = \"1.0.229\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
-        let cdeps = extract_cargo_lock(Cursor::new(cargo), &["serde".into()].into_iter().collect());
-        assert!(cdeps.len() == 1 && cdeps[0].direct && cdeps[0].name == "serde");
+        let cap = MAX_LOCKFILE_BYTES as usize;
+        let mut at_cap = cargo.as_bytes().to_vec();
+        at_cap.resize(cap, b' ');
+        assert_eq!(extract_cargo_lock(Cursor::new(&at_cap), &direct).len(), 1);
+        at_cap.push(b' ');
+        assert!(extract_cargo_lock(Cursor::new(&at_cap), &direct).is_empty());
 
-        let pnpm = "importers:\n  .:\n    dependencies:\n      react:\n        specifier: ^19\npackages:\n  react@19.1.0(peer@1.0.0):\n    resolution: {}\nsnapshots:\n  ghost@0.0.1: {}\n";
+        let pnpm = "importers:\n  .:\n    dependencies:\n      react:\n        specifier: ^19\n\
+            packages:\n  react@19.1.0(peer@1.0.0):\n    resolution: {}\nsnapshots:\n  g@0.1: {}\n";
         let pdeps = extract_pnpm_lock_v9(Cursor::new(pnpm));
         assert_eq!(pdeps.len(), 1);
         assert!(pdeps[0].direct);
         assert_eq!((pdeps[0].name.as_str(), pdeps[0].version.as_str()), ("react", "19.1.0"));
 
-        let uv = "[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [{ name = \"colorama\", marker = \"sys_platform == 'win32'\" }]\n[[package]]\nname = \"colorama\"\nversion = \"0.4.6\"\n";
+        let uv = "[[package]]\nname = \"d\"\nversion = \"0.1\"\nsource = { virtual = \".\" }\n\
+            dependencies = [{ name = \"colorama\", marker = \"sys_platform == 'win32'\" }]\n\
+            [[package]]\nname = \"colorama\"\nversion = \"0.4.6\"\n";
         let udeps = extract_uv_lock(Cursor::new(uv), &["colorama".into()].into_iter().collect());
-        assert!(udeps.len() == 1 && udeps[0].marker.as_deref() == Some("sys_platform == 'win32'"));
+        assert_eq!((udeps.len(), udeps[0].marker.as_deref()), (1, Some("sys_platform == 'win32'")));
 
-        let go_mod = "module demo\nrequire (\n\tgithub.com/gin-gonic/gin v1.10.0\n\tgolang.org/x/sys v0.25.0 // indirect\n)\n";
-        let gdeps = extract_go_mod_and_sum(Cursor::new(go_mod), Some(Cursor::new("github.com/gin-gonic/gin v1.10.0 h1:abc=\n")));
+        let gm = concat!(
+            "module d\nrequire (\n",
+            "\tgithub.com/gin-gonic/gin v1.10.0\n",
+            "\tgolang.org/x/sys v0.25.0 // indirect\n)\n",
+        );
+        let gdeps = extract_go_mod_and_sum(
+            Cursor::new(gm),
+            Some(Cursor::new("github.com/gin-gonic/gin v1.10.0 h1:abc=\n")),
+        );
         assert_eq!(gdeps.len(), 2);
         assert!(gdeps[0].direct && gdeps[0].integrity_verified);
         assert!(!gdeps[1].direct && !gdeps[1].integrity_verified);
+
+        let ws = TempRepo::with_files("ws_msrv", &[(
+            "Cargo.toml",
+            "[package]\nname = \"a\"\nrust-version.workspace = true\n\
+             [workspace.package]\nrust-version = \"1.85\"\n",
+        )]);
+        assert_eq!(project_msrv_minor(ws.path()), 85);
+        assert!(std_replacement("lazy_static", 85).is_some());
+        assert!(std_replacement("fs2", 85).is_none());
     }
 
     #[tokio::test]
-    async fn crates_io_etag_304_and_std_replacement_end_to_end() {
+    async fn crates_io_etag_304_and_hops() {
         let (hits, hits_304) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let (h1, h304) = (hits.clone(), hits_304.clone());
-        let app = Router::new().route(
-            "/re/qw/reqwest",
-            get(move |headers: HeaderMap| {
-                let (h1, h304) = (h1.clone(), h304.clone());
-                async move {
-                    h1.fetch_add(1, Ordering::Relaxed);
-                    if headers.get(axum::http::header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some("\"v1\"") {
-                        h304.fetch_add(1, Ordering::Relaxed);
-                        return (StatusCode::NOT_MODIFIED, [("etag", "\"v1\"")], "").into_response();
-                    }
-                    let body = "{\"vers\":\"1.0.0\",\"yanked\":false}\n{\"vers\":\"2.0.0\",\"yanked\":false}\n{\"vers\":\"3.1.0\",\"yanked\":false}\n";
-                    (StatusCode::OK, [("etag", "\"v1\"")], body).into_response()
+        let app = Router::new().route("/re/qw/reqwest", get(move |hdrs: HeaderMap| {
+            let (h1, h304) = (h1.clone(), h304.clone());
+            async move {
+                h1.fetch_add(1, Ordering::Relaxed);
+                if hdrs.get(axum::http::header::IF_NONE_MATCH).and_then(|v| v.to_str().ok())
+                    == Some("\"v1\"")
+                {
+                    h304.fetch_add(1, Ordering::Relaxed);
+                    return (StatusCode::NOT_MODIFIED, [("etag", "\"v1\"")], "").into_response();
                 }
-            }),
-        );
+                let body = "{\"vers\":\"1.0.0\",\"yanked\":false}\n\
+                    {\"vers\":\"2.0.0\",\"yanked\":false}\n{\"vers\":\"3.1.0\",\"yanked\":false}\n";
+                (StatusCode::OK, [("etag", "\"v1\"")], body).into_response()
+            }
+        }));
         let srv = TestAxum::spawn(app).await;
-        let base_url = &srv.base_url;
+        let repo = TempRepo::with_files("deps_etag", &[
+            ("Cargo.toml", "[package]\nname = \"d\"\nversion = \"0.1.0\"\nrust-version = \"1.100\"\n\
+                [dependencies]\nlazy_static = \"1.5\"\nserde_yaml = \"0.9\"\nreqwest = \"1.0\"\n"),
+            ("Cargo.lock", "version = 4\n[[package]]\nname = \"d\"\nversion = \"0.1.0\"\n\
+                [[package]]\nname = \"lazy_static\"\nversion = \"1.5.0\"\nsource = \"registry+x\"\n\
+                [[package]]\nname = \"serde_yaml\"\nversion = \"0.9.34\"\nsource = \"registry+x\"\n\
+                [[package]]\nname = \"reqwest\"\nversion = \"1.0.0\"\nsource = \"registry+x\"\n"),
+            ("src/lib.rs", "pub fn demo() -> usize { 1 }\n"),
+        ]);
 
-        let repo = TempRepo::with_files(
-            "deps_etag_304",
-            &[
-                ("Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nrust-version = \"1.100\"\n[dependencies]\nlazy_static = \"1.5\"\nserde_yaml = \"0.9\"\nreqwest = \"1.0\"\n"),
-                ("Cargo.lock", "version = 4\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n[[package]]\nname = \"lazy_static\"\nversion = \"1.5.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n[[package]]\nname = \"serde_yaml\"\nversion = \"0.9.34\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n[[package]]\nname = \"reqwest\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"),
-                ("src/lib.rs", "pub fn demo() -> usize { 1 }\n"),
-            ],
-        );
+        let rel_0x = [
+            ReleaseNoteRef { version: "0.2.0".into(), breaking: false, security: false },
+            ReleaseNoteRef { version: "0.2.1".into(), breaking: false, security: false },
+        ];
+        let plan_0x = plan_dep_hops(Ecosystem::Cargo, "blake3", "0.1.0", &rel_0x, 100);
+        assert_eq!((plan_0x.breaking_count, plan_0x.keep_guard.is_some()), (1, true));
 
-        let (cache_path, client) = (repo.join(".refit/cache/crates_index.zst"), reqwest::Client::new());
-        let rels1 = fetch_crates_io_releases(&client, base_url, &cache_path, &["reqwest"]).await;
+        let (cache, client) = (repo.join(".refit/cache/crates_index.zst"), reqwest::Client::new());
+        let rels1 = fetch_releases(&client, &srv.base_url, &cache, &["reqwest"]).await;
         assert_eq!((hits.load(Ordering::Relaxed), hits_304.load(Ordering::Relaxed)), (1, 0));
 
-        let (advisories, _) = evaluate_repo_deps(repo.path(), &rels1);
+        let (advisories, _) = audit_lockfiles(repo.path(), &rels1);
         let find = |n: &str| advisories.iter().find(|a| a.name == n).unwrap();
         assert_eq!(find("lazy_static").kind, "std_replacement");
         assert_contains_all(&find("lazy_static").recommendation, &["std::sync::LazyLock"]);
         assert_eq!(find("serde_yaml").kind, "rustsec_unmaintained");
         assert_contains_all(&find("serde_yaml").recommendation, &["RUSTSEC-2024-0320"]);
-        let reqw = find("reqwest");
-        assert_eq!(reqw.kind, "major_upgrade_hops");
-        assert_eq!((&reqw.hops, reqw.breaking_hops), (&vec!["2.0.0".into(), "3.1.0".into()], 2));
+        let rq = find("reqwest");
+        assert_eq!((rq.kind.as_str(), &rq.hops, rq.breaking_hops),
+            ("major_upgrade_hops", &vec!["2.0.0".into(), "3.1.0".into()], 2));
 
-        // Fresh TTL hit (0 HTTP calls), then stale cache -> If-None-Match 304 revalidation.
-        let _ = fetch_crates_io_releases(&client, base_url, &cache_path, &["reqwest"]).await;
+        let _ = fetch_releases(&client, &srv.base_url, &cache, &["reqwest"]).await;
         assert_eq!(hits.load(Ordering::Relaxed), 1);
-        let mut stale: CratesIndexCache = read_zstd(&cache_path).unwrap();
+        let mut stale: CratesIndexCache = read_zstd(&cache).unwrap();
         stale.entries.get_mut("reqwest").unwrap().fetched_ms = 1;
-        write_zstd(&cache_path, &stale).unwrap();
-        let rels2 = fetch_crates_io_releases(&client, base_url, &cache_path, &["reqwest"]).await;
-        assert_eq!((hits.load(Ordering::Relaxed), hits_304.load(Ordering::Relaxed), rels2["reqwest"].len()), (2, 1, 3));
+        write_zstd(&cache, &stale).unwrap();
+        let rels2 = fetch_releases(&client, &srv.base_url, &cache, &["reqwest"]).await;
+        assert_eq!((hits.load(Ordering::Relaxed), hits_304.load(Ordering::Relaxed), rels2["reqwest"].len()),
+            (2, 1, 3));
 
-        // Offline untangle_repo makes 0 HTTP calls and omits empty dep_advisories from JSON.
-        let report = untangle_repo(repo.path(), &HygieneScorer::open_persistent(repo.path())).unwrap();
-        assert!(report.dep_advisories.is_empty() && hits.load(Ordering::Relaxed) == 2);
-        assert!(!serde_json::to_string(&report).unwrap().contains("dep_advisories"));
+        let rep = untangle_repo(repo.path(), &HygieneScorer::open_persistent(repo.path())).unwrap();
+        assert!(rep.dep_advisories.is_empty() && hits.load(Ordering::Relaxed) == 2);
+        assert!(!serde_json::to_string(&rep).unwrap().contains("dep_advisories"));
     }
 }

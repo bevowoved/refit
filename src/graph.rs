@@ -434,7 +434,8 @@ mod tests {
         for i in 0..40 {
             utf.push_str(&format!("def fn_{i}():\n    return '🚀日本語テスト_{i}'\n\n"));
         }
-        assert!(!packet::slice_anchored(&utf, 120, &HashSet::new()).is_empty());
+        let utf_slice = packet::slice_anchored(&utf, 120, &HashSet::new());
+        assert!(utf_slice.contains("def fn_0") && utf_slice.len() < utf.len());
         assert_eq!(char_prefix("🚀日本語", 2), "🚀日");
 
         let fwd = wave_context(&plan.units, dir.path());

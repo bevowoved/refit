@@ -3,7 +3,7 @@ name = "refit"
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.100"
-description = "Pure-Rust cross-platform polyglot refactoring engine for Kimi K3.1 Pro on Cerebras + unpatched OpenClaw + native 10 req/s KeenAble ROI search"
+description = "Cross-platform code audit, verification, and parallel refactor engine"
 
 [features]
 default = ["alloc-mimalloc"]
@@ -11,20 +11,16 @@ alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 wal-crc32c = []
 sst-storage = []
-neural-v6 = []
 live-rewind = []
 doc-drift = []
 ste100 = []
-mcp-v2 = []
 build-cache = ["dep:reflink-copy"]
-full-v7 = [
+full = [
   "wal-crc32c",
   "sst-storage",
-  "neural-v6",
   "live-rewind",
   "doc-drift",
   "ste100",
-  "mcp-v2",
   "build-cache",
 ]
 

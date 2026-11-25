@@ -42,11 +42,13 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+const DEFAULT_UPSTREAM: &str = "https://api.cerebras.ai/v1";
+
 #[derive(Parser)]
 #[command(
     name = "refit",
-    version = "0.5.0",
-    about = "Pure-Rust cross-platform polyglot untangling & refactoring engine for Kimi K3.1 Pro on Cerebras"
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Cross-platform code audit, verification, and parallel refactor engine"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -56,7 +58,7 @@ struct Cli {
 #[derive(Args, Debug, Clone)]
 struct RunCliArgs {
     repo: PathBuf,
-    #[arg(long, default_value = "https://api.cerebras.ai/v1")] upstream: String,
+    #[arg(long, default_value = DEFAULT_UPSTREAM)] upstream: String,
     #[arg(long, default_value = "moonshotai-kimi-k3.1-pro-trial")] model: String,
     #[arg(long, default_value = "Cerebras WSE-3T")] provider_label: String,
     #[arg(long)] openclaw_url: Option<String>,
@@ -87,7 +89,7 @@ struct RunCliArgs {
 enum Commands {
     /// Probe the Cerebras endpoint through the proxy and print latency metrics.
     Probe {
-        #[arg(long, default_value = "https://api.cerebras.ai/v1")] upstream: String,
+        #[arg(long, default_value = DEFAULT_UPSTREAM)] upstream: String,
         #[arg(long, default_value = "moonshotai-kimi-k3.1-pro-trial")] model: String,
         #[arg(long)] api_key_file: Option<PathBuf>,
         #[arg(long)] openclaw_url: Option<String>,
@@ -146,7 +148,7 @@ enum Commands {
     /// Start the HTTP/2 Cerebras proxy and live HUD server.
     Proxy {
         #[arg(long, default_value = "127.0.0.1:18790")] listen: String,
-        #[arg(long, default_value = "https://api.cerebras.ai/v1")] upstream: String,
+        #[arg(long, default_value = DEFAULT_UPSTREAM)] upstream: String,
         #[arg(long, default_value = "moonshotai-kimi-k3.1-pro-trial")] model: String,
         #[arg(long, default_value = "ui/index.html")] ui_index: PathBuf,
         #[arg(long, default_value = "telemetry/proxy.jsonl")] telemetry_out: PathBuf,
@@ -161,7 +163,7 @@ enum Commands {
         repo: PathBuf,
         #[arg(long)] http: Option<String>,
     },
-    /// Run batch KeenAble web searches.
+    /// Run batch web research searches.
     Research {
         #[arg(long)] lang: Option<String>,
         #[arg(long)] repo: Option<PathBuf>,
@@ -214,7 +216,7 @@ fn cmd_scan(repo: &Path, no_cache: bool, fast: bool, approx_long: bool) -> Resul
     let style = hygiene::repo_style(repo);
     print_json(&json!({
         "version": env!("CARGO_PKG_VERSION"), "allocator": platform::allocator_name(),
-        "pure_rust_hygiene": "codehygiene_v0.7.0_exact", "scan_cache_hit": hit, "fast_mode": fast,
+        "pure_rust_hygiene": "codehygiene_exact", "scan_cache_hit": hit, "fast_mode": fast,
         "repo_fingerprint": bundle.repo_fingerprint, "scan_ms": started.elapsed().as_millis() as u64,
         "detected_languages": bundle.detected_languages, "polyglot_toolchains": bundle.polyglot_toolchains,
         "style_config": { "max_line_width": style.max_line_width, "indent_width": style.indent_width },
@@ -230,16 +232,29 @@ fn cmd_scan(repo: &Path, no_cache: bool, fast: bool, approx_long: bool) -> Resul
     }))
 }
 
+#[cfg(not(feature = "ste100"))]
+fn require_ste100() -> Result<()> {
+    anyhow::bail!("STE100 linting (`--ste100` / `--ste-dict`) requires `--features ste100`")
+}
+
+fn append_dep_research(md: &mut String, snippets: &str) {
+    if !snippets.is_empty() {
+        md.push_str("## Dependency Research\n\n");
+        md.push_str(snippets);
+    }
+}
+
 fn emit_audit_output(
     report: &types::AuditReport, dep_res: &[research::SearchResult],
     markdown: bool, ste100: bool, ste_dict: Option<&Path>,
 ) -> Result<()> {
-    if ste100 || ste_dict.is_some() { return emit_audit_ste100(report, dep_res, markdown, ste_dict); }
+    if ste100 || ste_dict.is_some() {
+        return emit_audit_prose(report, dep_res, markdown, ste_dict);
+    }
     if markdown {
         let mut md = untangle::render_audit(report);
         if !dep_res.is_empty() {
-            md.push_str("## Dependency Research (KeenAble)\n\n");
-            md.push_str(&research::WebClient::format_snippets(dep_res));
+            append_dep_research(&mut md, &research::WebClient::format_snippets(dep_res));
         }
         println!("{md}");
         return Ok(());
@@ -248,17 +263,16 @@ fn emit_audit_output(
 }
 
 #[cfg(feature = "ste100")]
-fn emit_audit_ste100(
+fn emit_audit_prose(
     report: &types::AuditReport,
     dep_res: &[research::SearchResult],
     markdown: bool,
     ste_dict: Option<&Path>,
 ) -> Result<()> {
-    let (mut compiled, lint) = untangle::render_audit_ste100(report, ste_dict)?;
+    let (mut compiled, lint) = untangle::render_audit_prose(report, ste_dict)?;
     if markdown {
         if !dep_res.is_empty() {
-            compiled.push_str("## Dependency Research (KeenAble)\n\n");
-            compiled.push_str(&research::WebClient::format_snippets_ste100(dep_res));
+            append_dep_research(&mut compiled, &research::WebClient::format_prose(dep_res));
         }
         println!("{compiled}");
         return Ok(());
@@ -271,16 +285,10 @@ fn emit_audit_ste100(
 }
 
 #[cfg(not(feature = "ste100"))]
-fn emit_audit_ste100(
-    _report: &types::AuditReport,
-    _dep_res: &[research::SearchResult],
-    _markdown: bool,
-    _ste_dict: Option<&Path>,
+fn emit_audit_prose(
+    _: &types::AuditReport, _: &[research::SearchResult], _: bool, _: Option<&Path>,
 ) -> Result<()> {
-    anyhow::bail!(
-        "ASD-STE100 linting (`--ste100` / `--ste-dict`) requires the `ste100` feature; \
-         rebuild with `cargo build --features ste100`"
-    )
+    require_ste100()
 }
 
 async fn cmd_probe(
@@ -291,7 +299,7 @@ async fn cmd_probe(
     let tel = telemetry::TelemetryHub::new(std::env::temp_dir().join("refit-probe.jsonl"))?;
     let cfg = proxy::ProxyConfig::new(addr.clone(), upstream, key, model.clone());
     let (pstate, handle) = proxy::start_proxy(cfg, tel).await?;
-    let client = platform::new_http("refit-probe/0.5.0", 120, 4)?;
+    let client = platform::new_http(concat!("refit-probe/", env!("CARGO_PKG_VERSION")), 120, 4)?;
     let url = openclaw_url.as_ref().map_or_else(
         || format!("http://{addr}/v1/chat/completions"),
         |oc| format!("{}/chat/completions", oc.trim_end_matches('/')),
@@ -363,24 +371,26 @@ fn cmd_audit_sync(
 fn cmd_sustain(repo: &Path, dry_run: bool, ste100: bool, ste_dict: Option<&Path>) -> Result<()> {
     let scorer = hygiene::HygieneScorer::open_persistent(repo);
     let rep = untangle::untangle_repo_with_scope(repo, &scorer, untangle::AuditScope::Sustain)?;
-    if ste100 || ste_dict.is_some() { return emit_sustain_ste100(repo, &rep, dry_run, ste_dict); }
+    if ste100 || ste_dict.is_some() {
+        return emit_sustain_prose(repo, &rep, dry_run, ste_dict);
+    }
     let out = untangle::write_sustain(repo, &rep, dry_run)?;
     platform::collect_os_memory();
     print_json(&out)
 }
 
 #[cfg(feature = "ste100")]
-fn emit_sustain_ste100(
+fn emit_sustain_prose(
     repo: &Path, rep: &types::AuditReport, dry_run: bool, ste_dict: Option<&Path>,
 ) -> Result<()> {
-    let (out, lint) = untangle::write_sustain_ste100(repo, rep, dry_run, ste_dict)?;
+    let (out, lint) = untangle::write_sustain_prose(repo, rep, dry_run, ste_dict)?;
     platform::collect_os_memory();
     print_json(&json!({ "sustain": out, "ste100": lint }))
 }
 
 #[cfg(not(feature = "ste100"))]
-fn emit_sustain_ste100(_: &Path, _: &types::AuditReport, _: bool, _: Option<&Path>) -> Result<()> {
-    anyhow::bail!("ASD-STE100 linting (`--ste100` / `--ste-dict`) requires `ste100` feature")
+fn emit_sustain_prose(_: &Path, _: &types::AuditReport, _: bool, _: Option<&Path>) -> Result<()> {
+    require_ste100()
 }
 
 fn cmd_mcp(repo: PathBuf, http: Option<String>) -> Result<()> {
@@ -416,7 +426,8 @@ fn main() -> Result<()> {
             }))
         }
         Commands::Learn { repo, rewind, trigger } => {
-            print_json(&learn::query_learn_and_rewind(&repo, rewind.as_deref(), learn::RewindTrigger::parse(&trigger))?)
+            let trig = learn::RewindTrigger::parse(&trigger);
+            print_json(&learn::query_rewind(&repo, rewind.as_deref(), trig)?)
         }
         Commands::Probe { upstream, model, api_key_file, openclaw_url, openclaw_token } => {
             init_tracing();
@@ -471,7 +482,7 @@ fn main() -> Result<()> {
                     |r| research::WebClient::for_repo(r, None),
                 );
                 let expanded = lang.map_or(queries.clone(), |l| {
-                    queries.into_iter().map(|q| format!("best native {l} library for {q} benchmark 2026")).collect()
+                    queries.into_iter().map(|q| format!("best native {l} library for {q} benchmark")).collect()
                 });
                 let results = client.research_batch(expanded, max_results).await;
                 print_json(&json!({

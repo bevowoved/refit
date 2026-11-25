@@ -677,7 +677,7 @@ mod tests {
     use crate::testutil::TempRepo;
 
     #[test]
-    fn infra_gha_2q_taint_multistage_docker_tf_sql_precision() {
+    fn infra_gha_docker_tf_sql_precision() {
         let gha_safe = concat!(
             "jobs:\n  safe:\n    steps:\n",
             "      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # v4\n",

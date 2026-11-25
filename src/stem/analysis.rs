@@ -751,9 +751,7 @@ pub fn match_tests_inverted(
     map
 }
 
-// ============================================================================
-// 4. Clean-Room Streaming Git Co-Change NPMI + Worktree HEAD-OID Cache
-// ============================================================================
+// 4. Streaming Git Co-Change NPMI + Worktree HEAD-OID Cache
 
 pub const MAX_GIT_COMMITS: usize = 2500;
 pub const BULK_COMMIT_LIMIT: usize = 40;
@@ -1122,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pearce_scc_exact_parity_dense_cyclic_and_deep_chain() {
+    fn pearce_scc_parity_dense_and_chain() {
         let mut rng = TestRng::new(0x9e37_79b9_7f4a_7c15);
         for &(n, mult) in &[(40usize, 1usize), (120, 3), (250, 6)] {
             let mut edges: Vec<(u32, u32)> = (0..n * mult)
@@ -1194,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_genome_npmi_hub_demotion_lockfile_filter_and_wipe_guard() {
+    fn genome_npmi_hub_filter_and_wipe_guard() {
         let mut bulk = to_string_vec(&["src/hub.rs", "Cargo.lock"]);
         bulk.extend((0..45).map(|i| format!("src/bulk_{i}.rs")));
         let mut commits = vec![bulk];
@@ -1218,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn test_genome_head_cache_worktree_and_sustain_skip() {
+    fn genome_head_cache_worktree_and_skip() {
         let fake_wt = TempRepo::new("wt_head");
         let oid = "0123456789abcdef0123456789abcdef01234567";
         fake_wt.write("common/packed-refs", format!("# pack-refs\n{oid} refs/heads/feat/wt\n"));

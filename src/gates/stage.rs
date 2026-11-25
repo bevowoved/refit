@@ -40,7 +40,7 @@ pub struct CacheGcStats { pub evicted_entries: usize, pub freed_bytes: u64, pub 
 pub fn stage_hardlinks() -> u64 { STAGE_HARDLINKS_TOTAL.load(Ordering::Relaxed) }
 #[cfg(test)] pub fn stage_copies() -> u64 { STAGE_COPIED_TOTAL.load(Ordering::Relaxed) }
 
-/// Zero-spawn process-wide PATH probe (`mbx` then `kache`) cached once via `OnceLock`.
+/// Cached PATH probe for `mbx` or `kache`.
 pub fn detect_rust_wrapper() -> Option<(RustCacheBackend, &'static Path)> {
     RUST_WRAPPER_CACHE.get_or_init(|| {
         find_tool_on_path("mbx").map(|p| (RustCacheBackend::Mbx, p))
@@ -447,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_copy_failure_propagates_and_sentinel_guard() {
+    fn stage_copy_err_and_read() {
         let tmp = TempRepo::with_files("stage_err", &[("src/a.rs", "pub fn ok() -> u8 { 42 }\n")]);
         let dst = tmp.join("out_stage");
         let occupied = dst.join("occupied_dir");
@@ -467,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_cache_orch_clone_lru_uv_and_conditional_wrapper() {
+    fn stage_cache_lru_and_wrap() {
         let tmp = TempRepo::with_files("stage_cache_orch", &[("src/a.rs", "pub fn x() -> u8 { 7 }\n")]);
         let src = tmp.join("src/a.rs");
 
@@ -534,5 +534,39 @@ mod tests {
         let low_mem = build_rust_cache_env_core(tmp.path(), &slot.dir, false, wrap, gb8, false, true);
         assert!(env_val(&low_mem, "MBX_BLAZE").is_none());
         drop(slot);
+    }
+
+    #[test]
+    fn stage_slots_survive_gc_race() {
+        use std::sync::{Arc, Barrier};
+        let tmp = TempRepo::with_files("slot_gc_race", &[("src/a.rs", "pub fn ok() {}\n")]);
+        let root = Arc::new(tmp.path().to_path_buf());
+        let acquired = Arc::new(Barrier::new(4));
+        let release = Arc::new(Barrier::new(4));
+
+        // Three slots guarantee at least one ephemeral slot (> max_cargo_slots = 2).
+        let mut workers = Vec::new();
+        for idx in 0..3 {
+            let (r, b1, b2) = (Arc::clone(&root), Arc::clone(&acquired), Arc::clone(&release));
+            workers.push(std::thread::spawn(move || {
+                let slot = CargoSlot::acquire(&r);
+                let marker = slot.dir.join(format!("active_{idx}.bin"));
+                fs::write(&marker, vec![idx as u8 + 1; 2048]).unwrap();
+                b1.wait();
+                b2.wait();
+                assert!(marker.exists(), "active slot {idx} evicted during concurrent GC");
+                drop(slot);
+            }));
+        }
+
+        acquired.wait();
+        for _ in 0..5 {
+            let _ = prune_repo_caches(&root, 0).unwrap();
+        }
+        release.wait();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(has_cachedir_tag(&root.join(".refit/cache")));
     }
 }
