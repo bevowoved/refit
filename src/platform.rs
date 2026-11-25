@@ -683,8 +683,6 @@ impl EpochRegistry {
         Self { global_epoch: AtomicU64::new(1), slots: std::array::from_fn(|_| AtomicU64::new(1)) }
     }
 
-    #[cfg(any(feature = "mcp-v2", test))]
-    pub fn global() -> &'static Self { Self::global_arc_slot().as_ref() }
     pub fn global_arc() -> std::sync::Arc<Self> { Self::global_arc_slot().clone() }
 
     fn global_arc_slot() -> &'static std::sync::Arc<Self> {

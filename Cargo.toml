@@ -15,7 +15,7 @@ neural-v6 = []
 live-rewind = []
 doc-drift = []
 ste100 = []
-mcp-v2 = ["dep:base64", "dep:heck"]
+mcp-v2 = []
 build-cache = ["dep:reflink-copy"]
 full-v7 = [
   "wal-crc32c",
@@ -32,7 +32,6 @@ full-v7 = [
 aho-corasick = "1.1.5"
 anyhow = "1.0.105"
 axum = "0.8.9"
-base64 = { version = "0.23.1", optional = true }
 blake3 = "1.8.7"
 byteorder = "1.5.0"
 bytes = "1.12.2"
@@ -45,7 +44,6 @@ futures-util = { version = "0.3.34", default-features = false, features = ["allo
 getrandom = "0.4.3"
 globset = "0.4.22"
 governor = { version = "0.10.4", default-features = false, features = ["std"] }
-heck = { version = "0.5.0", optional = true }
 httpdate = "1.0"
 ignore = "0.4.35"
 indexmap = "2.14.2"
@@ -89,10 +87,6 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_Threading",
   "Win32_Storage_FileSystem",
 ] }
-
-[dev-dependencies]
-base64 = "0.23.1"
-heck = "0.5.0"
 
 [profile.dev]
 debug = "line-tables-only"

@@ -386,19 +386,9 @@ fn emit_sustain_ste100(_: &Path, _: &types::AuditReport, _: bool, _: Option<&Pat
 fn cmd_mcp(repo: PathBuf, http: Option<String>) -> Result<()> {
     init_tracing();
     match http {
-        Some(addr) => run_mcp_http(repo, addr),
+        Some(addr) => build_rt(false)?.block_on(mcp::serve_http(repo, addr)),
         None => build_rt(false)?.block_on(mcp::serve_mcp(repo)),
     }
-}
-
-#[cfg(feature = "mcp-v2")]
-fn run_mcp_http(repo: PathBuf, addr: String) -> Result<()> {
-    build_rt(false)?.block_on(mcp::serve_http(repo, addr))
-}
-
-#[cfg(not(feature = "mcp-v2"))]
-fn run_mcp_http(_: PathBuf, _: String) -> Result<()> {
-    anyhow::bail!("Streamable HTTP (`--http`) requires `mcp-v2` feature")
 }
 
 fn main() -> Result<()> {

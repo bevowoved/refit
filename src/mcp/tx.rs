@@ -125,7 +125,8 @@ fn with_tx(
 
 pub fn tx_begin(repo_root: &Path, args: &Value) -> Value {
     let now = now_ms();
-    let ttl_secs = args["ttl_secs"].as_u64().unwrap_or(1800).clamp(1, 86_400);
+    let raw_ttl = args["ttl_secs"].as_u64().unwrap_or(1800);
+    let ttl_secs = raw_ttl.clamp(1, 86_400);
     let ttl_ms = ttl_secs * 1000;
     let root = txs_dir(repo_root);
     let swept = sweep_txs(&root, now);
