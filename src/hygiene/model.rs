@@ -8,6 +8,8 @@ use super::simd::{linear_sparse_direct_csr, sparse_parts_direct_csr};
 #[cfg(target_arch = "x86_64")]
 use super::simd::{linear_sparse_width_gated_avx2, sparse_parts_width_gated_avx2};
 use super::weights::ResolvedWeights;
+#[cfg(any(feature = "neural-v6", test))]
+use super::weights::{CompactConv, CompactCsr};
 use crate::types::{HygieneResult, Squiggle};
 use std::cell::RefCell;
 
@@ -525,7 +527,74 @@ fn finish_heads(w: &ResolvedWeights, n: usize, sc: &mut EvalScratch) -> HygieneR
         total_squiggles: Some(total_squiggles),
         event_load: Some(rounded_load),
         triggered_vetoes: Vec::new(),
+        multiscale_score: None,
+        calibration_log: None,
     }
+}
+
+#[cfg(any(feature = "neural-v6", test))]
+fn add_csr_counts(total: &mut u64, nnz: &mut u64, mat: &CompactCsr) {
+    *total += (mat.rows as u64) * (mat.cols as u64);
+    *nnz += mat.non_zero_count as u64;
+}
+
+#[cfg(any(feature = "neural-v6", test))]
+fn add_conv_counts(total: &mut u64, nnz: &mut u64, conv: &CompactConv) {
+    *total += (conv.k_size as u64) * (conv.rows as u64) * (conv.cols as u64);
+    *nnz += conv.non_zero_count as u64;
+}
+
+/// Compute aggregate ternary weight zero ratio across all layers in `ResolvedWeights`.
+#[cfg(any(feature = "neural-v6", test))]
+pub(super) fn weight_zero_ratio(weights: &ResolvedWeights) -> f64 {
+    let mut total = 0u64;
+    let mut nnz = 0u64;
+    for emb in [&weights.tok_emb, &weights.col_emb] {
+        total += (emb.rows as u64) * (emb.cols as u64);
+        nnz += emb.data.iter().filter(|&&val| val != 0.0).count() as u64;
+    }
+    for conv in [
+        &weights.pre_conv3_w,
+        &weights.conv3_w,
+        &weights.conv7_w,
+        &weights.sketch_w,
+        &weights.ml_paren_w,
+    ] {
+        add_conv_counts(&mut total, &mut nnz, conv);
+    }
+    for mat in [
+        &weights.pref1_proj,
+        &weights.gate1_w,
+        &weights.pref2_proj,
+        &weights.col_fuse_w,
+        &weights.col_sum_proj,
+        &weights.ml_proj,
+        &weights.ml_gate_w,
+        &weights.lmlp1_w,
+        &weights.lmlp2_w,
+        &weights.sq_w,
+        &weights.pool_gate_w,
+        &weights.doc1_w,
+        &weights.doc2_w,
+    ] {
+        add_csr_counts(&mut total, &mut nnz, mat);
+    }
+    for layer in &weights.ctx_layers {
+        if let Some(ref wq) = layer.attn.wq {
+            add_csr_counts(&mut total, &mut nnz, wq);
+        }
+        if let Some(ref wk) = layer.attn.wk {
+            add_csr_counts(&mut total, &mut nnz, wk);
+        }
+        add_csr_counts(&mut total, &mut nnz, &layer.attn.wv);
+        add_csr_counts(&mut total, &mut nnz, &layer.attn.wo);
+        add_csr_counts(&mut total, &mut nnz, &layer.cmlp_w);
+        add_csr_counts(&mut total, &mut nnz, &layer.cmlp2_w);
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    1.0 - (nnz as f64) / (total as f64)
 }
 
 /// 33-row L1-resident circular ring-buffer `pool_doc` (bit-exact with full `(n + 1) * dim` prefix).

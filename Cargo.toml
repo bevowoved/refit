@@ -11,6 +11,7 @@ alloc-mimalloc = ["dep:mimalloc"]
 alloc-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 wal-crc32c = []
 sst-storage = ["dep:roaring"]
+neural-v6 = []
 
 [dependencies]
 aho-corasick = "1.1.5"
