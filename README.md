@@ -15,13 +15,75 @@
 6. **Hardened Proxy, Web Search, and Concurrent MCP (`src/proxy.rs`, `src/research.rs`, `src/mcp.rs`):** Pace rolling uncached TPM with exact refunds, route web research across configurable providers (`REFIT_SEARCH_PROVIDERS`), and serve 17 concurrent MCP tools over stdio or stateless HTTP (`--http`).
 7. **Governance Artifacts and STE100 Prose (`refit sustain`, `refit learn`):** Generate `AGENTS.md`, `.refit/invariants.yml`, `docs/ADR-001-untangle.md`, and `.github/workflows/refit-guard.yml`, with optional `--ste100` prose linting and SymbolGraph-backed `--rewind` impact queries.
 
+## Install
+
+### Prebuilt Release Binaries (Linux, macOS Apple Silicon, Windows)
+
+Download the archive for your platform plus `SHA256SUMS.txt` from [GitHub Releases](https://github.com/patrickfield152-del/refit/releases):
+
+```bash
+# Linux / macOS (verify checksum, then extract)
+sha256sum -c --ignore-missing SHA256SUMS.txt
+tar -xzf refit-x86_64-unknown-linux-gnu.tar.gz   # or refit-aarch64-apple-darwin.tar.gz
+```
+
+```powershell
+# Windows (PowerShell)
+Get-FileHash refit-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+Expand-Archive refit-x86_64-pc-windows-msvc.zip -DestinationPath .\bin
+```
+
+### Build from Source (Rust `1.100.0`)
+
+```bash
+cargo install --path . --locked --features full
+```
+
+## Verified `v0.6.0` Benchmarks & Footprint
+
+| Metric | Measured Value | Notes |
+| :--- | :--- | :--- |
+| Release binary size | **`10.81 MiB`** (Win x64) · **`13.82 MiB`** (Linux x64 `jemalloc`) | Single static binary w/ embedded `weights.npz` |
+| Active Cargo dep duplicates | **`0`** across all 4 targets | `cargo tree --locked -e normal --duplicates` |
+| Neural parity vs JS reference | **`0.000000`** max delta | Pure-Rust SIMD + scalar parity verified |
+| Scan latency (real repos) | **`79 ms`** (`gin`) · **`346 ms`** (`hono`) · **`1.04 s`** (`uv`) | Cold `refit scan --no-cache` |
+| 1-vCPU Peak RSS (`jem_full`) | **`17.57 MiB`** (`mcp`) · **`27.34 MiB`** (`scan`) · **`29.71 MiB`** (`audit`) | Warm `56.95 ms`, sustain `27.67 ms` |
+| Quality & Mutation Gates | **`101/101`** Win · **`102/102`** WSL2 · **`8/8`** `T14` mutants killed | `0` clippy warnings, `0` squiggles (`51/51` files) |
+
+## MCP Client Setup
+
+`refit mcp` exposes 17 concurrent tools over stdio (default) or stateless HTTP (`--http`).
+
+### Claude Code / Cursor / Antigravity / Codex (`stdio`)
+
+```json
+{
+  "mcpServers": {
+    "refit": {
+      "command": "refit",
+      "args": ["mcp", "."]
+    }
+  }
+}
+```
+
+### Stateless HTTP Server
+
+```bash
+refit mcp /path/to/repo --http 127.0.0.1:18791
+```
+
+### OpenClaw
+
+Use [openclaw/openclaw.refit.json](openclaw/openclaw.refit.json) and [skills/refit/SKILL.md](skills/refit/SKILL.md).
+
 ## Quick Start
 
 ```bash
 # Build, verify (S1-S14), and mutation-test (T14) via pure-Rust xtask
-cargo clippy --workspace --all-targets --features full -- -D warnings
-cargo test --features full
-cargo build --release --features full
+cargo clippy --locked --workspace --all-targets --features full -- -D warnings
+cargo test --locked --features full
+cargo build --release --locked --features full
 cargo xtask verify
 cargo xtask mutate
 
@@ -31,10 +93,6 @@ cargo xtask mutate
 ./target/release/refit sustain ./your_repo --dry-run
 ./target/release/refit learn ./your_repo --rewind my_symbol
 ./target/release/refit gc ./your_repo
-
-# Run concurrent MCP server (stdio or HTTP)
-./target/release/refit mcp ./your_repo
-./target/release/refit mcp ./your_repo --http 127.0.0.1:18791
 
 # Run parallel refactoring in an isolated git worktree
 export CEREBRAS_API_KEY="csk-..."

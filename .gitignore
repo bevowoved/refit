@@ -21,5 +21,6 @@ dist/
 fixture/target_repo/
 fixture/target_repo_baseline/
 fixture/target_repo_crash_test/
+SUBMISSIONS/
 *.tmp
 *.bak
