@@ -1,0 +1,49 @@
+﻿{
+  "blocking_count": 0,
+  "kane": {
+    "adaptive_healed": false,
+    "author_steps": 1,
+    "cli_version": "0.10.9",
+    "confirmed_bug_740": false,
+    "credits_consumed": 24.9669725,
+    "duration_s": 75.0,
+    "evidence_excerpts": [
+      "[failure.yaml] generated: 2026-11-26T17:48:53.219Z",
+      "[failure.yaml] totals:",
+      "[failure.yaml] failures: 0",
+      "[failure.yaml] triaged: 0",
+      "[failure.yaml] untriaged: 0",
+      "[failure.yaml] failures: []",
+      "[tests/hud-mobile-viewport-f06f7bc9/logs/0-network.har] {\"log\": {\"version\": \"1.2\", \"creator\": {\"name\": \"v16-runner\", \"version\": \"\"}, \"entries\": [{\"startedDateTime\": \"2026-11-26T17:47:45.568877+00:00\", \"time\": 13033.24560546875, \"request\": {\"method\": \"GET\", \"url\": \"https://bev"
+    ],
+    "evidence_path": "C:\\Users\\ADMIN\\.testmuai\\kaneai\\sessions\\f5ef0a90-e076-49f9-a844-08c327a1d83e\\evidence\\26ca7bcd-bd51-4504-bd75-fbdece844250.evidence",
+    "evidence_serve_cmd": "kane-cli evidence serve \"C:\\Users\\ADMIN\\.testmuai\\kaneai\\sessions\\f5ef0a90-e076-49f9-a844-08c327a1d83e\\evidence\\26ca7bcd-bd51-4504-bd75-fbdece844250.evidence\"",
+    "exit_code": 0,
+    "final_state": {
+      "drawer_bug_740_display": "true",
+      "drawer_passed_display": "true",
+      "url": "https://bevowoved.github.io/refit/?demo=1&at=100&tab=kane"
+    },
+    "git_head": "832927933aaf6cee5a010d8e2bfa3c1e038bd2cf",
+    "ok": true,
+    "recorded_ms": 1795715354264,
+    "replay_steps": 0,
+    "summary": "Waited for the Gate 4 drawer to appear and confirmed it showed “PASSED.”\nClicked the “Cycle Red -> Repair -> Green” button in the drawer.\nThe drawer then displayed “BUG_740,” completing the requested action.",
+    "surface": "test_md",
+    "test_url": "https://test-manager.lambdatest.com/projects/01M8CCK3HA4AXTYRJCKDBE2CXY/test-cases/01M8CFGKD2V1KJECDJ20ZDVYZ8/dashboard/share/US_QSIMKC2608G5T2JKFG18SK3T3TG0H75A16056KSPCAFXTK2QA3UH7O6ZUQMVKLEX?type=summary&agentView=true&fqdn=summary-page",
+    "verdict": "passed"
+  },
+  "ok": true,
+  "osv_findings": [],
+  "secrets": {
+    "blocking_count": 0,
+    "cache_hits": 76,
+    "duration_ms": 7,
+    "files_checked": 79,
+    "findings": [],
+    "mode": "repo",
+    "rule_count": 135,
+    "warning_count": 0
+  },
+  "warning_count": 0
+}

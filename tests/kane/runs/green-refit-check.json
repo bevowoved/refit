@@ -1,0 +1,55 @@
+﻿{
+  "blocking_count": 1,
+  "kane": {
+    "adaptive_healed": false,
+    "author_steps": 0,
+    "cli_version": "0.10.9",
+    "confirmed_bug_740": false,
+    "credits_consumed": 29.25818,
+    "duration_s": 105.1,
+    "evidence_path": "C:\\Users\\ADMIN/.testmuai/kaneai/sessions\\41796971-cfb0-4731-a522-69746702a545\\evidence\\0af29ffb-14bd-4504-9012-778d9b923592.evidence",
+    "evidence_serve_cmd": "kane-cli evidence serve \"C:\\Users\\ADMIN/.testmuai/kaneai/sessions\\41796971-cfb0-4731-a522-69746702a545\\evidence\\0af29ffb-14bd-4504-9012-778d9b923592.evidence\"",
+    "exit_code": -1,
+    "final_state": {
+      "drawer_cap_visible": "true",
+      "drawer_open": "true",
+      "drawer_passed_visible": "true",
+      "drawer_true_visible": "true",
+      "url": "https://bevowoved.github.io/refit/?demo=1&at=100"
+    },
+    "git_head": "832927933aaf6cee5a010d8e2bfa3c1e038bd2cf",
+    "ok": false,
+    "recorded_ms": 1795715069401,
+    "replay_steps": 0,
+    "rewind_affected_files": [
+      "src/gates.rs",
+      "src/gates/audit.rs",
+      "src/gates/runners.rs",
+      "src/gates/stage.rs",
+      "src/platform.rs",
+      "src/platform/proc.rs",
+      "src/gates/rules.rs",
+      "src/graph.rs",
+      "src/graph/abi.rs",
+      "src/graph/packet.rs",
+      "src/graph/patch.rs",
+      "src/hygiene.rs"
+    ],
+    "summary": "The requested page was allowed to finish loading.\nSelected “Gate 4 · Kane” from the top navigation.\nThe Gate 4 panel opened and showed “PASSED,” “12 / 100 cap,” and “TRUE.”",
+    "surface": "test_md",
+    "verdict": "timeout"
+  },
+  "ok": false,
+  "osv_findings": [],
+  "secrets": {
+    "blocking_count": 0,
+    "cache_hits": 73,
+    "duration_ms": 14,
+    "files_checked": 77,
+    "findings": [],
+    "mode": "repo",
+    "rule_count": 135,
+    "warning_count": 0
+  },
+  "warning_count": 0
+}

@@ -1,0 +1,25 @@
+{
+  "test_id": "a1c209bd-91a1-4d51-be63-d79183599f95",
+  "project_id": "01M8CCK3HA4AXTYRJCKDBE2CXY",
+  "folder_id": "01M8CCK4JNNT47Z3CFYR1K77EM",
+  "org_id": "3450902",
+  "session_name": "hud_mobile_viewport",
+  "commit_id": "f5ef0a90-e076-49f9-a844-08c327a1d83e",
+  "testcase_id": "01M8CFGKD2V1KJECDJ20ZDVYZ8",
+  "executions": [
+    {
+      "execution_id": "26ca7bcd-bd51-4504-bd75-fbdece844250",
+      "run_kind": "author",
+      "status": "passed",
+      "valid": true,
+      "at": "2026-11-26T17:48:53.581Z"
+    },
+    {
+      "execution_id": "9b774e4e-3b65-40f5-96d6-1974f2b2f1ad",
+      "run_kind": "replay",
+      "status": "passed",
+      "valid": true,
+      "at": "2026-11-26T17:52:05.782Z"
+    }
+  ]
+}

@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "refit",
   "version": "0.6.0",
-  "description": "Converged Rust code-hygiene and verification engine: embedded neural codehygiene, architectural untangle, Stem symbol graph, deslop, web-wired MCP guidance, event-driven agent hooks, atomic MVCC WAL, and TestMu AI Kane CLI browser/mobile proof.",
+  "description": "Keep AI-written code clean and proven: local neural code hygiene, symbol-graph untangling, web-wired MCP, event-driven hooks, and Kane CLI live proof.",
   "author": {
     "name": "bevowoved",
     "url": "https://github.com/bevowoved/refit"

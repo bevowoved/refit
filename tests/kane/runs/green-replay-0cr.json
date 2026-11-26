@@ -1,0 +1,59 @@
+﻿{
+  "blocking_count": 0,
+  "kane": {
+    "adaptive_healed": false,
+    "author_steps": 0,
+    "cli_version": "0.10.9",
+    "confirmed_bug_740": false,
+    "duration_s": 48.0,
+    "evidence_excerpts": [
+      "[failure.yaml] generated: 2026-11-26T17:52:05.575Z",
+      "[failure.yaml] totals:",
+      "[failure.yaml] failures: 0",
+      "[failure.yaml] triaged: 0",
+      "[failure.yaml] untriaged: 0",
+      "[failure.yaml] failures: []",
+      "[tests/hud-mobile-viewport-f06f7bc9/logs/0-console.ndjson] {\"sequence\": 0, \"level\": \"error\", \"text\": \"Failed to load resource: the server responded with a status of 404 ()\", \"url\": \"https://kaneai-playground.lambdatest.io/favicon.ico\", \"line\": 0, \"step\": \"0-1\"}",
+      "[tests/hud-mobile-viewport-f06f7bc9/logs/0-network.har] {\"log\": {\"version\": \"1.2\", \"creator\": {\"name\": \"v16-runner\", \"version\": \"\"}, \"entries\": [{\"startedDateTime\": \"2026-11-26T17:51:30.528773+00:00\", \"time\": 12530.873291015625, \"request\": {\"method\": \"GET\", \"url\": \"https://fo"
+    ],
+    "evidence_path": "C:\\Users\\ADMIN\\.testmuai\\kaneai\\sessions\\93a69c65-d50a-4655-9bba-8f399ef61c38\\evidence\\9b774e4e-3b65-40f5-96d6-1974f2b2f1ad.evidence",
+    "evidence_serve_cmd": "kane-cli evidence serve \"C:\\Users\\ADMIN\\.testmuai\\kaneai\\sessions\\93a69c65-d50a-4655-9bba-8f399ef61c38\\evidence\\9b774e4e-3b65-40f5-96d6-1974f2b2f1ad.evidence\"",
+    "exit_code": 0,
+    "final_state": {
+      "drawer_bug_740_display": {
+        "secret": false,
+        "syntax": "{{drawer_bug_740_display}}",
+        "value": "true"
+      },
+      "drawer_passed_display": {
+        "secret": false,
+        "syntax": "{{drawer_passed_display}}",
+        "value": "true"
+      }
+    },
+    "git_head": "832927933aaf6cee5a010d8e2bfa3c1e038bd2cf",
+    "ok": true,
+    "policy_verdict": {
+      "exit_code": 0,
+      "result": "pass"
+    },
+    "recorded_ms": 1795715532444,
+    "replay_steps": 1,
+    "summary": "cached replay passed (1 replay / 0 author steps, 0 LLM credits)",
+    "surface": "test_md",
+    "verdict": "passed"
+  },
+  "ok": true,
+  "osv_findings": [],
+  "secrets": {
+    "blocking_count": 0,
+    "cache_hits": 79,
+    "duration_ms": 26,
+    "files_checked": 81,
+    "findings": [],
+    "mode": "repo",
+    "rule_count": 135,
+    "warning_count": 0
+  },
+  "warning_count": 0
+}
