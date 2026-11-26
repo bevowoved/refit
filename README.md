@@ -77,6 +77,44 @@ Enable the `<2 ms` push gate by setting `REFIT_KANE_GATE=1` (or adding `.refit/k
 
 ---
 
+## ROI & Agent Integration Channels
+
+Agents reach `refit` and Kane CLI across four synchronized channels: **CLI** (`refit check --kane`), **12-tool MCP** (`refit_check`), **`<5 ms` Hooks** (`refit hook`), and **Agent Skills** (`skills.sh` and `skill://refit/SKILL.md`).
+
+| Dimension | Measured Impact |
+| :--- | :--- |
+| **Token & Credit Cost** | Uses `12 / 100` MCP slots (`92 / 100` for Playwright MCP), blocks bad diffs in `<10 ms` (`0` Kane credits), replays `_test.md` at `0` LLM author steps, and rewinds exact `file:line` spans |
+| **Time Saved** | Catches cycles, clones, secrets, and doc-drift in `0.54 ms - 346 ms` locally before `30-120s` browser or CI runs |
+| **Security** | Enforces `135` secret rules, strips invisible Unicode Tag/BiDi attacks in `refit_read` and hooks, checks OSV.dev CVEs, and audits unredacted `.evidence` ZIPs |
+| **Reliability** | Commits multi-file edits atomically via `refit_tx` (BLAKE3 CAS + CRC32C WAL) and proves live Chrome/mobile UI behavior through Kane CLI |
+| **Maintainability** | Scores every edit with ternary `codehygiene` (`0.000000` parity), breaks Pearce SCC cycles, removes dead exports, and checks README drift and STE100 prose |
+
+---
+
+## Web Research (`refit_search`) & API Keys
+
+`refit research` and MCP `refit_search` work out of the box with **zero API keys**. By default, `refit` uses the free **Keenable Public MCP** (`https://api.keenable.ai/mcp-public`) for live web research and keyless **OSV.dev** for lockfile CVE checks.
+
+| Variable | Default / Behavior | When to Set |
+| :--- | :--- | :--- |
+| *(none)* | Free Keenable Public MCP + keyless OSV.dev + Zstd/BLAKE3 cache | Demos, local trials, and zero-setup agent onboarding |
+| `KEENABLE_API_KEY` | Switches Keenable to `https://api.keenable.ai/mcp` (`KEENABLE_MCP_URL` overrides) | Higher rate limits and authenticated Keenable quotas |
+| `EXA_API_KEY` | Adds Exa failover (`https://api.exa.ai/search`, override `EXA_API_URL`) | Multi-provider search redundancy |
+| `FIRECRAWL_API_KEY` | Adds Firecrawl failover (`https://api.firecrawl.dev/v2/search`, override `FIRECRAWL_API_URL`) | Deep markdown search failover |
+| `REFIT_SEARCH_PROVIDERS` | `keenable,exa,firecrawl` (supports `custom:name=https://url#KEY_ENV`) | Reorder failover chain or add custom MCP search servers |
+| `REFIT_OFFLINE=1` | Disables all outbound web and OSV.dev requests | Strict air-gapped CI or offline demos |
+
+```bash
+# Works immediately with zero API keys (free Keenable Public MCP + Zstd cache)
+refit research "rust rawzip crc32 verification"
+
+# Optional: add authenticated Keenable, Exa, or Firecrawl failover keys
+export KEENABLE_API_KEY="your-key"
+export EXA_API_KEY="your-key"
+```
+
+---
+
 ## How `refit × Kane CLI` Works
 
 ### 1. Closed-Loop Verification Sequence
