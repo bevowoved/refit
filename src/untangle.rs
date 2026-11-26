@@ -2,6 +2,7 @@ mod infra;
 mod similarity;
 #[cfg(any(feature = "ste100", test))]
 pub mod ste100;
+pub use infra::{install_secret_hooks, scan_repo_secrets};
 
 use crate::hygiene::HygieneScorer;
 use crate::lex::{

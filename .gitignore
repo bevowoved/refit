@@ -17,10 +17,16 @@ __pycache__/
 dist/
 *.log
 
-# Generated large target benchmark repo & temporary clips
+# Generated repos, runtime telemetry, media & local submission packs
 fixture/target_repo/
 fixture/target_repo_baseline/
 fixture/target_repo_crash_test/
+telemetry/
+reports/
 SUBMISSIONS/
+*.mp4
+*.zip
 *.tmp
 *.bak
+.DS_Store
+Thumbs.db

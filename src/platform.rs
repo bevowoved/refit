@@ -573,72 +573,237 @@ pub fn parse_go_block_lines<'a>(txt: &'a str, kw: &str) -> Vec<&'a str> {
     out
 }
 
-const DB_SCHEMES: &[&str] = &[
-    "postgres://", "postgresql://", "mysql://", "mongodb://", "mongodb+srv://", "redis://",
-];
-
-// (prefix, kind, redact_tag, detect_min, redact_min, upper_only)
-const SECRET_SPECS: &[(&str, &str, &str, usize, usize, bool)] = &[
-    ("csk-", "cerebras_api_key", "REDACTED_CSK_", 12, 8, false),
-    ("keen_", "keenable_api_key", "REDACTED_KEEN_", 12, 8, false),
-    ("sk-ant-", "anthropic_api_key", "REDACTED_ANTHROPIC_", 16, 12, false),
-    ("sk-proj-", "openai_api_key", "REDACTED_OPENAI_", 16, 12, false),
-    ("sk_live_", "stripe_live_key", "REDACTED_STRIPE_", 16, 12, false),
-    ("rk_live_", "stripe_restricted_key", "REDACTED_STRIPE_", 16, 12, false),
-    ("ghp_", "github_pat", "REDACTED_GITHUB_", 20, 16, false),
-    ("gho_", "github_oauth", "REDACTED_GITHUB_", 20, 16, false),
-    ("github_pat_", "github_fine_grained_pat", "REDACTED_GITHUB_", 20, 16, false),
-    ("xoxb-", "slack_bot_token", "REDACTED_SLACK_", 16, 12, false),
-    ("xoxp-", "slack_user_token", "REDACTED_SLACK_", 16, 12, false),
-    ("xoxa-", "slack_app_token", "REDACTED_SLACK_", 16, 12, false),
-    ("AKIA", "aws_access_key_id", "REDACTED_AWS_", 16, 16, true),
-    ("ASIA", "aws_sts_key_id", "REDACTED_AWS_", 16, 16, true),
-    ("sk-", "generic_sk_secret", "REDACTED_SK_", 24, 24, false),
-];
-
 const PEM_MARKER: &str = "PRIVATE KEY-----";
-const DB_BASE: usize = SECRET_SPECS.len();
-const PEM_IDX: usize = DB_BASE + DB_SCHEMES.len();
+const URI_SCHEMES: &[&[u8]] = &[
+    b"postgres", b"postgresql", b"mysql", b"mongodb", b"mongodb+srv", b"redis",
+    b"rediss", b"amqp", b"amqps", b"mssql", b"ftp", b"sftp", b"ldap", b"smtp",
+];
+// Compact rule table: prefix|kind|redact_tag|detect_min|redact_min|mode
+// mode: 0=alnum_-, 1=UPPER+dig, 2=hex, 3=b64/url, 4=alnum+digit_req
+const SECRET_TABLE_A: &str = concat!(
+    "sk-ant-api03-|anthropic_api_key|REDACTED_ANTHROPIC_|32|16|0;",
+    "sk-ant-admin-|anthropic_admin_key|REDACTED_ANTHROPIC_|32|16|0;",
+    "sk-ant-usr-|anthropic_user_key|REDACTED_ANTHROPIC_|32|16|0;",
+    "sk-ant-|anthropic_api_key|REDACTED_ANTHROPIC_|16|12|0;",
+    "sk-proj-|openai_api_key|REDACTED_OPENAI_|16|12|0;",
+    "sk-svcacct-|openai_service_key|REDACTED_OPENAI_|24|16|0;",
+    "sk-admin-|openai_admin_key|REDACTED_OPENAI_|24|16|0;",
+    "sk-or-v1-|openrouter_api_key|REDACTED_OPENROUTER_|48|24|2;",
+    "sk-lf-|langfuse_secret_key|REDACTED_LANGFUSE_|24|16|0;",
+    "sk-|generic_sk_secret|REDACTED_SK_|24|24|4;sk_live_|stripe_live_key|REDACTED_STRIPE_|16|12|0;",
+    "rk_live_|stripe_restricted_key|REDACTED_STRIPE_|16|12|0;",
+    "sk.eyJ|mapbox_secret_jwt|REDACTED_MAPBOX_|32|24|3;",
+    "ghp_|github_pat|REDACTED_GITHUB_|20|16|0;gho_|github_oauth|REDACTED_GITHUB_|20|16|0;",
+    "ghu_|github_u2s_token|REDACTED_GITHUB_|20|16|0;ghs_|github_s2s_token|REDACTED_GITHUB_|20|16|0;",
+    "ghr_|github_refresh_token|REDACTED_GITHUB_|20|16|0;",
+    "github_pat_|github_fine_grained_pat|REDACTED_GITHUB_|20|16|0;",
+    "glpat-|gitlab_pat|REDACTED_GITLAB_|20|16|0;gldt-|gitlab_deploy_token|REDACTED_GITLAB_|20|16|0;",
+    "glrt-|gitlab_runner_token|REDACTED_GITLAB_|20|16|0;glcbt-|gitlab_job_token|REDACTED_GITLAB_|20|16|0;",
+    "glsa_|grafana_sa_token|REDACTED_GRAFANA_|28|20|0;glc_|grafana_cloud_token|REDACTED_GRAFANA_|32|24|3;",
+    "xoxb-|slack_bot_token|REDACTED_SLACK_|16|12|0;xoxp-|slack_user_token|REDACTED_SLACK_|16|12|0;",
+    "xoxa-|slack_app_token|REDACTED_SLACK_|16|12|0;xoxr-|slack_refresh_token|REDACTED_SLACK_|16|12|0;",
+    "xoxs-|slack_legacy_token|REDACTED_SLACK_|16|12|0;xapp-|slack_app_level|REDACTED_SLACK_|24|16|0;",
+    "AKIA|aws_access_key_id|REDACTED_AWS_|16|16|1;ASIA|aws_sts_key_id|REDACTED_AWS_|16|16|1;",
+    "ABIA|aws_sts_svc_key|REDACTED_AWS_|16|16|1;ACCA|aws_ctx_key_id|REDACTED_AWS_|16|16|1;",
+    "AKCp|jfrog_api_key|REDACTED_JFROG_|48|32|0;AIza|gcp_api_key|REDACTED_GCP_|35|24|0;",
+    "ya29.|gcp_oauth_token|REDACTED_GCP_|32|24|3;1//0|gcp_oauth_refresh|REDACTED_GCP_|32|24|3;",
+    "dop_v1_|digitalocean_pat|REDACTED_DO_|64|32|2;doo_v1_|digitalocean_oauth|REDACTED_DO_|64|32|2;",
+    "dor_v1_|digitalocean_refresh|REDACTED_DO_|64|32|2;hvs.|vault_service_token|REDACTED_VAULT_|20|16|0;",
+    "hvb.|vault_batch_token|REDACTED_VAULT_|20|16|0;hvr.|vault_recovery_token|REDACTED_VAULT_|20|16|0;",
+    "dp.st.|doppler_svc_token|REDACTED_DOPPLER_|32|20|0;dp.sa.|doppler_sa_token|REDACTED_DOPPLER_|32|20|0;",
+    "dp.pt.|doppler_pers_token|REDACTED_DOPPLER_|32|20|0;dp.ct.|doppler_cli_token|REDACTED_DOPPLER_|32|20|0;",
+    "shpat_|shopify_admin_pat|REDACTED_SHOPIFY_|32|20|2;shpca_|shopify_custom_app|REDACTED_SHOPIFY_|32|20|2;",
+    "shppa_|shopify_private_app|REDACTED_SHOPIFY_|32|20|2;shpss_|shopify_shared_sec|REDACTED_SHOPIFY_|32|20|2;",
+    "bkua_|buildkite_user_tok|REDACTED_BK_|32|20|0;bkct_|buildkite_cluster|REDACTED_BK_|32|20|0;",
+    "bkar_|buildkite_agent|REDACTED_BK_|32|20|0;bkaj_|buildkite_job|REDACTED_BK_|32|20|0;",
+    "bktx_|buildkite_exch|REDACTED_BK_|32|20|0;csk-|cerebras_api_key|REDACTED_CSK_|12|8|0;",
+    "gsk_|groq_api_key|REDACTED_GROQ_|32|20|0;hf_|huggingface_token|REDACTED_HF_|30|20|4;",
+);
+const SECRET_TABLE_B: &str = concat!(
+    "keen_|keenable_api_key|REDACTED_KEEN_|12|8|0;xai-|xai_api_key|REDACTED_XAI_|32|20|0;",
+    "r8_|replicate_token|REDACTED_REPLICATE_|32|20|4;fc-|firecrawl_api_key|REDACTED_FC_|24|16|2;",
+    "tvly-|tavily_api_key|REDACTED_TAVILY_|24|16|0;pplx-|perplexity_api_key|REDACTED_PPLX_|32|20|0;",
+    "fw_|fireworks_api_key|REDACTED_FW_|24|16|4;lsv2_tr_|langsmith_trace_key|REDACTED_LS_|24|16|0;",
+    "lsv2_sk_|langsmith_svc_key|REDACTED_LS_|24|16|0;lsv2_pt_|langsmith_pat|REDACTED_LS_|24|16|0;",
+    "whsec_|stripe_webhook_secret|REDACTED_STRIPE_|24|16|0;pdl_live_|paddle_live_key|REDACTED_PADDLE_|24|16|0;",
+    "pdl_sdbx_|paddle_sandbox_key|REDACTED_PADDLE_|24|16|0;sq0csp-|square_oauth_secret|REDACTED_SQ_|32|20|0;",
+    "sq0atb-|square_access_token|REDACTED_SQ_|22|16|0;SG.|sendgrid_api_key|REDACTED_SG_|40|24|3;",
+    "xkeysib-|brevo_api_key|REDACTED_BREVO_|40|24|0;re_|resend_api_key|REDACTED_RESEND_|24|16|4;",
+    "sec-c-|pubnub_secret_key|REDACTED_PUBNUB_|32|20|0;tskey-api-|tailscale_api_key|REDACTED_TS_|20|16|0;",
+    "tskey-auth-|tailscale_auth_key|REDACTED_TS_|20|16|0;ops_|1password_svc_token|REDACTED_1P_|32|20|3;",
+    "npm_|npm_access_token|REDACTED_NPM_|32|20|0;pypi-|pypi_api_token|REDACTED_PYPI_|32|20|0;",
+    "cio_|crates_io_token|REDACTED_CRATES_|24|16|0;dckr_pat_|docker_hub_pat|REDACTED_DOCKER_|24|16|0;",
+    "dckr_oat_|docker_hub_oat|REDACTED_DOCKER_|24|16|0;hex_|hex_pm_token|REDACTED_HEX_|32|20|2;",
+    "CLOJARS_|clojars_token|REDACTED_CLOJARS_|40|24|0;packagist_ack_|packagist_key|REDACTED_PKG_|24|16|0;",
+    "packagist_acs_|packagist_secret|REDACTED_PKG_|24|16|0;squ_|sonarqube_user_tok|REDACTED_SONAR_|32|20|2;",
+    "sqp_|sonarqube_proj_tok|REDACTED_SONAR_|32|20|2;lin_api_|linear_api_key|REDACTED_LINEAR_|32|20|0;",
+    "ntn_|notion_api_token|REDACTED_NOTION_|32|20|0;figd_|figma_pat|REDACTED_FIGMA_|32|20|0;",
+    "sntrys_|sentry_auth_token|REDACTED_SENTRY_|32|20|3;sntryu_|sentry_user_token|REDACTED_SENTRY_|32|20|2;",
+    "phx_|posthog_personal_key|REDACTED_PH_|32|20|0;phs_|posthog_secret_key|REDACTED_PH_|32|20|0;",
+    "NRAK-|newrelic_user_key|REDACTED_NR_|24|16|1;NRII-|newrelic_insert_key|REDACTED_NR_|24|16|0;",
+    "pat-na1-|hubspot_pat_na|REDACTED_HS_|32|20|0;pat-eu1-|hubspot_pat_eu|REDACTED_HS_|32|20|0;",
+    "pat-in1-|hubspot_pat_in|REDACTED_HS_|32|20|0;sb_secret_|supabase_secret_key|REDACTED_SB_|24|16|0;",
+    "nt_live_|neon_api_key|REDACTED_NEON_|24|16|0;dapi|databricks_pat|REDACTED_DBX_|32|24|2;",
+    "LTAI|alibaba_access_key|REDACTED_ALI_|16|16|0;AccountKey=|azure_storage_key|REDACTED_AZ_|40|24|3;",
+    "SharedAccessSignature|azure_sas_token|REDACTED_AZ_|20|16|3;API-|octopus_api_key|REDACTED_OCTO_|20|16|1;",
+    "AGE-SECRET-KEY-1|age_secret_key|REDACTED_AGE_|40|24|1;nsec1|nostr_secret_key|REDACTED_NOSTR_|50|32|0;",
+    "xprv|bip32_ext_privkey|REDACTED_XPRV_|80|40|0;PuTTY-User-Key-File-|putty_private_key|REDACTED_PPK_|4|4|0;",
+    "hooks.slack.com/services/|slack_webhook_url|REDACTED_SLACK_|20|16|3;",
+    "discord.com/api/webhooks/|discord_webhook_url|REDACTED_DISCORD_|20|16|3;",
+);
+const GENERIC_KEYS: &[&str] = &[
+    "api_key", "apikey", "secret_key", "client_secret",
+    "access_key", "auth_token", "private_key", "password", "passwd",
+];
 
-static SECRET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
-    let patterns = SECRET_SPECS.iter().map(|spec| spec.0)
-        .chain(DB_SCHEMES.iter().copied()).chain(std::iter::once("-----BEGIN "));
-    AhoCorasickBuilder::new().match_kind(MatchKind::LeftmostLongest).build(patterns)
-        .expect("secret aho-corasick")
+struct SecretRule { pfx: &'static str, kind: &'static str, tag: &'static str, dmin: usize, rmin: usize, mode: u8 }
+struct SecretSlab { ac: AhoCorasick, rules: Vec<SecretRule> }
+struct SecretEngine { slabs: [SecretSlab; 2], generic_ac: AhoCorasick, hash: String, total: usize }
+
+fn parse_slab(raw: &'static str, extras: &[&'static str]) -> SecretSlab {
+    let rules: Vec<SecretRule> = raw.split(';').filter(|r| !r.is_empty()).map(|row| {
+        let mut it = row.split('|');
+        SecretRule {
+            pfx: it.next().unwrap_or(""), kind: it.next().unwrap_or(""), tag: it.next().unwrap_or(""),
+            dmin: it.next().and_then(|v| v.parse().ok()).unwrap_or(16),
+            rmin: it.next().and_then(|v| v.parse().ok()).unwrap_or(12),
+            mode: it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+        }
+    }).collect();
+    let ac = AhoCorasickBuilder::new().match_kind(MatchKind::LeftmostLongest)
+        .build(rules.iter().map(|r| r.pfx).chain(extras.iter().copied()))
+        .expect("secret slab ac");
+    SecretSlab { ac, rules }
+}
+
+static SECRET_ENGINE: LazyLock<SecretEngine> = LazyLock::new(|| {
+    let s0 = parse_slab(SECRET_TABLE_A, &["://", "-----BEGIN "]);
+    let s1 = parse_slab(SECRET_TABLE_B, &[]);
+    let total = s0.rules.len() + s1.rules.len() + URI_SCHEMES.len() + 2;
+    let mut h = blake3::Hasher::new();
+    h.update(SECRET_TABLE_A.as_bytes());
+    h.update(SECRET_TABLE_B.as_bytes());
+    let generic_ac = AhoCorasickBuilder::new().ascii_case_insensitive(true)
+        .build(GENERIC_KEYS).expect("generic secret ac");
+    SecretEngine { slabs: [s0, s1], generic_ac, hash: h.finalize().to_hex()[..16].into(), total }
 });
 
-fn secret_token_len(tail: &str, upper_only: bool) -> usize {
-    tail.bytes().take_while(|byte| {
-        if upper_only { byte.is_ascii_uppercase() || byte.is_ascii_digit() }
-        else { byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') }
-    }).count()
+/// Return `(rule_count, rules_blake3_16)` for zero-recompute secret caches.
+pub fn secret_rule_meta() -> (usize, &'static str) { (SECRET_ENGINE.total, &SECRET_ENGINE.hash) }
+
+fn token_len(bytes: &[u8], mode: u8) -> usize {
+    let n = bytes.iter().take_while(|&&c| match mode {
+        1 => c.is_ascii_uppercase() || c.is_ascii_digit(),
+        2 => c.is_ascii_hexdigit(),
+        3 => c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'+' | b'/' | b'='),
+        4 => c.is_ascii_alphanumeric(),
+        _ => c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'),
+    }).count();
+    if mode == 4 && !bytes[..n].iter().any(u8::is_ascii_digit) { 0 } else { n }
 }
 
-fn db_creds_span(after: &str) -> Option<(usize, &str, &str)> {
-    let end = after.find(['/', ' ', '"', '\'', ')', ']', '\n', '\r']).unwrap_or(after.len());
-    let (creds, host) = after[..end].split_once('@')?;
-    (!host.is_empty() && creds.contains(':')).then_some((end, creds, host))
+fn line_slice(bytes: &[u8], pos: usize) -> &[u8] {
+    let lo = bytes[..pos].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let hi = bytes[pos..].iter().position(|&b| b == b'\n').map_or(bytes.len(), |i| pos + i);
+    &bytes[lo..hi]
 }
 
-/// Single-pass SIMD secret detection across all 22 prefix/URI/PEM patterns.
-pub fn find_secret(line: &str) -> Option<&'static str> {
-    let bytes = line.as_bytes();
-    for mat in SECRET_AC.find_iter(line) {
-        let pid = mat.pattern().as_usize();
-        if pid == PEM_IDX {
-            if line[mat.end()..].contains(PEM_MARKER) { return Some("pem_private_key"); }
-        } else if pid < DB_BASE {
-            let (_, kind, _, dmin, _, upper) = SECRET_SPECS[pid];
-            if left_bound(bytes, mat.start()) && secret_token_len(&line[mat.end()..], upper) >= dmin {
-                return Some(kind);
+fn has_ignore_tag(line: &[u8]) -> bool {
+    const TAGS: &[&[u8]] = &[
+        b"gitleaks:allow", b"pragma: allowlist secret", b"trufflehog:ignore", b"refit:ignore",
+    ];
+    TAGS.iter().any(|t| line.windows(t.len()).any(|w| w.eq_ignore_ascii_case(t)))
+}
+
+fn uri_creds_span(bytes: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
+    if !URI_SCHEMES.iter().any(|s| start >= s.len() && bytes[start - s.len()..start].eq_ignore_ascii_case(s)) {
+        return None;
+    }
+    let after = &bytes[end..];
+    let stop = after.iter().position(|&b| matches!(b, b'/' | b' ' | b'"' | b'\'' | b')' | b']' | b'\n' | b'\r'))
+        .unwrap_or(after.len());
+    let at = after[..stop].iter().position(|&b| b == b'@')?;
+    let (creds, host) = (&after[..at], &after[at + 1..stop]);
+    if host.is_empty() || !creds.contains(&b':') || creds.ends_with(b":") { return None; }
+    if creds.windows(2).any(|w| w == b"${") || creds.windows(8).any(|w| w == b"REDACTED") { return None; }
+    Some((at + 1, stop))
+}
+
+fn shannon_entropy(bytes: &[u8]) -> (f64, usize) {
+    let mut freq = [0u32; 128];
+    for &b in bytes { if (b as usize) < 128 { freq[b as usize] += 1; } }
+    let (len, mut ent, mut uniq) = (bytes.len() as f64, 0.0, 0usize);
+    for c in freq {
+        if c > 0 { uniq += 1; let p = (c as f64) / len; ent -= p * p.log2(); }
+    }
+    (ent, uniq)
+}
+
+fn find_generic_entropy(bytes: &[u8]) -> Option<usize> {
+    const PLACEHOLDERS: &[&[u8]] = &[
+        b"example", b"redacted", b"dummy", b"placeholder", b"your_", b"changeme", b"xxxx", b"0000", b"${", b"{{",
+    ];
+    for mat in SECRET_ENGINE.generic_ac.find_iter(bytes) {
+        if !left_bound(bytes, mat.start()) { continue; }
+        let rest = &bytes[mat.end()..bytes.len().min(mat.end() + 140)];
+        let Some(eq) = rest.iter().position(|&b| matches!(b, b'=' | b':' | b'\n')) else { continue };
+        if rest[eq] == b'\n' || eq > 12 { continue; }
+        let after = rest[eq + 1..].iter().skip_while(|&&b| matches!(b, b' ' | b'\t')).copied().collect::<Vec<u8>>();
+        let Some(&q) = after.first().filter(|&&b| matches!(b, b'"' | b'\'')) else { continue };
+        let Some(end) = after[1..].iter().position(|&b| b == q) else { continue };
+        let val = &after[1..1 + end];
+        if val.len() < 20 || val.iter().any(|b| b.is_ascii_whitespace() || *b == b'/') { continue; }
+        let (has_d, has_a) = (val.iter().any(u8::is_ascii_digit), val.iter().any(u8::is_ascii_alphabetic));
+        if !has_d || !has_a || PLACEHOLDERS.iter().any(|p| val.windows(p.len()).any(|w| w.eq_ignore_ascii_case(p))) {
+            continue;
+        }
+        let (ent, uniq) = shannon_entropy(val);
+        if ent >= 3.8 && uniq >= 12 && !has_ignore_tag(line_slice(bytes, mat.start())) { return Some(mat.start()); }
+    }
+    None
+}
+
+fn match_slabs(bytes: &[u8]) -> Option<(usize, &'static str)> {
+    for (si, slab) in SECRET_ENGINE.slabs.iter().enumerate() {
+        let base = slab.rules.len();
+        for mat in slab.ac.find_iter(bytes) {
+            let pid = mat.pattern().as_usize();
+            if si == 0 && pid == base + 1 {
+                let ln = line_slice(bytes, mat.start());
+                if ln.windows(PEM_MARKER.len()).any(|w| w == PEM_MARKER.as_bytes())
+                    && !has_ignore_tag(ln)
+                {
+                    return Some((mat.start(), "pem_private_key"));
+                }
+            } else if si == 0 && pid == base {
+                if uri_creds_span(bytes, mat.start(), mat.end()).is_some()
+                    && !has_ignore_tag(line_slice(bytes, mat.start()))
+                {
+                    return Some((mat.start(), "database_credential_url"));
+                }
+            } else {
+                let r = &slab.rules[pid];
+                if left_bound(bytes, mat.start()) && token_len(&bytes[mat.end()..], r.mode) >= r.dmin
+                    && !has_ignore_tag(line_slice(bytes, mat.start()))
+                {
+                    return Some((mat.start(), r.kind));
+                }
             }
-        } else if let Some((_, creds, _)) = db_creds_span(&line[mat.end()..])
-            && !creds.ends_with(':') && !creds.contains("${") && !creds.contains("REDACTED")
-        {
-            return Some("database_credential_url");
         }
     }
     None
+}
+
+/// Single-pass 2-slab AVX2 Fat-Teddy SIMD detection across 120+ prefix/URI/PEM rules.
+pub fn find_secret(line: &str) -> Option<&'static str> { match_slabs(line.as_bytes()).map(|(_, k)| k) }
+
+/// Binary-safe zero-copy secret scan with Tier-4 high-entropy generic secret detection.
+pub fn find_secret_in_bytes(bytes: &[u8]) -> Option<(usize, &'static str)> {
+    if bytes[..bytes.len().min(8000)].contains(&0) { return None; }
+    let (pos, kind) = match_slabs(bytes)
+        .or_else(|| find_generic_entropy(bytes).map(|p| (p, "high_entropy_secret")))?;
+    let line = bytes[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+    Some((line, kind))
 }
 
 fn consume_pem_block(text: &str, end: usize) -> Option<usize> {
@@ -649,35 +814,42 @@ fn consume_pem_block(text: &str, end: usize) -> Option<usize> {
     Some(tail_start + end_rel + close_rel + PEM_MARKER.len())
 }
 
-/// Single-pass SIMD secret redaction across all secret prefixes, DB URIs, and PEM blocks.
+/// Single-pass SIMD secret redaction across all secret prefixes, URIs, and PEM blocks.
 pub fn redact_secrets(text: String) -> String {
-    if SECRET_AC.find(&text).is_none() && !text.contains(PEM_MARKER) { return text; }
     let bytes = text.as_bytes();
-    let (mut out, mut cursor) = (String::with_capacity(text.len()), 0usize);
-
-    for mat in SECRET_AC.find_iter(&text) {
-        if mat.start() < cursor { continue; }
-        let pid = mat.pattern().as_usize();
-        if pid == PEM_IDX {
-            if let Some(next_pos) = consume_pem_block(&text, mat.end()) {
-                out.push_str(&text[cursor..mat.start()]);
-                out.push_str("[REDACTED_PEM_PRIVATE_KEY]");
-                cursor = next_pos;
+    if SECRET_ENGINE.slabs.iter().all(|s| s.ac.find(bytes).is_none()) && !text.contains(PEM_MARKER) {
+        return text;
+    }
+    let mut hits: Vec<(usize, usize, String)> = Vec::new();
+    for (si, slab) in SECRET_ENGINE.slabs.iter().enumerate() {
+        let base = slab.rules.len();
+        for mat in slab.ac.find_iter(bytes) {
+            let pid = mat.pattern().as_usize();
+            if si == 0 && pid == base + 1 {
+                if let Some(next_pos) = consume_pem_block(&text, mat.end()) {
+                    hits.push((mat.start(), next_pos, "[REDACTED_PEM_PRIVATE_KEY]".into()));
+                }
+            } else if si == 0 && pid == base {
+                if let Some((host_off, stop)) = uri_creds_span(bytes, mat.start(), mat.end()) {
+                    let host = &text[mat.end() + host_off..mat.end() + stop];
+                    hits.push((mat.end(), mat.end() + stop, format!("REDACTED:REDACTED@{host}")));
+                }
+            } else {
+                let r = &slab.rules[pid];
+                let skip = token_len(&bytes[mat.end()..], 0);
+                if left_bound(bytes, mat.start()) && skip >= r.rmin {
+                    hits.push((mat.start(), mat.end() + skip, r.tag.into()));
+                }
             }
-        } else if pid < DB_BASE {
-            let (_, _, tag, _, rmin, _) = SECRET_SPECS[pid];
-            let skip = secret_token_len(&text[mat.end()..], false);
-            if left_bound(bytes, mat.start()) && skip >= rmin {
-                out.push_str(&text[cursor..mat.start()]);
-                out.push_str(tag);
-                cursor = mat.end() + skip;
-            }
-        } else if let Some((span_end, _, host)) = db_creds_span(&text[mat.end()..]) {
-            out.push_str(&text[cursor..mat.end()]);
-            out.push_str("REDACTED:REDACTED@");
-            out.push_str(host);
-            cursor = mat.end() + span_end;
         }
+    }
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+    let (mut out, mut cursor) = (String::with_capacity(text.len()), 0usize);
+    for (s, e, rep) in hits {
+        if s < cursor { continue; }
+        out.push_str(&text[cursor..s]);
+        out.push_str(&rep);
+        cursor = e;
     }
     out.push_str(&text[cursor..]);
     if out.contains(PEM_MARKER) { out.replace(PEM_MARKER, "REDACTED_PRIVATE_KEY-----") } else { out }
@@ -690,21 +862,14 @@ use crate::testutil::{TempRepo, TestRng};
 #[test]
 fn atomic_io_and_clock() {
     let dir = TempRepo::with_files("plat_io", &[
-        (".gitignore", "ignored_gen/\n*.generated.py\n"),
-        (".refitignore", "custom_skip/\n"),
-        ("src/keep.rs", "pub fn keep() {}\n"),
-        (".git/HEAD", "ref: refs/heads/main\n"),
-        ("node_modules/pkg/index.js", "module.exports = 1;\n"),
-        ("target/debug/bin.rs", "fn main() {}\n"),
-        (".refit/cas/blob", "x"),
-        ("ignored_gen/junk.py", "x = 1\n"),
-        ("src/auto.generated.py", "x = 2\n"),
-        ("custom_skip/skip.ts", "export const x = 1;\n"),
+        (".gitignore", "ignored_gen/\n*.generated.py\n"), (".refitignore", "custom_skip/\n"),
+        ("src/keep.rs", "pub fn keep() {}\n"), (".git/HEAD", "ref: refs/heads/main\n"),
+        ("node_modules/pkg/index.js", "module.exports = 1;\n"), ("target/debug/bin.rs", "fn main() {}\n"),
+        (".refit/cas/blob", "x"), ("ignored_gen/junk.py", "x = 1\n"),
+        ("src/auto.generated.py", "x = 2\n"), ("custom_skip/skip.ts", "export const x = 1;\n"),
     ]);
-    let rels: Vec<String> = walk_files(dir.path(), None)
-        .iter()
-        .filter_map(|path| crate::source::rel_norm(dir.path(), path))
-        .collect();
+    let rels: Vec<String> = walk_files(dir.path(), None).iter()
+        .filter_map(|p| crate::source::rel_norm(dir.path(), p)).collect();
     assert_eq!(rels, vec![".gitignore", ".refitignore", "src/keep.rs"]);
 
     let target = dir.join("state.json");
@@ -715,11 +880,7 @@ fn atomic_io_and_clock() {
     }
 
     let mut prev = now_ms();
-    for _ in 0..10_000 {
-        let cur = now_ms();
-        assert!(cur >= prev);
-        prev = cur;
-    }
+    for _ in 0..10_000 { let cur = now_ms(); assert!(cur >= prev); prev = cur; }
 
     let big = dir.join("big.txt");
     fs::write(&big, "hello\n".repeat(4000)).unwrap();
@@ -802,41 +963,37 @@ fn secret_detection_redaction() {
     let gh = ["ghp_", "1234567890abcdefghij123456"].concat();
     let db = ["postgres://", "admin:sup3rs3cr3t@db.internal:5432/prod"].concat();
     let slack = ["xoxa-", "1234567890abcdef1234"].concat();
-    let pem = [
+    let age = ["AGE-SECRET-KEY-1", "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"].concat();
+    let pem = concat!(
         "-----BEGIN RSA ",
         "PRIVATE KEY-----\nMIIEpAIBAAKCAQEASuperSecretBodyPayload==\n",
         "-----END RSA PRIVATE KEY-----",
-    ]
-    .concat();
-    let multi =
-        "docs = 'postgres://localhost/db' prod = 'postgres://admin:p4ssw0rd@db.prod:5432/app'";
+    ).to_string();
+    let multi = format!("docs = 'postgres://localhost/db' prod = '{}'",
+        ["postgres://", "admin:p4ssw0rd@db.prod:5432/app"].concat());
 
-    let samples = [
+    for (sample, want) in [
         (format!("key = \"{aws}\""), Some("aws_access_key_id")),
         (format!("tok = '{gh}'"), Some("github_pat")),
+        (format!("k = \"{age}\""), Some("age_secret_key")),
+        (format!("tok = '{gh}' # gitleaks:allow"), None),
         (db.clone(), Some("database_credential_url")),
         (pem.clone(), Some("pem_private_key")),
-        (multi.into(), Some("database_credential_url")),
+        (multi, Some("database_credential_url")),
         ("let normal = \"hello_world\";".into(), None),
-    ];
-    for (sample, want) in samples {
-        assert_eq!(find_secret(&sample), want);
+    ] {
+        assert_eq!(find_secret(&sample), want, "sample={sample}");
     }
+    assert!(secret_rule_meta().0 >= 130);
+    assert_eq!(find_secret_in_bytes(b"\x00\x01AKIAIOSFODNN7EXAMPLE"), None);
+    let ent_line = ["api_key = \"", "aB9xQ2mK7pZ4vL8nR3tW6yC1eH5j\""].concat();
+    assert_eq!(find_secret_in_bytes(ent_line.as_bytes()), Some((1, "high_entropy_secret")));
 
     let red = redact_secrets(format!("a={aws} b={gh} c={db} s={slack} p={pem}"));
-    let leaks = [
-        aws.as_str(),
-        gh.as_str(),
-        slack.as_str(),
-        "sup3rs3cr3t",
-        "SuperSecretBodyPayload",
-    ];
-    for leak in leaks {
+    for leak in [aws.as_str(), gh.as_str(), slack.as_str(), "sup3rs3cr3t", "SuperSecretBodyPayload"] {
         assert!(!red.contains(leak), "leaked {leak}");
     }
-    for tag in ["REDACTED_AWS_", "REDACTED_GITHUB_", "REDACTED_SLACK_"] {
-        assert!(red.contains(tag));
-    }
+    for tag in ["REDACTED_AWS_", "REDACTED_GITHUB_", "REDACTED_SLACK_"] { assert!(red.contains(tag)); }
 }
 
 #[cfg(test)]

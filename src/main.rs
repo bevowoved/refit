@@ -120,7 +120,7 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:18790")] listen: String,
         #[arg(long, default_value = DEFAULT_UPSTREAM)] upstream: String,
         #[arg(long, default_value = "moonshotai-kimi-k3.1-pro-trial")] model: String,
-        #[arg(long, default_value = "ui/index.html")] ui_index: PathBuf,
+        #[arg(long, default_value = "docs/index.html")] ui_index: PathBuf,
         #[arg(long, default_value = "telemetry/proxy.jsonl")] telemetry_out: PathBuf,
         #[arg(long)] repo: Option<PathBuf>,
         #[arg(long)] auth_token: Option<String>,
@@ -129,9 +129,14 @@ enum Commands {
         #[arg(long)] keep_warm: bool,
     },
     /// Start the concurrent JSON-RPC 2.0 MCP server (stdio, or stateless HTTP via --http).
-    Mcp {
+    Mcp { repo: PathBuf, #[arg(long)] http: Option<String> },
+    /// Scan repo, staged index, or git diff for secrets (or install pre-commit/pre-push hooks).
+    Secrets {
         repo: PathBuf,
-        #[arg(long)] http: Option<String>,
+        #[arg(long)] staged: bool,
+        #[arg(long)] diff: Option<String>,
+        #[arg(long)] install_hooks: bool,
+        #[arg(long)] no_cache: bool,
     },
     /// Run batch web research searches.
     Research {
@@ -362,6 +367,17 @@ fn cmd_mcp(repo: PathBuf, http: Option<String>) -> Result<()> {
     }
 }
 
+fn cmd_secrets(repo: &Path, staged: bool, diff: Option<&str>, install_hooks: bool, no_cache: bool) -> Result<()> {
+    if install_hooks {
+        return print_json(&json!({ "installed_hooks": untangle::install_secret_hooks(repo)? }));
+    }
+    let rep = untangle::scan_repo_secrets(repo, staged, diff, no_cache)?;
+    let count = rep.findings.len();
+    print_json(&rep)?;
+    if count > 0 { anyhow::bail!("blocked: {count} secret(s) detected"); }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     platform::init_allocator(platform::budget());
     match Cli::parse().command {
@@ -426,6 +442,9 @@ fn main() -> Result<()> {
             })
         }
         Commands::Mcp { repo, http } => cmd_mcp(repo, http),
+        Commands::Secrets { repo, staged, diff, install_hooks, no_cache } => {
+            cmd_secrets(&repo, staged, diff.as_deref(), install_hooks, no_cache)
+        }
         Commands::Research { lang, repo, max_results, queries } => {
             init_tracing();
             build_rt(false)?.block_on(async move {

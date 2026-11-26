@@ -8,7 +8,21 @@ name = "refit"
 version = "0.6.0"
 edition = "2024"
 rust-version = "1.100"
-description = "Cross-platform code audit, verification, and parallel refactor engine"
+description = "Cross-platform code audit, verification, secret guard, and parallel refactor engine"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+homepage = "https://patrickfield152-del.github.io/refit/"
+repository = "https://github.com/patrickfield152-del/refit"
+keywords = ["cli", "audit", "mcp", "secrets", "refactor"]
+categories = ["command-line-utilities", "development-tools"]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [features]
 default = ["alloc-mimalloc"]
@@ -114,6 +128,6 @@ opt-level = 2
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
+codegen-units = 16
 strip = "symbols"
 panic = "abort"

@@ -1,17 +1,26 @@
 use crate::lex::{ident_byte, left_bound, quoted_lit, scan_code};
-use crate::platform::find_secret;
-use crate::source::{RepoSnapshot, ext_of, parse_deps, supported_ext};
+use crate::platform::{
+    ensure_cachedir_tag, find_secret, find_secret_in_bytes, read_zstd, secret_rule_meta,
+    walk_files, write_atomic, write_zstd,
+};
+use crate::source::{RepoSnapshot, ext_of, parse_deps, rel_norm, supported_ext};
 use crate::types::{InfraFinding, UnusedDep};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use anyhow::Result;
 use fixedbitset::FixedBitSet;
+use rayon::prelude::*;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
+use std::time::{Instant, UNIX_EPOCH};
 
 static IGNORE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i-u:refit):[ \t]*(?i-u:ignore)(?:[ \t]*\[([^\]]*)\])?").expect("ignore re")
@@ -148,29 +157,17 @@ impl<'a> FindingSink<'a> {
     }
 
     fn skip_blank_or_comment(&mut self, raw_trim: &str, code_empty: bool) -> bool {
-        if raw_trim.is_empty() {
-            self.prev_ignore = None;
-            return true;
-        }
-        if code_empty {
-            self.prev_ignore = parse_ignore_directive(raw_trim);
-            return true;
-        }
+        if raw_trim.is_empty() { self.prev_ignore = None; return true; }
+        if code_empty { self.prev_ignore = parse_ignore_directive(raw_trim); return true; }
         false
     }
 
     fn begin_line(&mut self, raw: &str) { self.inline_ignore = parse_ignore_directive(raw); }
-    fn end_line(&mut self) {
-        self.prev_ignore = None;
-        self.inline_ignore = None;
-    }
+    fn end_line(&mut self) { self.prev_ignore = None; self.inline_ignore = None; }
 
     fn is_suppressed(&self, rule_id: &str) -> bool {
-        let matches = |list: &Vec<String>| {
-            list.is_empty() || list.iter().any(|item| item.eq_ignore_ascii_case(rule_id))
-        };
-        self.inline_ignore.as_ref().is_some_and(matches)
-            || self.prev_ignore.as_ref().is_some_and(matches)
+        let hit = |list: &Vec<String>| list.is_empty() || list.iter().any(|s| s.eq_ignore_ascii_case(rule_id));
+        self.inline_ignore.as_ref().is_some_and(hit) || self.prev_ignore.as_ref().is_some_and(hit)
     }
 
     fn emit(&mut self, line: usize, severity: &str, rule_id: &str, message: &str) {
@@ -179,22 +176,16 @@ impl<'a> FindingSink<'a> {
 
     fn emit_raw(&mut self, line: usize, severity: &str, rule_id: &str, message: &str) {
         self.out.push(InfraFinding {
-            file: self.rel.to_string(), line,
-            severity: severity.into(), rule_id: rule_id.into(), message: message.into(),
+            file: self.rel.into(), line, severity: severity.into(), rule_id: rule_id.into(), message: message.into(),
         });
     }
 }
 
 fn parse_ignore_directive(raw_line: &str) -> Option<Vec<String>> {
     let cap = IGNORE_RE.captures(raw_line)?;
-    let rules = cap.get(1).map_or_else(Vec::new, |mat| {
-        mat.as_str()
-            .split(',')
-            .map(|tok| tok.trim().to_ascii_lowercase())
-            .filter(|tok| !tok.is_empty())
-            .collect()
-    });
-    Some(rules)
+    Some(cap.get(1).map_or_else(Vec::new, |m| {
+        m.as_str().split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()).collect()
+    }))
 }
 
 fn scan_unused_deps(
@@ -207,14 +198,167 @@ fn scan_unused_deps(
         if !supported_ext(&ext) { continue; }
         let Some(matcher) = matchers[Eco::from_ext(&ext).idx()].as_mut() else { continue };
         if matcher.is_complete() { continue; }
-        if let Some(bytes) = snap.preloaded.get(rel) {
-            matcher.scan_bytes(bytes);
-        } else if let Ok(bytes) = fs::read(repo_root.join(rel)) {
-            matcher.scan_bytes(&bytes);
-        }
+        if let Some(bytes) = snap.preloaded.get(rel) { matcher.scan_bytes(bytes); }
+        else if let Ok(bytes) = fs::read(repo_root.join(rel)) { matcher.scan_bytes(&bytes); }
         if matchers.iter().all(|e| e.as_ref().is_none_or(EcoMatcher::is_complete)) { break; }
     }
     collect_unused_from_matchers(parsed, &matchers)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretHit { pub file: String, pub line: usize, pub kind: String }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SecretScanReport {
+    pub mode: String, pub rule_count: usize, pub files_checked: usize, pub cache_hits: usize,
+    pub duration_ms: u64, pub findings: Vec<SecretHit>,
+}
+
+type CachedSecret = (u64, u64, Option<(usize, String)>);
+
+#[derive(Default, Serialize, Deserialize)]
+struct SecretCacheDisk { rules_hash: String, entries: HashMap<String, CachedSecret> }
+
+struct FileSecretScan { file: String, mtime: u64, sz: u64, cached: bool, hit: Option<(usize, String)> }
+
+fn scan_git_blobs(repo: &Path, specs: &[(String, String)]) -> Vec<SecretHit> {
+    if specs.is_empty() { return Vec::new(); }
+    let Ok(mut child) = Command::new("git").args(["cat-file", "--batch"]).current_dir(repo)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+    else { return Vec::new() };
+    if let Some(mut stdin) = child.stdin.take() {
+        for (_, obj) in specs { let _ = writeln!(stdin, "{obj}"); }
+    }
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut blobs = Vec::with_capacity(specs.len());
+    for (rel, _) in specs {
+        let mut hdr = String::new();
+        if reader.read_line(&mut hdr).ok().filter(|&n| n > 0).is_none() { break; }
+        let sz = hdr.split_whitespace().nth(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        if sz == 0 || sz > 2 * 1024 * 1024 {
+            let (mut sink, mut rem) = (vec![0u8; sz.min(64 * 1024)], sz);
+            while rem > 0 {
+                let take = rem.min(sink.len());
+                if reader.read_exact(&mut sink[..take]).is_err() { break; }
+                rem -= take;
+            }
+            let mut nl = [0u8; 1];
+            let _ = reader.read_exact(&mut nl);
+            continue;
+        }
+        let mut buf = vec![0u8; sz];
+        if reader.read_exact(&mut buf).is_ok() {
+            let mut nl = [0u8; 1]; let _ = reader.read_exact(&mut nl);
+            blobs.push((rel.clone(), buf));
+        }
+    }
+    let _ = child.wait();
+    blobs.into_par_iter().filter_map(|(file, buf)| {
+        let (line, kind) = find_secret_in_bytes(&buf)?;
+        Some(SecretHit { file, line, kind: kind.into() })
+    }).collect()
+}
+
+/// Parallel zero-recompute secret scanner for repo, staged index, or git diff ranges.
+pub fn scan_repo_secrets(
+    repo_root: &Path, staged: bool, diff_base: Option<&str>, no_cache: bool,
+) -> Result<SecretScanReport> {
+    let (started, (rule_count, rhash)) = (Instant::now(), secret_rule_meta());
+    if staged || diff_base.is_some() {
+        let (mode, specs): (String, Vec<(String, String)>) = if staged {
+            let out = Command::new("git").args(["diff-index", "--cached", "--full-index", "HEAD"])
+                .current_dir(repo_root).output()?;
+            let rows = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| {
+                let p: Vec<&str> = l.split_whitespace().collect();
+                (p.len() >= 6 && p[4] != "D").then(|| (p[5].into(), p[3].into()))
+            }).collect();
+            ("staged".into(), rows)
+        } else {
+            let base = diff_base.unwrap_or("HEAD~1");
+            let rng = if base.contains("..") { base.to_string() } else { format!("{base}..HEAD") };
+            let out = Command::new("git").args(["diff", "--name-only", "--diff-filter=ACMR", &rng])
+                .current_dir(repo_root).output()?;
+            let tip = rng.split("..").last().unwrap_or("HEAD").to_string();
+            let rows = String::from_utf8_lossy(&out.stdout).lines()
+                .filter(|l| !l.trim().is_empty()).map(|f| (f.into(), format!("{tip}:{f}"))).collect();
+            (format!("diff:{rng}"), rows)
+        };
+        let mut findings = scan_git_blobs(repo_root, &specs);
+        findings.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+        return Ok(SecretScanReport {
+            mode, rule_count, files_checked: specs.len(), cache_hits: 0,
+            duration_ms: started.elapsed().as_millis() as u64, findings,
+        });
+    }
+    let cache_path = repo_root.join(".refit/cache/secrets_cache.zst");
+    let prev = if no_cache {
+        HashMap::new()
+    } else {
+        read_zstd::<SecretCacheDisk>(&cache_path)
+            .filter(|c| c.rules_hash == rhash)
+            .map_or_else(HashMap::new, |c| c.entries)
+    };
+    let files = walk_files(repo_root, None);
+    let results: Vec<FileSecretScan> = files
+        .par_iter()
+        .filter_map(|abs| {
+            let rel = rel_norm(repo_root, abs)?;
+            let meta = fs::metadata(abs).ok()?;
+            let sz = meta.len();
+            if sz == 0 || sz > 2 * 1024 * 1024 { return None; }
+            let mtime = meta.modified().ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as u64);
+            if let Some((pm, ps, ph)) = prev.get(&rel) && *pm == mtime && *ps == sz {
+                return Some(FileSecretScan { file: rel, mtime, sz, cached: true, hit: ph.clone() });
+            }
+            let bytes = fs::read(abs).ok()?;
+            let hit = find_secret_in_bytes(&bytes).map(|(l, k)| (l, k.to_string()));
+            Some(FileSecretScan { file: rel, mtime, sz, cached: false, hit })
+        })
+        .collect();
+    let (mut next_map, mut findings, mut cache_hits) = (HashMap::with_capacity(results.len()), Vec::new(), 0usize);
+    for row in results {
+        if row.cached { cache_hits += 1; }
+        if let Some((line, ref kind)) = row.hit {
+            findings.push(SecretHit { file: row.file.clone(), line, kind: kind.clone() });
+        }
+        next_map.insert(row.file, (row.mtime, row.sz, row.hit));
+    }
+    findings.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    if !no_cache {
+        if let Some(p) = cache_path.parent() { ensure_cachedir_tag(p); }
+        let _ = write_zstd(&cache_path, &SecretCacheDisk { rules_hash: rhash.into(), entries: next_map });
+    }
+    Ok(SecretScanReport {
+        mode: "repo".into(), rule_count, files_checked: files.len(), cache_hits,
+        duration_ms: started.elapsed().as_millis() as u64, findings,
+    })
+}
+
+/// Install local pre-commit and pre-push Git hooks backed by `refit secrets`.
+pub fn install_secret_hooks(repo_root: &Path) -> Result<Vec<String>> {
+    let hooks = repo_root.join(".git/hooks");
+    fs::create_dir_all(&hooks)?;
+    let pc = "#!/usr/bin/env sh\nexec refit secrets . --staged\n";
+    let pp = concat!(
+        "#!/usr/bin/env sh\nZ=0000000000000000000000000000000000000000\n",
+        "while read -r _ l _ r; do\n  [ \"$l\" = \"$Z\" ] && continue\n",
+        "  if [ \"$r\" = \"$Z\" ]; then refit secrets . --diff \"HEAD~1..$l\" || exit 1\n",
+        "  else refit secrets . --diff \"$r..$l\" || exit 1; fi\ndone\n",
+    );
+    let mut written = Vec::new();
+    for (name, body) in [("pre-commit", pc), ("pre-push", pp)] {
+        let p = hooks.join(name);
+        write_atomic(&p, body.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o755));
+        }
+        written.push(p.to_string_lossy().into_owned());
+    }
+    Ok(written)
 }
 
 /// Snapshot-backed infra & unused-dependency scan sharing the single `RepoSnapshot` tree walk.

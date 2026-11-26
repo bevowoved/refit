@@ -1,18 +1,28 @@
 ---
 name: refit
-description: Polyglot code refactoring contract for MCP and agent workflows. Supports Python, Rust, TypeScript, JavaScript, Go, and infra files inside isolated MVCC worktrees.
+description: >
+  Local pre-flight code audit, sub-millisecond secret guard, polyglot symbol graph,
+  and atomic MVCC refactoring engine for coding agents. Use when auditing repos,
+  blocking secret leaks pre-push, untangling cycles/clones/dead symbols, or applying
+  verified multi-file edits across Python, Rust, TypeScript, JavaScript, Go, and infra.
+license: MIT OR Apache-2.0
+compatibility: Single static Rust binary (Linux, macOS, Windows); zero Node/Bun runtime required
+metadata:
+  author: patrickfield152-del
+  version: "0.6.0"
+allowed-tools: Read, Glob, Grep, Bash(refit:*)
 ---
 
-# refit Polyglot Refactoring Contract
+# refit Polyglot Agent Contract
 
-You refactor and untangle code inside `refit`. The engine checks every change in an isolated stage (`clear_env=true`) with formatters and Gates 0 to 3.5 before an atomic MVCC commit.
+Use `refit` as your deterministic local verification and refactoring engine. Every change passes isolated staging (`clear_env=true`), formatters, Gates 0–3.5, and atomic MVCC commit.
 
 ## 1. Workflow Rules
 
-1. **Inspect before you edit.** Call read-only tools (`refit_symbols`, `refit_read`, `refit_search`, `refit_audit`, `refit_rewind`, `refit_dep_audit`) to check callers, dead symbols, and library docs. Do not guess unseen code.
-2. **Untangle structure.** Edit in place, or use `create`, `delete`, and `rename` patches to split large files, merge duplicate modules, and remove dead files. Update all callers in one transaction.
-3. **Keep tests strong.** Do not delete or weaken tests. Add falsifiable characterization tests before you split untested legacy code.
-4. **Rely on stage formatters.** The stage runs `ruff format`, `rustfmt`, `biome format`, and `gofmt` automatically. Spend tokens on logic, types, and module boundaries, not manual line wrapping.
+1. **Inspect before editing.** Call read-only tools (`refit_symbols`, `refit_read`, `refit_search`, `refit_audit`, `refit_rewind`, `refit_dep_audit`) to verify callers, dead symbols, and docs. Never guess unseen code.
+2. **Guard secrets before commit/push.** Run `refit secrets . --staged` (or install native hooks via `refit secrets . --install-hooks`) before committing or pushing.
+3. **Untangle structure.** Edit in place or batch `create`/`delete`/`rename` patches in one atomic MVCC transaction.
+4. **Keep tests strong.** Never weaken or drop assertions; rely on stage formatters (`ruff format`, `rustfmt`, `biome format`, `gofmt`).
 
 ## 2. Patch Format
 

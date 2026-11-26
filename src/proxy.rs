@@ -128,7 +128,7 @@ impl ProxyConfig {
     pub fn new(listen: String, upstream: String, api_key: String, model: String) -> Self {
         Self {
             listen_addr: listen, upstream_base_url: upstream, api_key, model_override: model,
-            ui_index_path: PathBuf::from("ui/index.html"), static_prefix_override: None,
+            ui_index_path: PathBuf::from("docs/index.html"), static_prefix_override: None,
             cache_retention: CacheMode::Short, keep_warm: false, auth_token: None,
             lang_prefixes: BTreeMap::new(), preserve_tools: true,
         }

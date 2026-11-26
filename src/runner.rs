@@ -43,7 +43,7 @@ pub struct RunOptions {
     #[arg(long)] pub openclaw_token: Option<String>,
     #[arg(long, default_value = "openclaw:main")] pub openclaw_model: String,
     #[arg(long, default_value = "127.0.0.1:18790")] pub proxy_addr: String,
-    #[arg(long = "ui-index", default_value = "ui/index.html")] pub ui_index_path: PathBuf,
+    #[arg(long = "ui-index", default_value = "docs/index.html")] pub ui_index_path: PathBuf,
     #[arg(long, default_value = "skills/refit/SKILL.md")] pub skill_path: PathBuf,
     #[arg(long = "telemetry-out", default_value = "telemetry/run.jsonl")] pub telemetry_path: PathBuf,
     #[arg(long)] pub bench_script: Option<PathBuf>,

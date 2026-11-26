@@ -1,60 +1,26 @@
 # refit
 
-`refit` is a pure-Rust polyglot code audit, verification, and parallel refactoring engine. It scans Python, Rust, TypeScript, JavaScript, Go, and infra files with zero Node or Bun runtime.
+[![CI](https://github.com/patrickfield152-del/refit/actions/workflows/ci.yml/badge.svg)](https://github.com/patrickfield152-del/refit/actions/workflows/ci.yml)
+[![Release](https://github.com/patrickfield152-del/refit/actions/workflows/release.yml/badge.svg)](https://github.com/patrickfield152-del/refit/releases)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license--credits)
+[![Rust 1.100+](https://img.shields.io/badge/rust-1.100%2B-orange.svg)](rust-toolchain.toml)
 
-- **Single Binary:** Builds on Linux, macOS, and Windows. Embeds the `codehygiene` ternary neural model (`weights.npz`) with zero external JS sidecar.
+**The local pre-flight engine for coding agents:** sub-millisecond secret push-guard, embedded ternary neural code hygiene, polyglot symbol graph, and atomic MVCC refactoring in **one static Rust binary** (zero Node/Bun runtime, zero active dependency duplicates).
+
 - **Interactive Replay:** [patrickfield152-del.github.io/refit/?replay=run.jsonl](https://patrickfield152-del.github.io/refit/?replay=run.jsonl)
+- **Agent Skill:** [skills/refit/SKILL.md](skills/refit/SKILL.md) (open `agentskills.io` / `skills.sh` standard)
 
-## Core Capabilities
+---
 
-1. **Repository Scan and Audit (`refit scan`, `refit audit`):** Detect cross-file clones, dead exported symbols, orphan files, large high-risk files, duplicate modules, unused dependencies (`package.json`, `Cargo.toml`, `pyproject.toml`, `go.mod`, lockfiles), and infra issues (Terraform, Dockerfiles, GitHub Actions, SQL).
-2. **Exact Pure-Rust Hygiene (`src/hygiene.rs`):** Run the embedded ternary neural model (`weights.npz`) with `0.000000` max parity delta against `vendor/codehygiene/worker.mjs`. Supports optional `--approx-long` fast path for long files while keeping exact caches isolated.
-3. **Polyglot Symbol Graph and DAG (`src/stem.rs`, `src/graph.rs`):** Index Python, Rust, TypeScript/TSX, JavaScript, and Go with `.gitignore` filtering, test-code stripping, and zstd front-coded SST storage for large repos (`>= 500` files). Collapse cyclic SCCs and dispatch disjoint Kahn waves.
-4. **Atomic Multi-File Transactions (`src/graph/patch.rs`, `src/mvcc.rs`):** Apply `edit`, `create`, `delete`, and `rename` patches inside atomic MVCC WAL transactions with BLAKE3 CAS checks, OS file locks, CRC32C checksums, and crash recovery.
-5. **Sandboxed Formatters and Gates (`src/gates.rs`, `src/gates/stage.rs`):** Run `ruff format`, `rustfmt`, `gofmt`, and `biome format` before Gates 0 to 3.5 inside ephemeral stages (`clear_env=true`, `CACHEDIR.TAG`, bounded LRU GC).
-6. **Hardened Proxy, Web Search, and Concurrent MCP (`src/proxy.rs`, `src/research.rs`, `src/mcp.rs`):** Pace rolling uncached TPM with exact refunds, route web research across configurable providers (`REFIT_SEARCH_PROVIDERS`), and serve 17 concurrent MCP tools over stdio or stateless HTTP (`--http`).
-7. **Governance Artifacts and STE100 Prose (`refit sustain`, `refit learn`):** Generate `AGENTS.md`, `.refit/invariants.yml`, `docs/ADR-001-untangle.md`, and `.github/workflows/refit-guard.yml`, with optional `--ste100` prose linting and SymbolGraph-backed `--rewind` impact queries.
+## Agent & Skill Setup (60 Seconds)
 
-## Install
-
-### Prebuilt Release Binaries (Linux, macOS Apple Silicon, Windows)
-
-Download the archive for your platform plus `SHA256SUMS.txt` from [GitHub Releases](https://github.com/patrickfield152-del/refit/releases):
+### 1. Install the Agent Skill (`Claude Code`, `Cursor`, `Antigravity`, `Codex`)
 
 ```bash
-# Linux / macOS (verify checksum, then extract)
-sha256sum -c --ignore-missing SHA256SUMS.txt
-tar -xzf refit-x86_64-unknown-linux-gnu.tar.gz   # or refit-aarch64-apple-darwin.tar.gz
+npx skills add patrickfield152-del/refit --skill refit
 ```
 
-```powershell
-# Windows (PowerShell)
-Get-FileHash refit-x86_64-pc-windows-msvc.zip -Algorithm SHA256
-Expand-Archive refit-x86_64-pc-windows-msvc.zip -DestinationPath .\bin
-```
-
-### Build from Source (Rust `1.100.0`)
-
-```bash
-cargo install --path . --locked --features full
-```
-
-## Verified `v0.6.0` Benchmarks & Footprint
-
-| Metric | Measured Value | Notes |
-| :--- | :--- | :--- |
-| Release binary size | **`10.81 MiB`** (Win x64) · **`13.82 MiB`** (Linux x64 `jemalloc`) | Single static binary w/ embedded `weights.npz` |
-| Active Cargo dep duplicates | **`0`** across all 4 targets | `cargo tree --locked -e normal --duplicates` |
-| Neural parity vs JS reference | **`0.000000`** max delta | Pure-Rust SIMD + scalar parity verified |
-| Scan latency (real repos) | **`79 ms`** (`gin`) · **`346 ms`** (`hono`) · **`1.04 s`** (`uv`) | Cold `refit scan --no-cache` |
-| 1-vCPU Peak RSS (`jem_full`) | **`17.57 MiB`** (`mcp`) · **`27.34 MiB`** (`scan`) · **`29.71 MiB`** (`audit`) | Warm `56.95 ms`, sustain `27.67 ms` |
-| Quality & Mutation Gates | **`101/101`** Win · **`102/102`** WSL2 · **`8/8`** `T14` mutants killed | `0` clippy warnings, `0` squiggles (`51/51` files) |
-
-## MCP Client Setup
-
-`refit mcp` exposes 17 concurrent tools over stdio (default) or stateless HTTP (`--http`).
-
-### Claude Code / Cursor / Antigravity / Codex (`stdio`)
+### 2. Connect the 17-Tool MCP Server (`stdio` or Stateless HTTP)
 
 ```json
 {
@@ -67,37 +33,87 @@ cargo install --path . --locked --features full
 }
 ```
 
-### Stateless HTTP Server
+Or run stateless HTTP (`refit mcp . --http 127.0.0.1:18791`) or OpenClaw ([openclaw/openclaw.refit.json](openclaw/openclaw.refit.json)).
+
+### 3. Block Secret Leaks Locally in Milliseconds (`pre-commit` + `pre-push`)
 
 ```bash
-refit mcp /path/to/repo --http 127.0.0.1:18791
+refit secrets . --install-hooks     # installs .git/hooks/{pre-commit,pre-push}
+refit secrets . --staged            # <10 ms staged blob scan via git cat-file --batch
+refit secrets . --diff origin/main  # <10 ms unpushed commit scan
+refit secrets .                     # parallel zero-recompute repo scan (BLAKE3 cache)
 ```
 
-### OpenClaw
+---
 
-Use [openclaw/openclaw.refit.json](openclaw/openclaw.refit.json) and [skills/refit/SKILL.md](skills/refit/SKILL.md).
+## Architecture & Pipeline
 
-## Quick Start
+```text
+  Repo / Git Index
+        │
+        ├─► [Secret Guard]  2-slab ≤64 AVX2 Fat-Teddy SIMD (130+ explicit rules + Tier-4 entropy)
+        │                   + BLAKE3 zero-recompute cache → 0.54 ms (10K LOC) / 0.24 ms warm (10K files)
+        ├─► [Symbol Graph]  Polyglot lexer (Py/Rs/TS/JS/Go) + zstd SST + Pearce SCC + Kahn waves
+        ├─► [Neural Gate]   Embedded ternary codehygiene (`weights.npz`, 0.000000 parity vs JS)
+        └─► [Atomic MVCC]   BLAKE3 CAS + CRC32C WAL + ephemeral isolated stages (clear_env=true)
+```
+
+### Secret Engine Benchmark (Measured: 10K LOC & 10K Files / 400K LOC / 39.5 MiB)
+
+| Variant | Startup | 10K LOC (Cold) | 10K Files / 400K LOC (Cold) | 10K Files (Warm Cache) |
+| :--- | ---: | ---: | ---: | ---: |
+| V1 — Flat `AhoCorasick` (>64 pats, scalar NFA) | `0.30 ms` | `1.22 ms` | `12.79 ms` | — |
+| V3 — `RegexSet` (121 compiled regexes) | `2.51 ms` | `1.42 ms` | `11.03 ms` | — |
+| **V2 (Shipped) — 2× ≤64 AVX2 Fat-Teddy + Zero-Regex Table + BLAKE3 Cache** | **`0.51 ms`** | **`0.54 ms`** | **`8.85 ms`** (~4.5 GB/s) | **`0.24 ms`** |
+
+Supports inline false-positive comments across all ecosystems: `gitleaks:allow`, `pragma: allowlist secret`, `trufflehog:ignore`, and `refit:ignore`.
+
+---
+
+## Verified `v0.6.0` Footprint & Benchmarks
+
+| Metric | Measured Value | Verification |
+| :--- | :--- | :--- |
+| Binary size | **`10.81 MiB`** (Win x64) · **`13.82 MiB`** (Linux x64 `jemalloc`) | Single binary w/ embedded `weights.npz` |
+| Active Cargo duplicates | **`0`** across all 4 targets | `cargo tree --locked -e normal --duplicates` |
+| Neural parity vs JS | **`0.000000`** max delta | `S4` exact SIMD + scalar parity |
+| Real-repo cold scan | **`79 ms`** (`gin`) · **`346 ms`** (`hono`) · **`1.04 s`** (`uv`) | `refit scan --no-cache` |
+| 1-vCPU Peak RSS (`jem_full`) | **`17.57 MiB`** (`mcp`) · **`27.34 MiB`** (`scan`) · **`29.71 MiB`** (`audit`) | Warm `56.95 ms`, sustain `27.67 ms` |
+| Quality & Mutation Gates | **`101/101`** Win · **`102/102`** WSL2 · **`8/8`** `T14` mutants killed | `0` clippy warnings, `0` squiggles, `0` infra findings |
+
+---
+
+## Install
 
 ```bash
-# Build, verify (S1-S14), and mutation-test (T14) via pure-Rust xtask
+# 1) Prebuilt binary via cargo-binstall (Linux, macOS Apple Silicon, Windows)
+cargo binstall refit
+
+# 2) Or download archives + SHA256SUMS.txt from GitHub Releases
+sha256sum -c --ignore-missing SHA256SUMS.txt
+tar -xzf refit-x86_64-unknown-linux-gnu.tar.gz   # or refit-aarch64-apple-darwin.tar.gz
+
+# 3) Or build from source (Rust 1.100+, parallel ThinLTO)
+cargo install --path . --locked --features full
+```
+
+## CLI & Verification Quick Start
+
+```bash
+# Verify (S1-S14) and mutation-test (T14) via pure-Rust xtask
 cargo clippy --locked --workspace --all-targets --features full -- -D warnings
 cargo test --locked --features full
-cargo build --release --locked --features full
 cargo xtask verify
 cargo xtask mutate
 
-# Scan, audit, or sustain a repository
-./target/release/refit scan ./fixture/target_repo --fast
-./target/release/refit audit ./your_repo --markdown
-./target/release/refit sustain ./your_repo --dry-run
-./target/release/refit learn ./your_repo --rewind my_symbol
-./target/release/refit gc ./your_repo
-
-# Run parallel refactoring in an isolated git worktree
-export CEREBRAS_API_KEY="csk-..."
-export REFIT_SEARCH_PROVIDERS="tavily,exa,brave"
-./target/release/refit run ./your_repo --worktree --openclaw-url http://127.0.0.1:18789/v1
+# Everyday agent & developer commands
+refit secrets . --staged                  # millisecond pre-commit / pre-push secret guard
+refit scan . --fast                       # DAG, symbol graph, and neural hygiene
+refit audit . --markdown                  # clones, dead symbols, unused deps, infra security
+refit sustain . --dry-run                 # generate AGENTS.md, invariants.yml, ADR-001, CI guard
+refit learn . --rewind my_symbol          # SymbolGraph 1-hop rewind impact query
+refit gc .                                # prune CAS blobs, stages, and bounded caches
+refit run . --worktree --openclaw-url http://127.0.0.1:18789/v1
 ```
 
 ## Feature Flags
@@ -114,7 +130,10 @@ export REFIT_SEARCH_PROVIDERS="tavily,exa,brave"
 | `build-cache` | Copy-on-write reflink stage acceleration |
 | `full` | Enables `wal-crc32c`, `sst-storage`, `live-rewind`, `doc-drift`, `ste100`, `build-cache` |
 
-## Credits
+## License & Credits
 
-- [`proxysoul/stem`](https://github.com/proxysoul/stem)
-- [`brianbell-x/codehygiene`](https://github.com/brianbell-x/codehygiene)
+Dual-licensed under **`MIT OR Apache-2.0`** (standard Rust ecosystem license; compatible with permissive rule ecosystems).
+
+- [`proxysoul/stem`](https://github.com/proxysoul/stem) — symbol graph inspiration
+- [`brianbell-x/codehygiene`](https://github.com/brianbell-x/codehygiene) — ternary neural code hygiene weights (`weights.npz`)
+- [`mongodb/kingfisher`](https://github.com/mongodb/kingfisher) (Apache-2.0) & [`gitleaks/gitleaks`](https://github.com/gitleaks/gitleaks) (MIT) — permissive secret pattern formats & prefilter design references
