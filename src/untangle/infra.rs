@@ -395,7 +395,7 @@ pub fn render_secrets_sarif(rep: &SecretScanReport) -> Value {
             "tool": {
                 "driver": {
                     "name": "refit",
-                    "informationUri": "https://github.com/patrickfield152-del/refit",
+                    "informationUri": "https://github.com/bevowoved/refit",
                     "rules": rules
                 }
             },

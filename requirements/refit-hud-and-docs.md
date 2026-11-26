@@ -1,7 +1,7 @@
 # refit Live Refactoring HUD & README Truth Requirements
 
 ## Target Application
-Live URL: https://patrickfield152-del.github.io/refit/?demo=1&at=100
+Live URL: https://bevowoved.github.io/refit/?demo=1&at=100
 
 ## UC-1: Interactive Replay HUD & Gate 4 Kane Inspector (Desktop Chrome)
 1. Opening the live URL renders the refit Live Refactoring HUD with the "refit" wordmark, Replay Controls bar, Topological Wavefront grid, and the "Gate 4 · Kane" button in the top status bar.

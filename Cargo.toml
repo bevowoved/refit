@@ -8,13 +8,14 @@ name = "refit"
 version = "0.6.0"
 edition = "2024"
 rust-version = "1.100"
-description = "Cross-platform code audit, verification, secret guard, and parallel refactor engine"
+description = "Converged neural code hygiene, architectural untangle, Stem symbol graph, deslop, web-wired MCP, event-driven hooks & Kane CLI verification engine"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-homepage = "https://patrickfield152-del.github.io/refit/"
-repository = "https://github.com/patrickfield152-del/refit"
-keywords = ["cli", "audit", "mcp", "secrets", "refactor"]
+homepage = "https://bevowoved.github.io/refit/"
+repository = "https://github.com/bevowoved/refit"
+keywords = ["code-hygiene", "untangle", "mcp", "refactor", "verification"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["fixture/*", "SUBMISSIONS/*", ".refit/*"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"

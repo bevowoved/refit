@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>refit × Kane CLI — 7ms Static Shield &amp; Closed-Loop Live Verification HUD</title>
-<meta name="description" content="Single static Rust binary: 0.54ms AVX2 secret &amp; Unicode guard, static OSV SCA, README lie detector, 12-tool SEP-2640 MCP server, and Gate 4 TestMu AI Kane CLI live browser/mobile verification." />
+<title>refit x TestMu AI Kane CLI | Neural Code Hygiene, Untangle &amp; Live Verification HUD</title>
+<meta name="description" content="Embedded Neural Code Hygiene, Architectural Untangle (SCC cycles, clones, deslop), Polyglot Stem SymbolGraph, web-wired MCP guidance (Keenable, OSV, SEP-2640), event-driven agent hooks, and atomic MVCC WAL paired with TestMu AI Kane CLI." />
 <meta property="og:type" content="website" />
-<meta property="og:title" content="refit × Kane CLI — The 7ms Static Shield + Live Verification Spine" />
-<meta property="og:description" content="Stop secrets, prompt injections, OSV CVEs, and README drift in 7ms — then prove live web &amp; mobile flows with Kane CLI inside an atomic MVCC loop." />
-<meta property="og:url" content="https://patrickfield152-del.github.io/refit/" />
+<meta property="og:title" content="refit x TestMu AI Kane CLI | Neural Code Hygiene &amp; Live Verification Spine" />
+<meta property="og:description" content="TestMu Loop Engineering: independent Neural Code Hygiene, Architectural Untangle, Polyglot Stem SymbolGraph, web-wired MCP guidance, and atomic MVCC WAL paired with TestMu AI Kane CLI live browser and mobile verification." />
+<meta property="og:url" content="https://bevowoved.github.io/refit/" />
 <meta name="twitter:card" content="summary_large_image" />
-<meta name="twitter:title" content="refit × Kane CLI — 7ms Static Shield + Live Verification Spine" />
-<meta name="twitter:description" content="12 converged MCP tools (vs 92 Playwright), 0.54ms AVX2 secret guard, .evidence secret auditor, and atomic MVCC self-healing with Kane CLI." />
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230A0D14'/%3E%3Ccircle cx='10' cy='10' r='3' fill='%23FF5A1F'/%3E%3Ccircle cx='22' cy='10' r='2.2' fill='%23FF5A1F' opacity='.7'/%3E%3Ccircle cx='10' cy='22' r='2.2' fill='%2322D3EE' opacity='.85'/%3E%3Ccircle cx='22' cy='22' r='3' fill='%2310B981'/%3E%3C/svg%3E" />
+<meta name="twitter:title" content="refit x TestMu AI Kane CLI | Neural Code Hygiene &amp; Live Verification Spine" />
+<meta name="twitter:description" content="12 converged SEP-2640 MCP tools (vs 92 Playwright), Embedded Neural Code Hygiene, Architectural Untangle, event-driven hooks, and atomic MVCC WAL with TestMu AI Kane CLI." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230F172A'/%3E%3Ccircle cx='10' cy='10' r='3' fill='%231D4ED8'/%3E%3Ccircle cx='22' cy='10' r='2.2' fill='%233B82F6' opacity='.85'/%3E%3Ccircle cx='10' cy='22' r='2.2' fill='%230369A1' opacity='.85'/%3E%3Ccircle cx='22' cy='22' r='3' fill='%23059669'/%3E%3C/svg%3E" />
 <style>
   :root {
     --ground: #0A0D14;
@@ -286,7 +286,7 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    transition: all 0.12s ease;
+    transition: background-color 160ms cubic-bezier(0.22, 1, 0.36, 1), border-color 160ms cubic-bezier(0.22, 1, 0.36, 1), color 160ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
   .rp-btn:hover {
@@ -1524,382 +1524,697 @@
     display: flex;
   }
 
-  /* ================= UNSLOP CEREBRAS LIGHT PAPER & HALFTONE EDITORIAL THEME ================= */
+  /* ================= ARCHITECTURAL GALLERY-LIGHT & PRECISION-INSTRUMENT THEME ================= */
   :root {
-    --ground: #F8F7F2;
+    --ground: #F6F8FA;
+    --frame: #EAEEF2;
     --card: #FFFFFF;
-    --card-well: #F3F1EC;
-    --border: rgba(28, 28, 27, 0.13);
-    --border-hi: rgba(28, 28, 27, 0.22);
-    --ink: #1C1C1B;
-    --muted: #575753;
-    --dim: #747470;
-    --orange: #D94826;
-    --cyan: #1D4ED8;
-    --purple: #6D28D9;
-    --emerald: #146C43;
-    --rose: #B42318;
+    --card-well: #F1F5F9;
+    --border: rgba(15, 23, 42, 0.14);
+    --border-hi: rgba(15, 23, 42, 0.24);
+    --ink: #0F172A;
+    --muted: #475569;
+    --dim: #475569;
+    --accent: #1D4ED8;
+    --accent-hover: #1E40AF;
+    --orange: #1D4ED8;
+    --cyan: #0369A1;
+    --purple: #4F46E5;
+    --emerald: #059669;
+    --emerald-ink: #047857;
+    --rose: #DC2626;
+    --rose-ink: #B91C1C;
     --amber: #B45309;
     --blue: #1D4ED8;
-    --sky: #1D4ED8;
+    --sky: #0369A1;
   }
 
   #viewport {
-    background: #EFECE6;
+    background: #EAEEF2;
   }
 
   #hud-stage {
-    background-color: #F8F7F2;
+    background-color: #F6F8FA;
     background-image:
-      radial-gradient(ellipse 680px 380px at 100% 0%, rgba(251, 238, 232, 0.9), transparent 72%),
-      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='9' height='9'><rect x='3' y='3' width='3' height='3' fill='%23f1957b' fill-opacity='0.34'/></svg>");
-    background-size: 100% 100%, 9px 9px;
+      radial-gradient(ellipse 760px 360px at 100% 0%, rgba(29, 78, 216, 0.065), transparent 70%),
+      radial-gradient(ellipse 620px 320px at 0% 100%, rgba(5, 150, 105, 0.045), transparent 70%),
+      radial-gradient(rgba(15, 23, 42, 0.11) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 16px 16px;
   }
 
   .topbar,
   .panel,
   .score-card,
-  .timeline-bar {
+  .timeline-card {
     background: #FFFFFF;
-    border-color: rgba(28, 28, 27, 0.13);
-    box-shadow: 0 10px 26px rgba(28, 28, 27, 0.05), 0 1px 3px rgba(28, 28, 27, 0.04);
+    border-color: rgba(15, 23, 42, 0.14);
+    box-shadow: 0 6px 20px rgba(15, 23, 42, 0.045), 0 1px 2px rgba(15, 23, 42, 0.04);
   }
 
   .brand-badge {
-    background: #FBEAE0;
-    border-color: rgba(217, 72, 38, 0.35);
+    background: #EFF6FF;
+    border-color: rgba(29, 78, 216, 0.30);
+  }
+
+  .brand-wordmark {
+    color: #0F172A;
+    letter-spacing: -0.03em;
   }
 
   .mode-chip {
-    background: #EAF6F0;
-    color: #146C43;
-    border-color: rgba(20, 108, 67, 0.35);
+    background: #ECFDF5;
+    color: #047857;
+    border-color: rgba(5, 150, 105, 0.36);
   }
 
   .mode-chip.replay {
-    background: #EEF4FD;
+    background: #EFF6FF;
     color: #1D4ED8;
-    border-color: rgba(29, 78, 216, 0.35);
+    border-color: rgba(29, 78, 216, 0.36);
   }
 
   .mode-chip.demo {
-    background: #F3EEFE;
-    color: #6D28D9;
-    border-color: rgba(109, 40, 217, 0.35);
+    background: #EEF2FF;
+    color: #4338CA;
+    border-color: rgba(79, 70, 229, 0.36);
+  }
+
+  .mode-chip.warn {
+    background: #FFFBEB;
+    color: #B45309;
+    border-color: rgba(180, 83, 9, 0.38);
   }
 
   .pill,
   .metric-well,
-  .tpm-stat-box,
-  .log-strip,
+  .kpi-box,
+  .bench-box,
+  .gate-strip,
+  .learn-strip,
+  .phase-breakdown,
+  .layer-meta,
   .wall-box,
   .replay-bar {
-    background: #F3F1EC !important;
-    border-color: rgba(28, 28, 27, 0.12) !important;
-    color: #1C1C1B !important;
+    background: #F1F5F9 !important;
+    border-color: rgba(15, 23, 42, 0.14) !important;
+    color: #0F172A !important;
+  }
+
+  .wall-box.warn {
+    background: #FFFBEB !important;
+    border-color: rgba(180, 83, 9, 0.45) !important;
+  }
+
+  .wall-box.over {
+    background: #FEF2F2 !important;
+    border-color: rgba(220, 38, 38, 0.48) !important;
+  }
+
+  .wal-pill.circuit-open {
+    background: #FFFBEB !important;
+    border-color: #B45309 !important;
+    box-shadow: 0 0 0 3px rgba(180, 83, 9, 0.14) !important;
+  }
+
+  .wal-pill.circuit-open .circuit-tag {
+    color: #92400E !important;
+    background: rgba(180, 83, 9, 0.15) !important;
+  }
+
+  .wal-pill.circuit-half {
+    background: #FFFBEB !important;
+    border-color: rgba(180, 83, 9, 0.45) !important;
+  }
+
+  .wal-pill.circuit-half .circuit-tag {
+    color: #B45309 !important;
   }
 
   .rp-btn {
     background: #FFFFFF !important;
-    color: #1C1C1B !important;
-    border-color: rgba(28, 28, 27, 0.16) !important;
+    color: #0F172A !important;
+    border-color: rgba(15, 23, 42, 0.18) !important;
+  }
+
+  .rp-btn:hover {
+    border-color: #1E40AF !important;
+    color: #1E40AF !important;
+    background: #EFF6FF !important;
   }
 
   .rp-btn.active {
-    background: #D94826 !important;
+    background: #1D4ED8 !important;
     color: #FFFFFF !important;
-    border-color: #D94826 !important;
+    border-color: #1D4ED8 !important;
+  }
+
+  .rp-btn.active:hover {
+    background: #1E40AF !important;
+    border-color: #1E40AF !important;
+    color: #FFFFFF !important;
   }
 
   .rp-scrub,
   .mini-track,
-  .tpm-track,
+  .pacer-track,
   .tl-bar {
-    background: #E5E2DA !important;
-    border-color: rgba(28, 28, 27, 0.14) !important;
+    background: #EAEEF2 !important;
+    border-color: rgba(15, 23, 42, 0.14) !important;
+  }
+
+  .rp-scrub::-webkit-slider-thumb {
+    background: #1D4ED8;
+    border: 2px solid #FFFFFF;
+    box-shadow: 0 1px 4px rgba(15, 23, 42, 0.28);
+  }
+
+  .rp-scrub::-moz-range-thumb {
+    background: #1D4ED8;
+    border: 2px solid #FFFFFF;
   }
 
   .panel-hdr {
-    background: #F8F7F2 !important;
-    border-bottom-color: rgba(28, 28, 27, 0.1) !important;
+    background: #F6F8FA !important;
+    border-bottom-color: rgba(15, 23, 42, 0.14) !important;
+    padding: 10px 16px;
+  }
+
+  .panel-title,
+  .sc-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    text-transform: none;
+    color: #0F172A;
+  }
+
+  .panel-title .dot {
+    background: #1D4ED8;
+  }
+
+  .mw-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    text-transform: none;
+    color: #475569;
+  }
+
+  .gs-label,
+  .hb-label {
+    text-transform: none;
+    letter-spacing: 0.01em;
+    font-weight: 600;
+    color: #475569;
   }
 
   .layer-row {
-    background: #FAF9F5 !important;
-    border-color: rgba(28, 28, 27, 0.08) !important;
+    background: transparent !important;
   }
 
   .tile {
-    background: #F1EFE9 !important;
-    border-color: rgba(28, 28, 27, 0.12) !important;
-    color: #1C1C1B !important;
+    background: #F1F5F9 !important;
+    border-color: rgba(15, 23, 42, 0.14) !important;
+    color: #0F172A !important;
   }
 
-  .tile .tile-id {
-    color: #1C1C1B !important;
+  .tile:hover {
+    box-shadow: 0 6px 14px rgba(15, 23, 42, 0.12);
   }
 
-  .tile .tile-meta {
-    color: #575753 !important;
-  }
+  .tile.st-queued .tile-bar { background: #CBD5E1 !important; }
+  .tile.st-queued .tile-name { color: #475569 !important; }
+  .tile.st-queued .tile-score { color: #334155 !important; }
+  .tile.st-queued .tile-st { color: #475569 !important; }
 
-  .tile.st-queued .tile-bar { background: #C8C4BA !important; }
-  .tile.st-queued .tile-name { color: #575753 !important; }
-  .tile.st-queued .tile-score { color: #4A4A47 !important; }
-  .tile.st-in_queue { background: #FEF6E7 !important; border-color: rgba(180, 83, 9, 0.35) !important; }
-  .tile.st-in_queue .tile-bar { background: #D97706 !important; }
+  .tile.st-in_queue { background: #FFFBEB !important; border-color: rgba(180, 83, 9, 0.42) !important; box-shadow: none !important; }
+  .tile.st-in_queue .tile-bar { background: #B45309 !important; }
   .tile.st-in_queue .tile-name { color: #92400E !important; }
   .tile.st-in_queue .tile-score { color: #B45309 !important; }
-  .tile.st-streaming { background: #EEF4FD !important; border-color: rgba(29, 78, 216, 0.35) !important; }
-  .tile.st-streaming .tile-bar { background: #2563EB !important; }
+  .tile.st-in_queue .tile-st { color: #B45309 !important; }
+
+  .tile.st-streaming { background: #EFF6FF !important; border-color: rgba(29, 78, 216, 0.42) !important; box-shadow: 0 0 0 2px rgba(29, 78, 216, 0.10) !important; }
+  .tile.st-streaming .tile-bar { background: #1D4ED8 !important; }
   .tile.st-streaming .tile-name { color: #1E40AF !important; }
   .tile.st-streaming .tile-score { color: #1D4ED8 !important; }
-  .tile.st-gating { background: #F3F0FA !important; border-color: rgba(109, 40, 217, 0.35) !important; }
-  .tile.st-gating .tile-bar { background: #6D28D9 !important; }
-  .tile.st-gating .tile-name { color: #5B21B6 !important; }
-  .tile.st-gating .tile-score { color: #6D28D9 !important; }
-  .tile.st-retry { background: #FDF0EE !important; border-color: rgba(217, 72, 38, 0.45) !important; }
-  .tile.st-retry .tile-bar { background: #D94826 !important; }
-  .tile.st-retry .tile-name { color: #9A2B14 !important; }
-  .tile.st-retry .tile-score { color: #C83E1D !important; }
-  .tile.st-committed { background: #EAF6F0 !important; border-color: rgba(20, 108, 67, 0.38) !important; }
-  .tile.st-committed .tile-bar { background: #15803D !important; }
-  .tile.st-committed .tile-name { color: #166534 !important; }
-  .tile.st-committed .tile-score { color: #14532D !important; }
-  .tile.st-committed .tile-st { color: #15803D !important; }
-  .tile.st-skipped_resumed { background: #EEF4FD !important; border-color: rgba(29, 78, 216, 0.38) !important; }
-  .tile.st-skipped_resumed .tile-bar { background: #1D4ED8 !important; }
-  .tile.st-skipped_resumed .tile-name { color: #1E40AF !important; }
-  .tile.st-skipped_resumed .tile-score { color: #1D4ED8 !important; }
-  .billing-note { color: #575753 !important; background: #F3F1EC !important; border-color: rgba(28, 28, 27, 0.12) !important; }
-  .billing-note b { color: #1C1C1B !important; }
+  .tile.st-streaming .tile-st { color: #1D4ED8 !important; }
+
+  .tile.st-gating { background: #EEF2FF !important; border-color: rgba(79, 70, 229, 0.40) !important; box-shadow: none !important; }
+  .tile.st-gating .tile-bar { background: #4F46E5 !important; }
+  .tile.st-gating .tile-name { color: #3730A3 !important; }
+  .tile.st-gating .tile-score { color: #4338CA !important; }
+  .tile.st-gating .tile-st { color: #4338CA !important; }
+
+  .tile.st-retry { background: #FEF2F2 !important; border-color: rgba(220, 38, 38, 0.46) !important; box-shadow: none !important; }
+  .tile.st-retry .tile-bar { background: #DC2626 !important; }
+  .tile.st-retry .tile-name { color: #991B1B !important; }
+  .tile.st-retry .tile-score { color: #B91C1C !important; }
+  .tile.st-retry .tile-st { color: #B91C1C !important; }
+
+  .tile.st-committed { background: #ECFDF5 !important; border-color: rgba(5, 150, 105, 0.40) !important; }
+  .tile.st-committed .tile-bar { background: #059669 !important; }
+  .tile.st-committed .tile-name { color: #065F46 !important; }
+  .tile.st-committed .tile-score { color: #047857 !important; }
+  .tile.st-committed .tile-st { color: #047857 !important; }
+
+  .tile.st-skipped_resumed {
+    background: repeating-linear-gradient(
+      -45deg,
+      rgba(3, 105, 161, 0.08),
+      rgba(3, 105, 161, 0.08) 5px,
+      #F0F9FF 5px,
+      #F0F9FF 10px
+    ) !important;
+    border-color: rgba(3, 105, 161, 0.44) !important;
+  }
+  .tile.st-skipped_resumed .tile-bar { background: #0369A1 !important; }
+  .tile.st-skipped_resumed .tile-name { color: #075985 !important; }
+  .tile.st-skipped_resumed .tile-score { color: #0369A1 !important; }
+  .tile.st-skipped_resumed .tile-st { color: #0369A1 !important; }
+
+  .feed-row {
+    background: #F6F8FA !important;
+    border-color: rgba(15, 23, 42, 0.12) !important;
+  }
+
+  .feed-row.latest {
+    background: #EFF6FF !important;
+    border-color: rgba(29, 78, 216, 0.35) !important;
+  }
+
+  .ev-badge.commit { background: #ECFDF5 !important; color: #047857 !important; border-color: rgba(5, 150, 105, 0.36) !important; }
+  .ev-badge.g3 { background: #EEF2FF !important; color: #4338CA !important; border-color: rgba(79, 70, 229, 0.36) !important; }
+  .ev-badge.rollback { background: #FEF2F2 !important; color: #B91C1C !important; border-color: rgba(220, 38, 38, 0.40) !important; }
+  .ev-badge.learn { background: #EFF6FF !important; color: #1D4ED8 !important; border-color: rgba(29, 78, 216, 0.36) !important; }
+  .ev-badge.circuit { background: #FFFBEB !important; color: #B45309 !important; border-color: rgba(180, 83, 9, 0.42) !important; }
+  .ev-badge.resume { background: #F0F9FF !important; color: #0369A1 !important; border-color: rgba(3, 105, 161, 0.38) !important; }
+  .ev-badge.kane { background: #EFF6FF !important; color: #1D4ED8 !important; border-color: rgba(29, 78, 216, 0.36) !important; }
+
+  .billing-note {
+    color: #475569 !important;
+    background: #F1F5F9 !important;
+    border-color: rgba(15, 23, 42, 0.14) !important;
+  }
+  .billing-note b { color: #0F172A !important; }
 
   .status-pill {
-    background: #F3F1EC !important;
-    border-color: rgba(28, 28, 27, 0.14) !important;
-    color: #4A4A47 !important;
+    background: #F1F5F9 !important;
+    border-color: rgba(15, 23, 42, 0.14) !important;
+    color: #475569 !important;
   }
 
   .status-pill.pass,
   .delta-tag {
-    background: #EAF6F0 !important;
-    border-color: rgba(20, 108, 67, 0.35) !important;
-    color: #146C43 !important;
+    background: #ECFDF5 !important;
+    border-color: rgba(5, 150, 105, 0.36) !important;
+    color: #047857 !important;
   }
 
   .status-pill.warn {
-    background: #FEF6E7 !important;
-    border-color: rgba(180, 83, 9, 0.35) !important;
+    background: #FFFBEB !important;
+    border-color: rgba(180, 83, 9, 0.38) !important;
     color: #B45309 !important;
   }
 
   .status-pill.fail {
-    background: #FDF0EE !important;
-    border-color: rgba(180, 35, 24, 0.35) !important;
-    color: #B42318 !important;
+    background: #FEF2F2 !important;
+    border-color: rgba(220, 38, 38, 0.40) !important;
+    color: #B91C1C !important;
   }
 
   .status-pill.purple {
-    background: #F3EEFE !important;
-    border-color: rgba(109, 40, 217, 0.35) !important;
-    color: #6D28D9 !important;
+    background: #EEF2FF !important;
+    border-color: rgba(79, 70, 229, 0.36) !important;
+    color: #4338CA !important;
+  }
+
+  .rb-pill {
+    background: #FFFFFF !important;
+    border-color: rgba(15, 23, 42, 0.16) !important;
+    color: #475569 !important;
+  }
+
+  .rb-pill.pass {
+    background: #ECFDF5 !important;
+    color: #047857 !important;
+    border-color: rgba(5, 150, 105, 0.38) !important;
+  }
+
+  .rb-pill.hit {
+    background: #FEF2F2 !important;
+    color: #B91C1C !important;
+    border-color: rgba(220, 38, 38, 0.42) !important;
   }
 
   .sc-num {
-    background: #FBEAE0 !important;
-    border-color: rgba(217, 72, 38, 0.35) !important;
-    color: #C83E1D !important;
+    background: #EFF6FF !important;
+    border-color: rgba(29, 78, 216, 0.30) !important;
+    color: #1D4ED8 !important;
   }
 
   .p10-line,
   .event-row {
-    border-color: rgba(28, 28, 27, 0.1) !important;
+    border-color: rgba(15, 23, 42, 0.12) !important;
+  }
+
+  .bt-after,
+  .kpi-val.emerald,
+  .bench-ratio,
+  .bd-nums b,
+  .layer-prog b {
+    color: #047857;
   }
 
   .tl-seg {
     color: #FFFFFF !important;
-    border-right-color: rgba(255, 255, 255, 0.5) !important;
+    border-right-color: rgba(255, 255, 255, 0.45) !important;
   }
+
+  .seg-queue { background: #B45309; }
+  .seg-decode { background: #0369A1; }
+  .seg-g1 { background: #1D4ED8; }
+  .seg-g2 { background: #059669; }
+  .seg-g3 { background: #4F46E5; }
+  .seg-g4 { background: repeating-linear-gradient(45deg, #1D4ED8, #1D4ED8 4px, #1E40AF 4px, #1E40AF 8px); }
 
   #tile-tooltip {
     background: #FFFFFF !important;
-    border-color: rgba(28, 28, 27, 0.18) !important;
-    box-shadow: 0 14px 36px rgba(28, 28, 27, 0.14) !important;
-    color: #1C1C1B !important;
+    border-color: rgba(15, 23, 42, 0.18) !important;
+    box-shadow: 0 14px 36px rgba(15, 23, 42, 0.14) !important;
+    color: #0F172A !important;
+  }
+
+  #error-toast {
+    background: #FEF2F2 !important;
+    border-color: #DC2626 !important;
+    color: #991B1B !important;
+    box-shadow: 0 12px 32px rgba(15, 23, 42, 0.16) !important;
   }
 
   .hero-badge,
   .hero-badge.aimd,
   .hero-badge.decode,
   .hero-badge.tps {
-    background: #F3F1EC !important;
-    border: 1px solid rgba(28, 28, 27, 0.14) !important;
-    color: #1C1C1B !important;
+    background: #F1F5F9 !important;
+    border: 1px solid rgba(15, 23, 42, 0.14) !important;
+    color: #0F172A !important;
   }
 
   .hero-badge.aimd {
-    background: #FBEAE0 !important;
-    border-color: rgba(217, 72, 38, 0.3) !important;
+    background: #EFF6FF !important;
+    border-color: rgba(29, 78, 216, 0.28) !important;
   }
 
   .hero-badge.decode,
   .hero-badge.tps {
-    background: #EEF4FD !important;
-    border-color: rgba(29, 78, 216, 0.28) !important;
+    background: #ECFDF5 !important;
+    border-color: rgba(5, 150, 105, 0.28) !important;
+  }
+
+  .hero-badge.decode .hb-val {
+    color: #047857 !important;
   }
 
   .hero-badge .hb-label,
   .hero-badge .hb-unit {
-    color: #575753 !important;
-  }
-
-  .pacer-track {
-    background: #E7E4DC !important;
-    border: 1px solid rgba(28, 28, 27, 0.14) !important;
+    color: #475569 !important;
   }
 
   .pacer-fill {
-    background: linear-gradient(90deg, #15803D 0%, #2563EB 58%, #D97706 84%, #E24F2A 100%) !important;
+    background: linear-gradient(90deg, #059669 0%, #1D4ED8 58%, #B45309 86%, #DC2626 100%) !important;
+  }
+
+  .pacer-fill.hot {
+    background: linear-gradient(90deg, #B45309 0%, #DC2626 100%) !important;
   }
 
   .ceiling-flag {
-    background: #FDF0EE !important;
-    border: 1px solid rgba(217, 72, 38, 0.4) !important;
-    color: #C83E1D !important;
+    background: #FEF2F2 !important;
+    border: 1px solid rgba(220, 38, 38, 0.42) !important;
+    color: #B91C1C !important;
+  }
+
+  .ceiling-line {
+    background: #DC2626 !important;
+    box-shadow: 0 0 6px rgba(220, 38, 38, 0.45) !important;
+  }
+
+  .topbar {
+    padding: 0 12px;
+    gap: 8px;
+  }
+
+  .top-left {
+    gap: 7px;
+  }
+
+  .pill {
+    padding: 0 9px;
+    gap: 6px;
+    font-size: 12px;
+  }
+
+  .replay-bar {
+    gap: 6px;
+    padding: 0 9px;
+  }
+
+  .rp-scrub {
+    width: 108px;
+  }
+
+  .clock-cluster {
+    gap: 8px;
+  }
+
+  .phase-breakdown {
+    gap: 6px;
+    padding: 5px 8px;
+    font-size: 11.5px;
   }
 
   .wal-pill {
-    max-width: 340px;
+    max-width: 245px;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
   .circuit-tag {
-    color: #146C43 !important;
+    color: #047857 !important;
   }
 
-  /* ================= TIME-TRAVEL MVCC DIFF DRAWER ================= */
+  /* ================= TIME-TRAVEL MVCC DIFF & GATE 4 DRAWER ================= */
   .mvcc-diff-btn {
-    height: 30px;
-    padding: 0 11px;
-    border-radius: 999px;
-    border: 1px solid #1C1C1B;
+    height: 32px;
+    padding: 0 10px;
+    border-radius: 7px;
+    border: 1px solid rgba(15, 23, 42, 0.22);
     background: #FFFFFF;
-    color: #1C1C1B;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.03em;
+    color: #0F172A;
+    font-family: var(--font-sans);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
     cursor: pointer;
-    transition: background 120ms ease, color 120ms ease;
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+    white-space: nowrap;
+    transition: background-color 160ms cubic-bezier(0.22, 1, 0.36, 1), border-color 160ms cubic-bezier(0.22, 1, 0.36, 1), color 160ms cubic-bezier(0.22, 1, 0.36, 1);
   }
-  .mvcc-diff-btn:hover, .mvcc-diff-btn.active {
-    background: #1C1C1B;
-    color: #F8F7F2;
+  .mvcc-diff-btn:hover {
+    border-color: #1E40AF;
+    color: #1E40AF;
+    background: #EFF6FF;
   }
+  .mvcc-diff-btn.active {
+    background: #1D4ED8;
+    border-color: #1D4ED8;
+    color: #FFFFFF;
+  }
+  .mvcc-diff-btn.active:hover {
+    background: #1E40AF;
+    border-color: #1E40AF;
+    color: #FFFFFF;
+  }
+  .mvcc-diff-btn.active .kane-dot {
+    background: #FFFFFF;
+  }
+  .mvcc-diff-btn.active .kane-dot.fail {
+    background: #FCA5A5;
+  }
+
   #mvcc-drawer {
     position: fixed;
     top: 66px;
     right: 22px;
     bottom: 22px;
-    width: 560px;
-    background: #F8F7F2;
-    border: 2px solid #1C1C1B;
-    border-radius: 10px;
-    box-shadow: 0 18px 48px rgba(28, 28, 27, 0.22);
+    width: 580px;
+    max-width: calc(100% - 24px);
+    background: #F6F8FA;
+    border: 1px solid rgba(15, 23, 42, 0.22);
+    border-radius: 12px;
+    box-shadow: 0 22px 54px rgba(15, 23, 42, 0.18), 0 4px 12px rgba(15, 23, 42, 0.08);
     z-index: 999;
     display: none;
     flex-direction: column;
     overflow: hidden;
-    color: #1C1C1B;
+    color: #0F172A;
+    user-select: text;
   }
   #mvcc-drawer.open { display: flex; }
+
   .mvcc-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 12px 16px;
+    gap: 12px;
+    padding: 14px 18px;
     background: #FFFFFF;
-    border-bottom: 1.5px solid #1C1C1B;
+    border-bottom: 1px solid rgba(15, 23, 42, 0.14);
   }
   .mvcc-title {
-    font-size: 13px;
-    font-weight: 800;
-    letter-spacing: 0.03em;
-    text-transform: uppercase;
+    font-family: var(--font-sans);
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    color: #0F172A;
   }
+
+  .mvcc-tabs {
+    display: flex;
+    gap: 8px;
+    padding: 10px 18px;
+    background: #EAEEF2;
+    border-bottom: 1px solid rgba(15, 23, 42, 0.14);
+  }
+  .mvcc-tab {
+    padding: 6px 12px;
+    border: 1px solid rgba(15, 23, 42, 0.18);
+    border-radius: 6px;
+    background: #FFFFFF;
+    color: #0F172A;
+    font-family: var(--font-sans);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 160ms cubic-bezier(0.22, 1, 0.36, 1), border-color 160ms cubic-bezier(0.22, 1, 0.36, 1), color 160ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .mvcc-tab:hover {
+    border-color: #1E40AF;
+    color: #1E40AF;
+  }
+  .mvcc-tab.active {
+    background: #1D4ED8;
+    border-color: #1D4ED8;
+    color: #FFFFFF;
+  }
+
   .mvcc-controls {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 10px 16px;
-    background: #F3F1EC;
-    border-bottom: 1px solid rgba(28, 28, 27, 0.16);
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
+    gap: 10px;
+    padding: 10px 18px;
+    background: #F1F5F9;
+    border-bottom: 1px solid rgba(15, 23, 42, 0.14);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: #475569;
   }
   .mvcc-controls input[type="range"] { flex: 1; accent-color: #1D4ED8; }
+
   .mvcc-nav-btn {
-    padding: 3px 9px;
-    border: 1px solid #1C1C1B;
-    border-radius: 5px;
+    padding: 5px 11px;
+    border: 1px solid rgba(15, 23, 42, 0.22);
+    border-radius: 6px;
     background: #FFFFFF;
-    color: #1C1C1B;
-    font-family: inherit;
-    font-size: 11px;
-    font-weight: 700;
+    color: #0F172A;
+    font-family: var(--font-sans);
+    font-size: 11.5px;
+    font-weight: 600;
     cursor: pointer;
+    transition: background-color 160ms cubic-bezier(0.22, 1, 0.36, 1), border-color 160ms cubic-bezier(0.22, 1, 0.36, 1), color 160ms cubic-bezier(0.22, 1, 0.36, 1);
   }
+  .mvcc-nav-btn:hover {
+    border-color: #1E40AF;
+    color: #1E40AF;
+    background: #EFF6FF;
+  }
+
   .mvcc-meta {
-    padding: 10px 16px;
+    padding: 12px 18px;
     background: #FFFFFF;
-    border-bottom: 1px solid rgba(28, 28, 27, 0.14);
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
+    border-bottom: 1px solid rgba(15, 23, 42, 0.14);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: #475569;
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 8px 14px;
   }
-  .mvcc-badge-ok { color: #146C43; font-weight: 800; }
-  .mvcc-badge-rb { color: #D94826; font-weight: 800; }
+  .mvcc-meta b {
+    color: #0F172A;
+  }
+  .mvcc-badge-ok { color: #047857; font-weight: 800; }
+  .mvcc-badge-rb { color: #DC2626; font-weight: 800; }
+
   .mvcc-body {
     flex: 1;
     overflow: auto;
-    padding: 12px 16px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 16px 18px;
+    font-family: var(--font-mono);
     font-size: 11.5px;
-    line-height: 1.48;
+    line-height: 1.5;
   }
-  .mvcc-diff-line { white-space: pre-wrap; word-break: break-all; padding: 1px 6px; border-radius: 3px; }
-  .mvcc-diff-add { background: rgba(20, 108, 67, 0.13); color: #0B4A2D; }
-  .mvcc-diff-del { background: rgba(217, 72, 38, 0.13); color: #9A2B12; }
-  .mvcc-diff-hdr { color: #1D4ED8; font-weight: 700; margin-top: 6px; }
-  #mvcc-drawer { max-width: calc(100% - 24px); }
-  .mvcc-tabs { display: flex; gap: 6px; padding: 8px 16px; background: #EFECE6; border-bottom: 1px solid rgba(28,28,27,0.16); }
-  .mvcc-tab { padding: 4px 10px; border: 1px solid #1C1C1B; border-radius: 5px; background: #FFFFFF; color: #1C1C1B; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; font-weight: 700; cursor: pointer; }
-  .mvcc-tab.active { background: #1C1C1B; color: #F8F7F2; }
-  .ev-badge.kane { background: #FBEAE0; color: #C83E1D; }
-  .rb-pill.pass { background: rgba(20,108,67,0.12); color: #146C43; border-color: rgba(20,108,67,0.35); }
-  .seg-g4 { background: repeating-linear-gradient(45deg, #D94826, #D94826 4px, #B42318 4px, #B42318 8px); }
-  .kane-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #146C43; margin-right: 6px; vertical-align: middle; }
-  .kane-dot.fail { background: #B42318; }
-  .editorial-plate-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
-  .editorial-plate { background: #F8F7F2; border: 1px solid rgba(28,28,27,0.22); border-radius: 6px; padding: 6px; text-align: center; }
-  .editorial-plate img { width: 100%; height: 76px; object-fit: cover; border-radius: 3px; filter: grayscale(100%) contrast(1.08) sepia(15%); mix-blend-mode: multiply; display: block; }
-  .editorial-plate figcaption { font-family: Georgia, "Times New Roman", serif; font-size: 9.5px; color: #4A4A47; margin-top: 4px; line-height: 1.25; }
-  .kane-card { background: #FFFFFF; border: 1px solid rgba(28,28,27,0.18); border-radius: 7px; padding: 10px 12px; margin-bottom: 10px; }
-  .kane-card h4 { font-family: Georgia, "Times New Roman", serif; font-size: 12px; letter-spacing: 0.02em; margin-bottom: 6px; color: #1C1C1B; display: flex; justify-content: space-between; align-items: center; }
-  .kane-bar-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 10.5px; }
-  .kane-bar-track { flex: 1; height: 8px; background: #EFECE6; border-radius: 4px; overflow: hidden; }
-  .kane-bar-fill { height: 100%; border-radius: 4px; }
-  .kane-step { padding: 4px 7px; border-left: 3px solid #146C43; background: #F8F7F2; margin: 4px 0; border-radius: 0 4px 4px 0; font-size: 11px; }
-  .kane-step.fail { border-left-color: #B42318; background: #FDF0EE; }
-  .kane-footnotes { font-family: Georgia, "Times New Roman", serif; font-size: 9.5px; color: #575753; border-top: 1px solid rgba(28,28,27,0.15); padding-top: 8px; margin-top: 10px; line-height: 1.45; }
-  .kane-footnotes a { color: #1D4ED8; text-decoration: none; }
+
+  .mvcc-diff-line { white-space: pre-wrap; word-break: break-all; padding: 2px 8px; border-radius: 4px; }
+  .mvcc-diff-add { background: rgba(5, 150, 105, 0.12); color: #065F46; }
+  .mvcc-diff-del { background: rgba(220, 38, 38, 0.11); color: #991B1B; }
+  .mvcc-diff-hdr { color: #1D4ED8; font-weight: 700; margin-top: 8px; }
+
+  .kane-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #059669; margin-right: 7px; vertical-align: middle; }
+  .kane-dot.fail { background: #DC2626; }
+
+  .editorial-plate-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
+  .editorial-plate { background: #FFFFFF; border: 1px solid rgba(15, 23, 42, 0.14); border-radius: 8px; padding: 7px; text-align: center; }
+  .editorial-plate img { width: 100%; height: 78px; object-fit: cover; border-radius: 5px; filter: grayscale(100%) contrast(1.08); display: block; }
+  .editorial-plate figcaption { font-family: var(--font-sans); font-size: 10.5px; font-weight: 600; color: #475569; margin-top: 6px; line-height: 1.3; }
+
+  .kane-card { background: #FFFFFF; border: 1px solid rgba(15, 23, 42, 0.14); border-radius: 8px; padding: 13px 15px; margin-bottom: 12px; }
+  .kane-card h4 { font-family: var(--font-sans); font-size: 12.5px; font-weight: 700; letter-spacing: -0.01em; margin-bottom: 8px; color: #0F172A; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .kane-summary { font-family: var(--font-sans); font-size: 12px; line-height: 1.5; color: #475569; margin-bottom: 8px; }
+  .kane-bar-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 11px; color: #0F172A; }
+  .kane-bar-track { flex: 1; height: 8px; background: #EAEEF2; border-radius: 999px; overflow: hidden; }
+  .kane-bar-fill { height: 100%; border-radius: 999px; }
+  .kane-step { padding: 7px 10px; border-left: 3px solid #059669; background: #F6F8FA; margin: 6px 0; border-radius: 0 6px 6px 0; font-size: 11.5px; line-height: 1.45; color: #0F172A; }
+  .kane-step.fail { border-left-color: #DC2626; background: #FEF2F2; }
+  .kane-cmd { margin-top: 8px; padding: 6px 9px; border-radius: 6px; background: #F1F5F9; border: 1px solid rgba(15, 23, 42, 0.12); font-size: 11px; color: #1D4ED8; word-break: break-all; }
+  .kane-truth-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 6px 0; border-bottom: 1px solid rgba(15, 23, 42, 0.09); font-family: var(--font-sans); font-size: 11.5px; line-height: 1.4; color: #0F172A; }
+  .kane-truth-row:last-child { border-bottom: none; padding-bottom: 0; }
+  .kane-truth-proof { color: #475569; font-family: var(--font-mono); font-size: 10.5px; }
+  .kane-footnotes { font-family: var(--font-sans); font-size: 10.5px; color: #475569; border-top: 1px solid rgba(15, 23, 42, 0.14); padding-top: 10px; margin-top: 12px; line-height: 1.55; }
+  .kane-footnotes a { color: #1D4ED8; text-decoration: none; font-weight: 600; }
+  .kane-footnotes a:hover { color: #1E40AF; text-decoration: underline; }
+  .kane-credits { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid rgba(15, 23, 42, 0.10); color: #475569; }
+
   @media (max-width: 720px) {
     #mvcc-drawer { left: 12px; right: 12px; top: 12px; bottom: 12px; width: auto; max-width: none; }
     .mvcc-tabs { flex-wrap: wrap; }
     .editorial-plate img { height: 60px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+    .pulse-dot,
+    .wal-pill.circuit-open {
+      animation: none !important;
+    }
   }
 </style>
 </head>
@@ -1912,16 +2227,16 @@
       <div class="top-left">
         <div class="brand-badge">
           <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
-            <rect x="1" y="1" width="22" height="22" rx="5" fill="#0A0D14" stroke="#FF5A1F" stroke-width="1.4"/>
-            <circle cx="7" cy="7" r="2.2" fill="#FF5A1F"/>
-            <circle cx="12" cy="7" r="1.6" fill="#FF5A1F" opacity="0.75"/>
-            <circle cx="17" cy="7" r="1.2" fill="#FF5A1F" opacity="0.45"/>
-            <circle cx="7" cy="12" r="1.6" fill="#FF5A1F" opacity="0.75"/>
-            <circle cx="12" cy="12" r="2.2" fill="#22D3EE"/>
-            <circle cx="17" cy="12" r="1.6" fill="#22D3EE" opacity="0.7"/>
-            <circle cx="7" cy="17" r="1.2" fill="#22D3EE" opacity="0.5"/>
-            <circle cx="12" cy="17" r="1.6" fill="#10B981" opacity="0.8"/>
-            <circle cx="17" cy="17" r="2.2" fill="#10B981"/>
+            <rect x="1" y="1" width="22" height="22" rx="5" fill="#0F172A" stroke="#1D4ED8" stroke-width="1.4"/>
+            <circle cx="7" cy="7" r="2.2" fill="#1D4ED8"/>
+            <circle cx="12" cy="7" r="1.6" fill="#3B82F6" opacity="0.85"/>
+            <circle cx="17" cy="7" r="1.2" fill="#60A5FA" opacity="0.6"/>
+            <circle cx="7" cy="12" r="1.6" fill="#3B82F6" opacity="0.85"/>
+            <circle cx="12" cy="12" r="2.2" fill="#0369A1"/>
+            <circle cx="17" cy="12" r="1.6" fill="#38BDF8" opacity="0.8"/>
+            <circle cx="7" cy="17" r="1.2" fill="#0369A1" opacity="0.65"/>
+            <circle cx="12" cy="17" r="1.6" fill="#059669" opacity="0.85"/>
+            <circle cx="17" cy="17" r="2.2" fill="#059669"/>
           </svg>
           <span class="brand-wordmark">refit</span>
           <span id="mode-chip" class="mode-chip"><span class="pulse-dot"></span><span id="mode-label">LIVE</span></span>
@@ -1946,8 +2261,8 @@
           <span>Circuit: <span class="circuit-tag" id="circuit-state">CLOSED</span></span>
         </div>
 
-        <button class="mvcc-diff-btn" id="btn-mvcc-diff" type="button" title="Toggle MVCC Time-Travel Diff &amp; Causality Drawer">MVCC Diff</button>
-        <button class="mvcc-diff-btn" id="btn-kane-evidence" data-testid="btn-kane-evidence" type="button" title="Inspect Gate 4 Kane CLI Proof, .evidence Secret Audit &amp; README Truth"><span class="kane-dot" id="kane-topbar-dot"></span>Gate 4 · Kane</button>
+        <button class="mvcc-diff-btn" id="btn-mvcc-diff" type="button" title="Toggle Atomic MVCC WAL Diff &amp; Causality Drawer">MVCC Diff</button>
+        <button class="mvcc-diff-btn" id="btn-kane-evidence" data-testid="btn-kane-evidence" type="button" title="Inspect TestMu Loop Engineering: Gate 4 TestMu AI Kane CLI Proof &amp; README Truth"><span class="kane-dot" id="kane-topbar-dot"></span>Gate 4 · Kane</button>
       </div>
 
       <!-- Replay / Demo Controls (Auto-shown when ?replay= or ?demo=1) -->
@@ -1993,17 +2308,17 @@
           <div class="panel-hdr">
             <div class="panel-title">
               <span class="dot"></span>
-              <span>TOPOLOGICAL WAVEFRONT</span>
-              <span class="mono" style="color:var(--ink);font-weight:700" id="dag-meta">64 modules · 4 layers · 0 committed</span>
+              <span>Topological wavefront (Untangle DAG)</span>
+              <span class="mono" style="color:var(--muted);font-weight:600" id="dag-meta">64 modules · 4 layers · 0 committed</span>
             </div>
             <div class="legend-row">
-              <span class="leg"><span class="leg-sw" style="background:#F1EFE9;border-color:#B5B1A7"></span>queued <b id="cnt-queued">64</b></span>
-              <span class="leg"><span class="leg-sw" style="background:#FEF6E7;border-color:#D97706"></span>in_queue <b id="cnt-in_queue">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:#EEF4FD;border-color:#2563EB"></span>streaming <b id="cnt-streaming">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:#F3F0FA;border-color:#6D28D9"></span>gating <b id="cnt-gating">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:#FDF0EE;border-color:#D94826"></span>retry <b id="cnt-retry">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:#EAF6F0;border-color:#15803D"></span>committed <b id="cnt-committed">0</b></span>
-              <span class="leg"><span class="leg-sw" style="background:#EEF4FD;border-color:#1D4ED8;border-style:dashed"></span>resumed <b id="cnt-skipped_resumed">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#F1F5F9;border-color:#94A3B8"></span>queued <b id="cnt-queued">64</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#FFFBEB;border-color:#B45309"></span>in_queue <b id="cnt-in_queue">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#EFF6FF;border-color:#1D4ED8"></span>streaming <b id="cnt-streaming">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#EEF2FF;border-color:#4F46E5"></span>gating <b id="cnt-gating">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#FEF2F2;border-color:#DC2626"></span>retry <b id="cnt-retry">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#ECFDF5;border-color:#059669"></span>committed <b id="cnt-committed">0</b></span>
+              <span class="leg"><span class="leg-sw" style="background:#F0F9FF;border-color:#0369A1;border-style:dashed"></span>resumed <b id="cnt-skipped_resumed">0</b></span>
             </div>
           </div>
 
@@ -2049,7 +2364,7 @@
           <div class="panel-hdr">
             <div class="panel-title">
               <span class="dot" style="background:var(--cyan)"></span>
-              <span>50K UNCACHED TPM PACER &amp; WAFER TELEMETRY</span>
+              <span>50K uncached TPM pacer &amp; wafer telemetry</span>
             </div>
             <div class="mono" style="font-size:11.5px;color:var(--muted)" id="proxy-meta">
               RPM <b style="color:var(--ink)" id="rpm-val">0/60</b> · 429s <b style="color:var(--ink)" id="http429-val">0</b> · Total TPM <b style="color:var(--cyan)" id="total-tpm-val">0</b>
@@ -2065,14 +2380,14 @@
               <div class="pacer-badges">
                 <div class="hero-badge aimd">
                   <div>
-                    <div class="hb-label">AIMD Concurrency</div>
+                    <div class="hb-label">AIMD concurrency</div>
                     <div class="hb-unit" id="aimd-trend">STEADY</div>
                   </div>
                   <div class="hb-val" id="aimd-k">K=4</div>
                 </div>
                 <div class="hero-badge decode">
                   <div>
-                    <div class="hb-label">Wafer Decode</div>
+                    <div class="hb-label">Wafer decode</div>
                     <div class="hb-unit" id="decode-sub">median --</div>
                   </div>
                   <div class="hb-val" id="decode-tps">0</div>
@@ -2082,7 +2397,7 @@
             </div>
 
             <div class="pacer-meter-wrap">
-              <div class="ceiling-flag" id="ceiling-flag">44K PACER CEILING</div>
+              <div class="ceiling-flag" id="ceiling-flag">44K pacer ceiling</div>
               <div class="pacer-track">
                 <div class="pacer-fill" id="pacer-fill"></div>
                 <div class="ceiling-line" id="ceiling-line"></div>
@@ -2093,8 +2408,8 @@
                 <span>20,000</span>
                 <span>30,000</span>
                 <span>40,000</span>
-                <span class="t-red">44K CEILING</span>
-                <span>50,000 CAP</span>
+                <span class="t-red">44K ceiling</span>
+                <span>50,000 cap</span>
               </div>
             </div>
           </div>
@@ -2105,17 +2420,17 @@
           <div class="panel-hdr">
             <div class="panel-title">
               <span class="dot" style="background:var(--emerald)"></span>
-              <span>LIVE EVENT FEED</span>
-              <span class="mono" style="font-size:11px;color:var(--dim)">commits · Gate 3 zero-warn · rollbacks · learn hits</span>
+              <span>Live event feed</span>
+              <span class="mono" style="font-size:11px;color:var(--dim);font-weight:500">commits · untangle &amp; hygiene · hooks · MVCC rollbacks</span>
             </div>
             <span class="mono" style="font-size:11px;color:var(--muted)" id="feed-seq">seq #0</span>
           </div>
           <div class="feed-list" id="feed-list">
             <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge commit">READY</span><span class="ev-mod">awaiting stream</span><span class="ev-msg">Connecting to refit telemetry...</span><span class="ev-right">--</span></div>
-            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge g3">G3</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>
-            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge learn">LEARN</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>
-            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge rollback">GATE</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>
-            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge resume">WAL</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>
+            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge g3">G3</span><span class="ev-mod">--</span><span class="ev-msg">--</span><span class="ev-right">--</span></div>
+            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge learn">LEARN</span><span class="ev-mod">--</span><span class="ev-msg">--</span><span class="ev-right">--</span></div>
+            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge rollback">GATE</span><span class="ev-mod">--</span><span class="ev-msg">--</span><span class="ev-right">--</span></div>
+            <div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge resume">WAL</span><span class="ev-mod">--</span><span class="ev-msg">--</span><span class="ev-right">--</span></div>
           </div>
         </div>
       </section>
@@ -2123,16 +2438,16 @@
       <!-- RIGHT PANE: 4-CARD SCORECARD -->
       <section class="right-pane">
 
-        <!-- CARD 1: Maintainability + Gate 3 Zero-Warning Burndown -->
+        <!-- CARD 1: Neural Code Hygiene + Gate 3 Zero-Warning Burndown -->
         <article class="score-card">
           <div class="sc-hdr">
-            <div class="sc-title"><span class="sc-num">01</span>MAINTAINABILITY + GATE 3 ZERO-WARNING BURNDOWN</div>
+            <div class="sc-title"><span class="sc-num">01</span>Neural code hygiene &amp; Gate 3 burndown</div>
             <span class="status-pill purple" id="g3-zero-pill">BURNDOWN ACTIVE</span>
           </div>
           <div class="c1-grid">
             <div class="metric-well">
               <div class="mw-label">
-                <span>codehygiene v0.7.0 · median</span>
+                <span>Neural codehygiene · median</span>
                 <span class="delta-tag" id="hyg-delta">+0.0</span>
               </div>
               <div class="big-transition">
@@ -2171,25 +2486,25 @@
           </div>
         </article>
 
-        <!-- CARD 2: Correctness + MVCC + Learn -->
+        <!-- CARD 2: Correctness + Atomic MVCC WAL + Learn -->
         <article class="score-card">
           <div class="sc-hdr">
-            <div class="sc-title"><span class="sc-num">02</span>CORRECTNESS + MVCC + LEARN</div>
+            <div class="sc-title"><span class="sc-num">02</span>Correctness, atomic MVCC WAL &amp; learn</div>
             <span class="status-pill pass" id="pytest-pill">PYTEST READY</span>
           </div>
           <div class="c2-top">
             <div class="kpi-box">
-              <div class="mw-label"><span>pytest passed / total</span><span id="pytest-pct" style="color:var(--emerald)">100%</span></div>
+              <div class="mw-label"><span>pytest passed / total</span><span id="pytest-pct" style="color:var(--emerald-ink)">100%</span></div>
               <div class="kpi-val emerald" id="pytest-ratio">0 / 0</div>
               <div class="kpi-sub" id="pytest-sub">before 0 fail · after 0 fail</div>
             </div>
             <div class="kpi-box">
-              <div class="mw-label"><span>cas_conflicts</span></div>
+              <div class="mw-label"><span>CAS conflicts</span></div>
               <div class="kpi-val" id="cas-conflicts">0</div>
               <div class="kpi-sub">MVCC retries <b id="retries-total" style="color:var(--ink)">0</b></div>
             </div>
             <div class="kpi-box">
-              <div class="mw-label"><span>resumed_skipped</span></div>
+              <div class="mw-label"><span>Resumed skipped</span></div>
               <div class="kpi-val sky" id="resumed-skipped">0</div>
               <div class="kpi-sub">ACID WAL fast-skip</div>
             </div>
@@ -2215,17 +2530,17 @@
         <!-- CARD 3: 50K TPM Survival & Prefix Cache -->
         <article class="score-card">
           <div class="sc-hdr">
-            <div class="sc-title"><span class="sc-num">03</span>50K TPM SURVIVAL &amp; PREFIX CACHE</div>
+            <div class="sc-title"><span class="sc-num">03</span>50K TPM survival &amp; prefix cache</div>
             <span class="status-pill pass" id="drift-pill">prefix_drift == 0</span>
           </div>
           <div class="c3-kpis">
             <div class="kpi-box">
-              <div class="mw-label"><span>AST Strip %</span></div>
+              <div class="mw-label"><span>AST strip %</span></div>
               <div class="kpi-val orange" id="ast-strip">0.0%</div>
               <div class="kpi-sub">context pruned</div>
             </div>
             <div class="kpi-box">
-              <div class="mw-label"><span>Prefix Cache</span></div>
+              <div class="mw-label"><span>Prefix cache</span></div>
               <div class="kpi-val cyan" id="cache-hit">0.0%</div>
               <div class="kpi-sub">static 2K prefix</div>
             </div>
@@ -2235,7 +2550,7 @@
               <div class="kpi-sub">vs <b id="card-tpm-cap" style="color:var(--ink)">50K</b> limit</div>
             </div>
             <div class="kpi-box">
-              <div class="mw-label"><span>Prefix Drift</span></div>
+              <div class="mw-label"><span>Prefix drift</span></div>
               <div class="kpi-val emerald" id="prefix-drift">0</div>
               <div class="kpi-sub" id="drift-sub">byte-identical</div>
             </div>
@@ -2249,7 +2564,7 @@
         <!-- CARD 4: OS-Measured Compute Cost -->
         <article class="score-card">
           <div class="sc-hdr">
-            <div class="sc-title"><span class="sc-num">04</span>OS-MEASURED COMPUTE COST</div>
+            <div class="sc-title"><span class="sc-num">04</span>OS-measured compute cost &amp; Stem graph</div>
             <span class="status-pill" id="bench-pill">&lt;= 1.05x PENDING</span>
           </div>
           <div class="c4-grid">
@@ -2264,7 +2579,7 @@
               <div class="bench-delta"><span id="cpu-before">--</span> → <b id="cpu-after">--</b> ms</div>
             </div>
             <div class="bench-box">
-              <div class="mw-label"><span>Target Peak RSS</span><span class="mono" id="bench-pairs-rss" style="color:var(--dim)">5x A/B</span></div>
+              <div class="mw-label"><span>Target peak RSS</span><span class="mono" id="bench-pairs-rss" style="color:var(--dim)">5x A/B</span></div>
               <div class="bench-ratio" id="rss-ratio">--</div>
               <div class="bench-delta"><span id="rss-before">--</span> → <b id="rss-after">--</b> MB</div>
             </div>
@@ -2278,9 +2593,9 @@
     <footer class="timeline-card">
       <div class="tl-hdr">
         <div class="panel-title">
-          <span class="dot" style="background:var(--orange)"></span>
-          <span>5-SEGMENT LATENCY TIMELINE</span>
-          <span class="mono" style="color:var(--dim)" id="tl-speedup">parallelism 1.0x</span>
+          <span class="dot" style="background:var(--accent)"></span>
+          <span>5-segment latency timeline</span>
+          <span class="mono" style="color:var(--dim);font-weight:500" id="tl-speedup">parallelism 1.0x</span>
         </div>
         <div class="tl-legend">
           <span class="tl-item"><span class="tl-dot seg-queue"></span>Queue <b id="tl-q-txt">0.0s (0%)</b></span>
@@ -2935,7 +3250,7 @@
           'resume',
           'RESUMED',
           ev.module_id,
-          'ACID WAL match — skipped already committed module',
+          'ACID WAL match: skipped already committed module',
           'WAL rev ' + st.walRev,
           ev.ts_ms
         );
@@ -3005,7 +3320,7 @@
           const gateName = String(verdict.failed_gate || d.gate || 'gate').toUpperCase();
           const diag = Array.isArray(verdict.diagnostics) && verdict.diagnostics.length
             ? verdict.diagnostics[0]
-            : (d.reason || 'verification rollback — retrying');
+            : (d.reason || 'verification rollback: retrying');
           pushFeed(st, 'rollback', 'ROLLBACK', ev.module_id, '[' + gateName + '] ' + diag, 'retry #' + (unit ? unit.retries : 1), ev.ts_ms);
         } else if (verdict.passed === true && verdict.gate3_ruff_errors === 0 && verdict.gate3_ty_errors === 0) {
           pushFeed(
@@ -3125,7 +3440,7 @@
           'rollback',
           'CAS RETRY',
           ev.module_id,
-          d.reason || 'BLAKE3 base mismatch — rebasing patch on latest WAL head',
+          d.reason || 'BLAKE3 base mismatch: rebasing patch on latest WAL head',
           'CAS #' + st.casConflicts,
           ev.ts_ms
         );
@@ -3172,7 +3487,7 @@
           'circuit',
           'CIRCUIT',
           'proxy:18790',
-          d.reason || '44K uncached TPM pacer ceiling hit — backing off AIMD K',
+          d.reason || '44K uncached TPM pacer ceiling hit: backing off AIMD K',
           'K=' + st.aimdK,
           ev.ts_ms
         );
@@ -3187,7 +3502,7 @@
           'commit',
           'CIRCUIT OK',
           'proxy:18790',
-          'Uncached TPM cooled below ceiling — resuming AIMD ramp',
+          'Uncached TPM cooled below ceiling: resuming AIMD ramp',
           'K=' + st.aimdK,
           ev.ts_ms
         );
@@ -3649,7 +3964,7 @@
             '<span class="ev-right">' + escHtml(item.right) + '</span>' +
             '</div>';
         } else {
-          feedHtml += '<div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge commit">—</span><span class="ev-mod">—</span><span class="ev-msg">—</span><span class="ev-right">—</span></div>';
+          feedHtml += '<div class="feed-row empty"><span class="ev-ts">--:--</span><span class="ev-badge commit">--</span><span class="ev-mod">--</span><span class="ev-msg">--</span><span class="ev-right">--</span></div>';
         }
       }
       els.feedList.innerHTML = feedHtml;
@@ -4258,7 +4573,7 @@
           uncached_tpm: 44320,
           data: {
             aimd_k: 4,
-            reason: 'Uncached TPM 44,320 crossed 44K ceiling — pausing dispatch 6.5s & halving K (8 -> 4)',
+            reason: 'Uncached TPM 44,320 crossed 44K ceiling: pausing dispatch 6.5s & halving K (8 -> 4)',
             proxy: {
               circuit_state: 'CIRCUIT_OPEN',
               uncached_tpm_rolling: 44320,
@@ -4342,7 +4657,7 @@
             module_id: u.id,
             layer: u.layer,
             wave: u.wave,
-            data: { reason: 'BLAKE3 base diverged on concurrent wave write — clean MVCC rebase' }
+            data: { reason: 'BLAKE3 base diverged on concurrent wave write: clean MVCC rebase' }
           });
           extraDelay = 2400;
         } else {
@@ -4640,7 +4955,7 @@
     drawer.setAttribute('data-testid', 'mvcc-drawer');
     drawer.innerHTML =
       '<div class="mvcc-head">' +
-        '<span class="mvcc-title" id="drawer-heading">Time-Travel MVCC &amp; Gate 4 Kane Proof</span>' +
+        '<span class="mvcc-title" id="drawer-heading">Atomic MVCC WAL &amp; TestMu AI Kane CLI Proof</span>' +
         '<button class="mvcc-nav-btn" id="mvcc-close" data-testid="mvcc-close" type="button">Close</button>' +
       '</div>' +
       '<div class="mvcc-tabs">' +
@@ -4674,50 +4989,50 @@
     const CLOSED_LOOP_PHASES = [
       {
         id: 'green', ok: true, verdict: 'passed', badge: 'G4: PASS · 0CR',
-        summary: 'Cached _test.md replay passed (2 replay / 0 author steps, 0 LLM credits, 0 .evidence secret leaks).',
-        cli: '0.10.9', duration_s: 1.84, credits: 0.0, replay: 2, author: 0,
+        summary: 'TestMu Loop Engineering green: independent Embedded Neural Code Hygiene + Untangle gate passed, then TestMu AI Kane CLI replayed live browser checks (2 replay / 0 author steps, 0 LLM credits, 0 .evidence secret leaks).',
+        cli: 'TestMu AI Kane CLI', duration_s: 1.84, credits: 0.0, replay: 2, author: 0,
         evidence_cmd: 'kane-cli evidence serve .testmuai/evidence/refit-hud-green.evidence',
         steps: [
-          { ok: true, label: 'Step 1 [refit static <7ms]', text: '0 secrets (AVX2 Fat-Teddy 0.54ms), 0 Unicode Tag/BiDi, 0 OSV CVEs, 0 doc_drift.' },
-          { ok: true, label: 'Step 2 [Kane Desktop Chrome]', text: 'Opened Gate 4 drawer, asserted verdict badge, MCP 12/100 budget, and README Truth matrix.' },
-          { ok: true, label: 'Step 3 [.evidence Secret Audit]', text: 'CRC-verified ZIP scan: 0 unredacted tokens leaked in failure.yaml or console logs (0.10.2 guard).' }
+          { ok: true, label: 'Step 1 [Neural Code Hygiene + Untangle + Hooks]', text: '0 SCC cycles, 0 clones/deslop regressions, 0 secrets/Unicode Tag or BiDi leaks, 0 OSV CVEs, 0 doc_drift.' },
+          { ok: true, label: 'Step 2 [TestMu AI Kane CLI Live Gate]', text: 'Independent browser & mobile gate opened Gate 4 drawer, asserted verdict badge, 12/100 MCP budget, and README Truth matrix.' },
+          { ok: true, label: 'Step 3 [.evidence Secret Audit]', text: 'CRC-verified ZIP scan: 0 unredacted tokens leaked in failure.yaml or console logs (event-driven hook guard).' }
         ],
         readme_truth: [
-          { claim: 'Single static Rust binary (47 .rs files, 0 Cargo duplicates)', status: 'TRUE', proof: 'refit audit . + cargo tree --duplicates' },
-          { claim: '12 converged annotated MCP tools (vs 92 Playwright Test MCP)', status: 'TRUE', proof: 'tools/list + Antigravity 100-tool cap' },
-          { claim: 'Live HUD Gate 4 Drawer opens cleanly on desktop & 390x844 mobile', status: 'TRUE', proof: 'Kane CLI _test.md replay (0 credits)' }
+          { claim: 'Embedded Neural Code Hygiene, Architectural Untangle (SCC cycles, clones, deslop) & Polyglot Stem SymbolGraph', status: 'TRUE', proof: 'refit audit . + single static Rust binary' },
+          { claim: 'Web-wired SEP-2640 MCP guidance (Keenable + OSV) in 12 tools (vs 92 Playwright Test MCP)', status: 'TRUE', proof: 'tools/list + 100-tool budget cap' },
+          { claim: 'Independent live browser & 390x844 mobile gate via TestMu AI Kane CLI inside atomic MVCC WAL', status: 'TRUE', proof: 'Kane CLI _test.md replay (0 credits)' }
         ]
       },
       {
         id: 'red', ok: false, verdict: 'bug_740', badge: 'G4: 740 BUG',
-        summary: 'Confirmed product bug (result_code 740): AGENT_INFO caught stale README path + broken MVCC drawer handler.',
-        cli: '0.10.9', duration_s: 8.42, credits: 1.2, replay: 1, author: 1,
+        summary: 'Confirmed product bug (result_code 740): independent Kane CLI AGENT_INFO caught stale README path and broken MVCC drawer handler, proving why no agent harness can audit itself.',
+        cli: 'TestMu AI Kane CLI', duration_s: 8.42, credits: 1.2, replay: 1, author: 1,
         evidence_cmd: 'kane-cli evidence serve .testmuai/evidence/refit-hud-red-740.evidence',
         steps: [
-          { ok: true, label: 'Step 1 [refit static 6.8ms]', text: 'Secrets & OSV clean; handed off to Gate 4 Kane CLI.' },
+          { ok: true, label: 'Step 1 [refit Hygiene + Untangle + Hooks]', text: 'Neural Code Hygiene, SCC untangle, OSV, and secret hooks clean; handed off to independent Gate 4 Kane CLI.' },
           { ok: false, label: 'Step 2 [AGENT_INFO · result_code 740]', text: 'Click on #btn-kane-evidence failed to switch drawer tab; console TypeError in renderKaneTab.' },
-          { ok: false, label: 'Step 3 [SymbolGraph Rewind]', text: 'Mapped to docs/index.html:4640 & src/mcp.rs:1175 -> recorded gate4_kane rule in .refit/learn.jsonl.' }
+          { ok: false, label: 'Step 3 [Polyglot Stem SymbolGraph Rewind]', text: 'Mapped to docs/index.html & src/mcp.rs -> recorded gate4_kane rule in .refit/learn.jsonl.' }
         ],
         readme_truth: [
-          { claim: 'Single static Rust binary (47 .rs files, 0 Cargo duplicates)', status: 'TRUE', proof: 'refit audit .' },
-          { claim: 'Live HUD Gate 4 Drawer opens cleanly on click', status: 'LIE', proof: 'Kane CLI 0.10.9 AGENT_INFO (result_code 740)' },
-          { claim: 'refit hook PreToolUse blocks git push until Gate 4 is green', status: 'TRUE', proof: 'exit 2 (kane_gate_unverified)' }
+          { claim: 'Embedded Neural Code Hygiene + Architectural Untangle + Polyglot Stem SymbolGraph', status: 'TRUE', proof: 'refit audit .' },
+          { claim: 'Live HUD Gate 4 Drawer opens cleanly on click', status: 'LIE', proof: 'TestMu AI Kane CLI AGENT_INFO (result_code 740)' },
+          { claim: 'Event-driven PreToolUse hook blocks git push until Gate 4 is green', status: 'TRUE', proof: 'exit 2 (kane_gate_unverified)' }
         ]
       },
       {
         id: 'repair', ok: true, verdict: 'repaired', badge: 'G4: HEALED',
-        summary: 'Atomic refit_tx shadow repair passed Gates 0-3.5 (7ms) -> untouched Kane _test.md re-verified GREEN -> MVCC committed.',
-        cli: '0.10.9', duration_s: 2.11, credits: 0.0, replay: 2, author: 0,
+        summary: 'Atomic MVCC WAL shadow repair passed Neural Code Hygiene, Untangle, and hook gates -> untouched TestMu AI Kane CLI _test.md re-verified GREEN -> MVCC committed.',
+        cli: 'TestMu AI Kane CLI', duration_s: 2.11, credits: 0.0, replay: 2, author: 0,
         evidence_cmd: 'kane-cli evidence serve .testmuai/evidence/refit-hud-healed.evidence',
         steps: [
-          { ok: true, label: 'Step 1 [refit_tx MVCC Stage]', text: 'Patched handler in isolated clear_env=true worktree; Gates 0-3.5 passed in 7ms.' },
-          { ok: true, label: 'Step 2 [Kane CLI Re-Verify]', text: 'Untouched _test.md re-executed with --no-adaptive-heal -> Exit 0 PASS.' },
-          { ok: true, label: 'Step 3 [PreToolUse Push Unblocked]', text: '.refit/kane_last.json matches HEAD -> refit hook allows git push (exit 0).' }
+          { ok: true, label: 'Step 1 [Atomic MVCC WAL Stage]', text: 'Patched handler in isolated clear_env=true worktree; Neural Code Hygiene, Untangle, and hooks passed cleanly.' },
+          { ok: true, label: 'Step 2 [TestMu AI Kane CLI Re-Verify]', text: 'Untouched _test.md re-executed with --no-adaptive-heal -> Exit 0 PASS.' },
+          { ok: true, label: 'Step 3 [PreToolUse Push Unblocked]', text: '.refit/kane_last.json matches HEAD -> event-driven hook allows git push (exit 0).' }
         ],
         readme_truth: [
-          { claim: 'Single static Rust binary (47 .rs files, 0 Cargo duplicates)', status: 'TRUE', proof: 'refit audit .' },
-          { claim: 'Live HUD Gate 4 Drawer opens cleanly on click', status: 'TRUE', proof: 'Re-verified GREEN after MVCC commit' },
-          { claim: 'refit hook PreToolUse unblocks git push on green HEAD match', status: 'TRUE', proof: 'exit 0 (<2ms .git/HEAD check)' }
+          { claim: 'Embedded Neural Code Hygiene + Architectural Untangle + Polyglot Stem SymbolGraph', status: 'TRUE', proof: 'refit audit .' },
+          { claim: 'Live HUD Gate 4 Drawer opens cleanly on click', status: 'TRUE', proof: 'Re-verified GREEN after atomic MVCC WAL commit' },
+          { claim: 'Event-driven PreToolUse hook unblocks git push on green HEAD match', status: 'TRUE', proof: 'exit 0 (<2ms .git/HEAD check)' }
         ]
       }
     ];
@@ -4742,7 +5057,7 @@
 
       metaEl.innerHTML =
         '<span class="' + (isOk ? 'mvcc-badge-ok' : 'mvcc-badge-rb') + '" data-testid="kane-verdict-badge">' + verdict.toUpperCase() + '</span>' +
-        '<span>kane-cli <b>' + ((liveLast && liveLast.cli_version) || p.cli) + '</b></span>' +
+        '<span>Gate 4 <b>' + p.cli + '</b></span>' +
         '<span>replay/author <b>' + p.replay + '/' + p.author + '</b></span>' +
         '<span>credits <b>' + p.credits.toFixed(1) + '</b></span>' +
         '<button class="mvcc-nav-btn" id="btn-cycle-kane" data-testid="kane-simulate-cycle" type="button">Cycle Red -> Repair -> Green</button>';
@@ -4752,34 +5067,39 @@
       }).join('');
       const truthHtml = p.readme_truth.map(function (r) {
         const cls = r.status === 'TRUE' ? 'mvcc-badge-ok' : 'mvcc-badge-rb';
-        return '<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px dashed rgba(28,28,27,0.12)">' +
-          '<span>' + r.claim + ' <span style="color:#575753">(' + r.proof + ')</span></span>' +
+        return '<div class="kane-truth-row">' +
+          '<span>' + r.claim + ' <span class="kane-truth-proof">(' + r.proof + ')</span></span>' +
           '<span class="' + cls + '">' + r.status + '</span></div>';
       }).join('');
 
       bodyEl.innerHTML =
         '<div class="editorial-plate-strip">' +
-          '<figure class="editorial-plate"><img alt="Caravaggio Medusa shield" src="./assets/plate-medusa.jpg" onerror="this.style.display=\'none\'" /><figcaption>Fig. I · 7ms Static Shield<sup>[1]</sup></figcaption></figure>' +
-          '<figure class="editorial-plate"><img alt="Moreau Hercules and the Lernaean Hydra" src="./assets/plate-hydra.jpg" onerror="this.style.display=\'none\'" /><figcaption>Fig. II · Closed-Loop Cauterize<sup>[2]</sup></figcaption></figure>' +
-          '<figure class="editorial-plate"><img alt="Bocca della Verita truth oracle" src="./assets/plate-verita.jpg" onerror="this.style.display=\'none\'" /><figcaption>Fig. III · README Truth<sup>[3]</sup></figcaption></figure>' +
+          '<figure class="editorial-plate"><img alt="Caravaggio Medusa shield" src="./assets/plate-medusa.jpg" onerror="this.style.display=\'none\'" /><figcaption>Fig. I · Hygiene &amp; Hook Shield<sup>[1]</sup></figcaption></figure>' +
+          '<figure class="editorial-plate"><img alt="Moreau Hercules and the Lernaean Hydra" src="./assets/plate-hydra.jpg" onerror="this.style.display=\'none\'" /><figcaption>Fig. II · Untangle &amp; MVCC Repair<sup>[2]</sup></figcaption></figure>' +
+          '<figure class="editorial-plate"><img alt="Bocca della Verita truth oracle" src="./assets/plate-verita.jpg" onerror="this.style.display=\'none\'" /><figcaption>Fig. III · Independent Gate 4 Truth<sup>[3]</sup></figcaption></figure>' +
         '</div>' +
         '<div class="kane-card">' +
-          '<h4><span>Two-Speed Shield &amp; Antigravity MCP Budget</span><span class="mvcc-badge-ok">47/48 .rs · 0 dupes</span></h4>' +
-          '<div class="kane-bar-row"><span style="width:128px">refit Static Shield</span><div class="kane-bar-track"><div class="kane-bar-fill" style="width:4%;background:#146C43"></div></div><b>7 ms · 0 cr</b></div>' +
-          '<div class="kane-bar-row"><span style="width:128px">refit MCP Tools</span><div class="kane-bar-track"><div class="kane-bar-fill" style="width:12%;background:#1D4ED8"></div></div><b>12 / 100 cap</b></div>' +
-          '<div class="kane-bar-row"><span style="width:128px">Playwright Test MCP</span><div class="kane-bar-track"><div class="kane-bar-fill" style="width:92%;background:#D94826"></div></div><b>92 / 100 cap</b></div>' +
+          '<h4><span>TestMu Loop Engineering &amp; Web-Wired MCP Budget</span><span class="mvcc-badge-ok">Dual independent gates</span></h4>' +
+          '<div class="kane-summary">No agent harness can audit itself: refit enforces independent Neural Code Hygiene, Architectural Untangle, Polyglot Stem SymbolGraph, web-wired MCP guidance (Keenable + OSV + SEP-2640), event-driven hooks, and atomic MVCC WAL while TestMu AI Kane CLI proves live browser and mobile behavior.</div>' +
+          '<div class="kane-bar-row"><span style="width:138px">refit Hygiene + Hooks</span><div class="kane-bar-track"><div class="kane-bar-fill" style="width:7%;background:#059669"></div></div><b>7 ms · 0 cr</b></div>' +
+          '<div class="kane-bar-row"><span style="width:138px">refit SEP-2640 MCP</span><div class="kane-bar-track"><div class="kane-bar-fill" style="width:12%;background:#1D4ED8"></div></div><b>12 / 100 cap</b></div>' +
+          '<div class="kane-bar-row"><span style="width:138px">Playwright Test MCP</span><div class="kane-bar-track"><div class="kane-bar-fill" style="width:92%;background:#B45309"></div></div><b>92 / 100 cap</b></div>' +
         '</div>' +
         '<div class="kane-card" data-testid="kane-step-list">' +
-          '<h4><span>Gate 4 Closed-Loop Trace (' + p.id.toUpperCase() + ')</span><span>' + p.duration_s.toFixed(2) + 's</span></h4>' +
-          '<div style="margin-bottom:6px;color:#4A4A47">' + p.summary + '</div>' +
+          '<h4><span>Gate 4 closed-loop trace (' + p.id.toUpperCase() + ')</span><span>' + p.duration_s.toFixed(2) + 's</span></h4>' +
+          '<div class="kane-summary">' + p.summary + '</div>' +
           stepsHtml +
-          '<div style="margin-top:6px;font-size:10.5px;color:#1D4ED8" data-testid="kane-evidence-cmd">$ ' + p.evidence_cmd + '</div>' +
+          '<div class="kane-cmd" data-testid="kane-evidence-cmd">$ ' + p.evidence_cmd + '</div>' +
         '</div>' +
         '<div class="kane-card" data-testid="kane-readme-truth">' +
-          '<h4><span>Dual-Layer README Lie Detector (Static + Kane CLI)</span><span>--verify-docs</span></h4>' +
+          '<h4><span>Dual-layer README truth matrix (Static + Kane CLI)</span><span>--verify-docs</span></h4>' +
           truthHtml +
         '</div>' +
         '<div class="kane-footnotes">' +
+          '<div class="kane-credits">' +
+            '<b>refit</b> (<a href="https://github.com/bevowoved/refit" target="_blank" rel="noreferrer">github.com/bevowoved/refit</a>) converges OSS inspirations from ' +
+            '<b>proxysoul/stem</b>, <b>codehygiene</b>, clean-room <b>Genome</b>/<b>SimiFlow</b>/<b>Untangle</b>, <b>OpenClaw</b>, <b>Keenable</b>, and <b>Kingfisher</b>/<b>Gitleaks</b>, paired with <b>TestMu AI Kane CLI</b>.' +
+          '</div>' +
           '<sup>[1]</sup> Caravaggio, <i>Medusa</i> (1597–98), Public Domain via <a href="https://commons.wikimedia.org/wiki/File:Caravaggio_-_Medusa_-_Google_Art_Project.jpg" target="_blank" rel="noreferrer">Wikimedia Commons</a>. ' +
           '<sup>[2]</sup> Gustave Moreau, <i>Hercules and the Lernaean Hydra</i> (1876), Art Institute of Chicago, Public Domain via <a href="https://commons.wikimedia.org/wiki/File:Gustave_Moreau_-_Hercules_and_the_Lernaean_Hydra_-_1964.231_-_Art_Institute_of_Chicago.jpg" target="_blank" rel="noreferrer">Wikimedia Commons</a>. ' +
           '<sup>[3]</sup> <i>Ercole alla Bocca della Verità</i> (1862), Public Domain via <a href="https://commons.wikimedia.org/wiki/File:Colpo_d%27occhio_a_Roma_p022_-_t_Ercole_alla_bocca_della_verit%C3%A0.jpg" target="_blank" rel="noreferrer">Wikimedia Commons</a>.' +
