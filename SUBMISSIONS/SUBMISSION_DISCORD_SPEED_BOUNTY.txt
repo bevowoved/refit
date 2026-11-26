@@ -1,5 +1,0 @@
-Speed Bounty entry: [RUN_SEPARATE_SPEED_PATCH_TPS] TPS
-
-Task: Santa's Speedy Shopper (5 real Christmas gifts with live links, measured strictly with wkasekende/openclaw-speed-patch in isolated workspace D:\cerebras\_speed_bounty\).
-
-Note: Run the isolated Santa's Speedy Shopper session inside D:\cerebras\_speed_bounty\ using the cloned patch at D:\cerebras\_vendor_src\openclaw-speed-patch\openclaw-cerebras-kimi-on-8b18b55.patch ONLY for Discord #share-your-demo. Never upload patched footage to X or r/cerebras.

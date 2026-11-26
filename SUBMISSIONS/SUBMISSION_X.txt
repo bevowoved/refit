@@ -1,7 +1,0 @@
-﻿Project Name: refit
-Team Members: @YOUR_X_HANDLE
-Project Description: refit v0.4 is a pure-Rust polyglot refactoring engine (10.98 MB mimalloc RSS, 0 Node sidecar) built for Kimi K3.1 Pro on Cerebras (891-938 tok/s, 18.8x vs GPU) and standard unpatched OpenClaw 2026.11.6 under the 50K uncached TPM cap. Using 90% AST slicing, 4 parallel Kahn waves, zero-copy hardlink staging, isolated git worktrees (main untouched before manual review), deduplicated zstd telemetry, native 10 req/s KeenAble library-ROI search, and 4 local gates across Python, Rust, TS/TSX, JS, and Go, it lowers LOC, CPU, peak/idle RSS, and log bits with zero regressions.
-GitHub Repository: https://github.com/patrickfield152-del/refit
-Live Replay: https://patrickfield152-del.github.io/refit/?replay=run.jsonl
-Demo Video: (attached, 54s with stereo audio)
-#KimiOnCerebras @Cerebras @Kimi_Moonshot

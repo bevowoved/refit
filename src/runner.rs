@@ -31,61 +31,57 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use worker::{WorkerCtx, WorkerOutcome, run_unit};
 
-#[derive(Debug, Clone)]
+pub const DEFAULT_UPSTREAM: &str = "https://api.cerebras.ai/v1";
+
+#[derive(clap::Args, Debug, Clone)]
 pub struct RunOptions {
-    pub repo_root: PathBuf,
-    pub api_key: String,
-    pub upstream_base_url: String,
-    pub openclaw_base_url: Option<String>,
-    pub openclaw_token: Option<String>,
-    pub openclaw_model: String,
-    pub model: String,
-    pub provider_label: String,
-    pub proxy_addr: String,
-    pub ui_index_path: PathBuf,
-    pub skill_path: PathBuf,
-    pub telemetry_path: PathBuf,
-    pub bench_script: Option<PathBuf>,
-    pub bench_cmd: Option<String>,
-    pub baseline_copy: Option<PathBuf>,
-    pub resume: bool,
-    pub initial_k: usize,
-    pub max_k: usize,
-    pub max_retries: u32,
-    pub hold_server_secs: u64,
-    pub max_units: Option<usize>,
-    pub worktree: bool,
-    pub include_dirty_worktree: bool,
-    pub cache_retention: CacheMode,
-    pub keep_warm: bool,
-    pub preserve_tools: bool,
-    pub strict_polyglot_tools: bool,
+    #[arg(value_name = "REPO")] pub repo_root: PathBuf,
+    #[arg(long = "upstream", default_value = DEFAULT_UPSTREAM)] pub upstream_base_url: String,
+    #[arg(long, default_value = "moonshotai-kimi-k3.1-pro-trial")] pub model: String,
+    #[arg(long, default_value = "Cerebras WSE-3T")] pub provider_label: String,
+    #[arg(long = "openclaw-url")] pub openclaw_base_url: Option<String>,
+    #[arg(long)] pub openclaw_token: Option<String>,
+    #[arg(long, default_value = "openclaw:main")] pub openclaw_model: String,
+    #[arg(long, default_value = "127.0.0.1:18790")] pub proxy_addr: String,
+    #[arg(long = "ui-index", default_value = "ui/index.html")] pub ui_index_path: PathBuf,
+    #[arg(long, default_value = "skills/refit/SKILL.md")] pub skill_path: PathBuf,
+    #[arg(long = "telemetry-out", default_value = "telemetry/run.jsonl")] pub telemetry_path: PathBuf,
+    #[arg(long)] pub bench_script: Option<PathBuf>,
+    #[arg(long)] pub bench_cmd: Option<String>,
+    #[arg(long)] pub baseline_copy: Option<PathBuf>,
+    #[arg(long)] pub api_key_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 12)] pub initial_k: usize,
+    #[arg(long, default_value_t = 20)] pub max_k: usize,
+    #[arg(long, default_value_t = 2)] pub max_retries: u32,
+    #[arg(long = "hold-secs", default_value_t = 0)] pub hold_server_secs: u64,
+    #[arg(long)] pub max_units: Option<usize>,
+    #[arg(long)] pub worktree: bool,
+    #[arg(long = "include-dirty")] pub include_dirty_worktree: bool,
+    #[arg(long = "cache-retention", env = "REFIT_CACHE_RETENTION")] pub cache_retention: Option<String>,
+    #[arg(long)] pub keep_warm: bool,
+    #[arg(long)] pub strip_tools: bool,
+    #[arg(long = "strict-tools")] pub strict_polyglot_tools: bool,
+    #[arg(skip)] pub api_key: String,
+    #[arg(skip)] pub resume: bool,
 }
 
 #[derive(Default)]
 struct RunTotals {
-    committed: usize,
-    skipped: usize,
-    cas_conflicts: u64,
-    rollbacks_g0: u64,
-    rollbacks_g1: u64,
-    rollbacks_g2: u64,
-    rollbacks_g3: u64,
-    retries: u64,
-    formatted: u64,
-    queue_ms: Vec<f64>,
-    decode_tps: Vec<f64>,
+    committed: usize, skipped: usize, cas_conflicts: u64, rollbacks_g0: u64, rollbacks_g1: u64,
+    rollbacks_g2: u64, rollbacks_g3: u64, retries: u64, formatted: u64,
+    queue_ms: Vec<f64>, decode_tps: Vec<f64>,
 }
 
 struct SchedState {
-    pending: Vec<ModuleUnit>,
-    completed: HashSet<String>,
-    rewound_once: HashSet<String>,
-    in_flight: HashMap<String, ModuleUnit>,
-    task_map: HashMap<tokio::task::Id, ModuleUnit>,
-    join_set: JoinSet<WorkerOutcome>,
-    tot: RunTotals,
-    k: usize,
+    pending: Vec<ModuleUnit>, completed: HashSet<String>, rewound_once: HashSet<String>,
+    in_flight: HashMap<String, ModuleUnit>, task_map: HashMap<tokio::task::Id, ModuleUnit>,
+    join_set: JoinSet<WorkerOutcome>, tot: RunTotals, k: usize,
+}
+
+fn unit_is_clean(unit: &ModuleUnit, audit: &AuditStats, min_hygiene: f64) -> bool {
+    let has_diags = unit.files.iter()
+        .any(|f| audit.per_file_diagnostics.get(f).is_some_and(|v| !v.is_empty()));
+    !has_diags && unit.baseline_hygiene >= min_hygiene
 }
 
 pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
@@ -105,8 +101,10 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
         listen_addr: opts.proxy_addr.clone(), upstream_base_url: opts.upstream_base_url.clone(),
         api_key: opts.api_key.clone(), model_override: opts.model.clone(),
         ui_index_path: opts.ui_index_path.clone(), static_prefix_override: Some(sys_prompt.clone()),
-        cache_retention: opts.cache_retention, keep_warm: opts.keep_warm, auth_token: explicit_tok,
-        lang_prefixes: prefix_map(&sys_prompt), preserve_tools: opts.preserve_tools,
+        cache_retention: CacheMode::parse_mode(opts.cache_retention.as_deref()),
+        keep_warm: opts.keep_warm || crate::platform::env_truthy("REFIT_KEEP_WARM"),
+        auth_token: explicit_tok, lang_prefixes: prefix_map(&sys_prompt),
+        preserve_tools: !opts.strip_tools,
     };
     let (proxy_state, proxy_handle) = start_proxy(proxy_cfg, telemetry.clone()).await?;
     proxy_state.bind_repo(active_repo.clone());
@@ -140,7 +138,7 @@ pub async fn execute_run(opts: RunOptions) -> Result<RunSummary> {
     };
 
     let pool_max = crate::platform::budget().http_pool_max;
-    let client = stream_http("refit-runner/0.5.0", 15, 600, pool_max)?;
+    let client = stream_http(concat!("refit-runner/", env!("CARGO_PKG_VERSION")), 15, 600, pool_max)?;
     let (chat_url, chat_bearer, chat_model, via_oc) = chat_endpoint(&client, &opts, &client_tok).await;
     let (rewind_index, file_to_unit) = if cfg!(any(feature = "live-rewind", test)) {
         build_rewind_index(&active_repo, &bundle, &gate_cfg)
@@ -213,10 +211,7 @@ fn filter_pending(
     let (plan, audit) = (&bundle.plan, &bundle.audit);
     let (mut pending, mut done, mut skipped) = (Vec::new(), HashSet::new(), 0usize);
     for u in &plan.units {
-        let has_diags = u.files.iter().any(|f| {
-            audit.per_file_diagnostics.get(f).is_some_and(|v| !v.is_empty())
-        });
-        if !has_diags && u.baseline_hygiene >= ctx.gate_cfg.min_hygiene_target {
+        if unit_is_clean(u, audit, ctx.gate_cfg.min_hygiene_target) {
             skipped += 1;
             done.insert(u.id.clone());
             continue;
@@ -236,17 +231,11 @@ fn filter_pending(
         let db = cp.get(&b.id).copied().unwrap_or(0);
         a.wave.cmp(&b.wave).then_with(|| db.cmp(&da)).then_with(|| a.id.cmp(&b.id))
     });
-    if let Some(lim) = opts.max_units
-        && pending.len() > lim
-    {
-        for dropped in pending.drain(lim..) {
-            done.insert(dropped.id);
-        }
+    if let Some(lim) = opts.max_units && pending.len() > lim {
+        for dropped in pending.drain(lim..) { done.insert(dropped.id); }
     }
     for u in &plan.units {
-        if !pending.iter().any(|p| p.id == u.id) {
-            done.insert(u.id.clone());
-        }
+        if !pending.iter().any(|p| p.id == u.id) { done.insert(u.id.clone()); }
     }
     (pending, done, skipped)
 }
@@ -271,12 +260,8 @@ async fn run_sched(
     };
     loop {
         ctx.shared_state.await_resume().await;
-        if ctx.shared_state.abort_asked() {
-            s.pending.clear();
-        }
-        if let Some(k_ov) = ctx.shared_state.k_override() {
-            s.k = k_ov.clamp(1, opts.max_k.max(2));
-        }
+        if ctx.shared_state.abort_asked() { s.pending.clear(); }
+        if let Some(k_ov) = ctx.shared_state.k_override() { s.k = k_ov.clamp(1, opts.max_k.max(2)); }
         drain_skipped(&ctx, &mut s);
         apply_rewind_events(&ctx, all_units, &mut s);
         spawn_ready(&ctx, all_units, &mut s);
@@ -287,16 +272,17 @@ async fn run_sched(
         match s.join_set.join_next().await {
             Some(Ok(out)) => apply_outcome(out, &ctx.shared_state, &mut s, opts.max_k),
             Some(Err(err)) => handle_panic(&ctx, err, &mut s),
-            None => {
-                for (_, orph) in s.in_flight.drain() {
-                    ctx.shared_state.step_inflight(-1);
-                    ctx.shared_state.mark_blocked(&orph.id, "worker_join_set_drained");
-                }
-                break;
-            }
+            None => { drain_orphans(&ctx, &mut s); break; }
         }
     }
     s.tot
+}
+
+fn drain_orphans(ctx: &WorkerCtx, s: &mut SchedState) {
+    for (_, orph) in s.in_flight.drain() {
+        ctx.shared_state.step_inflight(-1);
+        ctx.shared_state.mark_blocked(&orph.id, "worker_join_set_drained");
+    }
 }
 
 fn build_rewind_index(
@@ -310,29 +296,22 @@ fn build_rewind_index(
 
     for unit in &bundle.plan.units {
         unit_files.insert(unit.id.as_str(), unit.files.as_slice());
-        let has_diags = unit.files.iter().any(|rel| {
-            bundle.audit.per_file_diagnostics.get(rel).is_some_and(|v| !v.is_empty())
-        });
-        let dur = if !has_diags && unit.baseline_hygiene >= gate_cfg.min_hygiene_target {
-            Durability::High
-        } else {
-            Durability::Low
-        };
+        let clean = unit_is_clean(unit, &bundle.audit, gate_cfg.min_hygiene_target);
+        let dur = if clean { Durability::High } else { Durability::Low };
         for rel in &unit.files {
             file_to_unit.insert(rel.clone(), unit.id.clone());
             dur_by_file.insert(rel.as_str(), dur);
         }
     }
-    let mut index =
-        InvertedRewindIndex::from_symbol_graph(&load_symbols(repo_root, None), &dur_by_file);
+    let mut index = InvertedRewindIndex::from_symbol_graph(&load_symbols(repo_root, None), &dur_by_file);
     for unit in &bundle.plan.units {
         let Some(src_file) = unit.files.first() else { continue };
-        for dep_id in &unit.deps {
-            if let Some(dep_files) = unit_files.get(dep_id.as_str()) {
-                for dep_file in *dep_files {
-                    index.add_dep_by_path(src_file, dep_file);
-                }
-            }
+        let dep_files = unit.deps.iter()
+            .filter_map(|id| unit_files.get(id.as_str()))
+            .copied()
+            .flatten();
+        for dep_file in dep_files {
+            index.add_dep_by_path(src_file, dep_file);
         }
     }
     (index, file_to_unit)
@@ -589,12 +568,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sse_stream_timeout_and_utf8() {
+    async fn sse_stream_timeout_and_utf8() {
         let stalled = mock_sse(vec![sse_delta("partial")], 0, 5).await;
         assert!(collect_sse(get_sse(&stalled).await, Duration::from_millis(120)).await.is_err());
 
         let payload = sse_delta("café 🚀 日本語");
-        let pos = payload.windows(4).position(|w| w == "🚀".as_bytes()).unwrap();
+        let pos = payload.array_windows::<4>().position(|w| w.as_slice() == "🚀".as_bytes()).unwrap();
         let chunks = vec![payload[..pos + 2].to_vec(), payload[pos + 2..].to_vec()];
         let addr = mock_sse(chunks, 15, 0).await;
         let (_, _, text) = collect_sse(get_sse(&addr).await, Duration::from_secs(2)).await.unwrap();
@@ -603,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn test_effort_routing() {
+    fn effort_routing() {
         let (single, scc) = (unit_stub("a", &["a.py"]), unit_stub("a", &["a.py", "b.py"]));
         for (unit, attempt, diag, want) in [
             (&single, 1, "ruff F401", "low"), (&single, 1, "Gate 1 tests failed", "medium"),

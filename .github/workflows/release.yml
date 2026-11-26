@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -14,26 +17,34 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            features: "--no-default-features --features alloc-jemalloc,full"
             bin: refit
           - os: macos-latest
             target: aarch64-apple-darwin
+            features: "--features full"
             bin: refit
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            features: "--features full"
             bin: refit.exe
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
         with:
           targets: ${{ matrix.target }}
-      - name: Run unit tests
-        run: cargo test --locked || cargo test
+      - name: Verify single-version lockfile
+        shell: bash
+        run: |
+          dups=$(cargo tree --locked ${{ matrix.features }} -e normal --duplicates)
+          test -z "$dups"
+      - name: Run full test suite
+        run: cargo test --locked ${{ matrix.features }}
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked ${{ matrix.features }} --target ${{ matrix.target }}
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: refit-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.bin }}

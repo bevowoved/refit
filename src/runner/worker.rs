@@ -6,7 +6,7 @@ use crate::learn::{
     InvertedRewindIndex, LearnStore, MIN_KERNEL_COST_US, RewindEvent, should_use_index,
 };
 use crate::mvcc::{CommitOutcome, MvccStore};
-use crate::net::{drain_sse, json_str};
+use crate::net::drain_sse;
 use crate::platform::{MemGate, backoff_ms, char_prefix, now_ms};
 use crate::proxy::ProxyState;
 use crate::research::WebClient;
@@ -16,74 +16,98 @@ use crate::telemetry::{EventSpec, TelemetryHub};
 use crate::types::{GateVerdict, ModuleUnit};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[derive(Serialize)]
+struct ChatMsg {
+    role: &'static str, content: String,
+    #[serde(skip_serializing_if = "Option::is_none")] reasoning: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ChatReq<'a> {
+    model: &'a str, messages: Vec<ChatMsg>, stream: bool, max_completion_tokens: usize,
+    temperature: f32, reasoning_effort: &'static str, reasoning_format: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")] prompt_cache_key: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ChatResp { #[serde(default)] choices: Vec<ChatChoice> }
+
+impl ChatResp {
+    fn first_choice(self) -> Option<ChatChoice> { self.choices.into_iter().next() }
+}
+
+#[derive(Deserialize, Default)]
+struct ChatChoice { #[serde(default)] message: ChatPart, #[serde(default)] delta: ChatPart }
+
+#[derive(Deserialize, Default)]
+struct ChatPart { #[serde(default)] content: Option<String>, #[serde(default)] reasoning: Option<String> }
+
+#[derive(Serialize)]
+struct DispatchData { attempt: u32, k: usize, lang: &'static str, verifier_hint: &'static str }
+
+#[derive(Serialize)]
+struct RollbackData<'a> {
+    gate: &'a str, attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")] reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")] diagnostics: Option<&'a [String]>,
+}
+
+#[derive(Serialize)]
+struct RewindData<'a> {
+    trigger: &'static str, rule_key: &'a str, token: &'a str,
+    affected_files: usize, flagged_units: &'a [String],
+}
+
+#[derive(Serialize)]
+struct CommitData {
+    head_rev: u64, tx_id: String, attempt: u32, hygiene_before: f64, hygiene_after: f64,
+    ruff_errors: usize, ty_errors: usize, tests_passed: usize, formatted_files: usize,
+}
+
+fn to_val<T: Serialize>(v: &T) -> Value { serde_json::to_value(v).unwrap_or(Value::Null) }
+
 pub(super) struct WorkerCtx {
-    pub(super) run_id: String,
-    pub(super) repo_root: PathBuf,
-    pub(super) client: reqwest::Client,
-    pub(super) chat_url: String,
-    pub(super) chat_bearer: String,
-    pub(super) chat_model: String,
-    pub(super) static_sys: String,
-    pub(super) baseline_diags: HashMap<String, Vec<String>>,
-    pub(super) hygiene: Arc<HygieneScorer>,
-    pub(super) gate_cfg: Arc<GateConfig>,
-    pub(super) mvcc: Arc<MvccStore>,
-    pub(super) learn: Arc<LearnStore>,
+    pub(super) run_id: String, pub(super) repo_root: PathBuf, pub(super) client: reqwest::Client,
+    pub(super) chat_url: String, pub(super) chat_bearer: String, pub(super) chat_model: String,
+    pub(super) static_sys: String, pub(super) baseline_diags: HashMap<String, Vec<String>>,
+    pub(super) hygiene: Arc<HygieneScorer>, pub(super) gate_cfg: Arc<GateConfig>,
+    pub(super) mvcc: Arc<MvccStore>, pub(super) learn: Arc<LearnStore>,
     pub(super) rewind_index: Arc<InvertedRewindIndex>,
-    pub(super) file_to_unit: Arc<HashMap<String, String>>,
-    pub(super) proxy: Arc<ProxyState>,
-    pub(super) shared_state: Arc<RunState>,
-    pub(super) research: Arc<WebClient>,
-    pub(super) phase0_research: String,
-    pub(super) telemetry: TelemetryHub,
+    pub(super) file_to_unit: Arc<HashMap<String, String>>, pub(super) proxy: Arc<ProxyState>,
+    pub(super) shared_state: Arc<RunState>, pub(super) research: Arc<WebClient>,
+    pub(super) phase0_research: String, pub(super) telemetry: TelemetryHub,
     pub(super) max_retries: u32,
 }
 
 #[derive(Default)]
 pub(super) struct WorkerOutcome {
-    pub(super) unit_id: String,
-    pub(super) committed: bool,
-    pub(super) cas_conflicts: u64,
-    pub(super) rollbacks_g0: u64,
-    pub(super) rollbacks_g1: u64,
-    pub(super) rollbacks_g2: u64,
-    pub(super) rollbacks_g3: u64,
-    pub(super) retries: u64,
-    pub(super) formatted_files: u64,
-    pub(super) saw_429: bool,
-    pub(super) queue_ms_samples: Vec<f64>,
+    pub(super) unit_id: String, pub(super) committed: bool, pub(super) cas_conflicts: u64,
+    pub(super) rollbacks_g0: u64, pub(super) rollbacks_g1: u64, pub(super) rollbacks_g2: u64,
+    pub(super) rollbacks_g3: u64, pub(super) retries: u64, pub(super) formatted_files: u64,
+    pub(super) saw_429: bool, pub(super) queue_ms_samples: Vec<f64>,
     pub(super) decode_tps_samples: Vec<f64>,
 }
 
 struct UnitRun {
-    unit: ModuleUnit,
-    lang: &'static str,
-    dir: String,
-    k: usize,
-    out: WorkerOutcome,
-    base_diags: Vec<String>,
-    diags: Vec<String>,
-    initial_user: Option<String>,
-    prev_asst: Option<(String, String)>,
-    prior_fails: Vec<String>,
-    retry_note: String,
-    learn_keys: Vec<String>,
+    unit: ModuleUnit, lang: &'static str, dir: String, k: usize, out: WorkerOutcome,
+    base_diags: Vec<String>, diags: Vec<String>, initial_user: Option<String>,
+    prev_asst: Option<(String, String)>, prior_fails: Vec<String>,
+    retry_note: String, learn_keys: Vec<String>,
 }
 
 impl UnitRun {
     fn new(ctx: &WorkerCtx, unit: ModuleUnit, k: usize) -> Self {
         let raw_dir = dir_of(&unit.files[0]);
         let dir = if raw_dir.is_empty() { "*".into() } else { raw_dir };
-        let base_diags: Vec<String> = unit
-            .files
-            .iter()
+        let base_diags: Vec<String> = unit.files.iter()
             .flat_map(|f| ctx.baseline_diags.get(f).cloned().unwrap_or_default())
             .collect();
         let lang = guess_lang(&unit);
@@ -101,44 +125,31 @@ pub(super) async fn run_unit(
 ) -> WorkerOutcome {
     let mut r = UnitRun::new(&ctx, unit, current_k);
     for attempt in 1..=(ctx.max_retries + 1) {
-        if attempt > 1 {
-            r.out.retries += 1;
-        }
+        if attempt > 1 { r.out.retries += 1; }
         ctx.shared_state.set_phase(&r.unit.id, "dispatching", attempt, r.unit.loc);
 
         let (base_texts, exp_hashes) = read_bases(&ctx.repo_root, &r.unit.files);
         r.unit.base_blake3 = exp_hashes.clone();
         let (learn_suf, keys) = ctx.learn.rule_suffix(&r.dir);
         for lk in keys {
-            if !r.learn_keys.contains(&lk) {
-                r.learn_keys.push(lk);
-            }
+            if !r.learn_keys.contains(&lk) { r.learn_keys.push(lk); }
         }
 
         let Some(msgs) = build_msgs(&ctx, &mut r, &deps_abi, &learn_suf, attempt) else { break };
         let (reason, content) = match call_llm(&ctx, &mut r, attempt, msgs).await {
             Ok(pair) => pair,
-            Err(err_diag) => {
-                r.diags = vec![err_diag];
-                continue;
-            }
+            Err(err_diag) => { r.diags = vec![err_diag]; continue; }
         };
         r.prev_asst = Some((reason, content.clone()));
 
         let applied = match apply_patches(&base_texts, &parse_patches(&content)) {
             Ok(a) => a,
-            Err(e) => {
-                apply_err(&ctx, &mut r, attempt, &e.to_string());
-                continue;
-            }
+            Err(e) => { apply_err(&ctx, &mut r, attempt, &e.to_string()); continue; }
         };
 
         let verdict = match verify_unit(&ctx, &r.unit, attempt, applied.updated, applied.deleted).await {
             Ok(v) => v,
-            Err(e) => {
-                r.diags = vec![e];
-                continue;
-            }
+            Err(e) => { r.diags = vec![e]; continue; }
         };
         r.out.formatted_files += verdict.formatted_files as u64;
 
@@ -146,9 +157,7 @@ pub(super) async fn run_unit(
             gate_fail(&ctx, &mut r, attempt, verdict).await;
             continue;
         }
-        if commit_unit(&ctx, &mut r, attempt, &exp_hashes, verdict) {
-            break;
-        }
+        if commit_unit(&ctx, &mut r, attempt, &exp_hashes, verdict) { break; }
     }
     r.out
 }
@@ -164,10 +173,14 @@ fn read_bases(root: &Path, files: &[String]) -> (BTreeMap<String, String>, BTree
     (texts, hashes)
 }
 
+fn chat_msg(role: &'static str, content: impl Into<String>, reasoning: Option<String>) -> ChatMsg {
+    ChatMsg { role, content: content.into(), reasoning }
+}
+
 fn build_msgs(
     ctx: &WorkerCtx, r: &mut UnitRun, deps_abi: &str, learn_suf: &str, attempt: u32,
-) -> Option<Vec<Value>> {
-    let mut msgs = vec![json!({"role": "system", "content": ctx.static_sys})];
+) -> Option<Vec<ChatMsg>> {
+    let mut msgs = vec![chat_msg("system", ctx.static_sys.clone(), None)];
     let budget = if r.unit.files.len() > 1 { 24_000 } else { 12_000 };
 
     if attempt == 1 || r.initial_user.is_none() {
@@ -180,18 +193,15 @@ fn build_msgs(
             }
         }
         prompt.push_str(&pkt);
-        msgs.push(json!({"role": "user", "content": prompt}));
+        msgs.push(chat_msg("user", prompt.clone(), None));
         r.initial_user = Some(prompt);
         return Some(msgs);
     }
 
-    msgs.push(json!({"role": "user", "content": r.initial_user.as_deref().unwrap_or("")}));
+    msgs.push(chat_msg("user", r.initial_user.as_deref().unwrap_or(""), None));
     if let Some((prev_r, prev_c)) = &r.prev_asst {
-        let mut asst = json!({"role": "assistant", "content": char_prefix(prev_c, 2400)});
-        if !prev_r.is_empty() {
-            asst["reasoning"] = json!(char_prefix(prev_r, 600));
-        }
-        msgs.push(asst);
+        let reasoning = (!prev_r.is_empty()).then(|| char_prefix(prev_r, 600).to_string());
+        msgs.push(chat_msg("assistant", char_prefix(prev_c, 2400), reasoning));
     }
 
     let hist = if r.prior_fails.is_empty() {
@@ -208,32 +218,29 @@ fn build_msgs(
          file verbatim.\n{hist}Fix EVERY diagnostic below:\n- {}\n{}{}",
         r.diags.join("\n- "), learn_suf, r.retry_note
     );
-    msgs.push(json!({"role": "user", "content": feedback}));
+    msgs.push(chat_msg("user", feedback, None));
     Some(msgs)
 }
 
 async fn call_llm(
-    ctx: &WorkerCtx, r: &mut UnitRun, attempt: u32, msgs: Vec<Value>,
+    ctx: &WorkerCtx, r: &mut UnitRun, attempt: u32, msgs: Vec<ChatMsg>,
 ) -> std::result::Result<(String, String), String> {
-    let dispatch = json!({
-        "attempt": attempt, "k": r.k, "lang": r.lang, "verifier_hint": cold_verifier_hint(r.lang)
+    let dispatch = to_val(&DispatchData {
+        attempt, k: r.k, lang: r.lang, verifier_hint: cold_verifier_hint(r.lang),
     });
     ctx.telemetry.emit("wave_dispatch", EventSpec {
         uncached_tpm: Some(ctx.proxy.snapshot().uncached_tpm_rolling),
         data: Some(dispatch), ..EventSpec::unit(&r.unit)
     });
 
-    let effort = pick_effort(&r.unit, attempt, &r.diags);
-    let max_tok = if r.unit.files.len() > 1 { 5500 } else { 3200 };
-    let mut body = json!({
-        "model": ctx.chat_model, "messages": msgs, "stream": true,
-        "max_completion_tokens": max_tok, "temperature": 1.0,
-        "reasoning_effort": effort, "reasoning_format": "parsed"
-    });
-    if attempt >= 2 {
-        let short_run = char_prefix(&ctx.run_id, 10);
-        body["prompt_cache_key"] = json!(format!("refit:{short_run}:m:{}", r.unit.id));
-    }
+    let body = ChatReq {
+        model: &ctx.chat_model, messages: msgs, stream: true,
+        max_completion_tokens: if r.unit.files.len() > 1 { 5500 } else { 3200 },
+        temperature: 1.0, reasoning_effort: pick_effort(&r.unit, attempt, &r.diags),
+        reasoning_format: "parsed",
+        prompt_cache_key: (attempt >= 2)
+            .then(|| format!("refit:{}:m:{}", char_prefix(&ctx.run_id, 10), r.unit.id)),
+    };
 
     let req = ctx.client.post(&ctx.chat_url).bearer_auth(&ctx.chat_bearer)
         .header("x-refit-module", &r.unit.id)
@@ -287,7 +294,9 @@ fn apply_err(ctx: &WorkerCtx, r: &mut UnitRun, attempt: u32, err: &str) {
     let _ = ctx.mvcc.record_rollback(&r.unit.id, "asrf_apply", &msg);
     ctx.learn.record_failure("asrf_apply", &r.dir, &msg);
     r.prior_fails.push(format!("Attempt {attempt} failed at asrf_apply: {}", char_prefix(&msg, 120)));
-    let data = json!({"gate": "asrf_apply", "attempt": attempt, "reason": msg});
+    let data = to_val(&RollbackData {
+        gate: "asrf_apply", attempt, reason: Some(&msg), diagnostics: None,
+    });
     ctx.telemetry.emit_unit("mvcc_rollback", &r.unit, data);
     r.diags = vec![msg];
 }
@@ -347,7 +356,9 @@ async fn gate_fail(ctx: &WorkerCtx, r: &mut UnitRun, attempt: u32, verdict: Gate
         }
     }
 
-    let data = json!({"gate": fg, "attempt": attempt, "diagnostics": verdict.diagnostics});
+    let data = to_val(&RollbackData {
+        gate: &fg, attempt, reason: None, diagnostics: Some(&verdict.diagnostics),
+    });
     ctx.telemetry.emit_unit("mvcc_rollback", &r.unit, data);
     r.diags = verdict.diagnostics;
 }
@@ -366,9 +377,9 @@ fn dispatch_rewind(ctx: &WorkerCtx, unit: &ModuleUnit, event: RewindEvent) {
     flagged.sort();
     flagged.dedup();
     ctx.shared_state.record_rewind(event.clone(), &flagged);
-    let data = json!({
-        "trigger": event.trigger.as_str(), "rule_key": event.rule_key, "token": event.token,
-        "affected_files": affected.len(), "flagged_units": flagged
+    let data = to_val(&RewindData {
+        trigger: event.trigger().as_str(), rule_key: &event.rule_key, token: &event.token,
+        affected_files: affected.len(), flagged_units: &flagged,
     });
     ctx.telemetry.emit_unit("live_rewind", unit, data);
 }
@@ -389,13 +400,12 @@ fn commit_unit(
                 &r.unit.id, attempt, r.unit.loc, after_loc, verdict.gate2_score_after, first,
             );
             ctx.learn.credit_keys(&r.dir, &r.learn_keys);
-            let commit_data = json!({
-                "head_rev": head_rev, "tx_id": tx_id, "attempt": attempt,
-                "hygiene_before": verdict.gate2_score_before,
-                "hygiene_after": verdict.gate2_score_after,
-                "ruff_errors": verdict.gate3_ruff_errors, "ty_errors": verdict.gate3_ty_errors,
-                "tests_passed": verdict.gate1_tests_passed,
-                "formatted_files": verdict.formatted_files
+            let commit_data = to_val(&CommitData {
+                head_rev, tx_id, attempt,
+                hygiene_before: verdict.gate2_score_before,
+                hygiene_after: verdict.gate2_score_after,
+                ruff_errors: verdict.gate3_ruff_errors, ty_errors: verdict.gate3_ty_errors,
+                tests_passed: verdict.gate1_tests_passed, formatted_files: verdict.formatted_files,
             });
             ctx.telemetry.emit("mvcc_commit", EventSpec {
                 uncached_tpm: Some(ctx.proxy.snapshot().uncached_tpm_rolling),
@@ -429,24 +439,21 @@ pub(super) async fn collect_sse(
         .is_some_and(|ct| ct.contains("text/event-stream"));
     if !is_sse {
         let text = resp.text().await.context("read JSON response body")?;
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        let Ok(parsed) = serde_json::from_str::<ChatResp>(&text) else {
             return Ok((status, String::new(), text));
         };
-        let msg = &v["choices"][0]["message"];
-        return Ok((status, json_str(msg, "reasoning"), json_str(msg, "content")));
+        let msg = parsed.first_choice().map(|c| c.message).unwrap_or_default();
+        return Ok((status, msg.reasoning.unwrap_or_default(), msg.content.unwrap_or_default()));
     }
 
     let (mut reasoning, mut content) = (String::new(), String::new());
-    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut buf = Vec::with_capacity(4096);
     let mut stream = resp.bytes_stream();
     let mut on_val = |v: Value| {
-        let delta = &v["choices"][0]["delta"];
-        if let Some(d) = delta["content"].as_str() {
-            content.push_str(d);
-        }
-        if let Some(r) = delta["reasoning"].as_str() {
-            reasoning.push_str(r);
-        }
+        let Ok(chunk) = serde_json::from_value::<ChatResp>(v) else { return };
+        let Some(choice) = chunk.first_choice() else { return };
+        if let Some(d) = choice.delta.content { content.push_str(&d); }
+        if let Some(r) = choice.delta.reasoning { reasoning.push_str(&r); }
     };
 
     loop {

@@ -22,13 +22,10 @@ const CONTRACTIONS: &[&str] = &[
 ];
 const VERB_SWAPS: &[(&str, &str)] = &[
     ("utilize", "use"), ("utilizes", "uses"), ("utilized", "used"),
-    ("commence", "start"), ("commences", "starts"),
-    ("terminate", "stop"), ("terminates", "stops"),
+    ("commence", "start"), ("commences", "starts"), ("terminate", "stop"), ("terminates", "stops"),
     ("perform", "do"), ("performs", "does"), ("performed", "did"),
-    ("leverage", "use"), ("leverages", "uses"),
-    ("facilitate", "help"), ("facilitates", "helps"),
-    ("obtain", "get"), ("obtains", "gets"),
-    ("instantiate", "create"), ("instantiates", "creates"),
+    ("leverage", "use"), ("leverages", "uses"), ("facilitate", "help"), ("facilitates", "helps"),
+    ("obtain", "get"), ("obtains", "gets"), ("instantiate", "create"), ("instantiates", "creates"),
     ("attempt", "try"), ("attempts", "tries"),
 ];
 
@@ -74,8 +71,8 @@ const NON_NOUN_WORDS: &[&str] = &[
     "plain", "public", "private", "dirty", "cold", "warm", "hot", "hourly", "mandatory", "stateless",
     "deterministic", "bounded", "virtual", "external", "internal", "legacy", "local", "remote",
     "relative", "minimal", "actual", "other", "non-ascii", "headless", "active", "valid", "invalid",
-    "dead", "unused", "circular", "deep", "shallow", "prioritized", "structural", "technical", "full",
-    "total",
+    "dead", "unused", "circular", "deep", "shallow", "prioritized", "structural", "technical",
+    "full", "total",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,12 +84,8 @@ pub struct LintIssue { pub line: usize, pub rule: String, pub detail: String, pu
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProseReport {
-    pub total_sentences: usize,
-    pub compliant_sentences: usize,
-    pub violation_count: usize,
-    pub compliant: bool,
-    pub custom_dict_loaded: bool,
-    pub custom_dict_entries: usize,
+    pub total_sentences: usize, pub compliant_sentences: usize, pub violation_count: usize,
+    pub compliant: bool, pub custom_dict_loaded: bool, pub custom_dict_entries: usize,
     pub issues: Vec<LintIssue>,
 }
 
@@ -114,24 +107,8 @@ impl WordList {
     pub fn parse_str(raw: &str) -> Self {
         let mut dict = Self::default();
         for line in raw.lines().map(str::trim) {
-            if line.is_empty() || line.starts_with('#') || line.starts_with("//") { continue; }
-            if let Some((left, right)) = line.split_once(':') {
-                let word = left.trim().to_ascii_lowercase();
-                if word.is_empty() { continue; }
-                let (st, swap) = right.trim().split_once("->").map_or((right.trim(), None), |(s, r)| {
-                    (s.trim(), Some(r.trim().to_string()).filter(|x| !x.is_empty()))
-                });
-                match st.to_ascii_lowercase().as_str() {
-                    "technical" | "technical_noun" | "tn" => { dict.technical_nouns.insert(word); }
-                    "unapproved" | "banned" | "forbid" | "forbidden" | "disallow" => {
-                        dict.unapproved.insert(word, swap);
-                    }
-                    _ => { dict.approved.insert(word); }
-                }
-            } else if let Some(clean) = line.split_whitespace().next().map(str::to_ascii_lowercase)
-                && !clean.is_empty()
-            {
-                dict.approved.insert(clean);
+            if !line.is_empty() && !line.starts_with('#') && !line.starts_with("//") {
+                parse_dict_line(&mut dict, line);
             }
         }
         dict
@@ -147,42 +124,68 @@ impl WordList {
     }
 }
 
+fn parse_dict_line(dict: &mut WordList, line: &str) {
+    let Some((left, right)) = line.split_once(':') else {
+        if let Some(clean) = line.split_whitespace().next().map(str::to_ascii_lowercase)
+            && !clean.is_empty()
+        {
+            dict.approved.insert(clean);
+        }
+        return;
+    };
+    let word = left.trim().to_ascii_lowercase();
+    if word.is_empty() { return; }
+    let rhs = right.trim();
+    let (st, swap) = rhs.split_once("->").map_or((rhs, None), |(s, r)| {
+        (s.trim(), Some(r.trim().to_string()).filter(|x| !x.is_empty()))
+    });
+    match st.to_ascii_lowercase().as_str() {
+        "technical" | "technical_noun" | "tn" => { dict.technical_nouns.insert(word); }
+        "unapproved" | "banned" | "forbid" | "forbidden" | "disallow" => {
+            dict.unapproved.insert(word, swap);
+        }
+        _ => { dict.approved.insert(word); }
+    }
+}
+
 /// Classify whether a backtick span is a technical code token.
 pub fn is_code_token(span: &str) -> bool {
     let trimmed = span.trim();
     if trimmed.is_empty() { return true; }
     let count = trimmed.split_whitespace().count();
-    if count >= 5 { return false; }
     count == 1
-        || trimmed.chars().any(|ch| {
-            matches!(
-                ch,
-                ':' | '/' | '\\' | '_' | '-' | '=' | '(' | ')' | '[' | ']' | '.' | ';' | '$' | '%'
-                    | '@' | '<' | '>' | '{' | '}' | '0'..='9'
-            )
-        })
+        || (count < 5 && trimmed.bytes().any(|b| b.is_ascii_digit() || b":/\\_-=()[].;$%@<>{}".contains(&b)))
+}
+
+enum BtPart<'a> { Plain(&'a str), Span(usize, usize), Dangling(&'a str, &'a str) }
+
+fn walk_backticks<'a>(input: &'a str, mut on: impl FnMut(BtPart<'a>)) {
+    let mut last = 0usize;
+    for (open, close) in crate::lex::iter_backtick_ranges(input) {
+        on(BtPart::Plain(&input[last..open]));
+        on(BtPart::Span(open, close));
+        last = close + 1;
+    }
+    match input[last..].split_once('`') {
+        Some((before, after)) => on(BtPart::Dangling(before, after)),
+        None => on(BtPart::Plain(&input[last..])),
+    }
 }
 
 /// Mask code spans as `CODETOK` and unwrap prose disguised inside backticks.
 pub fn mask_code_spans(input: &str) -> (String, bool) {
-    let (mut out, mut last, mut disguised) = (String::with_capacity(input.len()), 0usize, false);
-    for (open, close) in crate::lex::iter_backtick_ranges(input) {
-        out.push_str(&input[last..open]);
-        let span = &input[open + 1..close];
-        if is_code_token(span) {
-            out.push_str(" CODETOK ");
-        } else {
-            disguised = true;
-            let _ = write!(out, " {span} ");
+    let (mut out, mut disguised) = (String::with_capacity(input.len()), false);
+    walk_backticks(input, |part| match part {
+        BtPart::Plain(s) => out.push_str(s),
+        BtPart::Span(open, close) => {
+            let span = &input[open + 1..close];
+            if is_code_token(span) { out.push_str(" CODETOK "); } else {
+                disguised = true;
+                let _ = write!(out, " {span} ");
+            }
         }
-        last = close + 1;
-    }
-    let tail = &input[last..];
-    if let Some((before, after)) = tail.split_once('`') {
-        let _ = write!(out, "{before} {after}");
-    } else {
-        out.push_str(tail);
-    }
+        BtPart::Dangling(before, after) => { let _ = write!(out, "{before} {after}"); }
+    });
     (out, disguised)
 }
 
@@ -201,11 +204,11 @@ pub fn lint_sentence(sentence: &str, kind: SentenceKind, dict: Option<&WordList>
     let limit = if kind == SentenceKind::Procedural { MAX_PROC_WORDS } else { MAX_DESC_WORDS };
     if raw_words.len() > limit { push_unique(&mut errs, "word_limit_exceeded"); }
 
-    let lowered_clean = scan_lexical_rules(&raw_words, dict, &mut errs);
-    check_voice(&lowered_clean, dict, &mut errs);
+    let lowered = scan_lexical_rules(&raw_words, dict, &mut errs);
+    check_voice(&lowered, dict, &mut errs);
     check_noun_clusters(&raw_words, dict, &mut errs);
     if kind == SentenceKind::Procedural
-        && lowered_clean.first().is_some_and(|first| BAD_OPENERS.contains(&first.as_str()))
+        && lowered.first().is_some_and(|first| BAD_OPENERS.contains(&first.as_str()))
     {
         push_unique(&mut errs, "non_imperative_procedural");
     }
@@ -231,45 +234,40 @@ fn scan_lexical_rules(
 
 fn check_verb_and_dict(clean: &str, dict: Option<&WordList>, errs: &mut Vec<&'static str>) {
     if clean.is_empty() || clean == "codetok" { return; }
-    if !dict.is_some_and(|d| d.is_approved(clean))
-        && VERB_SWAPS.iter().any(|(b, _)| *b == clean)
-    {
+    if !dict.is_some_and(|d| d.is_approved(clean)) && VERB_SWAPS.iter().any(|(b, _)| *b == clean) {
         push_unique(errs, "unapproved_verb");
     }
     let Some(user_dict) = dict else { return };
     if user_dict.unapproved.contains_key(clean) {
         push_unique(errs, "dict_unapproved_word");
-    } else if !user_dict.approved.is_empty()
-        && clean.len() >= 2
-        && clean.bytes().all(|b| b.is_ascii_alphabetic())
-        && !user_dict.is_approved(clean)
+    } else if !user_dict.approved.is_empty() && clean.len() >= 2
+        && clean.bytes().all(|b| b.is_ascii_alphabetic()) && !user_dict.is_approved(clean)
     {
         push_unique(errs, "dict_not_in_wordlist");
     }
 }
 
+fn classify_voice_follow(text: &str, dict: Option<&WordList>) -> Option<&'static str> {
+    if (text.len() > 4 && text.ends_with("ed")) || IRREG_PARTICIPLES.contains(&text) {
+        return Some("passive_voice");
+    }
+    if text.len() >= 5 && text.ends_with("ing")
+        && !dict.is_some_and(|d| d.is_tech_noun(text))
+        && !NOUN_ING_WORDS.contains(&text)
+    {
+        return Some("progressive_ing");
+    }
+    None
+}
+
 fn check_voice(tokens: &[String], dict: Option<&WordList>, errs: &mut Vec<&'static str>) {
     for (aux_idx, word) in tokens.iter().enumerate() {
-        if !PASSIVE_AUX.contains(&word.as_str()) { continue; }
-        let end = (aux_idx + 3).min(tokens.len());
-        let mut det_between = false;
-        for (offset, tok) in tokens[(aux_idx + 1)..end].iter().enumerate() {
-            let s = tok.as_str();
-            if offset == 0 && DETERMINERS.contains(&s) {
-                det_between = true;
-                continue;
-            }
-            if det_between { continue; }
-            if (s.len() > 4 && s.ends_with("ed")) || IRREG_PARTICIPLES.contains(&s) {
-                push_unique(errs, "passive_voice");
-                break;
-            }
-            if s.len() >= 5 && s.ends_with("ing")
-                && !dict.is_some_and(|d| d.is_tech_noun(s)) && !NOUN_ING_WORDS.contains(&s)
-            {
-                push_unique(errs, "progressive_ing");
-                break;
-            }
+        if !PASSIVE_AUX.contains(&word.as_str())
+            || tokens.get(aux_idx + 1).is_some_and(|t| DETERMINERS.contains(&t.as_str()))
+        { continue; }
+        let window = &tokens[(aux_idx + 1)..(aux_idx + 3).min(tokens.len())];
+        if let Some(rule) = window.iter().find_map(|tok| classify_voice_follow(tok, dict)) {
+            push_unique(errs, rule);
         }
     }
 }
@@ -293,57 +291,78 @@ fn check_noun_clusters(raw_words: &[&str], dict: Option<&WordList>, errs: &mut V
 
 fn is_noun_word(raw: &str, dict: Option<&WordList>) -> bool {
     let trimmed = raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-    if trimmed.len() <= 2
-        || trimmed == "CODETOK"
+    if trimmed.len() <= 2 || trimmed == "CODETOK"
         || trimmed.bytes().any(|b| b.is_ascii_digit())
         || trimmed.bytes().all(|b| b.is_ascii_uppercase() || b == b'-')
     { return false; }
     let lower = trimmed.to_ascii_lowercase();
-    !lower.ends_with("ly")
-        && !lower.ends_with("ed")
-        && !NON_NOUN_WORDS.contains(&lower.as_str())
-        && !dict.is_some_and(|d| d.is_tech_noun(&lower))
+    !lower.ends_with("ly") && !lower.ends_with("ed")
+        && !NON_NOUN_WORDS.contains(&lower.as_str()) && !dict.is_some_and(|d| d.is_tech_noun(&lower))
 }
 
 /// Replace verbose verbs outside backtick code spans.
 pub fn simplify_verbs(text: &str) -> String {
-    let (mut out, mut rest) = (String::with_capacity(text.len()), text);
-    while let Some(open) = rest.find('`') {
-        rewrite_plain_segment(&rest[..open], &mut out);
-        out.push('`');
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('`') else {
+    let mut out = String::with_capacity(text.len());
+    walk_backticks(text, |part| match part {
+        BtPart::Plain(s) => rewrite_plain_segment(s, &mut out),
+        BtPart::Span(open, close) => out.push_str(&text[open..=close]),
+        BtPart::Dangling(before, after) => {
+            rewrite_plain_segment(before, &mut out);
+            out.push('`');
             out.push_str(after);
-            return out;
-        };
-        out.push_str(&after[..=close]);
-        rest = &after[close + 1..];
-    }
-    rewrite_plain_segment(rest, &mut out);
+        }
+    });
     out
 }
 
 fn rewrite_plain_segment(segment: &str, out: &mut String) {
     let (bytes, mut cursor) = (segment.as_bytes(), 0usize);
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    for m in VERB_AC.find_iter(segment) {
-        let before_ok = m.start() == 0 || !is_word(bytes[m.start() - 1]);
-        let after_ok = m.end() == bytes.len() || !is_word(bytes[m.end()]);
-        if !before_ok || !after_ok { continue; }
-        out.push_str(&segment[cursor..m.start()]);
-        let swap = VERB_SWAPS[m.pattern().as_usize()].1;
-        if bytes[m.start()].is_ascii_uppercase() {
-            let mut chars = swap.chars();
-            if let Some(first) = chars.next() {
-                out.push(first.to_ascii_uppercase());
-                out.push_str(chars.as_str());
-            }
+    for mat in VERB_AC.find_iter(segment) {
+        if (mat.start() > 0 && is_word(bytes[mat.start() - 1]))
+            || (mat.end() < bytes.len() && is_word(bytes[mat.end()]))
+        { continue; }
+        out.push_str(&segment[cursor..mat.start()]);
+        let swap = VERB_SWAPS[mat.pattern().as_usize()].1;
+        if bytes[mat.start()].is_ascii_uppercase() {
+            out.push(swap.as_bytes()[0].to_ascii_uppercase() as char);
+            out.push_str(&swap[1..]);
         } else {
             out.push_str(swap);
         }
-        cursor = m.end();
+        cursor = mat.end();
     }
     out.push_str(&segment[cursor..]);
+}
+
+fn push_md_issues(line_no: usize, sentence: &str, rules: &[&str], issues: &mut Vec<LintIssue>) {
+    for &rule in rules {
+        issues.push(LintIssue {
+            line: line_no, rule: rule.to_string(),
+            detail: format!("Prose rule `{rule}` violated"), sentence: sentence.to_string(),
+        });
+    }
+}
+
+fn lint_md_line(
+    line_no: usize, body: &str, kind: SentenceKind, dict: Option<&WordList>, issues: &mut Vec<LintIssue>,
+) -> (usize, usize) {
+    let (mut total, mut ok) = (0usize, 0usize);
+    for sentence in split_sentences(body) {
+        total += 1;
+        let rules = lint_sentence(&sentence, kind, dict);
+        if rules.is_empty() { ok += 1; }
+        else { push_md_issues(line_no, &sentence, &rules, issues); }
+    }
+    (total, ok)
+}
+
+fn update_md_block_state(trimmed: &str, in_fence: &mut bool, in_untrusted: &mut bool) -> bool {
+    if trimmed.starts_with("```") { *in_fence = !*in_fence; return true; }
+    if trimmed.starts_with("<untrusted_web_evidence") { *in_untrusted = true; return true; }
+    if trimmed.starts_with("</untrusted_web_evidence") { *in_untrusted = false; return true; }
+    *in_fence || *in_untrusted || trimmed.is_empty()
+        || trimmed.starts_with(['#', '|']) || trimmed.starts_with("---") || trimmed.starts_with("> ")
 }
 
 /// Lint a Markdown document, skipping fenced code blocks and headings.
@@ -352,40 +371,12 @@ pub fn lint_md(markdown: &str, dict: Option<&WordList>) -> ProseReport {
     let (mut total_sentences, mut compliant_sentences, mut issues) = (0usize, 0usize, Vec::new());
 
     for (idx, raw_line) in markdown.lines().enumerate() {
-        let t = raw_line.trim();
-        if t.starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if t.starts_with("<untrusted_web_evidence") {
-            in_untrusted = true;
-            continue;
-        }
-        if t.starts_with("</untrusted_web_evidence") {
-            in_untrusted = false;
-            continue;
-        }
-        if in_fence || in_untrusted || t.is_empty()
-            || t.starts_with(['#', '|']) || t.starts_with("---") || t.starts_with("> ")
-        {
-            continue;
-        }
-        let (kind, body) = classify_md_line(t);
-        for sentence in split_sentences(body) {
-            total_sentences += 1;
-            let rules = lint_sentence(&sentence, kind, dict);
-            if rules.is_empty() {
-                compliant_sentences += 1;
-            } else {
-                for rule in rules {
-                    issues.push(LintIssue {
-                        line: idx + 1, rule: rule.to_string(),
-                        detail: format!("Prose rule `{rule}` violated"),
-                        sentence: sentence.clone(),
-                    });
-                }
-            }
-        }
+        let trimmed = raw_line.trim();
+        if update_md_block_state(trimmed, &mut in_fence, &mut in_untrusted) { continue; }
+        let (kind, body) = classify_md_line(trimmed);
+        let (tot, ok) = lint_md_line(idx + 1, body, kind, dict, &mut issues);
+        total_sentences += tot;
+        compliant_sentences += ok;
     }
 
     ProseReport {
@@ -400,25 +391,23 @@ fn classify_md_line(trimmed: &str) -> (SentenceKind, &str) {
     if digits > 0 && let Some(rest) = trimmed[digits..].strip_prefix(". ") {
         return (SentenceKind::Procedural, rest.trim());
     }
-    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
-        return (SentenceKind::Descriptive, rest.trim());
-    }
-    (SentenceKind::Descriptive, trimmed)
+    let body = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).map_or(trimmed, str::trim);
+    (SentenceKind::Descriptive, body)
 }
 
 fn split_sentences(line: &str) -> Vec<String> {
-    let (mut out, mut cur, mut in_code) = (Vec::new(), String::new(), false);
-    let chars: Vec<char> = line.chars().collect();
-    for (idx, &ch) in chars.iter().enumerate() {
+    let (mut out, mut start, mut in_code) = (Vec::new(), 0usize, false);
+    for (idx, ch) in line.char_indices() {
         if ch == '`' { in_code = !in_code; }
-        cur.push(ch);
-        if !in_code && matches!(ch, '.' | '!' | '?') && chars.get(idx + 1).is_none_or(|n| n.is_whitespace()) {
-            let trimmed = cur.trim();
-            if !trimmed.is_empty() { out.push(trimmed.to_string()); }
-            cur.clear();
+        let next_ch = line[idx + 1..].chars().next();
+        if !in_code && matches!(ch, '.' | '!' | '?') && next_ch.is_none_or(char::is_whitespace) {
+            let seg = line[start..=idx].trim();
+            if !seg.is_empty() { out.push(seg.to_string()); }
+            start = idx + 1;
         }
     }
-    if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+    let tail = line[start..].trim();
+    if !tail.is_empty() { out.push(tail.to_string()); }
     out
 }
 
@@ -435,6 +424,7 @@ pub fn audit_md(report: &crate::types::AuditReport) -> String {
         report.hygiene_median, report.hygiene_p10, report.scc_count,
         report.dead_symbols.len(), report.clone_clusters.len(), report.infra_findings.len(),
     );
+
     if !report.triage_plan.is_empty() {
         md.push_str("## Action Plan\n\n");
         for (idx, item) in report.triage_plan.iter().take(25).enumerate() {
@@ -443,17 +433,16 @@ pub fn audit_md(report: &crate::types::AuditReport) -> String {
                 "remove_unused_dep" => "Remove unused dependency in",
                 "review_delete" => "Review and delete", _ => "Inspect",
             };
-            let _ = writeln!(md, "{}. {verb} `{}` for priority `P{}` (`{}`).", idx + 1, item.file, item.priority, item.action);
+            let _ = writeln!(md, "{}. {verb} `{}` for priority `P{}` (`{}`).",
+                idx + 1, item.file, item.priority, item.action);
         }
         md.push('\n');
     }
     if !report.god_files.is_empty() {
         md.push_str("## Structural Risk Files\n\n");
         for god in report.god_files.iter().take(10) {
-            let _ = writeln!(
-                md, "- File `{}` has {} lines, score `{:.3}`, and action `{}`.",
-                god.file, god.loc, god.hygiene_score, god.recommendation
-            );
+            let _ = writeln!(md, "- File `{}` has {} lines, score `{:.3}`, and action `{}`.",
+                god.file, god.loc, god.hygiene_score, god.recommendation);
         }
         md.push('\n');
     }
@@ -499,16 +488,17 @@ mod tests {
             (D, "The cache doesn't keep expired entries on disk.", "contraction"),
             (P, "Please check `memory.current` before spawning Cargo.", "non_imperative_procedural"),
             (D, "The WAL frame was written to disk before crash.", "passive_voice"),
-            (P, "Invoke `TaskContext::cancelled()` because `tasks/cancel` is running inside the daemon.", "progressive_ing"),
+            (P, "Invoke `TaskContext::cancelled()` because `tasks/cancel` is running inside the daemon.",
+                "progressive_ing"),
             (P, long_proc, "word_limit_exceeded"),
             (D, disguised, "disguised_prose_in_code_span"),
             (P, "Check repository dependency version lockfile cache.", "noun_cluster_exceeded"),
         ] {
             assert!(lint_sentence(sent, kind, None).contains(&expected), "missed `{expected}` on `{sent}`");
         }
-        let rewritten = simplify_verbs("Utilize `utilize_fn()` and utilize_id and reutilize to obtain results.");
-        assert_eq!(rewritten, "Use `utilize_fn()` and utilize_id and reutilize to get results.");
-        assert_eq!(simplify_verbs(&rewritten), rewritten);
+        let rw = simplify_verbs("Utilize `utilize_fn()` and utilize_id and reutilize to obtain results.");
+        assert_eq!(rw, "Use `utilize_fn()` and utilize_id and reutilize to get results.");
+        assert_eq!(simplify_verbs(&rw), rw);
     }
 
     #[test]

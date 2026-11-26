@@ -80,35 +80,14 @@ pub struct RepoScan {
 
 /// Partition repository source and test files in a single pass.
 pub fn scan_files(root: &Path, preloaded: Option<&BTreeMap<String, Vec<u8>>>) -> RepoScan {
-    let mut out = RepoScan { sources: Vec::new(), tests: Vec::new(), all: Vec::new() };
-    let mut push = |rel: String, ext: String, abs: Option<PathBuf>| {
-        out.all.push((rel.clone(), ext.clone(), abs.clone()));
-        if rel.ends_with("__init__.py") {
-            return;
-        }
-        if test_path(&rel) {
-            out.tests.push((rel, ext, abs));
-        } else {
-            out.sources.push((rel, ext, abs));
-        }
+    let all_rels = match preloaded {
+        Some(map) => map.keys().cloned().collect(),
+        None => walk_files(root, None)
+            .into_iter()
+            .filter_map(|p| rel_norm(root, &p))
+            .collect(),
     };
-    if let Some(map) = preloaded {
-        for rel in map.keys() {
-            let ext = ext_of(rel);
-            if supported_ext(&ext) { push(rel.clone(), ext, None); }
-        }
-    } else {
-        for path in walk_files(root, None) {
-            let ext = ext_of(&path);
-            if let Some(rel) = supported_ext(&ext).then(|| rel_norm(root, &path)).flatten() {
-                push(rel, ext, Some(path));
-            }
-        }
-    }
-    out.sources.sort_by(|a, b| a.0.cmp(&b.0));
-    out.tests.sort_by(|a, b| a.0.cmp(&b.0));
-    out.all.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    RepoSnapshot { all_rels, ..RepoSnapshot::default() }.to_repo_scan()
 }
 
 const SNAP_DOC_FILENAMES: &[&str] = &[
@@ -127,6 +106,7 @@ fn is_snap_infra_file(rel: &str, fname: &str, ext_lo: &str) -> bool {
 
 /// Single-walk byte-budgeted repository snapshot shared across `stem`, `hygiene`,
 /// `similarity`, `drift`, and `infra` to eliminate redundant tree walks and disk re-reads.
+#[derive(Default)]
 pub struct RepoSnapshot {
     pub all_rels: Vec<String>,
     pub source_rels: Vec<String>,
@@ -375,15 +355,12 @@ fn cargo_deps(txt: &str, out: &mut Vec<ManifestDep>) {
 fn py_deps(txt: &str, out: &mut Vec<ManifestDep>) {
     let Ok(doc) = toml::from_str::<toml::Value>(txt) else { return };
     if let Some(arr) = doc.get("project").and_then(|p| p.get("dependencies")).and_then(toml::Value::as_array) {
-        for item in arr.iter().filter_map(toml::Value::as_str) {
-            push_py(item, out);
-        }
+        for item in arr.iter().filter_map(toml::Value::as_str) { push_py(item, out); }
     }
-    let poetry = doc.get("tool").and_then(|t| t.get("poetry")).and_then(|p| p.get("dependencies"));
-    if let Some(tbl) = poetry.and_then(toml::Value::as_table) {
-        for name in tbl.keys() {
-            push_py(name, out);
-        }
+    if let Some(tbl) = doc.get("tool").and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("dependencies")).and_then(toml::Value::as_table)
+    {
+        for name in tbl.keys() { push_py(name, out); }
     }
 }
 
@@ -397,10 +374,7 @@ fn push_py(raw: &str, out: &mut Vec<ManifestDep>) {
 
 fn go_deps(txt: &str, out: &mut Vec<ManifestDep>) {
     for line in crate::platform::parse_go_block_lines(txt, "require") {
-        if line.contains("// indirect") {
-            continue;
-        }
-        if let Some(m) = line.split_whitespace().next().filter(|s| !s.is_empty()) {
+        if !line.contains("// indirect") && let Some(m) = line.split_whitespace().next().filter(|s| !s.is_empty()) {
             push_dep(out, "go", m, false);
         }
     }
@@ -411,61 +385,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cargo_deps_workspace_aliases_and_dev() {
-        let member_toml = r#"
-[package]
-name = "my-crate"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-serde = "1.0"
-tokio.workspace = true
-blake3 = { workspace = true }
-local_core = { path = "../core" }
-http_old = { package = "http", version = "0.2" }
-
-[dev-dependencies]
-criterion = "0.5"
-
-[build-dependencies]
-cc = "1.2"
-
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["process"] }
-"#;
-
+    fn cargo_deps_ws_aliases_and_dev() {
+        let member_toml = concat!(
+            "[package]\nname = \"my-crate\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            "[dependencies]\nserde = \"1.0\"\ntokio.workspace = true\nblake3 = { workspace = true }\n",
+            "local_core = { path = \"../core\" }\nhttp_old = { package = \"http\", version = \"0.2\" }\n",
+            "[dev-dependencies]\ncriterion = \"0.5\"\n[build-dependencies]\ncc = \"1.2\"\n",
+            "[target.'cfg(unix)'.dependencies]\nnix = { version = \"0.31\", features = [\"process\"] }\n",
+        );
         let deps = parse_deps("Cargo.toml", member_toml);
         let pkgs: Vec<(&str, bool)> = deps.iter().map(|d| (d.package.as_str(), d.is_local)).collect();
-        assert!(pkgs.contains(&("serde", false)));
-        assert!(pkgs.contains(&("tokio", false)));
-        assert!(pkgs.contains(&("blake3", false)));
-        assert!(pkgs.contains(&("local_core", true)));
-        assert!(pkgs.contains(&("http", false)));
-        assert!(pkgs.contains(&("nix", false)));
-        assert!(!pkgs.iter().any(|(p, _)| p.contains(".workspace")));
-        assert!(!pkgs.iter().any(|(p, _)| *p == "criterion" || *p == "cc"));
+        for want in [("serde", false), ("tokio", false), ("blake3", false), ("local_core", true), ("http", false), ("nix", false)] {
+            assert!(pkgs.contains(&want), "missing {want:?}");
+        }
+        assert!(!pkgs.iter().any(|(p, _)| p.contains(".workspace") || *p == "criterion" || *p == "cc"));
 
         let detailed = parse_cargo_deps_detailed(member_toml);
-        let tokio_dep = detailed.iter().find(|d| d.key == "tokio").unwrap();
-        assert_eq!(tokio_dep.kind, CargoDepKind::Normal);
-        assert!(tokio_dep.workspace_inherited);
-        let alias_dep = detailed.iter().find(|d| d.key == "http_old").unwrap();
-        assert_eq!(alias_dep.package, "http");
-        let dev_dep = detailed.iter().find(|d| d.key == "criterion").unwrap();
-        assert_eq!(dev_dep.kind, CargoDepKind::Dev);
-        let target_dep = detailed.iter().find(|d| d.key == "nix").unwrap();
-        assert_eq!(target_dep.kind, CargoDepKind::Target);
-        assert_eq!(target_dep.target_cfg.as_deref(), Some("cfg(unix)"));
+        let find = |k: &str| detailed.iter().find(|d| d.key == k).unwrap();
+        assert_eq!((find("tokio").kind, find("tokio").workspace_inherited), (CargoDepKind::Normal, true));
+        assert_eq!((find("http_old").package.as_str(), find("criterion").kind), ("http", CargoDepKind::Dev));
+        assert_eq!((find("nix").kind, find("nix").target_cfg.as_deref()), (CargoDepKind::Target, Some("cfg(unix)")));
 
-        let virtual_ws = r#"
-[workspace]
-members = ["crates/*"]
-
-[workspace.dependencies]
-anyhow = "1.0"
-internal_util = { path = "crates/util" }
-"#;
+        let virtual_ws = concat!(
+            "[workspace]\nmembers = [\"crates/*\"]\n[workspace.dependencies]\n",
+            "anyhow = \"1.0\"\ninternal_util = { path = \"crates/util\" }\n",
+        );
         let ws_deps = parse_deps("Cargo.toml", virtual_ws);
         assert!(ws_deps.iter().any(|d| d.package == "anyhow" && !d.is_local));
         assert!(ws_deps.iter().any(|d| d.package == "internal_util" && d.is_local));

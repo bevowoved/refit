@@ -289,7 +289,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn test_state_concurrent_counters() {
+    fn state_concurrent_counters() {
         let st = RunState::new(1000);
         std::thread::scope(|s| {
             for i in 0..8usize {
@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_state_steering_and_priority() {
+    async fn state_steering_and_priority() {
         let st = RunState::new(500);
         st.steer_pause(true);
         st.steer_k(Some(6));

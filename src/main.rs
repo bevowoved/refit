@@ -36,13 +36,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static MALLOC_CONF: &[u8] = b"dirty_decay_ms:50,muzzy_decay_ms:50,narenas:2\0";
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
+use runner::DEFAULT_UPSTREAM;
 use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-const DEFAULT_UPSTREAM: &str = "https://api.cerebras.ai/v1";
 
 #[derive(Parser)]
 #[command(
@@ -53,36 +52,6 @@ const DEFAULT_UPSTREAM: &str = "https://api.cerebras.ai/v1";
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-}
-
-#[derive(Args, Debug, Clone)]
-struct RunCliArgs {
-    repo: PathBuf,
-    #[arg(long, default_value = DEFAULT_UPSTREAM)] upstream: String,
-    #[arg(long, default_value = "moonshotai-kimi-k3.1-pro-trial")] model: String,
-    #[arg(long, default_value = "Cerebras WSE-3T")] provider_label: String,
-    #[arg(long)] openclaw_url: Option<String>,
-    #[arg(long)] openclaw_token: Option<String>,
-    #[arg(long, default_value = "openclaw:main")] openclaw_model: String,
-    #[arg(long, default_value = "127.0.0.1:18790")] proxy_addr: String,
-    #[arg(long, default_value = "ui/index.html")] ui_index: PathBuf,
-    #[arg(long, default_value = "skills/refit/SKILL.md")] skill_path: PathBuf,
-    #[arg(long, default_value = "telemetry/run.jsonl")] telemetry_out: PathBuf,
-    #[arg(long)] bench_script: Option<PathBuf>,
-    #[arg(long)] bench_cmd: Option<String>,
-    #[arg(long)] baseline_copy: Option<PathBuf>,
-    #[arg(long)] api_key_file: Option<PathBuf>,
-    #[arg(long, default_value_t = 12)] initial_k: usize,
-    #[arg(long, default_value_t = 20)] max_k: usize,
-    #[arg(long, default_value_t = 2)] max_retries: u32,
-    #[arg(long, default_value_t = 0)] hold_secs: u64,
-    #[arg(long)] max_units: Option<usize>,
-    #[arg(long)] worktree: bool,
-    #[arg(long)] include_dirty: bool,
-    #[arg(long)] cache_retention: Option<String>,
-    #[arg(long)] keep_warm: bool,
-    #[arg(long)] strip_tools: bool,
-    #[arg(long)] strict_tools: bool,
 }
 
 #[derive(Subcommand)]
@@ -128,15 +97,16 @@ enum Commands {
     Learn {
         repo: PathBuf,
         #[arg(long)] rewind: Option<String>,
-        #[arg(long, default_value = "smell")] trigger: String,
+        #[arg(long, value_enum, default_value_t = learn::RewindTrigger::NewSmellPattern)]
+        trigger: learn::RewindTrigger,
     },
     /// Run parallel DAG refactoring with formatters, Gates 0 to 3.5, and MVCC WAL.
     Run {
-        #[command(flatten)] args: RunCliArgs,
+        #[command(flatten)] opts: runner::RunOptions,
         #[arg(long)] resume: bool,
     },
     /// Resume an interrupted run with the same flags as `refit run`.
-    Resume { #[command(flatten)] args: RunCliArgs },
+    Resume { #[command(flatten)] opts: runner::RunOptions },
     /// Run alternating OS CPU and RSS benchmarks.
     Bench {
         #[arg(long)] before: PathBuf,
@@ -192,20 +162,11 @@ fn read_key(file_opt: Option<&PathBuf>) -> Result<String> {
     anyhow::bail!("CEREBRAS_API_KEY env var is not set and --api-key-file was not provided");
 }
 
-fn run_opts(a: RunCliArgs, api_key: String, resume: bool) -> runner::RunOptions {
-    let retention = proxy::CacheMode::parse_mode(a.cache_retention.as_deref());
-    let kw = a.keep_warm || platform::env_truthy("REFIT_KEEP_WARM");
-    runner::RunOptions {
-        repo_root: a.repo, api_key, upstream_base_url: a.upstream, openclaw_base_url: a.openclaw_url,
-        openclaw_token: a.openclaw_token, openclaw_model: a.openclaw_model, model: a.model,
-        provider_label: a.provider_label, proxy_addr: a.proxy_addr, ui_index_path: a.ui_index,
-        skill_path: a.skill_path, telemetry_path: a.telemetry_out, bench_script: a.bench_script,
-        bench_cmd: a.bench_cmd, baseline_copy: a.baseline_copy, resume, initial_k: a.initial_k,
-        max_k: a.max_k, max_retries: a.max_retries, hold_server_secs: a.hold_secs,
-        max_units: a.max_units, worktree: a.worktree, include_dirty_worktree: a.include_dirty,
-        cache_retention: retention, keep_warm: kw, preserve_tools: !a.strip_tools,
-        strict_polyglot_tools: a.strict_tools,
-    }
+fn cmd_run(mut opts: runner::RunOptions, resume: bool) -> Result<()> {
+    init_tracing();
+    opts.api_key = read_key(opts.api_key_file.as_ref())?;
+    opts.resume = resume;
+    print_json(&build_rt(true)?.block_on(runner::execute_run(opts))?)
 }
 
 fn cmd_scan(repo: &Path, no_cache: bool, fast: bool, approx_long: bool) -> Result<()> {
@@ -426,23 +387,14 @@ fn main() -> Result<()> {
             }))
         }
         Commands::Learn { repo, rewind, trigger } => {
-            let trig = learn::RewindTrigger::parse(&trigger);
-            print_json(&learn::query_rewind(&repo, rewind.as_deref(), trig)?)
+            print_json(&learn::query_rewind(&repo, rewind.as_deref(), trigger)?)
         }
         Commands::Probe { upstream, model, api_key_file, openclaw_url, openclaw_token } => {
             init_tracing();
             build_rt(false)?.block_on(cmd_probe(upstream, model, api_key_file, openclaw_url, openclaw_token))
         }
-        Commands::Run { args, resume } => {
-            init_tracing();
-            let key = read_key(args.api_key_file.as_ref())?;
-            print_json(&build_rt(true)?.block_on(runner::execute_run(run_opts(args, key, resume)))?)
-        }
-        Commands::Resume { args } => {
-            init_tracing();
-            let key = read_key(args.api_key_file.as_ref())?;
-            print_json(&build_rt(true)?.block_on(runner::execute_run(run_opts(args, key, true)))?)
-        }
+        Commands::Run { opts, resume } => cmd_run(opts, resume),
+        Commands::Resume { opts } => cmd_run(opts, true),
         Commands::Bench { before, after, script, cmd, pairs } => {
             let res = if let Some(c) = cmd {
                 runner::bench_command(&c, &before, &after, pairs)?

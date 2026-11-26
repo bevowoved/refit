@@ -27,17 +27,12 @@ use std::path::Path;
 type SccWaves = (Vec<Vec<String>>, Vec<BTreeSet<usize>>, Vec<BTreeSet<usize>>, Vec<usize>);
 
 struct BuildCtx<'a> {
-    repo_root: &'a Path,
-    preloaded: Option<&'a BTreeMap<String, Vec<u8>>>,
-    hygiene: &'a HygieneScorer,
-    scc_ids: &'a [String],
-    mod_tests: &'a HashMap<String, Vec<String>>,
+    repo_root: &'a Path, preloaded: Option<&'a BTreeMap<String, Vec<u8>>>,
+    hygiene: &'a HygieneScorer, scc_ids: &'a [String], mod_tests: &'a HashMap<String, Vec<String>>,
 }
 
 pub fn build_dag(
-    repo_root: &Path,
-    stem_bin_hint: Option<&Path>,
-    hygiene: &HygieneScorer,
+    repo_root: &Path, stem_bin_hint: Option<&Path>, hygiene: &HygieneScorer,
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> Result<DagPlan> {
     let discovery = scan_edges(repo_root, stem_bin_hint, preloaded);
@@ -45,9 +40,7 @@ pub fn build_dag(
 }
 
 pub fn dag_from(
-    repo_root: &Path,
-    discovery: EdgeScan,
-    hygiene: &HygieneScorer,
+    repo_root: &Path, discovery: EdgeScan, hygiene: &HygieneScorer,
     preloaded: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> Result<DagPlan> {
     let scan = scan_files(repo_root, preloaded);
@@ -60,19 +53,17 @@ pub fn dag_from(
     } else {
         &discovery.edges
     };
-    let (scc_files, scc_deps, scc_dependents, wave_of) =
-        compute_waves(&source_files, active_edges);
+    let (scc_files, scc_deps, scc_dependents, wave_of) = compute_waves(&source_files, active_edges);
     let scc_ids = assign_ids(&scc_files);
     let bctx = BuildCtx { repo_root, preloaded, hygiene, scc_ids: &scc_ids, mod_tests: &mod_tests };
+    let make = |i: usize| build_unit(&bctx, &scc_files[i], &scc_deps[i], &scc_dependents[i], wave_of[i], i);
 
     let built: Result<Vec<ModuleUnit>> = if crate::platform::budget().is_constrained() {
-        (0..scc_files.len())
-            .map(|i| build_unit(&bctx, &scc_files[i], &scc_deps[i], &scc_dependents[i], wave_of[i], i))
-            .collect()
+        (0..scc_files.len()).map(make).collect()
     } else {
         (0..scc_files.len())
             .into_par_iter()
-            .map(|i| build_unit(&bctx, &scc_files[i], &scc_deps[i], &scc_dependents[i], wave_of[i], i))
+            .map(make)
             .collect()
     };
 
@@ -82,91 +73,68 @@ pub fn dag_from(
     sort_units(&mut units);
 
     Ok(DagPlan {
-        repo_root: repo_root.display().to_string(),
-        host_os: os_tag(),
-        stem_used: discovery.used_stem,
-        stem_index_ms: discovery.index_ms,
-        total_files: source_files.len(),
-        total_loc,
+        repo_root: repo_root.display().to_string(), host_os: os_tag(), stem_used: discovery.used_stem,
+        stem_index_ms: discovery.index_ms, total_files: source_files.len(), total_loc,
         scc_count: units.iter().filter(|u| u.files.len() > 1).count(),
-        wave_count: if units.is_empty() { 0 } else { max_wave + 1 },
-        units,
+        wave_count: if units.is_empty() { 0 } else { max_wave + 1 }, units,
     })
 }
 
 fn compute_waves(source_files: &[String], edges: &[(String, String)]) -> SccWaves {
     let (csr, csr_edges) = CsrGraph::from_named_edges(source_files, edges);
     let sccs = csr.pearce_scc();
-
     let mut file_scc = vec![0usize; source_files.len()];
     let mut scc_files = Vec::with_capacity(sccs.len());
     for (idx, comp) in sccs.into_iter().enumerate() {
         let mut files = Vec::with_capacity(comp.len());
         for node in comp {
-            let nu = node as usize;
-            file_scc[nu] = idx;
-            files.push(source_files[nu].clone());
+            file_scc[node as usize] = idx;
+            files.push(source_files[node as usize].clone());
         }
         files.sort();
         scc_files.push(files);
     }
 
     let n = scc_files.len();
-    let mut deps = vec![BTreeSet::new(); n];
-    let mut dependents = vec![BTreeSet::new(); n];
+    let (mut deps, mut dependents) = (vec![BTreeSet::new(); n], vec![BTreeSet::new(); n]);
     for &(u, v) in &csr_edges {
-        let su = file_scc[u as usize];
-        let sv = file_scc[v as usize];
-        if su != sv {
-            deps[su].insert(sv);
+        let (su, sv) = (file_scc[u as usize], file_scc[v as usize]);
+        if su != sv && deps[su].insert(sv) {
             dependents[sv].insert(su);
         }
     }
 
     let mut wave = vec![0usize; n];
     let mut in_deg: Vec<usize> = deps.iter().map(BTreeSet::len).collect();
-    let mut q: VecDeque<usize> = in_deg
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &d)| (d == 0).then_some(i))
-        .collect();
-
+    let mut q: VecDeque<usize> = (0..n).filter(|&i| in_deg[i] == 0).collect();
     while let Some(u) = q.pop_front() {
         for &v in &dependents[u] {
             wave[v] = wave[v].max(wave[u] + 1);
-            in_deg[v] = in_deg[v].saturating_sub(1);
-            if in_deg[v] == 0 {
-                q.push_back(v);
-            }
+            in_deg[v] -= 1;
+            if in_deg[v] == 0 { q.push_back(v); }
         }
     }
     (scc_files, deps, dependents, wave)
 }
 
-fn scc_label(files: &[String], stem_counts: &HashMap<&str, usize>) -> String {
-    if files.len() == 1 {
-        let rel = &files[0];
-        let st = match stem_of(Path::new(rel)) {
-            "" => "mod",
-            s => s,
-        };
-        if stem_counts.get(st).copied().unwrap_or(0) > 1 {
-            return rel.rsplit_once('.').map_or_else(|| rel.clone(), |(a, _)| a.to_string());
-        }
-        return st.to_string();
-    }
+fn file_stem_or<'a>(rel: &'a str, fallback: &'a str) -> &'a str {
+    match stem_of(Path::new(rel)) { "" => fallback, s => s }
+}
 
-    let parts: Vec<&str> = files
-        .iter()
+fn id_for_scc(files: &[String], stem_counts: &HashMap<&str, usize>) -> String {
+    if let [only] = files {
+        let st = file_stem_or(only, "mod");
+        if stem_counts[st] <= 1 { return st.into(); }
+        let stem_path = only.rsplit_once('.').map_or(only.as_str(), |(b, _)| b);
+        return stem_path.to_owned();
+    }
+    let parts: Vec<&str> = files.iter()
         .take(4)
-        .map(|f| match stem_of(Path::new(f)) {
-            "" => "m",
-            s => s,
-        })
+        .map(|f| file_stem_or(f, "m"))
         .collect();
     if files.len() > 4 {
-        let h = MvccStore::hash_bytes(files.join(",").as_bytes());
-        format!("scc_{}_{}", parts.join("_"), &h[..6])
+        let tag = &MvccStore::hash_bytes(files.join(",").as_bytes())[..6];
+        format!("scc_{}_{tag}", parts.join("_"))
     } else {
         format!("scc_{}", parts.join("_"))
     }
@@ -175,30 +143,19 @@ fn scc_label(files: &[String], stem_counts: &HashMap<&str, usize>) -> String {
 fn assign_ids(scc_files: &[Vec<String>]) -> Vec<String> {
     let mut stem_counts: HashMap<&str, usize> = HashMap::new();
     for files in scc_files.iter().filter(|f| f.len() == 1) {
-        let st = match stem_of(Path::new(&files[0])) {
-            "" => "mod",
-            s => s,
-        };
-        *stem_counts.entry(st).or_insert(0) += 1;
+        *stem_counts.entry(file_stem_or(&files[0], "mod")).or_insert(0) += 1;
     }
+    let mut ids: Vec<String> = scc_files.iter().map(|f| id_for_scc(f, &stem_counts)).collect();
 
-    let mut ids: Vec<String> = scc_files.iter().map(|f| scc_label(f, &stem_counts)).collect();
     let mut id_counts: HashMap<String, usize> = HashMap::new();
-    for id in &ids {
-        *id_counts.entry(id.clone()).or_insert(0) += 1;
-    }
-
-    for (i, id) in ids.iter_mut().enumerate() {
-        if id_counts.get(id).copied().unwrap_or(0) <= 1 {
-            continue;
-        }
-        let files = &scc_files[i];
-        if files.len() == 1 {
-            *id = files[0].clone();
+    for id in &ids { *id_counts.entry(id.clone()).or_insert(0) += 1; }
+    for (id, files) in ids.iter_mut().zip(scc_files) {
+        if id_counts[id.as_str()] <= 1 { continue; }
+        *id = if files.len() == 1 {
+            files[0].clone()
         } else {
-            let h = MvccStore::hash_bytes(files.join(",").as_bytes());
-            *id = format!("{id}_{}", &h[..6]);
-        }
+            format!("{id}_{}", &MvccStore::hash_bytes(files.join(",").as_bytes())[..6])
+        };
     }
     ids
 }
@@ -233,36 +190,27 @@ fn build_unit(
     }
 
     Ok(ModuleUnit {
-        id: ctx.scc_ids[idx].clone(),
-        files: files.to_vec(),
-        layer: infer_layer(&files[0], wave),
-        wave,
-        deps: collect_ids(deps, ctx.scc_ids),
-        dependents: collect_ids(dependents, ctx.scc_ids),
-        test_files: tests.into_iter().collect(),
-        loc,
-        base_blake3: base,
-        abi_hash: abi,
+        id: ctx.scc_ids[idx].clone(), files: files.to_vec(), layer: infer_layer(&files[0], wave), wave,
+        deps: collect_ids(deps, ctx.scc_ids), dependents: collect_ids(dependents, ctx.scc_ids),
+        test_files: tests.into_iter().collect(), loc, base_blake3: base, abi_hash: abi,
         baseline_hygiene: score_sum / (files.len().max(1) as f64),
         allow_abi_change: files.len() > 1 && files.len() <= 4,
     })
 }
 
 fn collect_ids(set: &BTreeSet<usize>, scc_ids: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(set.len());
-    for &d in set {
-        out.push(scc_ids[d].clone());
-    }
-    out
+    set.iter()
+        .map(|&d| scc_ids[d].clone())
+        .collect()
 }
 
 fn sort_units(units: &mut [ModuleUnit]) {
     units.sort_by(|a, b| {
-        let af = a.files.first().map_or("", String::as_str);
-        let bf = b.files.first().map_or("", String::as_str);
-        let (ap, bp) = (Path::new(af), Path::new(bf));
-        a.wave
-            .cmp(&b.wave)
+        let (ap, bp) = (
+            Path::new(a.files.first().map_or("", String::as_str)),
+            Path::new(b.files.first().map_or("", String::as_str)),
+        );
+        a.wave.cmp(&b.wave)
             .then(a.layer.cmp(&b.layer))
             .then(ext_str(ap).cmp(ext_str(bp)))
             .then(ap.parent().cmp(&bp.parent()))
@@ -271,15 +219,10 @@ fn sort_units(units: &mut [ModuleUnit]) {
 }
 
 fn infer_layer(rel: &str, wave: usize) -> usize {
-    if rel.contains("/core/") || rel.starts_with("core/") {
-        0
-    } else if rel.contains("/engine/") || rel.starts_with("engine/") {
-        1
-    } else if rel.contains("/services/") || rel.starts_with("services/") {
-        2
-    } else {
-        wave.min(3)
-    }
+    if rel.contains("/core/") || rel.starts_with("core/") { 0 }
+    else if rel.contains("/engine/") || rel.starts_with("engine/") { 1 }
+    else if rel.contains("/services/") || rel.starts_with("services/") { 2 }
+    else { wave.min(3) }
 }
 
 pub fn impacted_tests(plan: &DagPlan, changed_files: &[String]) -> Vec<String> {
@@ -307,73 +250,51 @@ pub fn impacted_tests(plan: &DagPlan, changed_files: &[String]) -> Vec<String> {
     tests.into_iter().collect()
 }
 
-/// Iterative longest-path critical depth over the unit dependent graph (zero recursion).
-pub fn critical_depths(units: &[ModuleUnit]) -> HashMap<String, usize> {
-    let n = units.len();
-    let mut idx_of: FxHashMap<&str, usize> =
-        FxHashMap::with_capacity_and_hasher(n, Default::default());
-    for (i, u) in units.iter().enumerate() {
-        idx_of.insert(u.id.as_str(), i);
-    }
-
-    let mut state = vec![0u8; n]; // 0 = unvisited, 1 = on_stack, 2 = done
-    let mut depth = vec![0usize; n];
-    let mut stack: Vec<(usize, usize)> = Vec::with_capacity(n.min(256));
-
-    for start in 0..n {
-        if state[start] != 0 {
-            continue;
-        }
-        state[start] = 1;
-        stack.push((start, 0));
-
-        while let Some((u, ei)) = stack.pop() {
-            if step_depth_edges(u, ei, units, &idx_of, &mut state, &mut depth, &mut stack) {
-                continue;
-            }
-            state[u] = 2;
-            if let Some(&(parent, _)) = stack.last() {
-                depth[parent] = depth[parent].max(1 + depth[u]);
-            }
-        }
-    }
-
-    let mut memo = HashMap::with_capacity(n);
-    for (i, u) in units.iter().enumerate() {
-        memo.insert(u.id.clone(), depth[i]);
-    }
-    memo
-}
-
-fn step_depth_edges(
-    u: usize,
-    mut ei: usize,
-    units: &[ModuleUnit],
-    idx_of: &FxHashMap<&str, usize>,
-    state: &mut [u8],
-    depth: &mut [usize],
-    stack: &mut Vec<(usize, usize)>,
-) -> bool {
+fn step_depth_frame(
+    u: usize, mut ei: usize, units: &[ModuleUnit], idx_of: &FxHashMap<&str, usize>,
+    state: &mut [u8], depth: &mut [usize], stack: &mut Vec<(usize, usize)>,
+) {
     let deps = &units[u].dependents;
     while ei < deps.len() {
-        let dep_name = deps[ei].as_str();
+        let dep = deps[ei].as_str();
         ei += 1;
-        let Some(&v) = idx_of.get(dep_name) else {
+        let Some(&v) = idx_of.get(dep) else {
             depth[u] = depth[u].max(1);
             continue;
         };
-        match state[v] {
-            0 => {
-                stack.push((u, ei));
-                state[v] = 1;
-                stack.push((v, 0));
-                return true;
-            }
-            2 => depth[u] = depth[u].max(1 + depth[v]),
-            _ => depth[u] = depth[u].max(1),
+        if state[v] == 0 {
+            stack.extend([(u, ei), (v, 0)]);
+            state[v] = 1;
+            return;
+        }
+        let cand = if state[v] == 2 { 1 + depth[v] } else { 1 };
+        depth[u] = depth[u].max(cand);
+    }
+    state[u] = 2;
+    if let Some(&(parent, _)) = stack.last() { depth[parent] = depth[parent].max(1 + depth[u]); }
+}
+
+/// Iterative longest-path critical depth over the unit dependent graph (zero recursion).
+pub fn critical_depths(units: &[ModuleUnit]) -> HashMap<String, usize> {
+    let n = units.len();
+    let idx_of: FxHashMap<&str, usize> = units.iter()
+        .enumerate()
+        .map(|(i, u)| (u.id.as_str(), i))
+        .collect();
+    let (mut state, mut depth, mut stack) = (vec![0u8; n], vec![0usize; n], Vec::with_capacity(n.min(256)));
+
+    for start in 0..n {
+        if state[start] != 0 { continue; }
+        state[start] = 1;
+        stack.push((start, 0usize));
+        while let Some((u, ei)) = stack.pop() {
+            step_depth_frame(u, ei, units, &idx_of, &mut state, &mut depth, &mut stack);
         }
     }
-    false
+    units.iter()
+        .enumerate()
+        .map(|(i, u)| (u.id.clone(), depth[i]))
+        .collect()
 }
 
 pub fn units_interfere(a: &ModuleUnit, b: &ModuleUnit) -> bool {
@@ -385,9 +306,96 @@ pub fn units_interfere(a: &ModuleUnit, b: &ModuleUnit) -> bool {
 }
 
 #[cfg(test)]
+fn verify_slice_utf8_and_wave(dir: &Path, plan: &DagPlan) {
+    let mut utf = String::from("# こんにちは世界 🚀 café résumé\n");
+    for i in 0..40 { utf.push_str(&format!("def fn_{i}():\n    return '🚀日本語テスト_{i}'\n\n")); }
+    let utf_slice = packet::slice_anchored(&utf, 120, &HashSet::new());
+    assert!(utf_slice.contains("def fn_0") && utf_slice.len() < utf.len());
+    assert_eq!(crate::platform::char_prefix("🚀日本語", 2), "🚀日");
+
+    let fwd = wave_context(&plan.units, dir);
+    let mut rev_u = plan.units.clone();
+    rev_u.reverse();
+    assert_eq!(fwd, wave_context(&rev_u, dir));
+    assert!(fwd.chars().count() <= 1200);
+    assert!(fwd.contains("def alpha") && fwd.contains("pub fn beta"));
+}
+
+#[cfg(test)]
+fn verify_interface_cutoff() {
+    let reg = crate::platform::EpochRegistry::new();
+    let check = |src: &str, prev: Option<&str>| {
+        check_interface_cutoff("packages/calc", &[("src/calc.rs", src)], prev, &reg)
+    };
+
+    let c1 = check("pub fn compute(x: i32) -> i32 { x + 1 }\n", None);
+    assert!(c1.changed);
+
+    let c2 = check("pub fn compute(x: i32) -> i32 { let y = x * 2; y - x + 1 }\n", Some(&c1.interface_blake3));
+    assert!(!c2.changed && c2.epoch == c1.epoch && c2.interface_blake3 == c1.interface_blake3);
+
+    let c3 = check("pub fn compute(x: i32, scale: i32) -> i32 { x * scale }\n", Some(&c2.interface_blake3));
+    assert!(c3.changed && c3.epoch > c2.epoch && c3.interface_blake3 != c2.interface_blake3);
+}
+
+#[cfg(test)]
+fn verify_asrf_elision_and_ops() {
+    let orig = concat!(
+        "pub fn run(x: i32) -> i32 {\n    let step1 = x + 1;\n",
+        "    let untouched_middle = step1 * 42;\n    untouched_middle\n}\n",
+    );
+    let s_el = "pub fn run(x: i32) -> i32 {\n// ... existing code ...\n    untouched_middle\n}";
+    let r_el = concat!(
+        "pub fn run(x: i32) -> i32 {\n    let _checked = x >= 0;\n",
+        "// ... existing code ...\n    untouched_middle + 1\n}",
+    );
+    let base1 = crate::testutil::map1("src/calc.rs", orig.to_string());
+    let mut patched = apply_patches(&base1, &parse_patches(&crate::testutil::asrf_edit("src/calc.rs", s_el, r_el))).unwrap();
+    let out = patched.updated.remove("src/calc.rs").unwrap_or_default();
+    assert!(out.contains("let untouched_middle = step1 * 42;"));
+    assert!(out.contains("let _checked = x >= 0;") && out.contains("untouched_middle + 1"));
+
+    let dup_base = crate::testutil::map1("src/dup.py", "def dup():\n    return 1\ndef dup():\n    return 2\n".into());
+    let dup_raw = crate::testutil::asrf_edit("src/dup.py", "def dup():\n# ... existing code ...\n    return 2", "def dup():\n# ... existing code ...\n    return 3");
+    assert!(apply_patches(&dup_base, &parse_patches(&dup_raw)).is_err());
+
+    let ops_base = BTreeMap::from([
+        ("src/old.ts".into(), "export const a = 1;\n".into()),
+        ("src/dead.ts".into(), "export const d = 0;\n".into()),
+    ]);
+    let ops_patch = concat!(
+        "<<<REFIT_PATCH path=\"src/shared.ts\" op=\"create\">>>\n<<<SEARCH>>>\n<<<REPLACE>>>\n",
+        "export const shared = 42;\n<<<END>>>\n",
+        "<<<REFIT_PATCH path=\"src/dead.ts\" op=\"delete\">>>\n<<<SEARCH>>>\n<<<REPLACE>>>\n<<<END>>>\n",
+        "<<<REFIT_PATCH path=\"src/old.ts\" op=\"rename\" new_path=\"src/core/new.ts\">>>\n",
+        "<<<SEARCH>>>\na = 1\n<<<REPLACE>>>\na = 2\n<<<END>>>"
+    );
+
+    let ops = apply_patches(&ops_base, &parse_patches(ops_patch)).unwrap();
+    assert!(ops.created.contains(&"src/shared.ts".to_string()));
+    assert!(ops.deleted.contains(&"src/dead.ts".to_string()));
+    assert!(ops.updated["src/core/new.ts"].contains("a = 2"));
+}
+
+#[cfg(test)]
+fn verify_patch_security() {
+    let sec_base = crate::testutil::map1("src/a.rs", "pub fn keep(a: i32, b: i32) -> i32 { a + b }\n".into());
+    let evil_patches = [
+        "<<<REFIT_PATCH path=\"../../pwn.rs\" op=\"create\">>>\n<<<REPLACE>>>\npwn\n<<<END>>>",
+        "<<<REFIT_PATCH path=\".git/hooks/pre-commit\" op=\"create\">>>\n<<<REPLACE>>>\npwn\n<<<END>>>",
+        "<<<REFIT_PATCH op=\"rename\" new_path=\"../escape.rs\" path=\"src/a.rs\">>>\n<<<END>>>",
+    ];
+    for evil in evil_patches { assert!(apply_patches(&sec_base, &parse_patches(evil)).is_err(), "{evil}"); }
+
+    let ren = parse_patches("<<<REFIT_PATCH op=\"rename\" new_path=\"src/b.rs\" path=\"src/a.rs\">>>\n<<<END>>>");
+    assert_eq!((ren[0].path.as_str(), ren[0].new_path.as_deref()), ("src/a.rs", Some("src/b.rs")));
+    let moved = apply_patches(&sec_base, &ren).unwrap();
+    assert!(moved.updated.contains_key("src/b.rs") && moved.deleted.contains(&"src/a.rs".to_string()));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::char_prefix;
     use crate::testutil::{TempRepo, asrf_edit, map1, plan_repo, unit_stub};
 
     fn plan_files(tag: &str, files: &[(&str, &str)]) -> (TempRepo, DagPlan) {
@@ -407,13 +415,12 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_slicing_and_wave_context() {
+    fn packet_slicing_and_wave_context() {
         let files = [
             ("src/a.py", "def alpha(x: int) -> int:\n    return x\n"),
             ("src/b.rs", "pub fn beta(y: i32) -> i32 { y }\n"),
         ];
         let (dir, plan) = plan_files("pkt", &files);
-
         let unit = unit_stub("a", &["src/a.py"]);
         let p1 = build_packet(dir.path(), &unit, &["z_err".into(), "a_err".into(), "z_err".into()], "", 4000).unwrap();
         let p2 = build_packet(dir.path(), &unit, &["a_err".into(), "z_err".into()], "", 4000).unwrap();
@@ -421,41 +428,31 @@ mod tests {
         assert!(p1.find("a_err").unwrap() < p1.find("z_err").unwrap());
 
         let mut src = String::from("import os\n\n");
-        for i in 0..25 {
-            src.push_str(&format!("def clean_{i}(x: int) -> int:\n    return x + {i}\n\n"));
-        }
-        src.push_str("@app.get('/hot')\ndef hot_target(items=[]):\n    if items:\n        if len(items) > 1:\n            return items[0]\n    return None\n");
+        for i in 0..25 { src.push_str(&format!("def clean_{i}(x: int) -> int:\n    return x + {i}\n\n")); }
+        let hot = concat!(
+            "@app.get('/hot')\ndef hot_target(items=[]):\n    if items:\n",
+            "        if len(items) > 1:\n            return items[0]\n    return None\n",
+        );
+        src.push_str(hot);
+
         let sliced = packet::slice_anchored(&src, 400, &HashSet::new());
         assert!(sliced.len() < src.len() && sliced.contains("def hot_target(items=[]):"));
         assert!(sliced.contains("@app.get('/hot')"), "decorator detached from hot_target: {sliced}");
         assert!(sliced.contains("// stub: def clean_"));
-
-        let mut utf = String::from("# こんにちは世界 🚀 café résumé\n");
-        for i in 0..40 {
-            utf.push_str(&format!("def fn_{i}():\n    return '🚀日本語テスト_{i}'\n\n"));
-        }
-        let utf_slice = packet::slice_anchored(&utf, 120, &HashSet::new());
-        assert!(utf_slice.contains("def fn_0") && utf_slice.len() < utf.len());
-        assert_eq!(char_prefix("🚀日本語", 2), "🚀日");
-
-        let fwd = wave_context(&plan.units, dir.path());
-        let mut rev_u = plan.units.clone();
-        rev_u.reverse();
-        assert_eq!(fwd, wave_context(&rev_u, dir.path()));
-        assert!(fwd.chars().count() <= 1200 && fwd.contains("def alpha") && fwd.contains("pub fn beta"));
+        verify_slice_utf8_and_wave(dir.path(), &plan);
     }
 
     #[test]
-    fn test_polyglot_abi_hashing() {
+    fn polyglot_abi_hashing() {
         let diff_cases = [
-            ("a.rs", "pub fn calc(x: i32) -> i32 { x }", "pub fn calc_v2(x: i32) -> i32 { x }"),
-            ("b.ts", "export function render(id: string) { return id; }", "export function renderCard(id: string) { return id; }"),
-            ("c.tsx", "export function Card({ title }: Props) { return title; }\n", "export function Card({ label }: Props) { return label; }\n"),
-            ("c.go", "package p\nfunc Build(x int) int { return x }", "package p\nfunc BuildAll(x int) int { return x }"),
-            ("svc.go", "package p\nfunc (s *Svc) Handle(id string) error { return nil }\n", "package p\nfunc (s *Svc) HandleV2(id string) error { return nil }\n"),
+            ("a.rs", "pub fn calc(x: i32) -> i32 { x }", "calc", "calc_v2"),
+            ("b.ts", "export function render(id: string) { return id; }", "render", "renderCard"),
+            ("c.tsx", "export function Card({ title }: Props) { return title; }\n", "title", "label"),
+            ("c.go", "package p\nfunc Build(x int) int { return x }", "Build", "BuildAll"),
+            ("svc.go", "package p\nfunc (s *Svc) Handle(id string) error { return nil }\n", "Handle", "HandleV2"),
         ];
-        for (rel, a, b) in diff_cases {
-            assert_ne!(hash_abi(rel, a), hash_abi(rel, b), "{rel}");
+        for (rel, src, old, new) in diff_cases {
+            assert_ne!(hash_abi(rel, src), hash_abi(rel, &src.replace(old, new)), "{rel}");
         }
 
         let rs_flat = "pub fn compute(a: i32, b: i32) -> i32 { a + b }\n";
@@ -467,35 +464,15 @@ mod tests {
         let renamed = "def compute(x: int, b: int = 1) -> int:\n    return x + b\n";
         assert_eq!(python_abi(untyped), python_abi(typed));
         assert_ne!(python_abi(untyped), python_abi(renamed));
-        assert_ne!(
-            python_abi("def calc(\n    x: int,\n    y: str,\n) -> float:\n    return 1.0\n"),
-            python_abi("def calc(\n    x: int,\n    z: str,\n) -> float:\n    return 1.0\n")
-        );
+        let py_a = "def calc(\n    x: int,\n    y: str,\n) -> float:\n    return 1.0\n";
+        let py_b = "def calc(\n    x: int,\n    z: str,\n) -> float:\n    return 1.0\n";
+        assert_ne!(python_abi(py_a), python_abi(py_b));
 
-        let reg = crate::platform::EpochRegistry::new();
-        let v1 = "pub fn compute(x: i32) -> i32 { x + 1 }\n";
-        let v2_same = "pub fn compute(x: i32) -> i32 { let y = x * 2; y - x + 1 }\n";
-        let v3_changed = "pub fn compute(x: i32, scale: i32) -> i32 { x * scale }\n";
-        let c1 = check_interface_cutoff("packages/calc", &[("src/calc.rs", v1)], None, &reg);
-        assert!(c1.changed);
-        let c2 = check_interface_cutoff(
-            "packages/calc",
-            &[("src/calc.rs", v2_same)],
-            Some(&c1.interface_blake3),
-            &reg,
-        );
-        assert!(!c2.changed && c2.epoch == c1.epoch && c2.interface_blake3 == c1.interface_blake3);
-        let c3 = check_interface_cutoff(
-            "packages/calc",
-            &[("src/calc.rs", v3_changed)],
-            Some(&c2.interface_blake3),
-            &reg,
-        );
-        assert!(c3.changed && c3.epoch > c2.epoch && c3.interface_blake3 != c2.interface_blake3);
+        verify_interface_cutoff();
     }
 
     #[test]
-    fn test_dag_scc_waves_and_impact() {
+    fn dag_scc_waves_and_impact() {
         let (_, poly) = plan_files("g_poly", &[
             ("src/a.py", "def py_fn(x):\n    return x\n"),
             ("src/b.rs", "pub fn rs_fn(x: i32) -> i32 { x }\n"),
@@ -551,49 +528,20 @@ mod tests {
     }
 
     #[test]
-    fn test_asrf_patch_ops_and_security() {
+    fn asrf_patch_ops_and_security() {
         let crlf = map1("pkg/a.py", "x = 1\r\ny = 2\r\n".to_string());
         let raw = format!("{}\r\n{}", asrf_edit("a.py", "x = 1", "x = 10"), asrf_edit("pkg/a.py", "y = 2", "y = 20"));
         assert_eq!(parse_patches(&raw).len(), 2);
         assert_eq!(run_patch(&crlf, &raw).unwrap().updated["pkg/a.py"], "x = 10\ny = 20\n");
 
-        assert!(patch::replace_window("    val = 1\n    val = 1\n", "val = 1", "val = 2", |a, b| a.trim() == b.trim()).is_none());
+        let dup_win = patch::replace_window("    val = 1\n    val = 1\n", "val = 1", "val = 2", |a, b| a.trim() == b.trim());
+        assert!(dup_win.is_none());
         let two = BTreeMap::from([("a.py".into(), "x = 1\n".into()), ("b.py".into(), "y = 2\n".into())]);
-        assert!(apply_patches(&two, &[]).is_err() && run_patch(&two, &asrf_edit("ghost.py", "x = 1", "x = 2")).is_err());
+        assert!(apply_patches(&two, &[]).is_err());
+        assert!(run_patch(&two, &asrf_edit("ghost.py", "x = 1", "x = 2")).is_err());
         assert!(edit_one("a.py", "x = 1\nx = 1\n", "x = 1", "x = 2").is_err());
 
-        let orig = "pub fn run(x: i32) -> i32 {\n    let step1 = x + 1;\n    let untouched_middle = step1 * 42;\n    untouched_middle\n}\n";
-        let s_el = "pub fn run(x: i32) -> i32 {\n// ... existing code ...\n    untouched_middle\n}";
-        let r_el = "pub fn run(x: i32) -> i32 {\n    let _checked = x >= 0;\n// ... existing code ...\n    untouched_middle + 1\n}";
-        let out = edit_one("src/calc.rs", orig, s_el, r_el).unwrap();
-        assert!(out.contains("let untouched_middle = step1 * 42;") && out.contains("let _checked = x >= 0;") && out.contains("untouched_middle + 1"));
-        assert!(edit_one("src/dup.py", "def dup():\n    return 1\ndef dup():\n    return 2\n", "def dup():\n# ... existing code ...\n    return 2", "def dup():\n# ... existing code ...\n    return 3").is_err());
-
-        let ops_base = BTreeMap::from([
-            ("src/old.ts".into(), "export const a = 1;\n".into()),
-            ("src/dead.ts".into(), "export const d = 0;\n".into()),
-        ]);
-        let ops_patch = concat!(
-            "<<<REFIT_PATCH path=\"src/shared.ts\" op=\"create\">>>\n<<<SEARCH>>>\n<<<REPLACE>>>\nexport const shared = 42;\n<<<END>>>\n",
-            "<<<REFIT_PATCH path=\"src/dead.ts\" op=\"delete\">>>\n<<<SEARCH>>>\n<<<REPLACE>>>\n<<<END>>>\n",
-            "<<<REFIT_PATCH path=\"src/old.ts\" op=\"rename\" new_path=\"src/core/new.ts\">>>\n<<<SEARCH>>>\na = 1\n<<<REPLACE>>>\na = 2\n<<<END>>>"
-        );
-        let ops = run_patch(&ops_base, ops_patch).unwrap();
-        assert!(ops.created.contains(&"src/shared.ts".to_string()) && ops.deleted.contains(&"src/dead.ts".to_string()));
-        assert!(ops.updated["src/core/new.ts"].contains("a = 2"));
-
-        let sec_base = map1("src/a.rs", "pub fn keep(a: i32, b: i32) -> i32 { a + b }\n".into());
-        for evil in [
-            "<<<REFIT_PATCH path=\"../../pwn.rs\" op=\"create\">>>\n<<<REPLACE>>>\npwn\n<<<END>>>",
-            "<<<REFIT_PATCH path=\".git/hooks/pre-commit\" op=\"create\">>>\n<<<REPLACE>>>\npwn\n<<<END>>>",
-            "<<<REFIT_PATCH op=\"rename\" new_path=\"../escape.rs\" path=\"src/a.rs\">>>\n<<<END>>>",
-        ] {
-            assert!(run_patch(&sec_base, evil).is_err(), "{evil}");
-        }
-
-        let ren = parse_patches("<<<REFIT_PATCH op=\"rename\" new_path=\"src/b.rs\" path=\"src/a.rs\">>>\n<<<END>>>");
-        assert_eq!((ren[0].path.as_str(), ren[0].new_path.as_deref()), ("src/a.rs", Some("src/b.rs")));
-        let moved = apply_patches(&sec_base, &ren).unwrap();
-        assert!(moved.updated.contains_key("src/b.rs") && moved.deleted.contains(&"src/a.rs".to_string()));
+        verify_asrf_elision_and_ops();
+        verify_patch_security();
     }
 }

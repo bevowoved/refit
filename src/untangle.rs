@@ -15,10 +15,26 @@ use crate::types::{
     TriageEntry, UnusedDep,
 };
 use anyhow::Result;
+use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
+use std::sync::LazyLock;
+
+static REPO_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"^(?:\./)?([A-Za-z0-9._-]+/[^ \t\r\n*?<>{}\[\]$#:]+?\.([A-Za-z]+))",
+        r"(?::[0-9-]+)?(?:#[^ \t\r\n*?<>{}\[\]$]*)?$",
+    ))
+    .expect("valid repo path regex")
+});
+static BT_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[A-Za-z0-9_]+::)*([A-Za-z][A-Za-z0-9_]{3,})\(\)$").expect("valid bt call regex")
+});
+static COMMENT_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([A-Za-z_][A-Za-z0-9_]{4,})\(\)").expect("valid comment call regex")
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditScope { Full, Sustain }
@@ -39,16 +55,19 @@ pub fn untangle_repo_with_scope(
 ) -> Result<AuditReport> {
     let repo_snap = RepoSnapshot::capture(repo_root, true);
     let (source_rels, preloaded) = (&repo_snap.source_rels, &repo_snap.preloaded);
-    tracing::debug!(sources = source_rels.len(), preloaded_bytes = repo_snap.total_preloaded_bytes, "snapshot");
+    tracing::debug!(sources = source_rels.len(), bytes = repo_snap.total_preloaded_bytes, "snapshot");
 
-    let (_discovery, sym_graph) = index_repo_snap(repo_root, &repo_snap);
-    let (hygiene_median, hygiene_p10, per_file_h) = hygiene.score_files(repo_root, source_rels, Some(preloaded));
+    let (_disc, sym_graph) = index_repo_snap(repo_root, &repo_snap);
+    let (hygiene_median, hygiene_p10, per_file_h) =
+        hygiene.score_files(repo_root, source_rels, Some(preloaded));
     let (csr, _) = analysis::CsrGraph::from_named_edges(source_rels, &sym_graph.runtime_edges);
     let sccs = csr.pearce_scc();
     let scc_count = sccs.iter().filter(|c| c.len() >= 2).count();
     let clone_clusters = similarity::find_clones(source_rels, preloaded);
-    let (god_files, orphan_files) = rank_files(repo_root, source_rels, preloaded, &per_file_h, &sym_graph);
-    let (total_infra_files, unused_deps, infra_findings) = infra::scan_parts_snap(repo_root, &repo_snap);
+    let (god_files, orphan_files) =
+        rank_files(repo_root, source_rels, preloaded, &per_file_h, &sym_graph);
+    let (total_infra_files, unused_deps, infra_findings) =
+        infra::scan_parts_snap(repo_root, &repo_snap);
 
     let (capability_clusters, doc_drift_findings, genome_twins, deep_module_findings) =
         if scope == AuditScope::Full {
@@ -61,7 +80,8 @@ pub fn untangle_repo_with_scope(
             let arch = analysis::ArchGraphRef {
                 all_edges: &sym_graph.edges, runtime_edges: &sym_graph.runtime_edges,
                 metrics: &sym_graph.metrics_by_file,
-                defs_by_file: Some(&sym_graph.defs_by_file), refs_by_file: Some(&sym_graph.refs_by_file),
+                defs_by_file: Some(&sym_graph.defs_by_file),
+                refs_by_file: Some(&sym_graph.refs_by_file),
             };
             let (_ego, deep) = analysis::analyze_ego_and_deep_modules(
                 source_rels, &sccs, &arch, &genome.file_commits, &clone_clusters,
@@ -71,13 +91,15 @@ pub fn untangle_repo_with_scope(
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
-    let triage_plan = build_triage(&infra_findings, &capability_clusters, &god_files, &unused_deps, &orphan_files);
+    let triage_plan =
+        build_triage(&infra_findings, &capability_clusters, &god_files, &unused_deps, &orphan_files);
     Ok(AuditReport {
         repo_root: repo_root.display().to_string(), total_source_files: source_rels.len(),
         total_infra_files, hygiene_median, hygiene_p10, scc_count,
         dead_symbols: sym_graph.dead_symbols.into_iter().take(80).collect(),
         orphan_files, clone_clusters, god_files, capability_clusters, unused_deps, infra_findings,
-        triage_plan, genome_twins, deep_module_findings, doc_drift_findings, dep_advisories: Vec::new(),
+        triage_plan, genome_twins, deep_module_findings, doc_drift_findings,
+        dep_advisories: Vec::new(),
     })
 }
 
@@ -95,8 +117,7 @@ fn rank_files(
         if fi == 0 && fo == 0 && !entrypoint(rel) { orphans.push(rel.clone()); }
         let risk = (1.0 - h_score).max(0.02) * (loc.max(2) as f64).ln() * (1.0 + (fi + fo) as f64);
         let rec = if loc >= 500 && h_score < 0.75 { "split_god_file" }
-            else if h_score < 0.85 { "refactor_in_place" }
-            else { "keep" };
+            else if h_score < 0.85 { "refactor_in_place" } else { "keep" };
         if rec != "keep" || risk >= 6.0 {
             god_files.push(GodFileScore {
                 file: rel.clone(), loc, hygiene_score: h_score, fan_in: fi, fan_out: fo,
@@ -104,7 +125,7 @@ fn rank_files(
             });
         }
     }
-    god_files.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap_or(std::cmp::Ordering::Equal));
+    god_files.sort_by(|a, b| b.risk_score.total_cmp(&a.risk_score));
     god_files.truncate(25);
     (god_files, orphans)
 }
@@ -117,21 +138,23 @@ fn build_triage(
     let mut push = |file: String, action: &str, reason: String, priority: u32| {
         plan.push(TriageEntry { file, action: action.into(), reason, priority });
     };
-    for f in infra.iter().filter(|f| matches!(f.severity.as_str(), "critical" | "high")).take(15) {
-        let prio = if f.severity == "critical" { 1 } else { 2 };
-        push(f.file.clone(), "harden_infra", format!("[{}] L{}: {}", f.rule_id, f.line, f.message), prio);
+    for finding in infra.iter().filter(|f| matches!(f.severity.as_str(), "critical" | "high")).take(15) {
+        let prio = if finding.severity == "critical" { 1 } else { 2 };
+        push(finding.file.clone(), "harden_infra",
+            format!("[{}] L{}: {}", finding.rule_id, finding.line, finding.message), prio);
     }
     for cap in caps { push(cap.files.join(", "), "consolidate", cap.recommendation.clone(), 2); }
-    for g in gods.iter().filter(|g| g.recommendation == "split_god_file").take(10) {
+    for god in gods.iter().filter(|g| g.recommendation == "split_god_file").take(10) {
         let msg = format!("{} LOC, hygiene {:.3}, fan_in={}, fan_out={} (risk {:.1})",
-            g.loc, g.hygiene_score, g.fan_in, g.fan_out, g.risk_score);
-        push(g.file.clone(), "split", msg, 2);
+            god.loc, god.hygiene_score, god.fan_in, god.fan_out, god.risk_score);
+        push(god.file.clone(), "split", msg, 2);
     }
-    for u in unused.iter().take(15) {
-        push(u.manifest.clone(), "remove_unused_dep", format!("Unused {} dep `{}`", u.ecosystem, u.package), 3);
+    for dep in unused.iter().take(15) {
+        push(dep.manifest.clone(), "remove_unused_dep",
+            format!("Unused {} dep `{}`", dep.ecosystem, dep.package), 3);
     }
-    for o in orphans.iter().take(10) {
-        push(o.clone(), "review_delete", "Zero graph edges (candidate dead file)".into(), 4);
+    for orp in orphans.iter().take(10) {
+        push(orp.clone(), "review_delete", "Zero graph edges (candidate dead file)".into(), 4);
     }
     plan.sort_by_key(|t| (t.priority, t.file.clone()));
     plan
@@ -159,43 +182,39 @@ pub fn render_audit(report: &AuditReport) -> String {
         report.hygiene_median, report.hygiene_p10, report.scc_count, report.dead_symbols.len(),
         report.clone_clusters.len(), report.unused_deps.len(), report.infra_findings.len()
     );
-    push_md_section(
-        &mut md,
-        "## Prioritized Triage Plan\n\n| Priority | Action | Target | Reason |\n| :--- | :--- | :--- | :--- |\n",
-        &report.triage_plan, 25,
-        |s, t| { let _ = writeln!(s, "| P{} | `{}` | `{}` | {} |", t.priority, t.action, t.file, t.reason); },
-    );
+
+    let triage_hdr = "## Prioritized Triage Plan\n\n\
+        | Priority | Action | Target | Reason |\n| :--- | :--- | :--- | :--- |\n";
+    push_md_section(&mut md, triage_hdr, &report.triage_plan, 25, |s, t| {
+        let _ = writeln!(s, "| P{} | `{}` | `{}` | {} |", t.priority, t.action, t.file, t.reason);
+    });
     push_md_section(&mut md, "## Top Structural Risk / God Files\n\n", &report.god_files, 10, |s, g| {
-        let _ = writeln!(
-            s, "- `{}` — {} LOC, hygiene `{:.3}`, fan-in `{}`, fan-out `{}`, risk `{:.2}` -> **{}**",
-            g.file, g.loc, g.hygiene_score, g.fan_in, g.fan_out, g.risk_score, g.recommendation
-        );
+        let _ = writeln!(s, "- `{}` — {} LOC, hygiene `{:.3}`, fan-in `{}`, fan-out `{}`, risk `{:.2}` -> **{}**",
+            g.file, g.loc, g.hygiene_score, g.fan_in, g.fan_out, g.risk_score, g.recommendation);
     });
     for (hdr, items) in [
         ("## Deep-Module Architectural Findings\n\n", &report.deep_module_findings),
         ("## Top Git Co-Change Twins\n\n", &report.genome_twins),
     ] {
-        push_md_section(&mut md, hdr, items, 15, |s, item| {
-            let _ = writeln!(s, "- {item}");
-        });
+        push_md_section(&mut md, hdr, items, 15, |s, item| { let _ = writeln!(s, "- {item}"); });
     }
     push_md_section(
-        &mut md, "## Documentation & Comment Drift\n\n", &report.doc_drift_findings, 20,
-        |s, df| { let _ = writeln!(s, "- `{}` L{} [{}]: `{}` — {}", df.file, df.line, df.kind, df.reference, df.message); },
+        &mut md, "## Documentation & Comment Drift\n\n", &report.doc_drift_findings, 20, |s, df| {
+            let _ = writeln!(s, "- `{}` L{} [{}]: `{}` — {}",
+                df.file, df.line, df.kind, df.reference, df.message);
+        },
     );
-    push_md_section(&mut md, "## Dependency Advisories & SemVer Hops\n\n", &report.dep_advisories, 25, |s, adv| {
-        let latest = adv.latest.as_deref().unwrap_or(&adv.installed);
-        let hops = if adv.hops.is_empty() {
-            String::new()
-        } else {
-            format!(" (hops: {}, breaking: {})", adv.hops.join(" -> "), adv.breaking_hops)
-        };
-        let guard = adv.keep_guard.as_deref().map(|g| format!(" [keep-guard: {g}]")).unwrap_or_default();
-        let _ = writeln!(
-            s, "- [{}] `{}/{}` `{}` -> `{}`{} — {}{}",
-            adv.kind, adv.ecosystem, adv.name, adv.installed, latest, hops, adv.recommendation, guard
-        );
-    });
+    push_md_section(
+        &mut md, "## Dependency Advisories & SemVer Hops\n\n", &report.dep_advisories, 25, |s, a| {
+            let latest = a.latest.as_deref().unwrap_or(&a.installed);
+            let hops = if a.hops.is_empty() { String::new() } else {
+                format!(" (hops: {}, breaking: {})", a.hops.join(" -> "), a.breaking_hops)
+            };
+            let guard = a.keep_guard.as_deref().map_or(String::new(), |g| format!(" [keep-guard: {g}]"));
+            let _ = writeln!(s, "- [{}] `{}/{}` `{}` -> `{}`{} — {}{}",
+                a.kind, a.ecosystem, a.name, a.installed, latest, hops, a.recommendation, guard);
+        },
+    );
     md
 }
 
@@ -229,11 +248,10 @@ fn write_sustain_docs(
         "      - uses: actions/checkout@v4\n      - name: Run refit structural & hygiene audit\n",
         "        run: refit audit . --markdown\n"
     );
+
     let items = [
-        ("AGENTS.md", agents),
-        (".refit/invariants.yml", invariants.into()),
-        ("docs/ADR-001-untangle.md", adr),
-        (".github/workflows/refit-guard.yml", ci.into()),
+        ("AGENTS.md", agents), (".refit/invariants.yml", invariants.into()),
+        ("docs/ADR-001-untangle.md", adr), (".github/workflows/refit-guard.yml", ci.into()),
     ];
     let mut written = Vec::with_capacity(items.len());
     for (rel, body) in items {
@@ -246,8 +264,7 @@ fn write_sustain_docs(
 pub fn write_sustain(repo_root: &Path, report: &AuditReport, dry_run: bool) -> Result<SustainFiles> {
     let agents = format!(
         concat!(
-            "# AGENTS.md — Repository Guardrails\n\n",
-            "Generated by `refit sustain`.\n\n",
+            "# AGENTS.md — Repository Guardrails\n\nGenerated by `refit sustain`.\n\n",
             "## Architectural Rules\n",
             "1. Keep maintainability score `>= 0.85` on modified files.\n",
             "2. Never introduce circular imports (`scc_count` baseline: `{}`).\n",
@@ -294,11 +311,8 @@ pub fn write_sustain_prose(
     );
     let normalized = ste100::simplify_verbs(&agents_doc);
     let lint = ste100::lint_md(&normalized, dict.as_ref());
-    let sustain = write_sustain_docs(repo_root, report, normalized, dry_run)?;
-    Ok((sustain, lint))
+    Ok((write_sustain_docs(repo_root, report, normalized, dry_run)?, lint))
 }
-
-// Documentation and comment drift scanner
 
 const KNOWN_PATH_ROOTS: &[&str] = &[
     "src", "lib", "app", "pkg", "packages", "crates", "cmd", "internal", "tests", "docs",
@@ -336,29 +350,48 @@ const BUILTIN_PKG_SCRIPTS: &[&str] = &[
 ];
 
 struct DriftCtx<'a> {
-    repo_root: &'a Path,
-    repo_files: &'a BTreeSet<String>,
-    repo_dirs: &'a BTreeSet<String>,
-    known_symbols: &'a BTreeSet<String>,
-    npm_scripts: Option<&'a BTreeSet<String>>,
+    repo_root: &'a Path, repo_files: &'a BTreeSet<String>, repo_dirs: &'a BTreeSet<String>,
+    known_symbols: &'a BTreeSet<String>, npm_scripts: Option<&'a BTreeSet<String>>,
 }
 
 impl DriftCtx<'_> {
     fn is_missing_path(&self, clean_path: &str) -> bool {
         !self.repo_files.contains(clean_path) && !self.repo_root.join(clean_path).exists()
     }
+
+    fn check_path(
+        &self, out: &mut Vec<DocDriftFinding>, file: &str, ln: usize, span: &str, msg: &str,
+    ) -> bool {
+        let Some(clean) = parse_repo_path_candidate(span, self.repo_dirs) else { return false };
+        if self.is_missing_path(clean) {
+            push_drift(out, file, ln, "doc_stale_path", clean.into(), msg.replace("{p}", clean));
+        }
+        true
+    }
+
+    fn check_sym(&self, out: &mut Vec<DocDriftFinding>, file: &str, ln: usize, sym: &str, msg: &str) {
+        if !self.known_symbols.is_empty() && !is_ignored_symbol(sym)
+            && !is_placeholder_text(sym) && !self.known_symbols.contains(sym)
+        {
+            push_drift(out, file, ln, "doc_stale_symbol", format!("{sym}()"), msg.replace("{s}", sym));
+        }
+    }
 }
 
-fn push_drift(out: &mut Vec<DocDriftFinding>, file: &str, line: usize, kind: &str, reference: String, message: String) {
+fn push_drift(
+    out: &mut Vec<DocDriftFinding>, file: &str, line: usize, kind: &str, reference: String, message: String,
+) {
     out.push(DocDriftFinding { file: file.to_string(), line, kind: kind.into(), reference, message });
 }
 
 /// Scan docs and comments for stale paths and symbol references.
 fn scan_doc_drift(repo_root: &Path, repo_snap: &RepoSnapshot, snap: &SymbolGraph) -> Vec<DocDriftFinding> {
-    let mut known_symbols = BTreeSet::new();
-    for syms in snap.defs_by_file.values().chain(snap.refs_by_file.values()) {
-        known_symbols.extend(syms.iter().cloned());
-    }
+    let known_symbols: BTreeSet<String> = snap
+        .defs_by_file
+        .values()
+        .chain(snap.refs_by_file.values())
+        .flat_map(|syms| syms.iter().cloned())
+        .collect();
     let (mut repo_files, mut repo_dirs) = (BTreeSet::new(), BTreeSet::new());
     for rel in &repo_snap.all_rels {
         repo_files.insert(rel.clone());
@@ -369,9 +402,12 @@ fn scan_doc_drift(repo_root: &Path, repo_snap: &RepoSnapshot, snap: &SymbolGraph
         repo_root, repo_files: &repo_files, repo_dirs: &repo_dirs,
         known_symbols: &known_symbols, npm_scripts: npm_scripts.as_ref(),
     };
+
     let mut findings = Vec::new();
     for (rel, abs) in &repo_snap.doc_rels {
-        if let Ok(content) = fs::read_to_string(abs) { scan_markdown_doc(&ctx, rel, &content, &mut findings); }
+        if let Ok(content) = fs::read_to_string(abs) {
+            scan_markdown_doc(&ctx, rel, &content, &mut findings);
+        }
     }
     for rel in repo_snap.source_rels.iter().filter(|r| !test_path(r)) {
         if let Some(bytes) = read_bytes(repo_root, rel, Some(&repo_snap.preloaded)) {
@@ -379,15 +415,15 @@ fn scan_doc_drift(repo_root: &Path, repo_snap: &RepoSnapshot, snap: &SymbolGraph
         }
     }
     findings.sort_by(|a, b| {
-        a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.kind.cmp(&b.kind)).then_with(|| a.reference.cmp(&b.reference))
+        (&a.file, a.line, &a.kind, &a.reference).cmp(&(&b.file, b.line, &b.kind, &b.reference))
     });
     findings.dedup_by(|a, b| a.file == b.file && a.line == b.line && a.reference == b.reference);
     findings
 }
 
 fn load_package_scripts(repo_root: &Path) -> Option<BTreeSet<String>> {
-    let val: serde_json::Value = serde_json::from_str(&fs::read_to_string(repo_root.join("package.json")).ok()?).ok()?;
+    let raw = fs::read_to_string(repo_root.join("package.json")).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
     Some(val.get("scripts")?.as_object()?.keys().cloned().collect())
 }
 
@@ -395,10 +431,7 @@ fn scan_markdown_doc(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec
     let mut in_fence = false;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") { in_fence = !in_fence; continue; }
         if in_fence || trimmed.is_empty() || contains_ignore_marker(trimmed) { continue; }
         for span in iter_backtick_spans(line) { check_doc_span(ctx, rel, idx + 1, span, out); }
     }
@@ -406,48 +439,32 @@ fn scan_markdown_doc(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec
 
 fn contains_ignore_marker(text: &str) -> bool { find_ascii_ci(text.as_bytes(), b"refit: ignore").is_some() }
 
-fn check_doc_span(ctx: &DriftCtx<'_>, doc_file: &str, ln: usize, span: &str, out: &mut Vec<DocDriftFinding>) {
+fn check_doc_span(ctx: &DriftCtx<'_>, doc: &str, ln: usize, span: &str, out: &mut Vec<DocDriftFinding>) {
     if let Some(script) = extract_cli_script_ref(span) {
         if let Some(scripts) = ctx.npm_scripts && !scripts.contains(script) && !is_placeholder_text(script) {
-            push_drift(
-                out, doc_file, ln, "doc_stale_cli", span.to_string(),
-                format!("Documented script `{script}` missing from package.json scripts"),
-            );
+            push_drift(out, doc, ln, "doc_stale_cli", span.into(),
+                format!("Documented script `{script}` missing from package.json scripts"));
         }
         return;
     }
-    if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs) {
-        if ctx.is_missing_path(clean_path) {
-            push_drift(
-                out, doc_file, ln, "doc_stale_path", clean_path.to_string(),
-                format!("Referenced file path `{clean_path}` does not exist in repository"),
-            );
-        }
+    if ctx.check_path(out, doc, ln, span, "Referenced file path `{p}` does not exist in repository") {
         return;
     }
-    if !ctx.known_symbols.is_empty()
-        && let Some(sym) = parse_backtick_call_symbol(span)
-        && !is_ignored_symbol(sym) && !ctx.known_symbols.contains(sym)
-    {
-        push_drift(
-            out, doc_file, ln, "doc_stale_symbol", format!("{sym}()"),
-            format!("Referenced symbol `{sym}()` not found in live codebase"),
-        );
+    if let Some(sym) = BT_CALL_RE.captures(span).and_then(|c| c.get(1)).map(|m| m.as_str()) {
+        ctx.check_sym(out, doc, ln, sym, "Referenced symbol `{s}()` not found in live codebase");
     }
 }
 
 fn extract_cli_script_ref(span: &str) -> Option<&str> {
-    let rest = span.strip_prefix("npm run ").or_else(|| span.strip_prefix("pnpm run "))
-        .or_else(|| span.strip_prefix("yarn run "))?;
+    let rest = ["npm run ", "pnpm run ", "yarn run "].iter().find_map(|p| span.strip_prefix(p))?;
     let name = rest.split_whitespace().next()?;
-    let ok = !name.is_empty() && !name.starts_with('-') && !has_placeholder_chars(name)
-        && !BUILTIN_PKG_SCRIPTS.contains(&name);
+    let ok = !name.is_empty() && !name.starts_with('-')
+        && !has_placeholder_chars(name) && !BUILTIN_PKG_SCRIPTS.contains(&name);
     ok.then_some(name)
 }
 
 fn has_placeholder_chars(text: &str) -> bool {
-    text.bytes().any(|b| matches!(b, b'*' | b'?' | b'<' | b'>' | b'{' | b'}' | b'[' | b']' | b'$'))
-        || text.contains("...")
+    text.bytes().any(|b| b"*?<>{}[]$".contains(&b)) || text.contains("...")
 }
 
 fn is_placeholder_text(text: &str) -> bool {
@@ -456,45 +473,37 @@ fn is_placeholder_text(text: &str) -> bool {
 }
 
 fn parse_repo_path_candidate<'a>(span: &'a str, repo_dirs: &BTreeSet<String>) -> Option<&'a str> {
-    if span.contains(char::is_whitespace) || span.contains("://")
-        || span.starts_with(['/', '~', '@']) || has_placeholder_chars(span)
-    { return None; }
-    let no_frag = span.split('#').next().unwrap_or(span);
-    let stripped = match no_frag.rsplit_once(':') {
-        Some((h, t)) if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || b == b'-') => h,
-        _ => no_frag,
-    };
-    let clean = stripped.trim_start_matches("./");
-    if !clean.contains('/') || clean.contains("..") || is_placeholder_text(clean)
+    let cap = REPO_PATH_RE.captures(span)?;
+    let (clean, ext) = (cap.get(1)?.as_str(), cap.get(2)?.as_str());
+    if clean.contains("..") || is_placeholder_text(clean)
         || RUNTIME_PREFIXES.iter().any(|p| clean.starts_with(p))
     { return None; }
     let (top, _) = clean.split_once('/')?;
     if !KNOWN_PATH_ROOTS.contains(&top) && !repo_dirs.contains(top) { return None; }
-    let (_, ext) = clean.rsplit_once('.')?;
     KNOWN_FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str()).then_some(clean)
-}
-
-fn parse_backtick_call_symbol(span: &str) -> Option<&str> {
-    if span.contains(char::is_whitespace) || has_placeholder_chars(span) { return None; }
-    let head = span.strip_suffix("()")?;
-    let sym = head.rsplit("::").next().unwrap_or(head);
-    if sym.contains(['.', '/']) || sym.len() < 4 || is_placeholder_text(sym) { return None; }
-    let valid = sym.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && sym.as_bytes()[0].is_ascii_alphabetic();
-    valid.then_some(sym)
 }
 
 fn is_ignored_symbol(sym: &str) -> bool { IGNORED_SYMBOLS.contains(&sym.to_ascii_lowercase().as_str()) }
 
-fn check_comment_line(ctx: &DriftCtx<'_>, rel: &str, ln: usize, comment: &str, out: &mut Vec<DocDriftFinding>) {
+fn check_comment_line(
+    ctx: &DriftCtx<'_>, rel: &str, ln: usize, comment: &str, out: &mut Vec<DocDriftFinding>,
+) {
     if comment.is_empty() || contains_ignore_marker(comment) { return; }
     for span in iter_backtick_spans(comment) {
-        if let Some(clean_path) = parse_repo_path_candidate(span, ctx.repo_dirs)
-            && ctx.is_missing_path(clean_path)
-        {
-            push_drift(out, rel, ln, "doc_stale_path", clean_path.to_string(), format!("Comment cites missing file `{clean_path}`"));
+        ctx.check_path(out, rel, ln, span, "Comment cites missing file `{p}`");
+    }
+    let bytes = comment.as_bytes();
+    for cap in COMMENT_CALL_RE.captures_iter(comment) {
+        let Some(mat) = cap.get(1) else { continue };
+        let prev_bad = mat.start() > 0 && {
+            let b = bytes[mat.start() - 1];
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.')
+        };
+        if !prev_bad {
+            ctx.check_sym(out, rel, ln, mat.as_str(),
+                "Stale comment reference `{s}()` not found in live codebase");
         }
     }
-    if !ctx.known_symbols.is_empty() { scan_comment_call_refs(ctx, rel, ln, comment, out); }
 }
 
 fn scan_source_comments(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut Vec<DocDriftFinding>) {
@@ -502,38 +511,20 @@ fn scan_source_comments(ctx: &DriftCtx<'_>, rel: &str, content: &str, out: &mut 
     if ext == "rs" {
         let mut cursor = LexCursor::new(LangKind::Rust, content.as_bytes());
         while let Some(tok) = cursor.next_token() {
-            if !matches!(tok.kind, LexKind::LineComment | LexKind::BlockComment) || tok.flags.in_test() { continue; }
+            if !matches!(tok.kind, LexKind::LineComment | LexKind::BlockComment) || tok.flags.in_test() {
+                continue;
+            }
             for (off, raw_line) in tok.as_str().lines().enumerate() {
-                if let Some(c) = extract_comment_body("rs", raw_line) {
-                    check_comment_line(ctx, rel, (tok.line as usize) + off, c, out);
+                if let Some(cmt) = extract_comment_body("rs", raw_line) {
+                    check_comment_line(ctx, rel, (tok.line as usize) + off, cmt, out);
                 }
             }
         }
         return;
     }
     for (idx, line) in content.lines().enumerate() {
-        if let Some(c) = extract_comment_body(&ext, line) { check_comment_line(ctx, rel, idx + 1, c, out); }
-    }
-}
-
-fn scan_comment_call_refs(ctx: &DriftCtx<'_>, rel: &str, ln: usize, comment: &str, out: &mut Vec<DocDriftFinding>) {
-    let (bytes, mut pos) = (comment.as_bytes(), 0usize);
-    while pos + 2 < bytes.len() {
-        if !(bytes[pos].is_ascii_alphabetic() || bytes[pos] == b'_') {
-            pos += 1;
-            continue;
-        }
-        let start = pos;
-        pos += 1;
-        while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') { pos += 1; }
-        let is_call = pos + 1 < bytes.len() && bytes[pos] == b'(' && bytes[pos + 1] == b')';
-        if !is_call || (start > 0 && bytes[start - 1] == b'.') { continue; }
-        let sym = &comment[start..pos];
-        if sym.len() >= 5 && !is_ignored_symbol(sym) && !is_placeholder_text(sym) && !ctx.known_symbols.contains(sym) {
-            push_drift(
-                out, rel, ln, "doc_stale_symbol", format!("{sym}()"),
-                format!("Stale comment reference `{sym}()` not found in live codebase"),
-            );
+        if let Some(cmt) = extract_comment_body(&ext, line) {
+            check_comment_line(ctx, rel, idx + 1, cmt, out);
         }
     }
 }
@@ -544,7 +535,7 @@ mod tests {
     use crate::testutil::TempRepo;
 
     #[test]
-    fn test_untangle_audit_infra_and_sustain() {
+    fn audit_infra_and_sustain() {
         let block = concat!(
             "    const normalized = raw.trim().toLowerCase();\n",
             "    const parts = normalized.split(':');\n",
@@ -592,14 +583,12 @@ mod tests {
 
         let (ste_md, ste_lint) = render_audit_prose(&rep, None).unwrap();
         assert!(ste_md.contains("# refit Audit Report") && ste_lint.compliant);
-
         let (sus_ste, sus_lint) = write_sustain_prose(dir.path(), &rep, true, None).unwrap();
-        assert_eq!(sus_ste.files_written.len(), 4);
-        assert!(sus_lint.compliant);
+        assert!(sus_ste.files_written.len() == 4 && sus_lint.compliant);
     }
 
     #[test]
-    fn drift_skips_cfg_test_comments_catches_prod() {
+    fn drift_skips_test_catches_prod() {
         let auth_rs = concat!(
             "// Delegates to live_verify_token() safely\n",
             "// Legacy note: previously called legacy_parse_wal() and `src/ghost_prod.rs`\n",

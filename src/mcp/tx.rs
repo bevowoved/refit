@@ -2,11 +2,11 @@ use crate::gates::{GateConfig, run_gates, scan_cached};
 use crate::graph::{apply_patches, hash_abi, impacted_tests, parse_patches};
 use crate::hygiene::HygieneScorer;
 use crate::mvcc::{CommitOutcome, MvccStore};
-use crate::net::{json_path, json_str};
 use crate::platform::{SieveCache, check_target_in_repo, ensure_cachedir_tag, now_ms, write_atomic};
 use crate::source::{count_lines, work_dir};
 use crate::types::{ModuleUnit, PatchOp};
 use parking_lot::Mutex;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -32,7 +32,7 @@ pub struct TxMeta {
 }
 
 impl StagedFile {
-    fn created(content: String) -> Self { Self { staged_content: content, created: true, ..Default::default() } }
+    fn created(staged_content: String) -> Self { Self { staged_content, created: true, ..Default::default() } }
     fn deleted(base_blake3: String, original_content: String) -> Self {
         Self { base_blake3, original_content, deleted: true, ..Default::default() }
     }
@@ -47,6 +47,31 @@ pub struct CommitReq<'a> {
     pub ctx: &'a ToolCtx<'a>, pub unit: &'a ModuleUnit, pub cands: &'a BTreeMap<String, String>,
     pub deleted: &'a [String], pub base: &'a BTreeMap<String, String>, pub dry_run: bool,
     pub tag: &'a str, pub extra_dry: Map<String, Value>, pub extra_ok: Map<String, Value>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TxArgs {
+    tx_handle: String, ttl_secs: Option<u64>, path: String, content: String,
+    from_path: String, to_path: String, patch_text: String, dry_run: bool, allow_abi_change: bool,
+}
+
+pub(super) fn parse_args<T: DeserializeOwned + Default>(args: &Value) -> T {
+    serde_json::from_value(args.clone()).unwrap_or_default()
+}
+pub(super) fn err_val(msg: impl Into<String>) -> Value { json!({ "error": msg.into() }) }
+
+pub(super) fn fail_val(flag: &str, msg: impl Into<String>, gate: Option<&str>) -> Value {
+    let mut m = Map::from_iter([(flag.into(), Value::Bool(false)), ("error".into(), msg.into().into())]);
+    if let Some(g) = gate { m.insert("failed_gate".into(), g.into()); }
+    Value::Object(m)
+}
+
+fn tx_ok(handle: &str, count: usize, key: &str, val: Value) -> Value {
+    Value::Object(Map::from_iter([
+        ("ok".into(), true.into()), ("tx_handle".into(), handle.into()),
+        ("staged_files_count".into(), count.into()), (key.into(), val),
+    ]))
 }
 
 pub fn txs_dir(repo_root: &Path) -> PathBuf { work_dir(repo_root, ".refit-tx", "refit-tx") }
@@ -99,236 +124,226 @@ fn upsert_created(meta: &mut TxMeta, path: &str, content: String) {
     }
 }
 
+fn ensure_absent(repo_root: &Path, meta: &TxMeta, path: &str, msg: &str) -> std::result::Result<(), Value> {
+    if repo_root.join(path).exists() && !meta.staged.get(path).is_some_and(|s| s.deleted) {
+        return Err(fail_val("ok", format!("{msg}: `{path}`"), None));
+    }
+    Ok(())
+}
+
 fn with_tx(
     repo_root: &Path, handle: &str, err_key: &str, save: bool,
     f: impl FnOnce(&Path, &mut TxMeta) -> std::result::Result<Value, Value>,
 ) -> Value {
-    if !check_txid(handle) { return json!({ err_key: false, "error": "invalid tx_handle" }); }
+    if !check_txid(handle) { return fail_val(err_key, "invalid tx_handle", None); }
     let lock = lock_tx(handle);
     let _g = lock.lock();
     let tx_dir = txs_dir(repo_root).join(handle);
     let meta_path = tx_dir.join("meta.json");
     let raw_meta = fs::read_to_string(&meta_path).ok();
     let Some(mut meta) = raw_meta.and_then(|s| serde_json::from_str::<TxMeta>(&s).ok()) else {
-        return json!({ err_key: false, "error": format!("unknown tx_handle `{handle}`") });
+        return fail_val(err_key, format!("unknown tx_handle `{handle}`"), None);
     };
     match f(&tx_dir, &mut meta) {
         Ok(resp) => {
-            if save && let Err(e) = write_tx(&meta_path, &meta) {
-                return json!({ err_key: false, "error": e });
-            }
+            if save && let Err(e) = write_tx(&meta_path, &meta) { return fail_val(err_key, e, None); }
             resp
         }
-        Err(err_val) => err_val,
+        Err(err_v) => err_v,
     }
 }
 
 pub fn tx_begin(repo_root: &Path, args: &Value) -> Value {
-    let now = now_ms();
-    let raw_ttl = args["ttl_secs"].as_u64().unwrap_or(1800);
-    let ttl_secs = raw_ttl.clamp(1, 86_400);
-    let ttl_ms = ttl_secs * 1000;
+    let a: TxArgs = parse_args(args);
+    let (now, ttl_ms) = (now_ms(), a.ttl_secs.unwrap_or(1800).clamp(1, 86_400) * 1000);
     let root = txs_dir(repo_root);
     let swept = sweep_txs(&root, now);
     let handle = format!("tx-{now}-{}", MCP_TX_SEQ.fetch_add(1, Ordering::Relaxed));
     let tx_dir = root.join(&handle);
-    if let Err(e) = fs::create_dir_all(&tx_dir) { return json!({"error": format!("create tx dir: {e}")}); }
+    if let Err(e) = fs::create_dir_all(&tx_dir) { return err_val(format!("create tx dir: {e}")); }
     ensure_cachedir_tag(&root);
     let meta = TxMeta { tx_handle: handle.clone(), created_ms: now, ttl_ms, staged: BTreeMap::new() };
-    if let Err(e) = write_tx(&tx_dir.join("meta.json"), &meta) { return json!({"ok": false, "error": e}); }
+    if let Err(e) = write_tx(&tx_dir.join("meta.json"), &meta) { return fail_val("ok", e, None); }
     json!({ "tx_handle": handle, "created_ms": now, "ttl_ms": ttl_ms, "swept_orphans": swept })
 }
 
-pub fn tx_create(repo_root: &Path, args: &Value) -> Value {
-    let (handle, path, content) = (args["tx_handle"].as_str().unwrap_or(""), json_path(args, "path"), json_str(args, "content"));
-    if !check_target(repo_root, &path) { return json!({"ok": false, "error": format!("unsafe path `{path}`")}); }
-    with_tx(repo_root, handle, "ok", true, |_, meta| {
-        if repo_root.join(&path).exists() && !meta.staged.get(&path).is_some_and(|s| s.deleted) {
-            return Err(json!({"ok": false, "error": format!("already exists: `{path}`")}));
-        }
-        upsert_created(meta, &path, content);
-        Ok(json!({ "ok": true, "tx_handle": handle, "created": path, "staged_files_count": meta.staged.len() }))
-    })
-}
-
-pub fn tx_delete(repo_root: &Path, args: &Value) -> Value {
-    let (handle, path) = (args["tx_handle"].as_str().unwrap_or(""), json_path(args, "path"));
-    if !check_target(repo_root, &path) { return json!({"ok": false, "error": format!("unsafe path `{path}`")}); }
-    with_tx(repo_root, handle, "ok", true, |_, meta| {
-        if meta.staged.get(&path).is_some_and(|s| s.created) {
-            meta.staged.remove(&path);
-        } else {
-            let (hash, orig) = existing_base(repo_root, meta, &path)?;
-            meta.staged.insert(path.clone(), StagedFile::deleted(hash, orig));
-        }
-        Ok(json!({ "ok": true, "tx_handle": handle, "deleted": path, "staged_files_count": meta.staged.len() }))
-    })
-}
-
-pub fn tx_move(repo_root: &Path, args: &Value) -> Value {
-    let (handle, from, to) = (args["tx_handle"].as_str().unwrap_or(""), json_path(args, "from_path"), json_path(args, "to_path"));
-    if !check_target(repo_root, &from) || !check_target(repo_root, &to) {
-        return json!({"ok": false, "error": "unsafe from_path or to_path"});
+fn tx_delete(repo_root: &Path, meta: &mut TxMeta, handle: &str, path: String) -> std::result::Result<Value, Value> {
+    if meta.staged.get(&path).is_some_and(|s| s.created) {
+        meta.staged.remove(&path);
+    } else {
+        let (h, orig) = existing_base(repo_root, meta, &path)?;
+        meta.staged.insert(path.clone(), StagedFile::deleted(h, orig));
     }
-    if from == to { return json!({"ok": false, "error": "from_path and to_path are identical"}); }
-    with_tx(repo_root, handle, "ok", true, |_, meta| {
-        if repo_root.join(&to).exists() && !meta.staged.get(&to).is_some_and(|s| s.deleted) {
-            return Err(json!({"ok": false, "error": format!("destination exists: `{to}`")}));
-        }
-        let (content, created, orig, hash) = read_source(repo_root, meta, &from)?;
-        if created {
-            meta.staged.remove(&from);
-        } else {
-            meta.staged.insert(from.clone(), StagedFile::deleted(hash, orig));
-        }
-        upsert_created(meta, &to, content);
-        Ok(json!({ "ok": true, "tx_handle": handle, "moved": [from, to], "staged_files_count": meta.staged.len() }))
-    })
+    Ok(tx_ok(handle, meta.staged.len(), "deleted", path.into()))
 }
 
-pub fn tx_stage(repo_root: &Path, args: &Value) -> Value {
-    let handle = args["tx_handle"].as_str().unwrap_or("");
-    let patch_text = args["patch_text"].as_str().unwrap_or("");
-    with_tx(repo_root, handle, "ok", true, |_, meta| {
-        let hunks = parse_patches(patch_text);
-        if hunks.is_empty() { return Err(json!({"ok": false, "error": "no <<<REFIT_PATCH>>> hunks found"})); }
-        check_hunks(repo_root, &hunks, "ok", None)?;
-        let working = load_working(repo_root, meta, &hunks)?;
-        let applied = apply_patches(&working, &hunks)
-            .map_err(|e| json!({"ok": false, "failed_gate": "asrf_parse", "error": e.to_string()}))?;
-        record_applied(meta, &working, applied);
-        let files: Vec<String> = meta.staged.keys().cloned().collect();
-        Ok(json!({ "ok": true, "tx_handle": handle, "staged_files_count": files.len(), "files": files }))
-    })
+fn tx_move(repo_root: &Path, meta: &mut TxMeta, handle: &str, from: String, to: String) -> std::result::Result<Value, Value> {
+    ensure_absent(repo_root, meta, &to, "destination exists")?;
+    let (content, created, orig, hash) = read_source(repo_root, meta, &from)?;
+    if created { meta.staged.remove(&from); }
+    else { meta.staged.insert(from.clone(), StagedFile::deleted(hash, orig)); }
+    upsert_created(meta, &to, content);
+    Ok(tx_ok(handle, meta.staged.len(), "moved", json!([from, to])))
+}
+
+fn tx_stage(repo_root: &Path, meta: &mut TxMeta, handle: &str, patch: &str) -> std::result::Result<Value, Value> {
+    let hunks = parse_patches(patch);
+    if hunks.is_empty() { return Err(fail_val("ok", "no <<<REFIT_PATCH>>> hunks found", None)); }
+    check_hunks(repo_root, &hunks, "ok", None)?;
+    let working = load_working(repo_root, meta, &hunks)?;
+    let applied = apply_patches(&working, &hunks).map_err(|e| fail_val("ok", e.to_string(), Some("asrf_parse")))?;
+    record_applied(meta, &working, applied);
+    let files: Vec<String> = meta.staged.keys().cloned().collect();
+    Ok(tx_ok(handle, files.len(), "files", json!(files)))
+}
+
+fn apply_tx_op(
+    repo_root: &Path, op: &str, a: TxArgs, path: String, from: String, to: String, meta: &mut TxMeta,
+) -> std::result::Result<Value, Value> {
+    match op {
+        "create" => {
+            ensure_absent(repo_root, meta, &path, "already exists")?;
+            upsert_created(meta, &path, a.content);
+            Ok(tx_ok(&a.tx_handle, meta.staged.len(), "created", path.into()))
+        }
+        "delete" => tx_delete(repo_root, meta, &a.tx_handle, path),
+        "move" => tx_move(repo_root, meta, &a.tx_handle, from, to),
+        _ => tx_stage(repo_root, meta, &a.tx_handle, &a.patch_text),
+    }
+}
+
+pub fn tx_mutate(repo_root: &Path, op: &str, args: &Value) -> Value {
+    let a: TxArgs = parse_args(args);
+    let (path, from, to) = (a.path.replace('\\', "/"), a.from_path.replace('\\', "/"), a.to_path.replace('\\', "/"));
+    match op {
+        "create" | "delete" if !check_target(repo_root, &path) => return fail_val("ok", format!("unsafe path `{path}`"), None),
+        "move" if !check_target(repo_root, &from) || !check_target(repo_root, &to) => return fail_val("ok", "unsafe from_path or to_path", None),
+        "move" if from == to => return fail_val("ok", "from_path and to_path are identical", None),
+        _ => {}
+    }
+    let handle = a.tx_handle.clone();
+    with_tx(repo_root, &handle, "ok", true, |_, meta| apply_tx_op(repo_root, op, a, path, from, to, meta))
 }
 
 pub fn tx_commit(ctx: &ToolCtx<'_>, args: &Value) -> Value {
-    let handle = args["tx_handle"].as_str().unwrap_or("");
-    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
-    let allow_abi = args["allow_abi_change"].as_bool().unwrap_or(false);
+    let a: TxArgs = parse_args(args);
     let mut committed = false;
-    let res = with_tx(ctx.repo_root, handle, "passed", false, |tx_dir, meta| {
-        if meta.staged.is_empty() {
-            return Err(json!({"passed": false, "error": "no staged files in transaction"}));
-        }
-        let (unit, cands, deleted, base) = build_unit(ctx.repo_root, handle, allow_abi, meta, ctx.hygiene);
+    let res = with_tx(ctx.repo_root, &a.tx_handle, "passed", false, |tx_dir, meta| {
+        if meta.staged.is_empty() { return Err(fail_val("passed", "no staged files in transaction", None)); }
+        let (unit, cands, deleted, base) = build_unit(ctx.repo_root, &a.tx_handle, a.allow_abi_change, meta, ctx.hygiene);
         let extra_dry = Map::from_iter([
-            ("tx_handle".into(), json!(handle)), ("staged_files_count".into(), json!(meta.staged.len())),
-            ("deleted_files_count".into(), json!(deleted.len())),
+            ("tx_handle".into(), a.tx_handle.clone().into()),
+            ("staged_files_count".into(), meta.staged.len().into()),
+            ("deleted_files_count".into(), deleted.len().into()),
         ]);
-        let extra_ok = Map::from_iter([("tx_handle".into(), json!(handle)), ("files_deleted".into(), json!(deleted.len()))]);
-        let req = CommitReq { ctx, unit: &unit, cands: &cands, deleted: &deleted, base: &base, dry_run, tag: "mcp-tx", extra_dry, extra_ok };
+        let extra_ok = Map::from_iter([("tx_handle".into(), a.tx_handle.clone().into()), ("files_deleted".into(), deleted.len().into())]);
+        let req = CommitReq { ctx, unit: &unit, cands: &cands, deleted: &deleted, base: &base, dry_run: a.dry_run, tag: "mcp-tx", extra_dry, extra_ok };
         let (dir_c, committed_ref) = (tx_dir.to_path_buf(), &mut committed);
         Ok(verify_commit(req, move || { let _ = fs::remove_dir_all(&dir_c); *committed_ref = true; }))
     });
-    if committed { evict_tx_lock(handle); }
+    if committed { evict_tx_lock(&a.tx_handle); }
     res
 }
 
 pub fn tx_abort(repo_root: &Path, args: &Value) -> Value {
-    let handle = args["tx_handle"].as_str().unwrap_or("");
-    if !check_txid(handle) { return json!({"rolled_back": false, "error": "invalid tx_handle"}); }
-    let tx_lock = lock_tx(handle);
+    let a: TxArgs = parse_args(args);
+    if !check_txid(&a.tx_handle) { return fail_val("rolled_back", "invalid tx_handle", None); }
+    let tx_lock = lock_tx(&a.tx_handle);
     let guard = tx_lock.lock();
-    let tx_dir = txs_dir(repo_root).join(handle);
+    let tx_dir = txs_dir(repo_root).join(&a.tx_handle);
     let existed = tx_dir.exists();
     let _ = fs::remove_dir_all(&tx_dir);
     drop(guard);
-    evict_tx_lock(handle);
-    json!({"rolled_back": existed, "tx_handle": handle})
+    evict_tx_lock(&a.tx_handle);
+    json!({ "rolled_back": existed, "tx_handle": a.tx_handle })
 }
 
 pub fn check_hunks(
     repo_root: &Path, hunks: &[crate::types::AsrfHunk], err_key: &str, gate: Option<&str>,
 ) -> std::result::Result<(), Value> {
     for h in hunks {
-        let bad = if !check_target(repo_root, &h.path) {
-            Some(format!("unsafe path `{}`", h.path))
-        } else {
-            h.new_path.as_deref().filter(|np| !check_target(repo_root, np)).map(|np| format!("unsafe new_path `{np}`"))
-        };
-        if let Some(msg) = bad {
-            let mut v = json!({ err_key: false, "error": msg });
-            if let Some(g) = gate { v["failed_gate"] = json!(g); }
-            return Err(v);
-        }
+        let bad = if !check_target(repo_root, &h.path) { Some(format!("unsafe path `{}`", h.path)) }
+        else { h.new_path.as_deref().filter(|np| !check_target(repo_root, np)).map(|np| format!("unsafe new_path `{np}`")) };
+        if let Some(msg) = bad { return Err(fail_val(err_key, msg, gate)); }
     }
     Ok(())
+}
+
+fn with_extra(mut val: Value, extra: &mut Map<String, Value>) -> Value {
+    if let Some(m) = val.as_object_mut() { m.append(extra); }
+    val
 }
 
 pub fn verify_commit(mut req: CommitReq<'_>, on_commit: impl FnOnce()) -> Value {
     let verdict = match run_gates(req.ctx.gate_cfg, req.unit, req.cands, req.deleted, req.ctx.hygiene) {
         Ok(v) => v,
-        Err(e) => return json!({"passed": false, "error": e.to_string()}),
+        Err(e) => return fail_val("passed", e.to_string(), None),
     };
     if !verdict.passed {
-        return serde_json::to_value(&verdict).unwrap_or_else(|_| json!({"passed": false}));
+        return serde_json::to_value(&verdict).unwrap_or_else(|_| json!({ "passed": false }));
     }
     if req.dry_run {
-        let mut out = json!({
+        return with_extra(json!({
             "passed": true, "dry_run": true, "committed": false,
             "gate0_syntax_ok": verdict.gate0_syntax_ok, "gate0_abi_ok": verdict.gate0_abi_ok,
             "gate2_score_before": verdict.gate2_score_before, "gate2_score_after": verdict.gate2_score_after,
             "gate3_ruff_errors": verdict.gate3_ruff_errors, "gate3_ty_errors": verdict.gate3_ty_errors,
-            "diagnostics": verdict.diagnostics
-        });
-        if let Some(m) = out.as_object_mut() { m.append(&mut req.extra_dry); }
-        return out;
+            "diagnostics": verdict.diagnostics,
+        }), &mut req.extra_dry);
     }
     let res = MvccStore::open(req.ctx.repo_root, req.tag)
         .and_then(|s| s.commit_tx(&req.unit.id, req.base, &verdict.final_contents, &verdict.deleted_files));
     match res {
         Ok(CommitOutcome::Committed { head_rev, tx_id, new_hashes }) => {
             on_commit();
-            let mut out = json!({
+            with_extra(json!({
                 "passed": true, "committed": true, "head_rev": head_rev, "tx_id": tx_id,
                 "files_committed": new_hashes.len(), "gate2_score_after": verdict.gate2_score_after,
-                "gate3_ruff_errors": verdict.gate3_ruff_errors, "gate3_ty_errors": verdict.gate3_ty_errors
-            });
-            if let Some(m) = out.as_object_mut() { m.append(&mut req.extra_ok); }
-            out
+                "gate3_ruff_errors": verdict.gate3_ruff_errors, "gate3_ty_errors": verdict.gate3_ty_errors,
+            }), &mut req.extra_ok)
         }
         Ok(CommitOutcome::CasConflict { path, expected, actual }) => json!({
-            "passed": false, "failed_gate": "mvcc_cas_conflict", "path": path, "expected": expected, "actual": actual
+            "passed": false, "failed_gate": "mvcc_cas_conflict",
+            "path": path, "expected": expected, "actual": actual
         }),
-        Err(e) => json!({"passed": false, "error": e.to_string()}),
+        Err(e) => fail_val("passed", e.to_string(), None),
     }
+}
+
+fn read_disk(repo_root: &Path, path: &str, label: &str) -> std::result::Result<String, Value> {
+    fs::read_to_string(repo_root.join(path)).map_err(|_| fail_val("ok", format!("{label}: `{path}`"), None))
 }
 
 fn existing_base(repo_root: &Path, meta: &TxMeta, path: &str) -> std::result::Result<(String, String), Value> {
     if let Some(prev) = meta.staged.get(path) {
         return Ok((prev.base_blake3.clone(), prev.original_content.clone()));
     }
-    let Ok(disk) = fs::read_to_string(repo_root.join(path)) else {
-        return Err(json!({"ok": false, "error": format!("file not found: `{path}`")}));
-    };
+    let disk = read_disk(repo_root, path, "file not found")?;
     Ok((MvccStore::hash_bytes(disk.as_bytes()), disk))
 }
 
 fn read_source(repo_root: &Path, meta: &TxMeta, from: &str) -> std::result::Result<(String, bool, String, String), Value> {
     if let Some(prev) = meta.staged.get(from) {
-        if prev.deleted { return Err(json!({"ok": false, "error": format!("already deleted: `{from}`")})); }
+        if prev.deleted { return Err(fail_val("ok", format!("already deleted: `{from}`"), None)); }
         return Ok((prev.staged_content.clone(), prev.created, prev.original_content.clone(), prev.base_blake3.clone()));
     }
-    let Ok(txt) = fs::read_to_string(repo_root.join(from)) else {
-        return Err(json!({"ok": false, "error": format!("source not found: `{from}`")}));
-    };
+    let txt = read_disk(repo_root, from, "source not found")?;
     let h = MvccStore::hash_bytes(txt.as_bytes());
     Ok((txt.clone(), false, txt, h))
 }
 
-fn load_working(repo_root: &Path, meta: &TxMeta, hunks: &[crate::types::AsrfHunk]) -> std::result::Result<BTreeMap<String, String>, Value> {
+fn load_working(
+    repo_root: &Path, meta: &TxMeta, hunks: &[crate::types::AsrfHunk],
+) -> std::result::Result<BTreeMap<String, String>, Value> {
     let mut working = BTreeMap::new();
     for h in hunks {
         if working.contains_key(&h.path) { continue; }
         if let Some(prev) = meta.staged.get(&h.path) {
-            if !prev.deleted {
-                working.insert(h.path.clone(), prev.staged_content.clone());
-            }
-        } else if h.op != PatchOp::Create {
-            let Ok(disk) = fs::read_to_string(repo_root.join(&h.path)) else {
-                return Err(json!({"ok": false, "error": format!("not found: `{}`", h.path)}));
-            };
+            if !prev.deleted { working.insert(h.path.clone(), prev.staged_content.clone()); }
+            continue;
+        }
+        if h.op != PatchOp::Create {
+            let disk = read_disk(repo_root, &h.path, "not found")?;
             working.insert(h.path.clone(), disk);
         }
     }
@@ -340,25 +355,27 @@ fn hash_working(working: &BTreeMap<String, String>, key: &str) -> (String, Strin
     (MvccStore::hash_bytes(orig.as_bytes()), orig)
 }
 
-fn record_applied(meta: &mut TxMeta, working: &BTreeMap<String, String>, applied: crate::graph::AppliedPatch) {
-    for del in &applied.deleted {
-        if meta.staged.get(del).is_some_and(|s| s.created) {
-            meta.staged.remove(del);
-            continue;
-        }
-        let (h, orig) = match meta.staged.get(del) {
-            Some(prev) => (prev.base_blake3.clone(), prev.original_content.clone()),
-            None => hash_working(working, del),
-        };
-        meta.staged.insert(del.clone(), StagedFile::deleted(h, orig));
+fn record_deleted(meta: &mut TxMeta, working: &BTreeMap<String, String>, del: &str) {
+    if meta.staged.get(del).is_some_and(|s| s.created) {
+        meta.staged.remove(del);
+        return;
     }
+    let (h, orig) = match meta.staged.get(del) {
+        Some(p) => (p.base_blake3.clone(), p.original_content.clone()),
+        None => hash_working(working, del),
+    };
+    meta.staged.insert(del.to_string(), StagedFile::deleted(h, orig));
+}
+
+fn record_applied(meta: &mut TxMeta, working: &BTreeMap<String, String>, applied: crate::graph::AppliedPatch) {
+    for del in &applied.deleted { record_deleted(meta, working, del); }
     for (rel, next) in applied.updated {
         if meta.staged.contains_key(&rel) || applied.created.contains(&rel) {
             upsert_created(meta, &rel, next);
-        } else {
-            let (h, o) = hash_working(working, &rel);
-            meta.staged.insert(rel, StagedFile::edited(h, o, next));
+            continue;
         }
+        let (h, o) = hash_working(working, &rel);
+        meta.staged.insert(rel, StagedFile::edited(h, o, next));
     }
 }
 
@@ -381,7 +398,8 @@ fn build_unit(
         cands.insert(rel.clone(), st.staged_content.clone());
     }
     let test_files = scan_cached(repo_root, true, true, hygiene)
-        .map(|(b, _)| impacted_tests(&b.plan, &files)).unwrap_or_default();
+        .map(|(b, _)| impacted_tests(&b.plan, &files))
+        .unwrap_or_default();
     let unit = ModuleUnit {
         id: handle.to_string(), files, layer: 0, wave: 0, deps: Vec::new(), dependents: Vec::new(),
         test_files, loc, base_blake3: base.clone(), abi_hash: abi,
@@ -399,19 +417,12 @@ mod tests {
     fn check_target_is_fail_closed() {
         let missing_root = std::env::temp_dir().join("refit_nonexistent_root_fail_closed_99999");
         let _ = fs::remove_dir_all(&missing_root);
-        assert!(
-            !check_target(&missing_root, "src/main.rs"),
-            "check_target MUST fail closed when repo_root cannot be canonicalized"
-        );
-
+        assert!(!check_target(&missing_root, "src/main.rs"), "check_target MUST fail closed when repo_root cannot be canonicalized");
         let repo = TempRepo::with_files("tx_fail_closed", &[("src/ok.rs", "fn main() {}\n")]);
         assert!(check_target(repo.path(), "src/ok.rs"));
         assert!(check_target(repo.path(), "src/new_sub/file.rs"));
-        assert!(!check_target(repo.path(), "../escape.rs"));
-        assert!(!check_target(repo.path(), ".git/config"));
-        assert!(!check_target(repo.path(), ".gi\u{0307}t/HEAD"));
-        assert!(!check_target(repo.path(), "src/CON.rs"));
-        assert!(!check_target(repo.path(), "src/a.rs:ads"));
-        assert!(!check_target(repo.path(), "src/bad. "));
+        for bad in ["../escape.rs", ".git/config", ".gi\u{0307}t/HEAD", "src/CON.rs", "src/a.rs:ads", "src/bad. "] {
+            assert!(!check_target(repo.path(), bad), "must reject `{bad}`");
+        }
     }
 }

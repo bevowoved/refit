@@ -353,8 +353,8 @@ mod tests {
 
     #[test]
     fn patch_lf_and_path_guard() {
-        assert!(matches!(normalize_lf("let x = 1;\n"), Cow::Borrowed(_)));
-        assert!(matches!(normalize_lf("let x = 1;\r\n"), Cow::Owned(_)));
+        std::assert_matches!(normalize_lf("let x = 1;\n"), Cow::Borrowed(_));
+        std::assert_matches!(normalize_lf("let x = 1;\r\n"), Cow::Owned(_));
 
         let base = BTreeMap::from([("src/a.rs".to_string(), "pub fn a() -> u8 { 1 }\n".to_string())]);
         for bad_path in ["src/CON.rs", "src/a.rs:ads", ".git/config", ".gi\u{0307}t/HEAD", "src/bad. "] {

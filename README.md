@@ -18,10 +18,12 @@
 ## Quick Start
 
 ```bash
-# Build and test with warnings denied
-cargo clippy --all-targets --features full -- -D warnings
+# Build, verify (S1-S14), and mutation-test (T14) via pure-Rust xtask
+cargo clippy --workspace --all-targets --features full -- -D warnings
 cargo test --features full
 cargo build --release --features full
+cargo xtask verify
+cargo xtask mutate
 
 # Scan, audit, or sustain a repository
 ./target/release/refit scan ./fixture/target_repo --fast

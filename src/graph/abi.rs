@@ -1,11 +1,12 @@
-use crate::lex::{
-    RUST_PUB, TS_EXPORT, blank_noise_sentinel, first_ident, go_export, match_prefix, scan_code,
-};
+use crate::lex::{RUST_PUB, TS_EXPORT, blank_noise_sentinel, first_ident, go_export, match_prefix};
 use crate::mvcc::MvccStore;
 #[cfg(test)]
 use crate::platform::EpochRegistry;
 use crate::source::{ext_of, is_js};
-use std::ops::ControlFlow;
+use crate::stem::parse::{
+    bracket_delta, join_sig_lines, leading_indent, norm_sig, py_def_colon, sig_end,
+    split_top_commas,
+};
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,58 +21,29 @@ pub fn hash_abi(rel_path: &str, source: &str) -> String {
     let ext = ext_of(rel_path);
     match ext.as_str() {
         "py" => python_abi(source),
-        "rs" => rust_abi(source),
+        "rs" => {
+            let cleaned = blank_noise_sentinel("rs", source).to_clean_string(source);
+            brace_abi(&cleaned, false)
+        }
         "go" => go_abi(source),
-        e if is_js(e) => ts_abi(source),
+        e if is_js(e) => brace_abi(source, true),
         _ => MvccStore::hash_bytes(b""),
     }
 }
 
-/// Compute a package interface digest from precomputed `(rel, abi_hash)` pairs.
 #[cfg(test)]
 pub fn hash_digests(digests: &[(&str, &str)]) -> String {
-    let mut items: Vec<(&str, &str)> = digests.to_vec();
-    items.sort_by(|lhs, rhs| lhs.0.cmp(rhs.0));
-
-    let mut hasher = blake3::Hasher::new();
+    let mut items = digests.to_vec();
+    items.sort_by(|a, b| a.0.cmp(b.0));
+    let mut h = blake3::Hasher::new();
     for (rel, abi) in items {
-        hasher.update(rel.as_bytes());
-        hasher.update(&[0u8]);
-        hasher.update(abi.as_bytes());
-        hasher.update(b"\n");
+        for part in [rel.as_bytes(), &[0u8], abi.as_bytes(), b"\n"] {
+            h.update(part);
+        }
     }
-    hasher.finalize().to_hex().to_string()
+    h.finalize().to_hex().to_string()
 }
 
-/// Check package interface cutoff against `EpochRegistry` without bumping epoch on unchanged ABI.
-#[cfg(test)]
-pub fn check_interface_cutoff_digests(
-    pkg_id: &str,
-    digests: &[(&str, &str)],
-    prev_interface_blake3: Option<&str>,
-    registry: &EpochRegistry,
-) -> InterfaceCutoff {
-    let next_hash = hash_digests(digests);
-    if prev_interface_blake3 == Some(next_hash.as_str()) {
-        let epoch = registry.slot_epoch(pkg_id);
-        return InterfaceCutoff {
-            pkg_id: pkg_id.to_string(),
-            interface_blake3: next_hash,
-            changed: false,
-            epoch,
-        };
-    }
-    let rev = u64::from_str_radix(&next_hash[..16], 16).unwrap_or(1);
-    let epoch = registry.publish(pkg_id, rev);
-    InterfaceCutoff {
-        pkg_id: pkg_id.to_string(),
-        interface_blake3: next_hash,
-        changed: true,
-        epoch,
-    }
-}
-
-/// Salsa early-cutoff helper wired to `hash_abi` and `EpochRegistry`.
 #[cfg(test)]
 pub fn check_interface_cutoff(
     pkg_id: &str,
@@ -79,234 +51,16 @@ pub fn check_interface_cutoff(
     prev_interface_blake3: Option<&str>,
     registry: &EpochRegistry,
 ) -> InterfaceCutoff {
-    let owned: Vec<(&str, String)> = files
-        .iter()
-        .map(|&(rel, src)| (rel, hash_abi(rel, src)))
-        .collect();
+    let owned: Vec<(&str, String)> = files.iter().map(|&(r, s)| (r, hash_abi(r, s))).collect();
     let refs: Vec<(&str, &str)> = owned.iter().map(|(r, a)| (*r, a.as_str())).collect();
-    check_interface_cutoff_digests(pkg_id, &refs, prev_interface_blake3, registry)
-}
-
-/// Compute the Python exported ABI hash across multi-line defs, classes, and `__all__`.
-pub fn python_abi(source: &str) -> String {
-    let mut sigs = Vec::new();
-    let lines: Vec<&str> = source.lines().collect();
-    let mut cur_class: Option<String> = None;
-    let mut i = 0usize;
-
-    while i < lines.len() {
-        let line = lines[i];
-        let indent = line.bytes().take_while(|&b| matches!(b, b' ' | b'\t')).count();
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
-            i += 1;
-            continue;
-        }
-
-        if indent == 0 {
-            if let Some(rest) = t.strip_prefix("class ") {
-                cur_class = first_ident(rest)
-                    .filter(|c| !c.starts_with('_'))
-                    .map(|c| {
-                        sigs.push(format!("class {c}"));
-                        c.to_string()
-                    });
-                i += 1;
-                continue;
-            }
-            if !t.starts_with('@') {
-                cur_class = None;
-            }
-            if t.starts_with("__all__") {
-                let mut sig = t.to_string();
-                while paren_delta(&sig) > 0 && i + 1 < lines.len() {
-                    i += 1;
-                    sig.push(' ');
-                    sig.push_str(lines[i].trim());
-                }
-                sigs.push(norm_sig(&sig));
-                i += 1;
-                continue;
-            }
-        }
-
-        if let Some(rest) = t.strip_prefix("async def ").or_else(|| t.strip_prefix("def ")) {
-            let public = !rest.starts_with('_') || rest.starts_with("__init__");
-            let in_scope = indent == 0 || (indent <= 4 && cur_class.is_some());
-            if public && in_scope {
-                push_pydef(&lines, &mut i, indent, cur_class.as_deref(), &mut sigs);
-            }
-        }
-        i += 1;
-    }
-
-    sigs.sort();
-    MvccStore::hash_bytes(sigs.join("\n").as_bytes())
-}
-
-fn push_pydef(
-    lines: &[&str],
-    i: &mut usize,
-    indent: usize,
-    cur_class: Option<&str>,
-    sigs: &mut Vec<String>,
-) {
-    let mut sig = strip_hash(lines[*i].trim()).to_string();
-    while (paren_delta(&sig) > 0 || def_colon(&sig).is_none()) && *i + 1 < lines.len() {
-        *i += 1;
-        sig.push(' ');
-        sig.push_str(strip_hash(lines[*i].trim()));
-    }
-    if let Some(colon) = def_colon(&sig) {
-        sig.truncate(colon);
-    }
-
-    let norm = norm_params(&sig);
-    if indent > 0 {
-        if let Some(cls) = cur_class {
-            sigs.push(format!("{cls}.{norm}"));
-        }
+    let next_hash = hash_digests(&refs);
+    let changed = prev_interface_blake3 != Some(next_hash.as_str());
+    let epoch = if changed {
+        registry.publish(pkg_id, u64::from_str_radix(&next_hash[..16], 16).unwrap_or(1))
     } else {
-        sigs.push(norm);
-    }
-}
-
-fn strip_hash(line: &str) -> &str {
-    let mut cut = line.len();
-    scan_code(line.as_bytes(), b"\"'", |i, b| {
-        if b == b'#' {
-            cut = i;
-            return ControlFlow::Break(());
-        }
-        ControlFlow::Continue(())
-    });
-    line[..cut].trim_end()
-}
-
-fn paren_delta(s: &str) -> i32 {
-    let mut d = 0i32;
-    scan_code(s.as_bytes(), b"\"'", |_, b| {
-        match b {
-            b'(' | b'[' | b'{' => d += 1,
-            b')' | b']' | b'}' => d -= 1,
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    });
-    d
-}
-
-fn def_colon(sig: &str) -> Option<usize> {
-    let (mut depth, mut closed, mut found) = (0i32, false, None);
-    scan_code(sig.as_bytes(), b"\"'", |i, b| {
-        match b {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => {
-                depth -= 1;
-                closed |= b == b')' && depth == 0;
-            }
-            b':' if depth == 0 && closed => {
-                found = Some(i);
-                return ControlFlow::Break(());
-            }
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    });
-    found
-}
-
-fn norm_sig(sig: &str) -> String {
-    let mut collapsed = String::with_capacity(sig.len());
-    for (idx, word) in sig.split_whitespace().enumerate() {
-        if idx > 0 {
-            collapsed.push(' ');
-        }
-        collapsed.push_str(word);
-    }
-    let bytes = collapsed.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b' ' {
-            let prev = out.last().copied();
-            let next = bytes.get(i + 1).copied();
-            if matches!(prev, Some(b'(' | b'<' | b'['))
-                || matches!(next, Some(b')' | b'>' | b']' | b','))
-            {
-                i += 1;
-                continue;
-            }
-        }
-        if b == b',' && matches!(bytes.get(i + 1), Some(b')' | b'>')) {
-            i += 1;
-            continue;
-        }
-        if matches!(b, b')' | b'>') && out.last() == Some(&b',') {
-            out.pop();
-        }
-        out.push(b);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or(collapsed)
-}
-
-fn sig_end(sig: &str, allow_semi: bool, stop_arrow: bool) -> Option<usize> {
-    let b = sig.as_bytes();
-    let (mut paren, mut bracket, mut angle, mut skip_to, mut found) = (0i32, 0i32, 0i32, 0usize, None);
-
-    scan_code(b, b"\"'`", |i, c| {
-        if i < skip_to {
-            return ControlFlow::Continue(());
-        }
-        if b.get(i..i + 2) == Some(b"->") {
-            skip_to = i + 2;
-            return ControlFlow::Continue(());
-        }
-        if b.get(i..i + 2) == Some(b"=>") {
-            if stop_arrow && paren == 0 && bracket == 0 && angle == 0 {
-                found = Some(i);
-                return ControlFlow::Break(());
-            }
-            skip_to = i + 2;
-            return ControlFlow::Continue(());
-        }
-
-        match c {
-            b'(' => paren += 1,
-            b')' => paren = (paren - 1).max(0),
-            b'[' => bracket += 1,
-            b']' => bracket = (bracket - 1).max(0),
-            b'<' => angle += 1,
-            b'>' => angle = (angle - 1).max(0),
-            b'{' if paren == 0 && bracket == 0 && angle == 0 => {
-                if b.get(i + 1) == Some(&b'}') {
-                    skip_to = i + 2;
-                } else {
-                    found = Some(i);
-                    return ControlFlow::Break(());
-                }
-            }
-            b';' if allow_semi && paren == 0 && bracket == 0 && angle == 0 => {
-                found = Some(i);
-                return ControlFlow::Break(());
-            }
-            _ => {}
-        }
-        ControlFlow::Continue(())
-    });
-    found
-}
-
-fn join_sig(lines: &[&str], i: &mut usize, stop: impl Fn(&str) -> bool) -> String {
-    let mut sig = lines[*i].trim().to_string();
-    while !stop(&sig) && *i + 1 < lines.len() {
-        *i += 1;
-        sig.push(' ');
-        sig.push_str(lines[*i].trim());
-    }
-    sig
+        registry.slot_epoch(pkg_id)
+    };
+    InterfaceCutoff { pkg_id: pkg_id.into(), interface_blake3: next_hash, changed, epoch }
 }
 
 fn finish_abi(mut sigs: Vec<String>) -> String {
@@ -314,37 +68,79 @@ fn finish_abi(mut sigs: Vec<String>) -> String {
     MvccStore::hash_bytes(sigs.join("\n").as_bytes())
 }
 
-fn push_ended(lines: &[&str], i: &mut usize, sigs: &mut Vec<String>, braces: bool, eq: bool) {
-    let sig = join_sig(lines, i, |s| sig_end(s, braces, eq).is_some());
-    let end = sig_end(&sig, braces, eq).unwrap_or(sig.len());
-    sigs.push(norm_sig(&sig[..end]));
+fn python_top_item(t: &str, lines: &[&str], i: &mut usize, sigs: &mut Vec<String>, cur_class: &mut Option<String>) -> bool {
+    if let Some(rest) = t.strip_prefix("class ") {
+        *cur_class = first_ident(rest).filter(|c| !c.starts_with('_')).map(|c| {
+            sigs.push(format!("class {c}"));
+            c.to_string()
+        });
+        return true;
+    }
+    if !t.starts_with('@') { *cur_class = None; }
+    if t.starts_with("__all__") {
+        let joined = join_sig_lines(lines, i, false, |s| bracket_delta(s) <= 0);
+        sigs.push(norm_sig(&joined));
+        return true;
+    }
+    false
 }
 
-fn rust_abi(source: &str) -> String {
-    let cleaned = blank_noise_sentinel("rs", source).to_clean_string(source);
-    let lines: Vec<&str> = cleaned.lines().collect();
-    let (mut sigs, mut i) = (Vec::new(), 0usize);
+fn step_py_line(lines: &[&str], i: &mut usize, sigs: &mut Vec<String>, cur_class: &mut Option<String>) {
+    let indent = leading_indent(lines[*i]);
+    let t = lines[*i].trim();
+    if t.is_empty() || t.starts_with('#') { return; }
+    if indent == 0 && python_top_item(t, lines, i, sigs, cur_class) { return; }
+    let Some(rest) = t.strip_prefix("async def ").or_else(|| t.strip_prefix("def ")) else { return };
+    let is_pub = !rest.starts_with('_') || rest.starts_with("__init__");
+    if is_pub && (indent == 0 || (indent <= 4 && cur_class.is_some())) {
+        let owner = cur_class.as_deref().filter(|_| indent > 0);
+        sigs.push(parse_py_def(lines, i, owner));
+    }
+}
 
+/// Compute the Python exported ABI hash across multi-line defs, classes, and `__all__`.
+pub fn python_abi(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let (mut sigs, mut cur_class, mut i) = (Vec::new(), None::<String>, 0usize);
     while i < lines.len() {
-        if match_prefix(lines[i].trim(), RUST_PUB).is_some() {
-            push_ended(&lines, &mut i, &mut sigs, true, false);
-        }
+        step_py_line(&lines, &mut i, &mut sigs, &mut cur_class);
         i += 1;
     }
     finish_abi(sigs)
 }
 
-fn ts_abi(source: &str) -> String {
+fn parse_py_def(lines: &[&str], i: &mut usize, owner: Option<&str>) -> String {
+    let mut sig = join_sig_lines(lines, i, true, |s| {
+        bracket_delta(s) <= 0 && py_def_colon(s).is_some()
+    });
+    if let Some(colon) = py_def_colon(&sig) { sig.truncate(colon); }
+    let norm = norm_params(&sig);
+    match owner {
+        Some(cls) => format!("{cls}.{norm}"),
+        None => norm,
+    }
+}
+
+fn is_brace_export(t: &str, is_ts: bool) -> bool {
+    if is_ts {
+        match_prefix(t, TS_EXPORT).is_some() || t.starts_with("export *")
+    } else {
+        match_prefix(t, RUST_PUB).is_some()
+    }
+}
+
+fn brace_abi(source: &str, is_ts: bool) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let (mut sigs, mut i) = (Vec::new(), 0usize);
-
     while i < lines.len() {
         let t = lines[i].trim();
-        if t.starts_with("export {") {
-            let sig = join_sig(&lines, &mut i, |s| s.contains('}'));
+        if is_ts && t.starts_with("export {") {
+            let sig = join_sig_lines(&lines, &mut i, false, |s| s.contains('}'));
             sigs.push(norm_sig(sig.split(';').next().unwrap_or(&sig)));
-        } else if match_prefix(t, TS_EXPORT).is_some() || t.starts_with("export *") {
-            push_ended(&lines, &mut i, &mut sigs, true, true);
+        } else if is_brace_export(t, is_ts) {
+            let sig = join_sig_lines(&lines, &mut i, false, |s| sig_end(s, true, is_ts).is_some());
+            let end = sig_end(&sig, true, is_ts).unwrap_or(sig.len());
+            sigs.push(norm_sig(&sig[..end]));
         }
         i += 1;
     }
@@ -354,11 +150,10 @@ fn ts_abi(source: &str) -> String {
 fn go_abi(source: &str) -> String {
     let lines: Vec<&str> = source.lines().collect();
     let (mut sigs, mut i) = (Vec::new(), 0usize);
-
     while i < lines.len() {
         if go_export(lines[i].trim()).is_some() {
-            let sig = join_sig(&lines, &mut i, |s| {
-                sig_end(s, false, false).is_some() || !s.contains('(') || paren_delta(s) <= 0
+            let sig = join_sig_lines(&lines, &mut i, false, |s| {
+                sig_end(s, false, false).is_some() || !s.contains('(') || bracket_delta(s) <= 0
             });
             let end = sig_end(&sig, false, false).unwrap_or(sig.len());
             sigs.push(norm_sig(&sig[..end]));
@@ -376,38 +171,12 @@ fn norm_params(sig: &str) -> String {
     let (Some(open), Some(close)) = (sig.find('('), sig.rfind(')')) else {
         return sig.trim().to_string();
     };
-
-    let prefix = sig[..open].trim();
-    let raw = &sig[open + 1..close];
-    let mut names = Vec::new();
-    let (mut depth, mut start) = (0usize, 0usize);
-
-    for (idx, ch) in raw.char_indices() {
-        match ch {
-            '[' | '(' | '{' => depth += 1,
-            ']' | ')' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                push_param(&raw[start..idx], &mut names);
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    push_param(&raw[start..], &mut names);
-    format!("{prefix}({})", names.join(", "))
-}
-
-fn push_param<'a>(raw: &'a str, out: &mut Vec<&'a str>) {
-    let name = raw
-        .trim()
-        .split('=')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .trim();
-    if !name.is_empty() {
-        out.push(name);
-    }
+    let names: Vec<&str> = split_top_commas(&sig[open + 1..close])
+        .into_iter()
+        .filter_map(|raw| {
+            let head = raw.split('=').next()?.split(':').next()?.trim();
+            (!head.is_empty()).then_some(head)
+        })
+        .collect();
+    format!("{}({})", sig[..open].trim(), names.join(", "))
 }

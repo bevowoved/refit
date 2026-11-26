@@ -1,39 +1,23 @@
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static SEQ: AtomicU64 = AtomicU64::new(1);
+struct TestRepo(tempfile::TempDir);
 
-struct TempDir(PathBuf);
-
-impl TempDir {
+impl TestRepo {
     fn new(tag: &str) -> Self {
-        let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("refit_e2e_{tag}_{}_{id}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        Self(tempfile::Builder::new().prefix(&format!("refit_e2e_{tag}_")).tempdir().unwrap())
     }
 
-    fn path(&self) -> &Path {
-        &self.0
-    }
+    fn path(&self) -> &Path { self.0.path() }
 
     fn write(&self, rel: &str, body: &str) {
-        let p = self.0.join(rel);
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
+        let p = self.0.path().join(rel);
+        if let Some(parent) = p.parent() { fs::create_dir_all(parent).unwrap(); }
         fs::write(p, body).unwrap();
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -55,8 +39,8 @@ fn run_refit(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
     )
 }
 
-fn sample_repo(tag: &str) -> TempDir {
-    let dir = TempDir::new(tag);
+fn sample_repo(tag: &str) -> TestRepo {
+    let dir = TestRepo::new(tag);
     dir.write(
         "Cargo.toml",
         "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -224,4 +208,126 @@ fn cli_mcp_stdio_roundtrip_and_batch_reject() {
 
     let scan = responses.iter().find(|r| r["id"] == 4).expect("refit_scan response");
     assert!(scan["error"].is_null(), "refit_scan failed: {scan:?}");
+}
+
+#[test]
+fn cli_bench_cmd_and_run_worktree_mock() {
+    let repo = TestRepo::new("run_wt");
+    let root = repo.path().to_str().unwrap();
+
+    // 1. Real-binary `refit bench --cmd` JSON check (use refit itself — cross-OS & non-shell)
+    let cmd = format!("\"{}\" --version", env!("CARGO_BIN_EXE_refit"));
+    let (code, out, err) = run_refit(
+        &["bench", "--before", root, "--after", root, "--pairs", "2", "--cmd", &cmd],
+        &[],
+    );
+    assert_eq!(code, 0, "bench failed: {err}");
+    let bj: Value = serde_json::from_str(&out).expect("bench JSON");
+    assert_eq!(bj["pairs"].as_u64(), Some(2), "unexpected bench JSON: {bj}");
+    assert!(bj["before_wall_ms_median"].as_f64().is_some(), "missing wall median: {bj}");
+
+    // 2. Real-binary `refit run <tmp> --worktree --openclaw-url <mock>` -> SSE -> Gates -> MVCC WAL
+    let bad_js = concat!(
+        "function decide(a, b, c, d, e) {\n",
+        "    if (a) {\n        if (b) {\n            if (c) {\n",
+        "                if (d) {\n                    if (e) {\n",
+        "                        return a + b + c + d + e;\n",
+        "                    }\n                }\n            }\n        }\n    }\n",
+        "    return 0;\n}\nmodule.exports = { decide };\n",
+    );
+    repo.write("src/decide.js", bad_js);
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["config", "core.autocrlf", "false"][..],
+        &["config", "user.email", "e2e@local.test"][..],
+        &["config", "user.name", "E2E"][..],
+        &["add", "-A"][..],
+        &["commit", "-q", "-m", "init"][..],
+    ] {
+        let st = Command::new("git").args(args).current_dir(repo.path()).status().unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy_port = {
+        let tmp_l = TcpListener::bind("127.0.0.1:0").unwrap();
+        tmp_l.local_addr().unwrap().port()
+    };
+    let patch_body = format!(
+        "<<<REFIT_PATCH path=\"src/decide.js\">>>\n<<<SEARCH>>>\n{bad_js}<<<REPLACE>>>\n\
+         function decide(a, b, c, d, e) {{\n    if (a && b && c && d && e) {{\n\
+         \x20       return a + b + c + d + e;\n    }}\n    return 0;\n}}\n\
+         module.exports = {{ decide }};\n<<<END>>>"
+    );
+    let sse_chunk = serde_json::json!({
+        "choices": [{"delta": {"content": patch_body}}],
+        "usage": {"prompt_tokens": 20, "completion_tokens": 15, "total_tokens": 35}
+    });
+    let sse_body = format!("data: {sse_chunk}\n\ndata: [DONE]\n\n");
+    let srv = std::thread::spawn(move || {
+        for _ in 0..8 {
+            let Ok((mut stream, _)) = listener.accept() else { break };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut req_buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let mut body_start = None;
+            let mut content_len = 0usize;
+            while let Ok(n) = stream.read(&mut tmp) {
+                if n == 0 { break; }
+                req_buf.extend_from_slice(&tmp[..n]);
+                if body_start.is_none()
+                    && let Some(pos) = req_buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    body_start = Some(pos + 4);
+                    let hdr = String::from_utf8_lossy(&req_buf[..pos]);
+                    for line in hdr.lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(bs) = body_start && req_buf.len() >= bs + content_len { break; }
+            }
+            let req_head = String::from_utf8_lossy(&req_buf[..req_buf.len().min(64)]);
+            let resp = if req_head.starts_with("GET ") {
+                let ok = r#"{"data":[{"id":"openclaw:main"}]}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok}",
+                    ok.len()
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_body}",
+                    sse_body.len()
+                )
+            };
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let mock_url = format!("http://127.0.0.1:{port}/v1");
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let tel_out = repo.path().join(".refit/e2e_run.jsonl");
+    let tel_str = tel_out.to_str().unwrap();
+    let (rc, rout, rerr) = run_refit(
+        &[
+            "run", root, "--worktree", "--openclaw-url", &mock_url,
+            "--proxy-addr", &proxy_addr, "--telemetry-out", tel_str,
+            "--initial-k", "1", "--max-k", "1", "--max-retries", "1",
+        ],
+        &[("CEREBRAS_API_KEY", "test-key-e2e")],
+    );
+    drop(srv);
+    assert_eq!(rc, 0, "refit run --worktree failed: {rerr}\n{rout}");
+    let rj: Value = serde_json::from_str(&rout).expect("run summary JSON");
+    assert!(rj["total_units"].as_u64().unwrap_or(0) >= 1, "unexpected summary: {rj}");
+    assert!(rj["committed_units"].as_u64().unwrap_or(0) >= 1, "expected WAL commit: {rj}");
+    assert_eq!(fs::read_to_string(repo.path().join("src/decide.js")).unwrap(), bad_js);
+    if let Some(wt) = rj["worktree_path"].as_str() {
+        let _ = fs::remove_dir_all(wt);
+    }
 }

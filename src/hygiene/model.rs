@@ -288,7 +288,7 @@ unsafe fn run_context_with<K: HygieneKernel>(
     sc: &mut EvalScratch,
 ) -> Option<SparseStats> {
     let dim = w.state_dim;
-    let mut stats = (opts.approx_long && n > opts.approx_threshold).then(SparseStats::default);
+    let mut stats = opts.is_approx_active(n).then(SparseStats::default);
 
     for (layer_idx, layer) in w.ctx_layers.iter().enumerate() {
         // SAFETY: Caller verified `K` features; state and attention buffers hold `n` rows.

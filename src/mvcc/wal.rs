@@ -4,11 +4,10 @@
 use crate::platform::sync_file_barrier;
 use crate::types::WalRecord;
 use anyhow::{Context, Result};
-use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use bytes::BufMut;
 use memchr::{memchr, memmem};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +15,6 @@ use std::path::{Path, PathBuf};
 pub const WAL_MAGIC: &[u8; 4] = b"RFWL";
 pub const WAL_HEADER_LEN: usize = 20;
 pub const WAL_MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
-const CRC32C_POLY: u32 = 0x82F6_3B78;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalEvent {
@@ -62,26 +60,13 @@ pub enum CommitOutcome {
     CasConflict { path: String, expected: String, actual: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WalHaltError {
+    #[error("WAL clean-halt: mid-file corruption at byte offset {0}")]
     MidFileCorruption(usize),
+    #[error("WAL clean-halt: unrecoverable rollback ({0})")]
     UnrecoverableRollback(String),
 }
-
-impl fmt::Display for WalHaltError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MidFileCorruption(off) => {
-                write!(f, "WAL clean-halt: mid-file corruption at byte offset {off}")
-            }
-            Self::UnrecoverableRollback(detail) => {
-                write!(f, "WAL clean-halt: unrecoverable rollback ({detail})")
-            }
-        }
-    }
-}
-
-impl std::error::Error for WalHaltError {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalScanStats {
@@ -99,19 +84,9 @@ enum StepOutcome {
     StopAtTornTail,
 }
 
-/// Compact pure-Rust Castagnoli CRC32C (`0x82F63B78`; RFC 3720 check `0xE3069283`).
+/// Hardware-accelerated Castagnoli CRC32C (`0x82F63B78`; RFC 3720 check `0xE3069283`).
 #[inline]
-pub fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in bytes {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (CRC32C_POLY & mask);
-        }
-    }
-    !crc
-}
+pub fn crc32c(bytes: &[u8]) -> u32 { crc32c::crc32c(bytes) }
 
 /// Encode `[Magic "RFWL" 4B | Len u32 | CRC32C 4B | Seq u64 | JSON payload | '\n']`.
 pub fn encode_wal_frame(seq: u64, payload: &[u8]) -> Result<Vec<u8>> {
@@ -120,12 +95,12 @@ pub fn encode_wal_frame(seq: u64, payload: &[u8]) -> Result<Vec<u8>> {
     }
     let mut frame = Vec::with_capacity(WAL_HEADER_LEN + payload.len() + 1);
     frame.extend_from_slice(WAL_MAGIC);
-    frame.write_u32::<LittleEndian>(payload.len() as u32)?;
-    frame.write_u32::<LittleEndian>(0)?;
-    frame.write_u64::<LittleEndian>(seq)?;
+    frame.put_u32_le(payload.len() as u32);
+    frame.put_u32_le(0);
+    frame.put_u64_le(seq);
     frame.extend_from_slice(payload);
     let checksum = crc32c(&frame[12..]);
-    LittleEndian::write_u32(&mut frame[8..12], checksum);
+    frame[8..12].copy_from_slice(&checksum.to_le_bytes());
     frame.push(b'\n');
     Ok(frame)
 }
@@ -190,9 +165,9 @@ fn parse_frame_header(buf: &[u8], pos: usize) -> Option<(usize, u32, u64)> {
         return None;
     }
     Some((
-        LittleEndian::read_u32(&hdr[4..8]) as usize,
-        LittleEndian::read_u32(&hdr[8..12]),
-        LittleEndian::read_u64(&hdr[12..20]),
+        u32::from_le_bytes(hdr[4..8].try_into().ok()?) as usize,
+        u32::from_le_bytes(hdr[8..12].try_into().ok()?),
+        u64::from_le_bytes(hdr[12..20].try_into().ok()?),
     ))
 }
 

@@ -19,12 +19,28 @@ pub(super) const FAR_INDEX_BYTES: usize =
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvalOptions {
-    pub approx_long: bool,
+    approx_long: bool,
     pub approx_threshold: usize,
 }
 
 impl Default for EvalOptions {
     fn default() -> Self { Self { approx_long: false, approx_threshold: 1024 } }
+}
+
+impl EvalOptions {
+    #[cfg(test)]
+    pub fn new(approx_long: bool, approx_threshold: usize) -> Self {
+        Self { approx_long, approx_threshold }
+    }
+
+    pub fn with_approx_long(mut self, enabled: bool) -> Self {
+        self.approx_long = enabled;
+        self
+    }
+
+    pub fn is_approx_active(self, lines: usize) -> bool {
+        self.approx_long && lines > self.approx_threshold
+    }
 }
 
 #[derive(Debug, Clone, Default)]

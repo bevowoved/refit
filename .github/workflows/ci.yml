@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            features: "--no-default-features --features alloc-jemalloc,full"
+          - os: macos-latest
+            features: "--features full"
+          - os: windows-latest
+            features: "--features full"
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d5e4d57b030548f435d0befec15ff413a2c60eff # 1.100.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Enforce single-version dependency graph (0 active duplicates)
+        shell: bash
+        run: |
+          dups=$(cargo tree --locked ${{ matrix.features }} -e normal --duplicates)
+          if [ -n "$dups" ]; then
+            echo "Active multi-version duplicate detected:"
+            echo "$dups"
+            exit 1
+          fi
+
+      - name: Enforce zero lint suppressions in src/
+        shell: bash
+        run: |
+          if grep -rnE '#\[(allow|expect)\(' src/; then
+            echo "Found forbidden #[allow(/#[expect( in src/"
+            exit 1
+          fi
+
+      - name: Clippy (-D warnings)
+        run: |
+          cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+          cargo clippy --locked --package xtask --all-targets -- -D warnings
+
+      - name: Full unit and integration tests
+        run: cargo test --locked ${{ matrix.features }}
+
+      - name: T14 mutation sensitivity (8/8 killed)
+        run: cargo xtask mutate
+
+      - name: Release self-audit
+        run: |
+          cargo build --release --locked ${{ matrix.features }}
+          ./target/release/refit audit .

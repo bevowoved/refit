@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn bench_abba_bootstrap_ci_and_exact_wilcoxon() {
+    fn bench_abba_ci_and_wilcoxon() {
         let (before, after) = (Path::new("before_repo"), Path::new("after_repo"));
 
         let (mut order, mut step) = (Vec::new(), 0u64);

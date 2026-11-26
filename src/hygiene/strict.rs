@@ -15,24 +15,17 @@ const WARN_CF_DEPTH: usize = 5;
 const WARN_COGNITIVE: usize = 25;
 
 /// Sorted UTS #39 confusable characters for binary search.
-const UTS39_CONFUSABLES: [(char, &str, char); 49] = [
-    ('\u{037E}', "Greek question mark", ';'), ('\u{0391}', "Greek", 'A'), ('\u{0392}', "Greek", 'B'),
-    ('\u{0395}', "Greek", 'E'), ('\u{0396}', "Greek", 'Z'), ('\u{0397}', "Greek", 'H'),
-    ('\u{0399}', "Greek", 'I'), ('\u{039A}', "Greek", 'K'), ('\u{039C}', "Greek", 'M'),
-    ('\u{039D}', "Greek", 'N'), ('\u{039F}', "Greek", 'O'), ('\u{03A1}', "Greek", 'P'),
-    ('\u{03A4}', "Greek", 'T'), ('\u{03A5}', "Greek", 'Y'), ('\u{03A7}', "Greek", 'X'),
-    ('\u{03B1}', "Greek", 'a'), ('\u{03B9}', "Greek", 'i'), ('\u{03BA}', "Greek", 'k'),
-    ('\u{03BD}', "Greek", 'v'), ('\u{03BF}', "Greek", 'o'), ('\u{03C1}', "Greek", 'p'),
-    ('\u{03C4}', "Greek", 't'), ('\u{03C5}', "Greek", 'u'), ('\u{03C7}', "Greek", 'x'),
-    ('\u{0405}', "Cyrillic", 'S'), ('\u{0406}', "Cyrillic", 'I'), ('\u{0408}', "Cyrillic", 'J'),
-    ('\u{0410}', "Cyrillic", 'A'), ('\u{0412}', "Cyrillic", 'B'), ('\u{0415}', "Cyrillic", 'E'),
-    ('\u{041A}', "Cyrillic", 'K'), ('\u{041C}', "Cyrillic", 'M'), ('\u{041D}', "Cyrillic", 'H'),
-    ('\u{041E}', "Cyrillic", 'O'), ('\u{0420}', "Cyrillic", 'P'), ('\u{0421}', "Cyrillic", 'C'),
-    ('\u{0422}', "Cyrillic", 'T'), ('\u{0423}', "Cyrillic", 'Y'), ('\u{0425}', "Cyrillic", 'X'),
-    ('\u{0430}', "Cyrillic", 'a'), ('\u{0435}', "Cyrillic", 'e'), ('\u{043E}', "Cyrillic", 'o'),
-    ('\u{0440}', "Cyrillic", 'p'), ('\u{0441}', "Cyrillic", 'c'), ('\u{0443}', "Cyrillic", 'y'),
-    ('\u{0445}', "Cyrillic", 'x'), ('\u{0455}', "Cyrillic", 's'), ('\u{0456}', "Cyrillic", 'i'),
-    ('\u{0458}', "Cyrillic", 'j'),
+const UTS39_CONFUSABLES: [(char, char); 49] = [
+    ('\u{037E}', ';'), ('\u{0391}', 'A'), ('\u{0392}', 'B'), ('\u{0395}', 'E'), ('\u{0396}', 'Z'),
+    ('\u{0397}', 'H'), ('\u{0399}', 'I'), ('\u{039A}', 'K'), ('\u{039C}', 'M'), ('\u{039D}', 'N'),
+    ('\u{039F}', 'O'), ('\u{03A1}', 'P'), ('\u{03A4}', 'T'), ('\u{03A5}', 'Y'), ('\u{03A7}', 'X'),
+    ('\u{03B1}', 'a'), ('\u{03B9}', 'i'), ('\u{03BA}', 'k'), ('\u{03BD}', 'v'), ('\u{03BF}', 'o'),
+    ('\u{03C1}', 'p'), ('\u{03C4}', 't'), ('\u{03C5}', 'u'), ('\u{03C7}', 'x'), ('\u{0405}', 'S'),
+    ('\u{0406}', 'I'), ('\u{0408}', 'J'), ('\u{0410}', 'A'), ('\u{0412}', 'B'), ('\u{0415}', 'E'),
+    ('\u{041A}', 'K'), ('\u{041C}', 'M'), ('\u{041D}', 'H'), ('\u{041E}', 'O'), ('\u{0420}', 'P'),
+    ('\u{0421}', 'C'), ('\u{0422}', 'T'), ('\u{0423}', 'Y'), ('\u{0425}', 'X'), ('\u{0430}', 'a'),
+    ('\u{0435}', 'e'), ('\u{043E}', 'o'), ('\u{0440}', 'p'), ('\u{0441}', 'c'), ('\u{0443}', 'y'),
+    ('\u{0445}', 'x'), ('\u{0455}', 's'), ('\u{0456}', 'i'), ('\u{0458}', 'j'),
 ];
 
 const _: () = {
@@ -42,6 +35,10 @@ const _: () = {
         i += 1;
     }
 };
+
+fn confusable_script(ch: char) -> &'static str {
+    if ch == '\u{037E}' { "Greek question mark" } else if (ch as u32) < 0x0400 { "Greek" } else { "Cyrillic" }
+}
 
 const PROD_IDIOMS: [(&str, f64); 15] = [
     ("todo!(", 0.90), ("unimplemented!(", 0.90), ("transmute", 0.85), (".unwrap()", 0.55),
@@ -121,38 +118,36 @@ pub struct CalibrationAudit {
     pub pairs_evaluated: usize, pub blocks: usize, pub far_hits: usize, pub index_bytes: usize,
     pub reused: bool, pub reuse_hits: usize, pub slab_reuses: usize, pub idiom_hits: usize,
     pub raw_score: f64, pub delta_block: f64, pub delta_cross: f64, pub delta_idiom: f64,
-    pub veto_cap: f64, pub final_score: f64, pub use_5trit_lut: bool, pub structural_rules: Vec<String>,
+    veto_cap: f64, pub final_score: f64, pub use_5trit_lut: bool, pub structural_rules: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StrictReport {
     pub metrics: StrictMetrics, pub block: BlockModuleMetrics, pub findings: Vec<StrictFinding>,
-    pub veto_cap: f64, pub strict_score: f64, pub idiom_hits: usize, pub idiom_risk: f64,
+    veto_cap: f64, pub strict_score: f64, pub idiom_hits: usize, pub idiom_risk: f64,
 }
 
 impl StrictReport {
-    pub fn veto_rules(&self) -> Vec<&'static str> {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Veto)
-            .map(|f| f.rule)
-            .collect()
+    fn vetoes(&self) -> impl Iterator<Item = &StrictFinding> {
+        self.findings.iter().filter(|f| f.severity == Severity::Veto)
     }
 
+    pub fn veto_rules(&self) -> Vec<&'static str> { self.vetoes().map(|f| f.rule).collect() }
+
     pub fn formatted_vetoes(&self) -> Vec<String> {
-        self.findings
-            .iter()
-            .filter(|f| f.severity == Severity::Veto)
-            .map(StrictFinding::format_entry)
-            .collect()
+        self.vetoes().map(StrictFinding::format_entry).collect()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct AntiGamingAudit {
-    pub path: String, pub passed: bool, pub veto_cap: f64, pub indent_mode: &'static str,
+    pub path: String, pub passed: bool, veto_cap: f64, pub indent_mode: &'static str,
     pub indent_quantum: usize, pub before_vetoes: Vec<String>,
     pub after_vetoes: Vec<String>, pub introduced_vetoes: Vec<String>,
+}
+
+impl AntiGamingAudit {
+    pub fn veto_cap(&self) -> f64 { self.veto_cap }
 }
 
 /// Apply strict rules and ego calibration while preserving `base.score`.
@@ -253,15 +248,11 @@ pub fn find_cfg_test_mod_decls(rel_path: &str, src: &str) -> Vec<String> {
     }
     let parent = rel_path.rsplit_once('/').map_or("", |(dir, _)| dir);
     let mut out = Vec::new();
-    for idx in 0..toks.len() {
-        let tok = toks[idx];
-        if tok.flags.in_test()
-            && tok.kind == LexKind::Ident
-            && tok.slice == b"mod"
-            && let Some(nt) = toks.get(idx + 1).filter(|n| n.kind == LexKind::Ident)
-            && toks.get(idx + 2).is_some_and(|n| n.kind == LexKind::Semi)
+    for [t0, t1, t2] in toks.array_windows::<3>() {
+        if t0.flags.in_test() && t0.kind == LexKind::Ident && t0.slice == b"mod"
+            && t1.kind == LexKind::Ident && t2.kind == LexKind::Semi
         {
-            let name = nt.as_str();
+            let name = t1.as_str();
             let base = if parent.is_empty() { name.to_string() } else { format!("{parent}/{name}") };
             out.extend([format!("{base}.rs"), format!("{base}/mod.rs")]);
         }
@@ -295,10 +286,36 @@ struct StrictTok<'a> {
     kind: LexKind, text: &'a str, line: usize, line_indent: usize, in_test: bool, in_os_cfg: bool,
 }
 
+impl StrictTok<'_> {
+    #[inline]
+    fn is(&self, kind: LexKind) -> bool { self.kind == kind }
+
+    #[inline]
+    fn kw(&self, text: &str) -> bool { self.kind == LexKind::Ident && self.text == text }
+}
+
+#[inline]
+fn kind_at(tokens: &[StrictTok<'_>], idx: usize, kind: LexKind) -> bool {
+    tokens.get(idx).is_some_and(|t| t.kind == kind)
+}
+
+#[inline]
+fn kw_at(tokens: &[StrictTok<'_>], idx: usize, text: &str) -> bool {
+    tokens.get(idx).is_some_and(|t| t.kw(text))
+}
+
+fn brace_body<'a>(tokens: &'a [StrictTok<'a>], after: usize) -> Option<&'a [StrictTok<'a>]> {
+    let mut pos = after + 1;
+    while pos < tokens.len() && !matches!(tokens[pos].kind, LexKind::LBrace | LexKind::Semi) { pos += 1; }
+    if !kind_at(tokens, pos, LexKind::LBrace) { return None; }
+    let end = skip_balanced(tokens, pos, LexKind::LBrace, LexKind::RBrace);
+    Some(&tokens[pos + 1..end.saturating_sub(1)])
+}
+
 fn init_line_scans(src: &str, file_is_test_only: bool) -> Vec<LineScan<'_>> {
     let mut lines = vec![LineScan::default()];
     for raw in src.split('\n') {
-        let trimmed_cr = raw.strip_suffix('\r').unwrap_or(raw);
+        let trimmed_cr = raw.trim_suffix('\r');
         let (mut col, mut lead_sp, mut lead_tb, mut lead_done) = (0usize, 0usize, 0usize, false);
         for ch in trimmed_cr.chars() {
             match ch {
@@ -316,18 +333,13 @@ fn init_line_scans(src: &str, file_is_test_only: bool) -> Vec<LineScan<'_>> {
 }
 
 fn strip_comment_delims(kind: LexKind, text: &str) -> &str {
-    match kind {
-        LexKind::LineComment => text.strip_prefix("///")
-            .or_else(|| text.strip_prefix("//!"))
-            .or_else(|| text.strip_prefix("//"))
-            .or_else(|| text.strip_prefix('#'))
-            .unwrap_or(text),
-        LexKind::BlockComment => text.strip_prefix("/**")
-            .or_else(|| text.strip_prefix("/*!"))
-            .or_else(|| text.strip_prefix("/*"))
-            .unwrap_or(text).strip_suffix("*/").unwrap_or(text),
-        _ => text,
-    }
+    let prefs: &[&str] = match kind {
+        LexKind::LineComment => &["///", "//!", "//", "#"],
+        LexKind::BlockComment => &["/**", "/*!", "/*"],
+        _ => return text,
+    };
+    let body = prefs.iter().find_map(|p| text.strip_prefix(p)).unwrap_or(text);
+    if kind == LexKind::BlockComment { body.trim_suffix("*/") } else { body }
 }
 
 fn is_tail_op(kind: LexKind, text: &str) -> bool {
@@ -613,30 +625,25 @@ fn compute_block_delta(m: &BlockModuleMetrics) -> f64 {
 
 fn check_bidi(src: &str, findings: &mut Vec<StrictFinding>) {
     const BIDI: &[(char, &str)] = &[
-        ('\u{202A}', "U+202A LRE"), ('\u{202B}', "U+202B RLE"), ('\u{202C}', "U+202C PDF"),
-        ('\u{202D}', "U+202D LRO"), ('\u{202E}', "U+202E RLO (Trojan Source)"),
-        ('\u{2066}', "U+2066 LRI (Trojan Source)"), ('\u{2067}', "U+2067 RLI (Trojan Source)"),
-        ('\u{2068}', "U+2068 FSI (Trojan Source)"), ('\u{2069}', "U+2069 PDI (Trojan Source)"),
-        ('\u{200E}', "U+200E LRM"), ('\u{200F}', "U+200F RLM"), ('\u{061C}', "U+061C ALM"),
-        ('\u{200B}', "U+200B ZWSP"), ('\u{200C}', "U+200C ZWNJ"), ('\u{200D}', "U+200D ZWJ"),
-        ('\u{2060}', "U+2060 WJ"),
+        ('\u{202A}', "LRE"), ('\u{202B}', "RLE"), ('\u{202C}', "PDF"), ('\u{202D}', "LRO"),
+        ('\u{202E}', "RLO (Trojan Source)"), ('\u{2066}', "LRI (Trojan Source)"),
+        ('\u{2067}', "RLI (Trojan Source)"), ('\u{2068}', "FSI (Trojan Source)"),
+        ('\u{2069}', "PDI (Trojan Source)"), ('\u{200E}', "LRM"), ('\u{200F}', "RLM"),
+        ('\u{061C}', "ALM"), ('\u{200B}', "ZWSP"), ('\u{200C}', "ZWNJ"), ('\u{200D}', "ZWJ"),
+        ('\u{2060}', "WJ"),
     ];
     for (idx, line) in src.lines().enumerate() {
         if line.is_ascii() { continue; }
         let ln = idx + 1;
         for (ci, ch) in line.chars().enumerate() {
             let tag = if ch == '\u{FEFF}' && !(ln == 1 && ci == 0) {
-                Some("U+FEFF mid-file BOM/ZWNBSP")
+                Some("mid-file BOM/ZWNBSP")
             } else {
                 BIDI.iter().find(|&&(c, _)| c == ch).map(|&(_, t)| t)
             };
             if let Some(tag) = tag {
-                veto_fmt(
-                    findings,
-                    "bidi_trojan_source",
-                    ln,
-                    format!("forbidden invisible/BiDi control {tag} (CVE-2021-42574)"),
-                );
+                let msg = format!("forbidden invisible/BiDi control U+{:04X} {tag} (CVE-2021-42574)", ch as u32);
+                veto_fmt(findings, "bidi_trojan_source", ln, msg);
                 break;
             }
         }
@@ -655,41 +662,30 @@ fn check_uts39_homoglyphs(tokens: &[StrictTok<'_>], lines: &[LineScan<'_>], find
             continue;
         }
         let detail = tok.text.chars().find_map(|ch| {
-            if let Ok(i) = UTS39_CONFUSABLES.binary_search_by_key(&ch, |&(c, _, _)| c) {
-                let (_, scr, looks) = UTS39_CONFUSABLES[i];
+            if let Ok(i) = UTS39_CONFUSABLES.binary_search_by_key(&ch, |&(c, _)| c) {
+                let (scr, looks) = (confusable_script(ch), UTS39_CONFUSABLES[i].1);
                 Some(format!("{scr} confusable U+{:04X} (looks like '{looks}') in code token", ch as u32))
             } else if is_cyrillic_or_greek(ch) {
                 Some(format!("Cyrillic/Greek script char U+{:04X} in code token", ch as u32))
-            } else {
-                None
-            }
+            } else { None }
         });
         if let Some(d) = detail && flagged.insert(tok.line) {
             veto_fmt(findings, "uts39_homoglyph", tok.line, d);
         }
     }
     for (ln, ls) in lines.iter().enumerate().skip(1) {
-        if ls.comment_slices.is_empty() || flagged.contains(&ln) {
-            continue;
-        }
+        if ls.comment_slices.is_empty() || flagged.contains(&ln) { continue; }
         for &cmt in &ls.comment_slices {
-            if cmt.is_ascii() {
-                continue;
-            }
+            if cmt.is_ascii() { continue; }
             let hit = cmt.split_whitespace().find_map(|w| {
-                w.bytes()
-                    .any(|b| b.is_ascii_alphabetic())
+                w.bytes().any(|b| b.is_ascii_alphabetic())
                     .then(|| w.chars().find(|&c| is_cyrillic_or_greek(c)))
                     .flatten()
             });
             if let Some(ch) = hit {
                 flagged.insert(ln);
-                veto_fmt(
-                    findings,
-                    "uts39_homoglyph",
-                    ln,
-                    format!("mixed Latin + Cyrillic/Greek homoglyph U+{:04X} in comment word", ch as u32),
-                );
+                let msg = format!("mixed Latin + Cyrillic/Greek homoglyph U+{:04X} in comment word", ch as u32);
+                veto_fmt(findings, "uts39_homoglyph", ln, msg);
                 break;
             }
         }
@@ -699,16 +695,11 @@ fn check_uts39_homoglyphs(tokens: &[StrictTok<'_>], lines: &[LineScan<'_>], find
 fn check_suppressions(lines: &[LineScan<'_>], findings: &mut Vec<StrictFinding>) {
     const NEEDLES: &[&[u8]] = &[b"@ts-ignore", b"@ts-nocheck", b"eslint-disable", b"noqa"];
     for (ln, ls) in lines.iter().enumerate().skip(1) {
-        if ls.in_test || ls.comment_slices.is_empty() {
-            continue;
-        }
+        if ls.in_test || ls.comment_slices.is_empty() { continue; }
         let bad = ls.comment_slices.iter().any(|c| {
-            let b = c.as_bytes();
-            NEEDLES.iter().any(|n| crate::lex::find_ascii_ci(b, n).is_some())
+            NEEDLES.iter().any(|n| crate::lex::find_ascii_ci(c.as_bytes(), n).is_some())
         });
-        if bad {
-            veto_fmt(findings, "lint_suppression", ln, "forbidden lint/typecheck suppression comment");
-        }
+        if bad { veto_fmt(findings, "lint_suppression", ln, "forbidden lint/typecheck suppression comment"); }
     }
 }
 
@@ -716,53 +707,38 @@ fn check_attrs_and_macros(tokens: &[StrictTok<'_>], findings: &mut Vec<StrictFin
     let mut idx = 0usize;
     while idx < tokens.len() {
         let tok = &tokens[idx];
-        if tok.in_test {
-            idx += 1;
-            continue;
-        }
-        if tok.kind == LexKind::Hash && let Some(next_idx) = inspect_attr(tokens, idx, findings) {
+        if tok.in_test { idx += 1; continue; }
+        if tok.is(LexKind::Hash) && let Some(next_idx) = inspect_attr(tokens, idx, findings) {
             idx = next_idx;
             continue;
         }
         let open_after = tokens.get(idx + 2).is_some_and(|t| {
             matches!(t.kind, LexKind::LParen | LexKind::LBracket | LexKind::LBrace)
         });
-        if tok.kind == LexKind::Ident
+        if tok.is(LexKind::Ident)
             && matches!(tok.text, "todo" | "unimplemented")
-            && tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Bang)
+            && kind_at(tokens, idx + 1, LexKind::Bang)
             && open_after
         {
-            veto_fmt(
-                findings,
-                "prod_placeholder_macro",
-                tok.line,
-                format!("forbidden production `{}!()` placeholder", tok.text),
-            );
+            let msg = format!("forbidden production `{}!()` placeholder", tok.text);
+            veto_fmt(findings, "prod_placeholder_macro", tok.line, msg);
         }
         idx += 1;
     }
 }
 
 fn inspect_attr(tokens: &[StrictTok<'_>], idx: usize, findings: &mut Vec<StrictFinding>) -> Option<usize> {
-    let open = if tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::LBracket) {
+    let open = if kind_at(tokens, idx + 1, LexKind::LBracket) {
         idx + 1
-    } else if tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Bang)
-        && tokens.get(idx + 2).is_some_and(|t| t.kind == LexKind::LBracket)
-    {
+    } else if kind_at(tokens, idx + 1, LexKind::Bang) && kind_at(tokens, idx + 2, LexKind::LBracket) {
         idx + 2
-    } else {
-        return None;
-    };
+    } else { return None };
     let pos = skip_balanced(tokens, open, LexKind::LBracket, LexKind::RBracket);
     let inner = &tokens[open + 1..pos.saturating_sub(1)];
-    if let Some(first) = inner.first().filter(|t| t.kind == LexKind::Ident) {
+    if let Some(first) = inner.first().filter(|t| t.is(LexKind::Ident)) {
         let ln = tokens[idx].line;
-        let has_id = |name: &str| inner.iter().any(|t| t.kind == LexKind::Ident && t.text == name);
-        let has_reason = inner.windows(2).any(|w| {
-            w[0].kind == LexKind::Ident
-                && w[0].text == "reason"
-                && w[1].kind == LexKind::Eq
-        });
+        let has_id = |name: &str| inner.iter().any(|t| t.kw(name));
+        let has_reason = inner.array_windows::<2>().any(|[a, b]| a.kw("reason") && b.is(LexKind::Eq));
         match first.text {
             "allow" => veto_fmt(findings, "lint_suppression", ln, "forbidden allow-attribute lint suppression"),
             "cfg_attr" if has_id("allow") => {
@@ -781,81 +757,50 @@ fn inspect_attr(tokens: &[StrictTok<'_>], idx: usize, findings: &mut Vec<StrictF
 }
 
 fn check_unsafe_and_unwraps(
-    tokens: &[StrictTok<'_>],
-    lines: &[LineScan<'_>],
-    metrics: &mut StrictMetrics,
-    findings: &mut Vec<StrictFinding>,
+    tokens: &[StrictTok<'_>], lines: &[LineScan<'_>],
+    metrics: &mut StrictMetrics, findings: &mut Vec<StrictFinding>,
 ) {
     for (idx, tok) in tokens.iter().enumerate() {
-        if tok.in_test {
-            continue;
-        }
-        let is_unwrap = tok.kind == LexKind::Dot
-            && tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Ident && t.text == "unwrap")
-            && tokens.get(idx + 2).is_some_and(|t| t.kind == LexKind::LParen);
-        if is_unwrap {
+        if tok.in_test { continue; }
+        if tok.is(LexKind::Dot) && kw_at(tokens, idx + 1, "unwrap") && kind_at(tokens, idx + 2, LexKind::LParen) {
             metrics.prod_unwraps += 1;
-            if idx >= 4
-                && tokens[idx - 4].kind == LexKind::Dot
-                && tokens[idx - 3].kind == LexKind::Ident
+            if idx >= 4 && tokens[idx - 4].is(LexKind::Dot) && tokens[idx - 3].is(LexKind::Ident)
                 && matches!(tokens[idx - 3].text, "lock" | "read" | "write")
-                && tokens[idx - 2].kind == LexKind::LParen
-                && tokens[idx - 1].kind == LexKind::RParen
+                && tokens[idx - 2].is(LexKind::LParen) && tokens[idx - 1].is(LexKind::RParen)
             {
-                veto_fmt(
-                    findings,
-                    "std_lock_unwrap",
-                    tok.line,
-                    format!("forbidden `.{}().unwrap()` lock-poison panic in prod", tokens[idx - 3].text),
-                );
+                let msg = format!("forbidden `.{}().unwrap()` lock-poison panic in prod", tokens[idx - 3].text);
+                veto_fmt(findings, "std_lock_unwrap", tok.line, msg);
             }
         }
-        if tok.kind == LexKind::Ident && tok.text == "unsafe" {
-            check_unsafe_site(tokens, idx, lines, metrics, findings);
-        }
+        if tok.kw("unsafe") { check_unsafe_site(tokens, idx, lines, metrics, findings); }
     }
     if metrics.prod_unwraps >= 10 {
-        veto_fmt(findings, "prod_unwrap_spam", 1, format!("excessive production `.unwrap()` count: {}", metrics.prod_unwraps));
+        let msg = format!("excessive production `.unwrap()` count: {}", metrics.prod_unwraps);
+        veto_fmt(findings, "prod_unwrap_spam", 1, msg);
     } else if metrics.prod_unwraps > 0 {
-        warn_fmt(findings, "prod_unwrap_advisory", 1, format!("{} invariant-guarded prod `.unwrap()` call(s)", metrics.prod_unwraps));
+        let msg = format!("{} invariant-guarded prod `.unwrap()` call(s)", metrics.prod_unwraps);
+        warn_fmt(findings, "prod_unwrap_advisory", 1, msg);
     }
 }
 
 fn check_unsafe_site(
-    tokens: &[StrictTok<'_>],
-    idx: usize,
-    lines: &[LineScan<'_>],
-    metrics: &mut StrictMetrics,
-    findings: &mut Vec<StrictFinding>,
+    tokens: &[StrictTok<'_>], idx: usize, lines: &[LineScan<'_>],
+    metrics: &mut StrictMetrics, findings: &mut Vec<StrictFinding>,
 ) {
-    let is_attr = idx > 0
-        && tokens[idx - 1].kind == LexKind::LBracket
-        && tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::LParen);
-    let is_extern = tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Ident && t.text == "extern");
-    if is_attr || is_extern {
-        return;
-    }
+    let is_attr = idx > 0 && tokens[idx - 1].is(LexKind::LBracket) && kind_at(tokens, idx + 1, LexKind::LParen);
+    if is_attr || kw_at(tokens, idx + 1, "extern") { return; }
     let tok = &tokens[idx];
     metrics.unsafe_blocks += 1;
     let has_doc = (tok.line.saturating_sub(3).max(1)..=tok.line)
         .any(|ln| lines.get(ln).is_some_and(|ls| ls.has_safety_comment));
-    if has_doc {
-        return;
-    }
+    if has_doc { return; }
     if tok.in_os_cfg && !unsafe_block_contains_ub(tokens, idx) {
         warn_fmt(
-            findings,
-            "unsafe_os_ffi_missing_safety_doc",
-            tok.line,
+            findings, "unsafe_os_ffi_missing_safety_doc", tok.line,
             "OS-FFI `unsafe` inside `#[cfg(windows|unix)]` lacks `// SAFETY:` doc",
         );
     } else {
-        veto_fmt(
-            findings,
-            "unsafe_undocumented",
-            tok.line,
-            "undocumented `unsafe` block/fn missing `// SAFETY:` comment",
-        );
+        veto_fmt(findings, "unsafe_undocumented", tok.line, "undocumented `unsafe` block/fn missing `// SAFETY:` comment");
     }
 }
 
@@ -865,14 +810,9 @@ fn unsafe_block_contains_ub(tokens: &[StrictTok<'_>], idx: usize) -> bool {
         "from_raw_parts", "from_raw_parts_mut", "set_len", "assume_init",
         "uninitialized", "unreachable_unchecked",
     ];
-    let mut pos = idx + 1;
-    while pos < tokens.len() && !matches!(tokens[pos].kind, LexKind::LBrace | LexKind::Semi) { pos += 1; }
-    if tokens.get(pos).is_none_or(|t| t.kind != LexKind::LBrace) { return false; }
-    let end = skip_balanced(tokens, pos, LexKind::LBrace, LexKind::RBrace);
-    (pos + 1..end.saturating_sub(1)).any(|s| {
-        let is_static_mut = tokens[s].text == "static"
-            && tokens.get(s + 1).is_some_and(|t| t.kind == LexKind::Ident && t.text == "mut");
-        tokens[s].kind == LexKind::Ident && (UB.contains(&tokens[s].text) || is_static_mut)
+    let Some(body) = brace_body(tokens, idx) else { return false };
+    body.iter().enumerate().any(|(s, tok)| {
+        tok.is(LexKind::Ident) && (UB.contains(&tok.text) || (tok.text == "static" && kw_at(body, s + 1, "mut")))
     })
 }
 
@@ -917,6 +857,15 @@ impl BlankCommentAcc {
             }
         } else if self.nonblank_run >= 2 { self.alt_blank_run = 0; }
         self.nonblank_run = 0;
+    }
+
+    fn record_nonblank(&mut self) {
+        self.consec_blank = 0;
+        self.nonblank_run += 1;
+        if self.nonblank_run >= 2 {
+            self.alt_blank_run = 0;
+        }
+        self.nonblank_prod += 1;
     }
 
     fn record_pure_nondoc(&mut self, lines: &[LineScan<'_>], ln: usize, body: &str) {
@@ -970,12 +919,8 @@ fn check_lines(
                 || ls.has_pad_smuggle || (ls.tail_ops >= 3 && ts >= 16)
                 || ls.tail_ident_chars >= 24;
             if dense {
-                veto_fmt(
-                    findings,
-                    "hidden_dense_tail",
-                    ln,
-                    format!("line width {} > {MAX_COLS} with dense/smuggled code tail", ls.raw_cols),
-                );
+                let msg = format!("line width {} > {MAX_COLS} with dense/smuggled code tail", ls.raw_cols);
+                veto_fmt(findings, "hidden_dense_tail", ln, msg);
             }
         }
         let is_blank = !ls.has_code && !ls.has_nondoc_comment
@@ -983,12 +928,7 @@ fn check_lines(
         if is_blank {
             acc.record_blank(ln, metrics);
         } else {
-            acc.consec_blank = 0;
-            acc.nonblank_run += 1;
-            if acc.nonblank_run >= 2 {
-                acc.alt_blank_run = 0;
-            }
-            acc.nonblank_prod += 1;
+            acc.record_nonblank();
         }
         if ls.has_nondoc_comment && !ls.has_code && !ls.has_doc_comment && !ls.has_safety_comment {
             let first = ls.comment_slices.first().copied().unwrap_or("");
@@ -1004,23 +944,16 @@ fn is_comment_echo_pair(lines: &[LineScan<'_>], ln: usize, body: &str) -> bool {
         "the", "and", "for", "with", "from", "that", "this", "into", "not", "are", "use", "all",
         "can", "has", "was", "but", "when", "then", "else", "only", "each", "also",
     ];
-    let mut c_words = BTreeSet::new();
-    for raw in crate::lex::iter_idents(body.as_bytes()) {
-        if raw.len() >= 3 {
-            let w = std::str::from_utf8(raw).unwrap_or("").to_ascii_lowercase();
-            if !STOP.contains(&w.as_str()) {
-                c_words.insert(w);
-            }
-        }
-    }
-    if c_words.len() < 2 {
-        return false;
-    }
+    let c_words: BTreeSet<String> = crate::lex::iter_idents(body.as_bytes())
+        .filter(|raw| raw.len() >= 3)
+        .map(|raw| std::str::from_utf8(raw).unwrap_or("").to_ascii_lowercase())
+        .filter(|w| !STOP.contains(&w.as_str()))
+        .collect();
+    if c_words.len() < 2 { return false; }
     let end = (ln + 2).min(lines.len().saturating_sub(1));
     for next_ls in &lines[(ln + 1).min(lines.len())..=end] {
         if !next_ls.in_test && next_ls.has_code {
-            let shared = c_words
-                .iter()
+            let shared = c_words.iter()
                 .filter(|w| next_ls.code_idents.iter().any(|id| id.eq_ignore_ascii_case(w)))
                 .count();
             return shared >= 2 && (shared * 100) / c_words.len() >= 50;
@@ -1155,20 +1088,20 @@ fn count_fn_params(tokens: &[StrictTok<'_>], start: usize, end: usize, is_go: bo
 }
 
 fn is_pub_before(tokens: &[StrictTok<'_>], idx: usize) -> bool {
-    tokens[idx.saturating_sub(4)..idx].iter().any(|t| t.kind == LexKind::Ident && t.text == "pub")
+    tokens[idx.saturating_sub(4)..idx].iter().any(|t| t.kw("pub"))
 }
 
 fn parse_fn_header<'a>(tokens: &[StrictTok<'a>], fn_idx: usize, is_go: bool) -> Option<(PendingFn<'a>, bool)> {
     let mut np = fn_idx + 1;
-    if is_go && tokens.get(np).is_some_and(|t| t.kind == LexKind::LParen) {
+    if is_go && kind_at(tokens, np, LexKind::LParen) {
         np = skip_balanced(tokens, np, LexKind::LParen, LexKind::RParen);
     }
-    let name_tok = tokens.get(np).filter(|t| t.kind == LexKind::Ident)?;
+    let name_tok = tokens.get(np).filter(|t| t.is(LexKind::Ident))?;
     let mut pos = np + 1;
-    if !is_go && tokens.get(pos).is_some_and(|t| t.kind == LexKind::Lt) {
+    if !is_go && kind_at(tokens, pos, LexKind::Lt) {
         pos = skip_balanced(tokens, pos, LexKind::Lt, LexKind::Gt);
     }
-    if !tokens.get(pos).is_some_and(|t| t.kind == LexKind::LParen) { return None; }
+    if !kind_at(tokens, pos, LexKind::LParen) { return None; }
     let p_start = pos + 1;
     pos = skip_balanced(tokens, pos, LexKind::LParen, LexKind::RParen);
     let (total_params, short_params, arity, bool_params) =
@@ -1190,7 +1123,7 @@ fn is_match_guard_if(tokens: &[StrictTok<'_>], if_idx: usize) -> bool {
     let mut d = Delims::default();
     for tok in &tokens[if_idx + 1..] {
         if d.p == 0 && d.b == 0 {
-            if tok.kind == LexKind::FatArrow { return true; }
+            if tok.is(LexKind::FatArrow) { return true; }
             if matches!(tok.kind, LexKind::LBrace | LexKind::Semi | LexKind::RBrace) { return false; }
         }
         d.step(tok.kind);
@@ -1204,13 +1137,13 @@ fn closure_opens_brace(tokens: &[StrictTok<'_>], pipe_idx: usize) -> bool {
         match tokens[pos].kind {
             LexKind::Pipe => {
                 let mut after = pos + 1;
-                if tokens.get(after).is_some_and(|t| t.kind == LexKind::Arrow) {
+                if kind_at(tokens, after, LexKind::Arrow) {
                     after += 1;
                     while after < tokens.len()
                         && !matches!(tokens[after].kind, LexKind::LBrace | LexKind::Semi | LexKind::Comma)
                     { after += 1; }
                 }
-                return tokens.get(after).is_some_and(|t| t.kind == LexKind::LBrace);
+                return kind_at(tokens, after, LexKind::LBrace);
             }
             LexKind::Semi | LexKind::LBrace | LexKind::RBrace => return false,
             _ => pos += 1,
@@ -1228,6 +1161,13 @@ struct FnAnalyzer<'a> {
 
 impl<'a> FnAnalyzer<'a> {
     fn clear_bool_op(&mut self) { if let Some(cur) = self.fn_stack.last_mut() { cur.last_bool_op = None; } }
+
+    fn record_bool_op(&mut self, op: LexKind) {
+        if let Some(cur) = self.fn_stack.last_mut() && cur.last_bool_op != Some(op) {
+            cur.cognitive += 1;
+            cur.last_bool_op = Some(op);
+        }
+    }
 
     fn handle_lbrace(&mut self, tok_idx: usize, tokens: &[StrictTok<'a>], lines: &[LineScan<'_>]) {
         let tok = &tokens[tok_idx];
@@ -1256,16 +1196,8 @@ impl<'a> FnAnalyzer<'a> {
         }
         let match_cl = self.pending_closure.last()
             .is_some_and(|&(cp, cb)| cp == self.paren_depth && cb == self.bracket_depth);
-        if match_cl {
-            self.pending_closure.pop();
-            self.brace_stack.push(BraceFrame {
-                kind: BraceKind::Closure, line: tok.line, line_indent: tok.line_indent,
-            });
-        } else {
-            self.brace_stack.push(BraceFrame {
-                kind: BraceKind::Other, line: tok.line, line_indent: tok.line_indent,
-            });
-        }
+        let kind = if match_cl { self.pending_closure.pop(); BraceKind::Closure } else { BraceKind::Other };
+        self.brace_stack.push(BraceFrame { kind, line: tok.line, line_indent: tok.line_indent });
         self.clear_bool_op();
     }
 
@@ -1273,9 +1205,7 @@ impl<'a> FnAnalyzer<'a> {
         let mut parent_cf: Option<(usize, usize)> = None;
         let (mut depth, mut same_ln) = (1usize, usize::from(pcf.kw_line == tok.line));
         for frame in self.brace_stack.iter().rev() {
-            if frame.kind == BraceKind::FnBody {
-                break;
-            }
+            if frame.kind == BraceKind::FnBody { break; }
             if frame.kind == BraceKind::ControlFlow {
                 parent_cf.get_or_insert((frame.line, frame.line_indent));
                 depth += 1;
@@ -1286,21 +1216,15 @@ impl<'a> FnAnalyzer<'a> {
             pcf.kw_line > pf_line && pcf.line_indent <= pf_indent + 1
         });
         self.brace_stack.push(BraceFrame {
-            kind: BraceKind::ControlFlow,
-            line: pcf.kw_line,
-            line_indent: pcf.line_indent,
+            kind: BraceKind::ControlFlow, line: pcf.kw_line, line_indent: pcf.line_indent,
         });
         if let Some(cur) = self.fn_stack.last_mut() {
             cur.max_cf_depth = cur.max_cf_depth.max(depth);
-            if compressed {
-                cur.indent_compressed += 1;
-            }
+            if compressed { cur.indent_compressed += 1; }
             let cnt = cur.cf_opens_by_line.entry(tok.line).or_insert(0);
             *cnt += 1;
             let semis = lines.get(tok.line).map_or(0, |l| l.total_semis);
-            if same_ln >= 3 || (*cnt >= 3 && (same_ln >= 2 || semis >= 2)) {
-                cur.packed_cf_line = true;
-            }
+            if same_ln >= 3 || (*cnt >= 3 && (same_ln >= 2 || semis >= 2)) { cur.packed_cf_line = true; }
             cur.last_bool_op = None;
         }
     }
@@ -1318,10 +1242,7 @@ impl<'a> FnAnalyzer<'a> {
 
     fn handle_fn_ident(&mut self, tokens: &[StrictTok<'a>], idx: usize, prev: Option<&StrictTok<'a>>, is_go: bool) {
         let tok = &tokens[idx];
-        let nest = self
-            .brace_stack
-            .iter()
-            .rev()
+        let nest = self.brace_stack.iter().rev()
             .take_while(|f| f.kind != BraceKind::FnBody)
             .filter(|f| matches!(f.kind, BraceKind::ControlFlow | BraceKind::Closure))
             .count();
@@ -1332,17 +1253,11 @@ impl<'a> FnAnalyzer<'a> {
                     cur.last_bool_op = None;
                 }
             }
-            "if" => {
-                let else_if = prev.is_some_and(|p| p.kind == LexKind::Ident && p.text == "else");
-                self.add_cf(tok, if else_if { 1 } else { 1 + nest });
+            "if" => self.add_cf(tok, if prev.is_some_and(|p| p.kw("else")) { 1 } else { 1 + nest }),
+            "else" if !kw_at(tokens, idx + 1, "if") => {
+                self.add_cf(tok, if prev.is_some_and(|p| p.is(LexKind::RBrace)) { 1 } else { 1 + nest });
             }
-            "else" if !tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Ident && t.text == "if") => {
-                let after_brace = prev.is_some_and(|p| p.kind == LexKind::RBrace);
-                self.add_cf(tok, if after_brace { 1 } else { 1 + nest });
-            }
-            "for" if !tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::Lt) => {
-                self.add_cf(tok, 1 + nest);
-            }
+            "for" if !kind_at(tokens, idx + 1, LexKind::Lt) => self.add_cf(tok, 1 + nest),
             "while" | "loop" | "match" | "switch" => self.add_cf(tok, 1 + nest),
             "let" if !is_go => self.handle_let(tokens, idx, prev),
             _ => {}
@@ -1354,10 +1269,7 @@ impl<'a> FnAnalyzer<'a> {
         metrics: &mut StrictMetrics, block: &mut BlockModuleMetrics, findings: &mut Vec<StrictFinding>,
     ) {
         let Some(popped) = self.brace_stack.pop() else { return };
-        if popped.kind != BraceKind::FnBody {
-            self.clear_bool_op();
-            return;
-        }
+        if popped.kind != BraceKind::FnBody { self.clear_bool_op(); return; }
         if let Some(acc) = self.fn_stack.pop() {
             let body = &tokens[(acc.open_tok_idx + 1).min(idx)..idx];
             finalize_fn(&acc, line, body, metrics, block, findings);
@@ -1366,20 +1278,13 @@ impl<'a> FnAnalyzer<'a> {
 
     fn handle_let(&mut self, tokens: &[StrictTok<'a>], idx: usize, prev: Option<&StrictTok<'a>>) {
         let is_let_chain = prev.is_some_and(|p| {
-            p.kind == LexKind::AndAnd || (p.kind == LexKind::Ident && matches!(p.text, "if" | "while"))
+            p.is(LexKind::AndAnd) || (p.is(LexKind::Ident) && matches!(p.text, "if" | "while"))
         });
-        if is_let_chain {
-            return;
-        }
-        let Some(cur) = self.fn_stack.last_mut() else {
-            return;
-        };
-        let mut delims = Delims::default();
-        let mut end = idx + 1;
+        if is_let_chain { return; }
+        let Some(cur) = self.fn_stack.last_mut() else { return };
+        let (mut delims, mut end) = (Delims::default(), idx + 1);
         for tok in &tokens[idx + 1..] {
-            if delims.top_pbc() && matches!(tok.kind, LexKind::Eq | LexKind::Colon | LexKind::Semi) {
-                break;
-            }
+            if delims.top_pbc() && matches!(tok.kind, LexKind::Eq | LexKind::Colon | LexKind::Semi) { break; }
             delims.step(tok.kind);
             end += 1;
         }
@@ -1388,15 +1293,10 @@ impl<'a> FnAnalyzer<'a> {
 }
 
 fn count_pub_struct_fields(tokens: &[StrictTok<'_>], struct_idx: usize) -> usize {
-    let mut pos = struct_idx + 1;
-    while pos < tokens.len() && !matches!(tokens[pos].kind, LexKind::LBrace | LexKind::Semi) { pos += 1; }
-    if tokens.get(pos).is_none_or(|t| t.kind != LexKind::LBrace) { return 0; }
-    let end = skip_balanced(tokens, pos, LexKind::LBrace, LexKind::RBrace);
-    (pos + 1..end.saturating_sub(1)).filter(|&i| {
-        tokens[i].kind == LexKind::Ident && tokens[i].text == "pub"
-            && tokens.get(i + 1).is_some_and(|n| n.kind == LexKind::Ident)
-            && tokens.get(i + 2).is_some_and(|n| n.kind == LexKind::Colon)
-    }).count()
+    let Some(body) = brace_body(tokens, struct_idx) else { return 0 };
+    body.array_windows::<3>()
+        .filter(|[a, b, c]| a.kw("pub") && b.is(LexKind::Ident) && c.is(LexKind::Colon))
+        .count()
 }
 
 fn scan_fns(
@@ -1410,26 +1310,24 @@ fn scan_fns(
         let prev = (idx > 0 && !tokens[idx - 1].in_test).then(|| &tokens[idx - 1]);
         pub_fields += check_decl_and_surface(tokens, idx, is_go, &mut state, block, findings);
         match tok.kind {
-            LexKind::LParen => state.paren_depth += 1,
-            LexKind::RParen => state.paren_depth = state.paren_depth.saturating_sub(1),
-            LexKind::LBracket => state.bracket_depth += 1,
-            LexKind::RBracket => state.bracket_depth = state.bracket_depth.saturating_sub(1),
-            LexKind::Semi | LexKind::Comma | LexKind::FatArrow => state.clear_bool_op(),
             LexKind::LBrace => state.handle_lbrace(idx, tokens, lines),
             LexKind::RBrace => state.handle_rbrace(idx, tok.line, tokens, metrics, block, findings),
+            LexKind::Semi | LexKind::Comma | LexKind::FatArrow => state.clear_bool_op(),
+            LexKind::LParen | LexKind::RParen | LexKind::LBracket | LexKind::RBracket => {
+                let delta = usize::from(matches!(tok.kind, LexKind::LParen | LexKind::LBracket));
+                let target = if matches!(tok.kind, LexKind::LParen | LexKind::RParen) {
+                    &mut state.paren_depth
+                } else {
+                    &mut state.bracket_depth
+                };
+                *target = if delta == 1 { *target + 1 } else { target.saturating_sub(1) };
+            }
             _ => step_fn_body_token(&mut state, tokens, idx, prev, is_go),
         }
     }
-    if !is_go
-        && metrics.prod_bindings >= 10
-        && (metrics.prod_short_1char * 100) / metrics.prod_bindings >= 40
-    {
-        veto_fmt(
-            findings,
-            "short_ident",
-            1,
-            format!("file-wide 1-char identifier ratio {}/{}", metrics.prod_short_1char, metrics.prod_bindings),
-        );
+    if !is_go && metrics.prod_bindings >= 10 && (metrics.prod_short_1char * 100) / metrics.prod_bindings >= 40 {
+        let msg = format!("file-wide 1-char identifier ratio {}/{}", metrics.prod_short_1char, metrics.prod_bindings);
+        veto_fmt(findings, "short_ident", 1, msg);
     }
     pub_fields
 }
@@ -1441,42 +1339,27 @@ fn flag_short_decl(findings: &mut Vec<StrictFinding>, kind: &str, name: &str, li
 }
 
 fn check_decl_and_surface<'a>(
-    tokens: &[StrictTok<'a>],
-    idx: usize,
-    is_go: bool,
-    state: &mut FnAnalyzer<'a>,
-    block: &mut BlockModuleMetrics,
-    findings: &mut Vec<StrictFinding>,
+    tokens: &[StrictTok<'a>], idx: usize, is_go: bool,
+    state: &mut FnAnalyzer<'a>, block: &mut BlockModuleMetrics, findings: &mut Vec<StrictFinding>,
 ) -> usize {
     let (tok, mut pub_fields) = (&tokens[idx], 0usize);
-    if !is_go && tok.kind == LexKind::Ident {
+    if !is_go && tok.is(LexKind::Ident) {
         if matches!(tok.text, "struct" | "enum" | "trait") {
-            if is_pub_before(tokens, idx) {
-                block.pub_items += 1;
-            }
-            if tok.text == "struct" {
-                pub_fields = count_pub_struct_fields(tokens, idx);
-            }
-            if let Some(nt) = tokens.get(idx + 1).filter(|n| n.kind == LexKind::Ident) {
+            if is_pub_before(tokens, idx) { block.pub_items += 1; }
+            if tok.text == "struct" { pub_fields = count_pub_struct_fields(tokens, idx); }
+            if let Some(nt) = tokens.get(idx + 1).filter(|n| n.is(LexKind::Ident)) {
                 flag_short_decl(findings, tok.text, nt.text, nt.line);
             }
-        } else if matches!(tok.text, "const" | "type")
-            && state.fn_stack.is_empty()
-            && is_pub_before(tokens, idx)
-        {
+        } else if matches!(tok.text, "const" | "type") && state.fn_stack.is_empty() && is_pub_before(tokens, idx) {
             block.pub_items += 1;
         }
     }
-    if tok.kind == LexKind::Ident
+    if tok.is(LexKind::Ident)
         && ((is_go && tok.text == "func") || (!is_go && tok.text == "fn"))
         && let Some((mut pfn, has_body)) = parse_fn_header(tokens, idx, is_go)
     {
-        if pfn.is_pub {
-            block.pub_items += 1;
-        }
-        if !is_go {
-            flag_short_decl(findings, "prod function", pfn.name, pfn.line);
-        }
+        if pfn.is_pub { block.pub_items += 1; }
+        if !is_go { flag_short_decl(findings, "prod function", pfn.name, pfn.line); }
         if has_body {
             pfn.paren_depth = state.paren_depth;
             pfn.bracket_depth = state.bracket_depth;
@@ -1492,21 +1375,11 @@ fn step_fn_body_token<'a>(
 ) {
     if state.fn_stack.is_empty() { return; }
     match tokens[idx].kind {
-        LexKind::AndAnd => {
-            if let Some(cur) = state.fn_stack.last_mut() && cur.last_bool_op != Some(LexKind::AndAnd) {
-                cur.cognitive += 1;
-                cur.last_bool_op = Some(LexKind::AndAnd);
-            }
-        }
+        LexKind::AndAnd => state.record_bool_op(LexKind::AndAnd),
         LexKind::OrOr => {
             if prev.is_some_and(is_value_ending_tok) {
-                if let Some(cur) = state.fn_stack.last_mut()
-                    && cur.last_bool_op != Some(LexKind::OrOr)
-                {
-                    cur.cognitive += 1;
-                    cur.last_bool_op = Some(LexKind::OrOr);
-                }
-            } else if !is_go && tokens.get(idx + 1).is_some_and(|t| t.kind == LexKind::LBrace) {
+                state.record_bool_op(LexKind::OrOr);
+            } else if !is_go && kind_at(tokens, idx + 1, LexKind::LBrace) {
                 state.pending_closure.push((state.paren_depth, state.bracket_depth));
             }
         }
@@ -1530,56 +1403,32 @@ fn finalize_fn(
     block.max_cognitive = block.max_cognitive.max(acc.cognitive);
     block.max_params = block.max_params.max(acc.arity);
     block.max_bool_params = block.max_bool_params.max(acc.bool_params);
-    if fn_loc <= 4 && !body.is_empty() && body.len() <= 14
-        && !body.iter().any(|t| t.kind == LexKind::Semi)
-    {
-        let self_field = body.windows(3).any(|w| {
-            w[0].kind == LexKind::Ident && w[0].text == "self"
-                && w[1].kind == LexKind::Dot && w[2].kind == LexKind::Ident
-        });
-        let is_getter = self_field && !body.iter().any(|t| t.kind == LexKind::LParen);
-        if acc.is_pub && is_getter {
-            block.getter_leaks += 1;
-        } else if !is_getter && body.iter().any(|t| t.kind == LexKind::LParen) {
-            block.passthrough_fns += 1;
-        }
+    if fn_loc <= 4 && !body.is_empty() && body.len() <= 14 && !body.iter().any(|t| t.is(LexKind::Semi)) {
+        let self_field = body.array_windows::<3>()
+            .any(|[a, b, c]| a.kw("self") && b.is(LexKind::Dot) && c.is(LexKind::Ident));
+        let is_getter = self_field && !body.iter().any(|t| t.is(LexKind::LParen));
+        if acc.is_pub && is_getter { block.getter_leaks += 1; }
+        else if !is_getter && body.iter().any(|t| t.is(LexKind::LParen)) { block.passthrough_fns += 1; }
     }
     metrics.max_cf_depth = metrics.max_cf_depth.max(acc.max_cf_depth);
     metrics.max_cognitive = metrics.max_cognitive.max(acc.cognitive);
     metrics.prod_bindings += acc.total_bindings;
     metrics.prod_short_1char += acc.short_1char;
 
-    let too_deep = acc.max_cf_depth >= MAX_CF_DEPTH_VETO
-        || acc.cognitive > MAX_COGNITIVE_VETO
-        || acc.indent_compressed >= 4
-        || acc.packed_cf_line;
-    if too_deep {
-        veto_fmt(
-            findings,
-            "deep_nesting_spaghetti",
-            acc.line,
-            format!(
-                "fn `{}`: cf_depth={} (<{MAX_CF_DEPTH_VETO}), cognitive={} (<={MAX_COGNITIVE_VETO}), compressed={}, packed={}",
-                acc.name, acc.max_cf_depth, acc.cognitive, acc.indent_compressed, acc.packed_cf_line
-            ),
+    let deep_veto = acc.max_cf_depth >= MAX_CF_DEPTH_VETO || acc.cognitive > MAX_COGNITIVE_VETO;
+    let layout_veto = acc.indent_compressed >= 4 || acc.packed_cf_line;
+    if deep_veto || layout_veto {
+        let msg = format!(
+            "fn `{}`: cf_depth={} (<{MAX_CF_DEPTH_VETO}), cognitive={} (<={MAX_COGNITIVE_VETO}), compressed={}, packed={}",
+            acc.name, acc.max_cf_depth, acc.cognitive, acc.indent_compressed, acc.packed_cf_line,
         );
+        veto_fmt(findings, "deep_nesting_spaghetti", acc.line, msg);
     } else if acc.max_cf_depth >= WARN_CF_DEPTH || acc.cognitive >= WARN_COGNITIVE {
-        warn_fmt(
-            findings,
-            "complexity_borderline",
-            acc.line,
-            format!("fn `{}` borderline: cf_depth={}, cognitive={}", acc.name, acc.max_cf_depth, acc.cognitive),
-        );
+        let msg = format!("fn `{}` borderline: cf_depth={}, cognitive={}", acc.name, acc.max_cf_depth, acc.cognitive);
+        warn_fmt(findings, "complexity_borderline", acc.line, msg);
     }
-    if acc.total_bindings >= 5
-        && acc.short_1char >= 4
-        && (acc.short_1char * 100) / acc.total_bindings >= 55
-    {
-        veto_fmt(
-            findings,
-            "short_ident",
-            acc.line,
-            format!("fn `{}` 1-char variable ratio {}/{}", acc.name, acc.short_1char, acc.total_bindings),
-        );
+    if acc.total_bindings >= 5 && acc.short_1char >= 4 && (acc.short_1char * 100) / acc.total_bindings >= 55 {
+        let msg = format!("fn `{}` 1-char variable ratio {}/{}", acc.name, acc.short_1char, acc.total_bindings);
+        veto_fmt(findings, "short_ident", acc.line, msg);
     }
 }

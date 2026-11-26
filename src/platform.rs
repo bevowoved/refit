@@ -17,37 +17,30 @@ use crate::lex::left_bound;
 use crate::net::build_http;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{Context, Result};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use ignore::WalkBuilder;
-use indexmap::IndexMap;
-use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHasher};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EPOCH_SLOTS: usize = 64;
-
 const FILE_BUF_SIZE: usize = 64 * 1024;
-#[cfg(target_os = "linux")]
-const FADV_SEQ_MIN: u64 = 64 * 1024;
-#[cfg(target_os = "linux")]
-const FADV_DONTNEED_MIN: u64 = 1024 * 1024;
+#[cfg(target_os = "linux")] const FADV_SEQ_MIN: u64 = 64 * 1024;
+#[cfg(target_os = "linux")] const FADV_DONTNEED_MIN: u64 = 1024 * 1024;
 const ZSTD_STREAM_WLOG: u32 = 18;
 /// Binary stat cache format header bytes.
-const STAT_MAGIC: &[u8; 8] = b"RFST0002";
+const STAT_MAGIC: &[u8; 8] = b"RFST0003";
 const STAT_MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 const RACY_GIT_NS: u64 = 2_000_000_000;
 const CACHEDIR_TAG_BODY: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CLOCK_ANCHOR: OnceLock<(u64, Instant)> = OnceLock::new();
 
 const SKIP_DIRS: &[&str] = &[
@@ -66,40 +59,25 @@ const SANDBOX_VARS: &[&str] = &[
 ];
 
 pub fn os_tag() -> String {
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        other => other,
-    };
+    let arch = match std::env::consts::ARCH { "x86_64" => "x64", "aarch64" => "arm64", other => other };
     format!("{}-{arch}", std::env::consts::OS)
 }
 
 #[inline]
 pub fn now_ms() -> u64 {
     let (epoch_ms, started) = CLOCK_ANCHOR.get_or_init(|| {
-        let base = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let base = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |dur| dur.as_millis() as u64);
         (base, Instant::now())
     });
     epoch_ms.saturating_add(started.elapsed().as_millis() as u64)
 }
 
-#[inline]
-pub fn skip_dir(name: &str) -> bool {
-    SKIP_DIRS.contains(&name)
-}
-
+#[inline] pub fn skip_dir(name: &str) -> bool { SKIP_DIRS.contains(&name) }
 pub fn walk_files(repo_root: &Path, max_depth: Option<usize>) -> Vec<PathBuf> {
     walk_tree(repo_root, max_depth, false)
 }
 
-pub fn walk_tree(
-    repo_root: &Path,
-    max_depth: Option<usize>,
-    include_hidden_configs: bool,
-) -> Vec<PathBuf> {
+pub fn walk_tree(repo_root: &Path, max_depth: Option<usize>, include_hidden_configs: bool) -> Vec<PathBuf> {
     let mut wb = WalkBuilder::new(repo_root);
     wb.hidden(false)
         .git_ignore(true)
@@ -109,63 +87,41 @@ pub fn walk_tree(
         .parents(false)
         .require_git(false)
         .add_custom_ignore_filename(".refitignore")
-        .filter_entry(move |e| keep_entry(e, include_hidden_configs));
-
-    if let Some(d) = max_depth {
-        wb.max_depth(Some(d));
-    }
-
-    let mut out: Vec<PathBuf> = wb
-        .build()
-        .flatten()
-        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-        .map(|e| e.into_path())
-        .collect();
+        .max_depth(max_depth)
+        .filter_entry(move |entry| keep_entry(entry, include_hidden_configs));
+    let mut out: Vec<PathBuf> = wb.build().flatten()
+        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+        .map(ignore::DirEntry::into_path).collect();
     out.sort();
     out
 }
 
-fn keep_entry(e: &ignore::DirEntry, include_hidden: bool) -> bool {
-    if e.depth() == 0 || !e.file_type().is_some_and(|ft| ft.is_dir()) {
-        return true;
-    }
-
-    let name = e.file_name().to_string_lossy();
-    if skip_dir(&name) || has_cachedir_tag(e.path()) {
-        return false;
-    }
-    if name.starts_with('.') {
-        return include_hidden && name == ".github";
-    }
-    true
+fn keep_entry(entry: &ignore::DirEntry, include_hidden: bool) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_some_and(|ft| ft.is_dir()) { return true; }
+    let name = entry.file_name().to_string_lossy();
+    if skip_dir(&name) || has_cachedir_tag(entry.path()) { return false; }
+    !name.starts_with('.') || (include_hidden && name == ".github")
 }
 
 pub fn sandbox_env(extra: &[(String, String)]) -> Vec<(String, String)> {
-    let mut env = Vec::with_capacity(SANDBOX_VARS.len() + extra.len() + 1);
-    for &k in SANDBOX_VARS {
-        if let Ok(v) = std::env::var(k) {
-            env.push((k.to_string(), v));
-        }
-    }
+    let mut env: Vec<(String, String)> = SANDBOX_VARS.iter()
+        .filter_map(|&key| std::env::var(key).ok().map(|val| (key.to_string(), val)))
+        .collect();
     if std::env::var_os("MSYSTEM").is_some() {
-        env.push(("MSYS_NO_PATHCONV".to_string(), "1".to_string()));
+        env.push(("MSYS_NO_PATHCONV".into(), "1".into()));
     }
-
-    for (k, v) in extra {
-        if let Some(slot) = env.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(k)) {
-            slot.1 = v.clone();
+    for (key, val) in extra {
+        if let Some(slot) = env.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(key)) {
+            slot.1 = val.clone();
         } else {
-            env.push((k.clone(), v.clone()));
+            env.push((key.clone(), val.clone()));
         }
     }
     env
 }
 
-pub fn char_prefix(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
+pub fn char_prefix(text: &str, max_chars: usize) -> &str {
+    text.char_indices().nth(max_chars).map_or(text, |(idx, _)| &text[..idx])
 }
 
 pub fn new_http(user_agent: &str, timeout_secs: u64, pool_max: usize) -> Result<reqwest::Client> {
@@ -173,49 +129,44 @@ pub fn new_http(user_agent: &str, timeout_secs: u64, pool_max: usize) -> Result<
 }
 
 pub fn stream_http(
-    user_agent: &str,
-    connect_timeout_secs: u64,
-    pool_idle_secs: u64,
-    pool_max: usize,
+    user_agent: &str, connect_timeout_secs: u64, pool_idle_secs: u64, pool_max: usize,
 ) -> Result<reqwest::Client> {
     build_http(user_agent, connect_timeout_secs, pool_idle_secs, pool_max, None)
 }
 
-/// Reusable O(1) 64 KiB scratch buffer for streaming file I/O.
-pub struct FileBuf {
-    buf: Vec<u8>,
+fn stream_read_chunks(
+    path: &Path, buf: &mut [u8], mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<u64> {
+    let mut reader = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    advise_file(&reader, reader.metadata().map_or(0, |meta| meta.len()), false);
+    let mut total = 0u64;
+    loop {
+        let read_n = reader.read(buf)?;
+        if read_n == 0 { break; }
+        on_chunk(&buf[..read_n])?;
+        total += read_n as u64;
+    }
+    advise_file(&reader, total, true);
+    Ok(total)
 }
 
+/// Reusable O(1) 64 KiB scratch buffer for streaming file I/O.
+pub struct FileBuf { buf: Vec<u8> }
+
 impl FileBuf {
-    pub fn new() -> Self {
-        Self { buf: vec![0u8; FILE_BUF_SIZE] }
-    }
+    pub fn new() -> Self { Self { buf: vec![0u8; FILE_BUF_SIZE] } }
 
     pub fn hash_file_blake3(&mut self, path: &Path) -> Result<(u64, String)> {
-        let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
-        advise_file(&f, file_len, false);
-
         let mut hasher = blake3::Hasher::new();
-        let mut total = 0u64;
-        loop {
-            let n = f.read(&mut self.buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&self.buf[..n]);
-            total += n as u64;
-        }
-        advise_file(&f, total, true);
+        let total = stream_read_chunks(path, &mut self.buf, |chunk| {
+            hasher.update(chunk);
+            Ok(())
+        })?;
         Ok((total, hasher.finalize().to_hex().to_string()))
     }
 }
 
-impl Default for FileBuf {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+impl Default for FileBuf { fn default() -> Self { Self::new() } }
 
 /// Write the standard 43-byte `CACHEDIR.TAG` marker inside `dir`.
 pub fn ensure_cachedir_tag(dir: &Path) {
@@ -227,71 +178,74 @@ pub fn ensure_cachedir_tag(dir: &Path) {
 
 #[inline]
 pub fn has_cachedir_tag(dir: &Path) -> bool {
-    let Ok(mut f) = File::open(dir.join("CACHEDIR.TAG")) else { return false };
+    let Ok(mut file) = File::open(dir.join("CACHEDIR.TAG")) else { return false };
     let mut head = [0u8; 43];
-    f.read_exact(&mut head).is_ok()
+    file.read_exact(&mut head).is_ok()
         && head.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55")
 }
 
 fn advise_file(file: &File, len: u64, dontneed: bool) {
-    #[cfg(target_os = "linux")]
-    {
-        use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
-        let adv = if dontneed && len >= FADV_DONTNEED_MIN {
-            Some(PosixFadviseAdvice::POSIX_FADV_DONTNEED)
-        } else if !dontneed && (FADV_SEQ_MIN..FADV_DONTNEED_MIN).contains(&len) {
-            Some(PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL)
-        } else {
-            None
-        };
-        if let Some(a) = adv { let _ = posix_fadvise(file, 0, 0, a); }
+    cfg_select! {
+        target_os = "linux" => {
+            use rustix::fs::{Advice, fadvise};
+            let adv = if dontneed && len >= FADV_DONTNEED_MIN {
+                Some(Advice::DontNeed)
+            } else if !dontneed && (FADV_SEQ_MIN..FADV_DONTNEED_MIN).contains(&len) {
+                Some(Advice::Sequential)
+            } else { None };
+            if let Some(hint) = adv { let _ = fadvise(file, 0, None, hint); }
+        }
+        _ => { let _ = (file, len, dontneed); }
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = (file, len, dontneed);
 }
 
 /// Cross-OS durability barrier (`fdatasync` on Linux, `F_FULLFSYNC` on macOS, `sync_data` on Win).
 pub fn sync_file_barrier(file: &File) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    if nix::fcntl::fcntl(file, nix::fcntl::FcntlArg::F_FULLFSYNC).is_ok() { return Ok(()); }
+    if rustix::fs::fcntl_fullfsync(file).is_ok() { return Ok(()); }
     file.sync_data()
 }
 
-fn write_atomic_with<T>(target: &Path, write_fn: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
-    let parent = match target.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create parent dir {}", parent.display()))?;
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nonce = u32::from_le_bytes(os_random_bytes::<4>().unwrap_or([0; 4]));
-    let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
-    let tmp = parent.join(format!(".refit.tmp.{}.{seq}.{nonce:08x}.{name}", std::process::id()));
-
-    let outcome = (|| -> Result<T> {
-        let mut f = File::create(&tmp)
-            .with_context(|| format!("create temp file {}", tmp.display()))?;
-        let res = write_fn(&mut f)?;
-        sync_file_barrier(&f)?;
-        advise_file(&f, f.metadata().map(|m| m.len()).unwrap_or(0), true);
-        Ok(res)
-    })();
-    match outcome {
-        Ok(val) => {
-            replace_file(&tmp, target, parent)?;
-            Ok(val)
-        }
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            Err(err)
+fn persist_with_retry(mut tmp: tempfile::NamedTempFile, target: &Path) -> Result<()> {
+    let mut delay_ms = 5u64;
+    for attempt in 0..7 {
+        match tmp.persist(target) {
+            Ok(_) => {
+                #[cfg(unix)]
+                if let Some(parent) = target.parent() && let Ok(dir) = File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+                return Ok(());
+            }
+            Err(err) if cfg!(windows) && err.error.raw_os_error() == Some(5) && attempt < 6 => {
+                tmp = err.file;
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(160);
+            }
+            Err(err) => return Err(err.error).with_context(|| format!("atomic persist {}", target.display())),
         }
     }
+    unreachable!()
+}
+
+fn write_atomic_with<T>(target: &Path, write_fn: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
+    let parent = target
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).with_context(|| format!("create parent dir {}", parent.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temp file in {}", parent.display()))?;
+    let res = write_fn(tmp.as_file_mut())?;
+    sync_file_barrier(tmp.as_file())?;
+    advise_file(tmp.as_file(), tmp.as_file().metadata().map_or(0, |meta| meta.len()), true);
+    persist_with_retry(tmp, target)?;
+    Ok(res)
 }
 
 pub fn write_zstd<T: Serialize>(path: &Path, val: &T) -> Result<()> {
-    write_atomic_with(path, |f| {
-        let mut enc = zstd::stream::Encoder::new(f, 1)?;
+    write_atomic_with(path, |file| {
+        let mut enc = zstd::stream::Encoder::new(file, 1)?;
         let _ = enc.window_log(ZSTD_STREAM_WLOG);
         serde_json::to_writer(&mut enc, val)?;
         enc.finish()?;
@@ -300,37 +254,28 @@ pub fn write_zstd<T: Serialize>(path: &Path, val: &T) -> Result<()> {
 }
 
 pub fn read_zstd<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let f = File::open(path).ok()?;
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    advise_file(&f, len, false);
-    let out = serde_json::from_reader(zstd::stream::Decoder::new(&f).ok()?).ok();
-    advise_file(&f, len, true);
+    let file = File::open(path).ok()?;
+    let len = file.metadata().map_or(0, |meta| meta.len());
+    advise_file(&file, len, false);
+    let out = serde_json::from_reader(zstd::stream::Decoder::new(&file).ok()?).ok();
+    advise_file(&file, len, true);
     out
 }
 
 /// Stream-compress an existing file on disk into `dst` without loading the whole file in RAM.
 pub fn compress_file_zstd(src: &Path, dst: &Path, level: i32) -> Result<(u64, u64)> {
     write_atomic_with(dst, |writer| {
-        let mut reader = File::open(src).with_context(|| format!("open {}", src.display()))?;
-        advise_file(&reader, reader.metadata().map(|m| m.len()).unwrap_or(0), false);
         let mut enc = zstd::stream::Encoder::new(&mut *writer, level)?;
         let _ = enc.window_log(ZSTD_STREAM_WLOG);
-        let (mut buf, mut raw_total) = (vec![0u8; FILE_BUF_SIZE], 0u64);
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 { break; }
-            enc.write_all(&buf[..n])?;
-            raw_total += n as u64;
-        }
-        advise_file(&reader, raw_total, true);
+        let mut buf = vec![0u8; FILE_BUF_SIZE];
+        let raw_total = stream_read_chunks(src, &mut buf, |chunk| Ok(enc.write_all(chunk)?))?;
         enc.finish()?;
-        Ok((raw_total, writer.metadata().map(|m| m.len()).unwrap_or(0)))
+        Ok((raw_total, writer.metadata().map_or(0, |meta| meta.len())))
     })
 }
 
 pub fn mkdir_private(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("create private directory {}", path.display()))?;
+    fs::create_dir_all(path).with_context(|| format!("create private directory {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -347,10 +292,10 @@ pub fn os_random_bytes<const N: usize>() -> Result<[u8; N]> {
 }
 
 pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<()> {
-    write_atomic_with(target, |f| Ok(f.write_all(bytes)?))
+    write_atomic_with(target, |file| Ok(file.write_all(bytes)?))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatEntry { pub mtime_ns: u64, pub size: u64, pub blake3: String }
 
 pub fn file_mtime_size(path: &Path) -> Option<(u64, u64)> {
@@ -360,18 +305,13 @@ pub fn file_mtime_size(path: &Path) -> Option<(u64, u64)> {
 }
 
 pub fn now_unix_ns() -> u64 {
-    let Ok(dur) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return 0;
-    };
-    dur.as_nanos() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |dur| dur.as_nanos() as u64)
 }
 
 /// Trust a stat cache hit when at least 2 seconds elapsed since mtime.
 #[inline]
 pub fn stat_cache_fresh(entry: &StatEntry, mtime_ns: u64, size: u64, now_ns: u64) -> bool {
-    entry.size == size
-        && entry.mtime_ns == mtime_ns
-        && now_ns.saturating_sub(mtime_ns) >= RACY_GIT_NS
+    entry.size == size && entry.mtime_ns == mtime_ns && now_ns.saturating_sub(mtime_ns) >= RACY_GIT_NS
 }
 
 pub fn load_stat_cache(path: &Path) -> BTreeMap<String, StatEntry> {
@@ -383,57 +323,23 @@ pub fn load_stat_cache(path: &Path) -> BTreeMap<String, StatEntry> {
 }
 
 pub fn save_stat_cache(path: &Path, map: &BTreeMap<String, StatEntry>) -> Result<()> {
-    if let Some(p) = path.parent() { ensure_cachedir_tag(p); }
+    if let Some(parent) = path.parent() { ensure_cachedir_tag(parent); }
     write_atomic(path, &zstd::bulk::compress(&encode_stat_map(map), 1)?)
 }
 
-pub fn write_u16_str(out: &mut Vec<u8>, s: &str) {
-    let b = s.as_bytes();
-    let n = b.len().min(u16::MAX as usize);
-    let _ = out.write_u16::<LittleEndian>(n as u16);
-    out.extend_from_slice(&b[..n]);
-}
-
-pub fn read_u16_str(rd: &mut Cursor<&[u8]>) -> Option<String> {
-    let n = rd.read_u16::<LittleEndian>().ok()? as usize;
-    let mut buf = vec![0u8; n];
-    rd.read_exact(&mut buf).ok()?;
-    String::from_utf8(buf).ok()
-}
-
 fn encode_stat_map(map: &BTreeMap<String, StatEntry>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(12 + map.len() * 112);
+    let mut out = Vec::with_capacity(STAT_MAGIC.len() + map.len() * 96);
     out.extend_from_slice(STAT_MAGIC);
-    let _ = out.write_u32::<LittleEndian>(map.len() as u32);
-    for (rel, e) in map {
-        write_u16_str(&mut out, rel);
-        let _ = out.write_u64::<LittleEndian>(e.mtime_ns);
-        let _ = out.write_u64::<LittleEndian>(e.size);
-        write_u16_str(&mut out, &e.blake3);
-    }
+    if let Ok(body) = postcard::to_allocvec(map) { out.extend_from_slice(&body); }
     out
 }
 
 fn decode_stat_map(buf: &[u8]) -> Option<BTreeMap<String, StatEntry>> {
-    if buf.len() < 12 || &buf[..8] != STAT_MAGIC { return None; }
-    let mut rd = Cursor::new(&buf[8..]);
-    let count = rd.read_u32::<LittleEndian>().ok()? as usize;
-    let mut map = BTreeMap::new();
-    for _ in 0..count {
-        let rel = read_u16_str(&mut rd)?;
-        let mtime_ns = rd.read_u64::<LittleEndian>().ok()?;
-        let size = rd.read_u64::<LittleEndian>().ok()?;
-        let blake3 = read_u16_str(&mut rd)?;
-        map.insert(rel, StatEntry { mtime_ns, size, blake3 });
-    }
-    Some(map)
+    postcard::from_bytes(buf.strip_prefix(STAT_MAGIC)?).ok()
 }
 
 /// Cross-OS sidecar lock (`File::lock()` with `O_EXCL` stale-reaper fallback for OverlayFS/WSL2).
-pub enum SidecarLock {
-    OsFile(File),
-    ExclLease(PathBuf),
-}
+pub enum SidecarLock { OsFile(File), ExclLease(PathBuf) }
 
 impl SidecarLock {
     pub fn acquire(lock_path: &Path) -> Result<Self> {
@@ -461,15 +367,15 @@ impl SidecarLock {
 impl Drop for SidecarLock {
     fn drop(&mut self) {
         match self {
-            Self::OsFile(f) => { let _ = f.unlock(); }
-            Self::ExclLease(p) => { let _ = fs::remove_file(p); }
+            Self::OsFile(file) => { let _ = file.unlock(); }
+            Self::ExclLease(path) => { let _ = fs::remove_file(path); }
         }
     }
 }
 
 fn open_lock_file(lock_path: &Path) -> Result<File> {
-    if let Some(p) = lock_path.parent() {
-        fs::create_dir_all(p).with_context(|| format!("create lock dir {}", p.display()))?;
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create lock dir {}", parent.display()))?;
     }
     OpenOptions::new()
         .create(true)
@@ -483,12 +389,11 @@ fn open_lock_file(lock_path: &Path) -> Result<File> {
 fn is_lock_unsupported(err: &io::Error) -> bool {
     #[cfg(unix)]
     if let Some(code) = err.raw_os_error() {
-        let e = nix::errno::Errno::from_raw(code);
-        if e == nix::errno::Errno::EOPNOTSUPP
-            || e == nix::errno::Errno::ENOTSUP
-            || e == nix::errno::Errno::ENOLCK
-            || e == nix::errno::Errno::ENOSYS
-        {
+        let unsupported = code == libc::EOPNOTSUPP
+            || code == libc::ENOTSUP
+            || code == libc::ENOLCK
+            || code == libc::ENOSYS;
+        if unsupported {
             return true;
         }
     }
@@ -496,28 +401,26 @@ fn is_lock_unsupported(err: &io::Error) -> bool {
 }
 
 fn try_acquire_excl_once(lock_path: &Path) -> Result<Option<SidecarLock>> {
-    let name = lock_path.file_name().and_then(|s| s.to_str()).unwrap_or("refit.lock");
+    let name = lock_path.file_name().and_then(|seg| seg.to_str()).unwrap_or("refit.lock");
     let lease = lock_path.with_file_name(format!("{name}.excl"));
     let mut opts = OpenOptions::new();
     opts.create_new(true).write(true);
     match opts.open(&lease) {
-        Ok(mut f) => {
-            let _ = writeln!(f, "{} {}", std::process::id(), now_ms());
+        Ok(mut file) => {
+            let _ = writeln!(file, "{} {}", std::process::id(), now_ms());
             Ok(Some(SidecarLock::ExclLease(lease)))
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
             reap_stale_excl(&lease);
             Ok(None)
         }
-        Err(e) => Err(e.into()),
+        Err(err) => Err(err.into()),
     }
 }
 
 fn acquire_excl_fallback(lock_path: &Path) -> Result<SidecarLock> {
     for attempt in 0..200u64 {
-        if let Some(lock) = try_acquire_excl_once(lock_path)? {
-            return Ok(lock);
-        }
+        if let Some(lock) = try_acquire_excl_once(lock_path)? { return Ok(lock); }
         std::thread::sleep(Duration::from_millis((5 + attempt).min(50)));
     }
     anyhow::bail!("timed out waiting for O_EXCL fallback lock {}", lock_path.display())
@@ -526,204 +429,74 @@ fn acquire_excl_fallback(lock_path: &Path) -> Result<SidecarLock> {
 fn reap_stale_excl(lease: &Path) {
     #[cfg(unix)]
     if let Ok(raw) = fs::read_to_string(lease) {
-        let pid = raw
-            .split_whitespace()
-            .next()
-            .and_then(|s| s.parse::<i32>().ok());
-        if let Some(pid) = pid
-            && pid > 0
+        let token = raw.split_whitespace().next();
+        if let Some(pid) = token
+            .and_then(|tok| tok.parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw)
             && matches!(
-                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-                Ok(()) | Err(nix::errno::Errno::EPERM)
+                rustix::process::test_kill_process(pid),
+                Ok(()) | Err(rustix::io::Errno::PERM)
             )
         {
             return;
         }
     }
-    let Ok(meta) = fs::metadata(lease) else {
-        return;
-    };
-    let stale = meta
-        .modified()
+    let elapsed = fs::metadata(lease)
+        .and_then(|meta| meta.modified())
         .ok()
-        .and_then(|m| m.elapsed().ok())
-        .is_some_and(|age| age > Duration::from_secs(60));
-    if stale {
+        .and_then(|mt| mt.elapsed().ok());
+    if elapsed.is_some_and(|age| age > Duration::from_secs(60)) {
         let _ = fs::remove_file(lease);
     }
 }
 
-#[cfg(windows)]
-fn wide_path(p: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    let mut v: Vec<u16> = p.as_os_str().encode_wide().collect();
-    v.push(0);
-    v
+#[derive(Clone, Copy)]
+struct TupleWeighter(usize);
+
+impl<K, V> quick_cache::Weighter<K, (V, usize)> for TupleWeighter {
+    #[inline] fn weight(&self, _key: &K, val: &(V, usize)) -> u64 { val.1.max(self.0) as u64 }
 }
 
-#[cfg(windows)]
-fn replace_file(src_path: &Path, dst_path: &Path, _parent: &Path) -> Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-    let src = wide_path(src_path);
-    let dst = wide_path(dst_path);
-
-    let mut last_err = None;
-    for attempt in 0..5 {
-        // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 buffers alive for this call.
-        if unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), flags) } != 0 {
-            return Ok(());
-        }
-        last_err = Some(std::io::Error::last_os_error());
-        std::thread::sleep(std::time::Duration::from_millis(10 * (attempt + 1)));
-    }
-
-    let _ = fs::remove_file(src_path);
-    anyhow::bail!("MoveFileExW failed for {}: {:?}", dst_path.display(), last_err)
-}
-
-#[cfg(unix)]
-fn replace_file(src_path: &Path, dst_path: &Path, parent: &Path) -> Result<()> {
-    fs::rename(src_path, dst_path).with_context(|| {
-        let _ = fs::remove_file(src_path);
-        format!("atomic rename {} -> {}", src_path.display(), dst_path.display())
-    })?;
-    if let Ok(dir) = File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
-}
-
-/// Thread-safe byte- and entry-bounded SIEVE cache over `IndexMap` + `FxBuildHasher`.
-struct SieveState<K, V> {
-    map: IndexMap<K, (V, usize, bool), FxBuildHasher>,
-    hand: usize,
-    total_weight: usize,
-    max_entries: usize,
+/// Thread-safe byte- and entry-bounded cache backed by `quick_cache` + `FxBuildHasher`.
+pub struct SieveCache<K, V> {
+    inner: quick_cache::sync::Cache<K, (V, usize), TupleWeighter, FxBuildHasher>,
     max_bytes: usize,
 }
 
-impl<K: Eq + Hash + Clone, V> SieveState<K, V> {
-    fn clamp_hand(&mut self) {
-        self.hand = if self.map.is_empty() { 0 } else { self.hand % self.map.len() };
-    }
-
-    fn evict_one_except(&mut self, protected: Option<&K>) -> bool {
-        let len = self.map.len();
-        if len == 0 || (len == 1 && protected.is_some()) { return false; }
-        let mut idx = self.hand % len;
-        for _ in 0..len.saturating_mul(2).saturating_add(2) {
-            if self.map.get_index(idx).is_some_and(|(k, _)| protected == Some(k)) {
-                idx = (idx + 1) % len;
-                continue;
-            }
-            let visited = self
-                .map
-                .get_index_mut(idx)
-                .is_some_and(|(_, (_, _, v))| std::mem::replace(v, false));
-            if !visited {
-                if let Some((_, (_, w, _))) = self.map.shift_remove_index(idx) {
-                    self.total_weight = self.total_weight.saturating_sub(w);
-                }
-                self.hand = idx;
-                self.clamp_hand();
-                return true;
-            }
-            idx = (idx + 1) % len;
-        }
-        false
-    }
-
-    fn insert(&mut self, key: K, val: V, weight: usize) -> Option<V> {
-        let w = weight.max(1);
-        if w > self.max_bytes {
-            let (i, _, (prev, old_w, _)) = self.map.shift_remove_full(&key)?;
-            if i < self.hand {
-                self.hand = self.hand.saturating_sub(1);
-            } else {
-                self.clamp_hand();
-            }
-            self.total_weight = self.total_weight.saturating_sub(old_w);
-            return Some(prev);
-        }
-        if let Some((slot_val, slot_w, visited)) = self.map.get_mut(&key) {
-            self.total_weight = self.total_weight.saturating_sub(*slot_w).saturating_add(w);
-            (*slot_w, *visited) = (w, true);
-            let prev = std::mem::replace(slot_val, val);
-            while self.total_weight > self.max_bytes
-                && self.map.len() > 1
-                && self.evict_one_except(Some(&key))
-            {}
-            return Some(prev);
-        }
-        while (self.map.len() >= self.max_entries
-            || (self.total_weight.saturating_add(w) > self.max_bytes && !self.map.is_empty()))
-            && self.evict_one_except(None)
-        {}
-        self.map.insert(key, (val, w, false));
-        self.total_weight = self.total_weight.saturating_add(w);
-        None
-    }
-}
-
-pub struct SieveCache<K, V> { inner: Mutex<SieveState<K, V>> }
-
 impl<K: Eq + Hash + Clone, V: Clone> SieveCache<K, V> {
     pub fn new(max_entries: usize, max_bytes: usize) -> Self {
-        Self {
-            inner: Mutex::new(SieveState {
-                map: IndexMap::with_hasher(FxBuildHasher),
-                hand: 0,
-                total_weight: 0,
-                max_entries: max_entries.max(1),
-                max_bytes: max_bytes.max(1),
-            }),
-        }
+        let (max_entries, max_bytes) = (max_entries.max(1), max_bytes.max(1));
+        let opts = quick_cache::OptionsBuilder::new()
+            .estimated_items_capacity(max_entries).weight_capacity(max_bytes as u64)
+            .hot_allocation(1.0).build().expect("valid cache options");
+        let inner = quick_cache::sync::Cache::with_options(
+            opts, TupleWeighter((max_bytes / max_entries).max(1)), FxBuildHasher,
+            quick_cache::sync::DefaultLifecycle::default(),
+        );
+        Self { inner, max_bytes }
     }
 
-    pub fn get(&self, key: &K) -> Option<V> {
-        let mut g = self.inner.lock();
-        let (v, _, visited) = g.map.get_mut(key)?;
-        *visited = true;
-        Some(v.clone())
-    }
+    pub fn get(&self, key: &K) -> Option<V> { self.inner.get(key).map(|(val, _)| val) }
 
     pub fn insert(&self, key: K, val: V, weight_bytes: usize) -> Option<V> {
-        self.inner.lock().insert(key, val, weight_bytes)
+        let weight = weight_bytes.max(1);
+        let prev = self.inner.remove(&key).map(|(_, (old, _))| old);
+        if weight <= self.max_bytes { self.inner.insert(key, (val, weight)); }
+        prev
     }
 
     pub fn get_or_insert_with(&self, key: K, weight_bytes: usize, make: impl FnOnce() -> V) -> V {
-        let mut g = self.inner.lock();
-        if let Some((v, _, visited)) = g.map.get_mut(&key) {
-            *visited = true;
-            return v.clone();
-        }
-        let val = make();
-        g.insert(key, val.clone(), weight_bytes);
+        let weight = weight_bytes.max(1);
+        if weight > self.max_bytes { return self.get(&key).unwrap_or_else(make); }
+        let Ok((val, _)) = self
+            .inner
+            .get_or_insert_with(&key, || Ok::<_, std::convert::Infallible>((make(), weight)));
         val
     }
 
-    pub fn remove(&self, key: &K) -> Option<V> {
-        let mut g = self.inner.lock();
-        let (v, w, _) = g.map.swap_remove(key)?;
-        g.total_weight = g.total_weight.saturating_sub(w);
-        g.clamp_hand();
-        Some(v)
-    }
-
-    pub fn len(&self) -> usize { self.inner.lock().map.len() }
-
-    pub fn snapshot(&self) -> Vec<(K, V)> {
-        let guard = self.inner.lock();
-        guard
-            .map
-            .iter()
-            .map(|(k, (v, _, _))| (k.clone(), v.clone()))
-            .collect()
-    }
+    pub fn remove(&self, key: &K) -> Option<V> { self.inner.remove(key).map(|(_, (val, _))| val) }
+    pub fn len(&self) -> usize { self.inner.len() }
+    pub fn snapshot(&self) -> Vec<(K, V)> { self.inner.iter().map(|(key, (val, _))| (key, val)).collect() }
 }
 
 /// Lock-free monotonic epoch registry (`global_epoch` + 64 atomic key slots).
@@ -745,13 +518,12 @@ impl EpochRegistry {
 
     #[inline]
     fn slot_idx(key: &str) -> usize {
-        let mut h = FxHasher::default();
-        key.hash(&mut h);
-        (h.finish() as usize) & (EPOCH_SLOTS - 1)
+        let mut hasher = FxHasher::default();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) & (EPOCH_SLOTS - 1)
     }
 
-    #[inline]
-    pub fn slot_epoch(&self, key: &str) -> u64 {
+    #[inline] pub fn slot_epoch(&self, key: &str) -> u64 {
         self.slots[Self::slot_idx(key)].load(Ordering::Acquire)
     }
 
@@ -768,27 +540,21 @@ impl EpochRegistry {
     pub fn publish_batch(&self, module_id: &str, files: &[String], _head_rev: u64) -> u64 {
         let next = self.global_epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         self.slots[Self::slot_idx(module_id)].fetch_max(next, Ordering::Release);
-        for f in files { self.slots[Self::slot_idx(f)].fetch_max(next, Ordering::Release); }
+        for rel in files { self.slots[Self::slot_idx(rel)].fetch_max(next, Ordering::Release); }
         next
     }
 }
 
-impl Default for EpochRegistry {
-    fn default() -> Self { Self::new() }
-}
+impl Default for EpochRegistry { fn default() -> Self { Self::new() } }
 
 /// Extract trimmed body lines from Go `keyword ( ... )` blocks and single-line `keyword ...` entries.
 pub fn parse_go_block_lines<'a>(txt: &'a str, kw: &str) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut in_block = false;
+    let (mut out, mut in_block) = (Vec::new(), false);
     for raw in txt.lines() {
         let line = raw.trim();
         if in_block {
-            if line.starts_with(')') {
-                in_block = false;
-            } else if !line.is_empty() && !line.starts_with("//") {
-                out.push(line);
-            }
+            if line.starts_with(')') { in_block = false; }
+            else if !line.is_empty() && !line.starts_with("//") { out.push(line); }
             continue;
         }
         let Some(rest) = line.strip_prefix(kw) else { continue };
@@ -796,13 +562,11 @@ pub fn parse_go_block_lines<'a>(txt: &'a str, kw: &str) -> Vec<&'a str> {
         if let Some(body) = after.strip_prefix('(') {
             if let Some(end) = body.find(')') {
                 let inner = body[..end].trim();
-                if !inner.is_empty() && !inner.starts_with("//") {
-                    out.push(inner);
-                }
+                if !inner.is_empty() && !inner.starts_with("//") { out.push(inner); }
             } else {
                 in_block = true;
             }
-        } else if !after.is_empty() && rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+        } else if !after.is_empty() && rest.starts_with(|ch: char| ch.is_ascii_whitespace()) {
             out.push(after);
         }
     }
@@ -810,8 +574,7 @@ pub fn parse_go_block_lines<'a>(txt: &'a str, kw: &str) -> Vec<&'a str> {
 }
 
 const DB_SCHEMES: &[&str] = &[
-    "postgres://", "postgresql://", "mysql://", "mongodb://",
-    "mongodb+srv://", "redis://",
+    "postgres://", "postgresql://", "mysql://", "mongodb://", "mongodb+srv://", "redis://",
 ];
 
 // (prefix, kind, redact_tag, detect_min, redact_min, upper_only)
@@ -838,39 +601,23 @@ const DB_BASE: usize = SECRET_SPECS.len();
 const PEM_IDX: usize = DB_BASE + DB_SCHEMES.len();
 
 static SECRET_AC: LazyLock<AhoCorasick> = LazyLock::new(|| {
-    let mut patterns: Vec<&str> = Vec::with_capacity(PEM_IDX + 1);
-    for &(prefix, _, _, _, _, _) in SECRET_SPECS {
-        patterns.push(prefix);
-    }
-    patterns.extend_from_slice(DB_SCHEMES);
-    patterns.push("-----BEGIN ");
-    AhoCorasickBuilder::new()
-        .match_kind(MatchKind::LeftmostLongest)
-        .build(patterns)
+    let patterns = SECRET_SPECS.iter().map(|spec| spec.0)
+        .chain(DB_SCHEMES.iter().copied()).chain(std::iter::once("-----BEGIN "));
+    AhoCorasickBuilder::new().match_kind(MatchKind::LeftmostLongest).build(patterns)
         .expect("secret aho-corasick")
 });
 
 fn secret_token_len(tail: &str, upper_only: bool) -> usize {
-    if upper_only {
-        tail.bytes()
-            .take_while(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-            .count()
-    } else {
-        tail.bytes()
-            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
-            .count()
-    }
+    tail.bytes().take_while(|byte| {
+        if upper_only { byte.is_ascii_uppercase() || byte.is_ascii_digit() }
+        else { byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') }
+    }).count()
 }
 
 fn db_creds_span(after: &str) -> Option<(usize, &str, &str)> {
-    let end = after
-        .find(['/', ' ', '"', '\'', ')', ']', '\n', '\r'])
-        .unwrap_or(after.len());
+    let end = after.find(['/', ' ', '"', '\'', ')', ']', '\n', '\r']).unwrap_or(after.len());
     let (creds, host) = after[..end].split_once('@')?;
-    if host.is_empty() || !creds.contains(':') {
-        return None;
-    }
-    Some((end, creds, host))
+    (!host.is_empty() && creds.contains(':')).then_some((end, creds, host))
 }
 
 /// Single-pass SIMD secret detection across all 22 prefix/URI/PEM patterns.
@@ -879,18 +626,14 @@ pub fn find_secret(line: &str) -> Option<&'static str> {
     for mat in SECRET_AC.find_iter(line) {
         let pid = mat.pattern().as_usize();
         if pid == PEM_IDX {
-            if line[mat.end()..].contains(PEM_MARKER) {
-                return Some("pem_private_key");
-            }
+            if line[mat.end()..].contains(PEM_MARKER) { return Some("pem_private_key"); }
         } else if pid < DB_BASE {
             let (_, kind, _, dmin, _, upper) = SECRET_SPECS[pid];
             if left_bound(bytes, mat.start()) && secret_token_len(&line[mat.end()..], upper) >= dmin {
                 return Some(kind);
             }
         } else if let Some((_, creds, _)) = db_creds_span(&line[mat.end()..])
-            && !creds.ends_with(':')
-            && !creds.contains("${")
-            && !creds.contains("REDACTED")
+            && !creds.ends_with(':') && !creds.contains("${") && !creds.contains("REDACTED")
         {
             return Some("database_credential_url");
         }
@@ -898,257 +641,285 @@ pub fn find_secret(line: &str) -> Option<&'static str> {
     None
 }
 
-fn consume_pem_block(s: &str, end: usize) -> Option<usize> {
-    let hdr_rel = s[end..].find(PEM_MARKER)?;
-    let tail_start = end + hdr_rel + PEM_MARKER.len();
-    let tail = &s[tail_start..];
-    let Some(end_rel) = tail.find("-----END ") else { return Some(s.len()) };
-    let Some(close_rel) = tail[end_rel..].find(PEM_MARKER) else { return Some(s.len()) };
+fn consume_pem_block(text: &str, end: usize) -> Option<usize> {
+    let tail_start = end + text[end..].find(PEM_MARKER)? + PEM_MARKER.len();
+    let tail = &text[tail_start..];
+    let Some(end_rel) = tail.find("-----END ") else { return Some(text.len()) };
+    let Some(close_rel) = tail[end_rel..].find(PEM_MARKER) else { return Some(text.len()) };
     Some(tail_start + end_rel + close_rel + PEM_MARKER.len())
 }
 
 /// Single-pass SIMD secret redaction across all secret prefixes, DB URIs, and PEM blocks.
-pub fn redact_secrets(s: String) -> String {
-    if SECRET_AC.find(&s).is_none() && !s.contains(PEM_MARKER) {
-        return s;
-    }
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut cursor = 0usize;
+pub fn redact_secrets(text: String) -> String {
+    if SECRET_AC.find(&text).is_none() && !text.contains(PEM_MARKER) { return text; }
+    let bytes = text.as_bytes();
+    let (mut out, mut cursor) = (String::with_capacity(text.len()), 0usize);
 
-    for mat in SECRET_AC.find_iter(&s) {
+    for mat in SECRET_AC.find_iter(&text) {
         if mat.start() < cursor { continue; }
         let pid = mat.pattern().as_usize();
         if pid == PEM_IDX {
-            if let Some(next_pos) = consume_pem_block(&s, mat.end()) {
-                out.push_str(&s[cursor..mat.start()]);
+            if let Some(next_pos) = consume_pem_block(&text, mat.end()) {
+                out.push_str(&text[cursor..mat.start()]);
                 out.push_str("[REDACTED_PEM_PRIVATE_KEY]");
                 cursor = next_pos;
             }
         } else if pid < DB_BASE {
             let (_, _, tag, _, rmin, _) = SECRET_SPECS[pid];
-            let skip = secret_token_len(&s[mat.end()..], false);
+            let skip = secret_token_len(&text[mat.end()..], false);
             if left_bound(bytes, mat.start()) && skip >= rmin {
-                out.push_str(&s[cursor..mat.start()]);
+                out.push_str(&text[cursor..mat.start()]);
                 out.push_str(tag);
                 cursor = mat.end() + skip;
             }
-        } else if let Some((span_end, _, host)) = db_creds_span(&s[mat.end()..]) {
-            out.push_str(&s[cursor..mat.end()]);
+        } else if let Some((span_end, _, host)) = db_creds_span(&text[mat.end()..]) {
+            out.push_str(&text[cursor..mat.end()]);
             out.push_str("REDACTED:REDACTED@");
             out.push_str(host);
             cursor = mat.end() + span_end;
         }
     }
+    out.push_str(&text[cursor..]);
+    if out.contains(PEM_MARKER) { out.replace(PEM_MARKER, "REDACTED_PRIVATE_KEY-----") } else { out }
+}
 
-    out.push_str(&s[cursor..]);
-    if out.contains(PEM_MARKER) {
-        out.replace(PEM_MARKER, "REDACTED_PRIVATE_KEY-----")
+#[cfg(test)]
+use crate::testutil::{TempRepo, TestRng};
+
+#[cfg(test)]
+#[test]
+fn atomic_io_and_clock() {
+    let dir = TempRepo::with_files("plat_io", &[
+        (".gitignore", "ignored_gen/\n*.generated.py\n"),
+        (".refitignore", "custom_skip/\n"),
+        ("src/keep.rs", "pub fn keep() {}\n"),
+        (".git/HEAD", "ref: refs/heads/main\n"),
+        ("node_modules/pkg/index.js", "module.exports = 1;\n"),
+        ("target/debug/bin.rs", "fn main() {}\n"),
+        (".refit/cas/blob", "x"),
+        ("ignored_gen/junk.py", "x = 1\n"),
+        ("src/auto.generated.py", "x = 2\n"),
+        ("custom_skip/skip.ts", "export const x = 1;\n"),
+    ]);
+    let rels: Vec<String> = walk_files(dir.path(), None)
+        .iter()
+        .filter_map(|path| crate::source::rel_norm(dir.path(), path))
+        .collect();
+    assert_eq!(rels, vec![".gitignore", ".refitignore", "src/keep.rs"]);
+
+    let target = dir.join("state.json");
+    for rev in 0..25 {
+        let payload = format!("{{\"rev\":{rev}}}");
+        write_atomic(&target, payload.as_bytes()).unwrap();
+        assert_eq!(dir.read("state.json"), payload);
+    }
+
+    let mut prev = now_ms();
+    for _ in 0..10_000 {
+        let cur = now_ms();
+        assert!(cur >= prev);
+        prev = cur;
+    }
+
+    let big = dir.join("big.txt");
+    fs::write(&big, "hello\n".repeat(4000)).unwrap();
+    let (len, hex) = FileBuf::new().hash_file_blake3(&big).unwrap();
+    let raw = fs::read(&big).unwrap();
+    assert_eq!((len, hex), (raw.len() as u64, blake3::hash(&raw).to_hex().to_string()));
+}
+
+#[cfg(test)]
+#[test]
+fn sidecar_lock_and_cmd() {
+    let dir = TempRepo::new("plat_lock");
+    let lp = dir.join(".refit/test.lock");
+    let lk = SidecarLock::acquire(&lp).unwrap();
+    assert!(SidecarLock::try_acquire(&lp).unwrap().is_none());
+    drop(lk);
+
+    let lk2 = SidecarLock::try_acquire(&lp).unwrap().expect("lock reacquired");
+    assert!(SidecarLock::try_acquire(&lp).unwrap().is_none());
+    drop(lk2);
+
+    let cwd = std::env::temp_dir();
+    let (prog, flag, slow_cmd) = if cfg!(windows) {
+        ("cmd", "/C", "ping -n 5 127.0.0.1 >nul")
     } else {
-        out
+        ("sh", "-c", "sleep 3")
+    };
+    let run = |cmd: &str, ms: u64| {
+        run_cmd(prog, &[flag.into(), cmd.into()], &cwd, &[], false, ms).unwrap()
+    };
+
+    let ok = run("echo ok", 5_000);
+    let ok_out = ok.stdout.trim().to_ascii_lowercase();
+    assert_eq!((ok.exit_code, ok.timed_out, ok_out.as_str()), (0, false, "ok"));
+
+    let slow = run(slow_cmd, 150);
+    assert_eq!((slow.timed_out, slow.exit_code), (true, -1));
+}
+
+#[cfg(test)]
+#[test]
+fn http_and_retry_logic() {
+    let _c1 = new_http(concat!("refit-probe/", env!("CARGO_PKG_VERSION")), 30, 16).unwrap();
+    let _c2 = stream_http(concat!("refit-stream/", env!("CARGO_PKG_VERSION")), 15, 600, 16)
+        .unwrap();
+    for code in [200, 201, 204, 400, 401, 403, 404, 422, 432] {
+        assert!(!is_retryable(code), "code={code}");
+    }
+    assert!(is_quota_exhausted(432) && !is_quota_exhausted(429));
+    for code in [408, 429, 500, 502, 503, 504, 529] {
+        assert!(is_retryable(code), "code={code}");
+    }
+
+    let cases = [
+        ("3", Some(3_000)),
+        ("1.5", Some(1_500)),
+        ("9999", Some(30_000)),
+        ("-5", None),
+        ("bad", None),
+    ];
+    for (raw, want) in cases {
+        assert_eq!(retry_ms(raw, 30_000), want);
+    }
+
+    let soon = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(5));
+    assert!((2_000..=6_500).contains(&retry_ms(&soon, 30_000).unwrap()));
+    let far = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(3600));
+    assert_eq!(retry_ms(&far, 15_000), Some(15_000));
+    assert_eq!(backoff_ms(0, 200, 10_000, Some(4_500), 1), 4_500);
+    assert_ne!(
+        backoff_ms(2, 200, 10_000, None, 11),
+        backoff_ms(2, 200, 10_000, None, 97)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn secret_detection_redaction() {
+    let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+    let gh = ["ghp_", "1234567890abcdefghij123456"].concat();
+    let db = ["postgres://", "admin:sup3rs3cr3t@db.internal:5432/prod"].concat();
+    let slack = ["xoxa-", "1234567890abcdef1234"].concat();
+    let pem = [
+        "-----BEGIN RSA ",
+        "PRIVATE KEY-----\nMIIEpAIBAAKCAQEASuperSecretBodyPayload==\n",
+        "-----END RSA PRIVATE KEY-----",
+    ]
+    .concat();
+    let multi =
+        "docs = 'postgres://localhost/db' prod = 'postgres://admin:p4ssw0rd@db.prod:5432/app'";
+
+    let samples = [
+        (format!("key = \"{aws}\""), Some("aws_access_key_id")),
+        (format!("tok = '{gh}'"), Some("github_pat")),
+        (db.clone(), Some("database_credential_url")),
+        (pem.clone(), Some("pem_private_key")),
+        (multi.into(), Some("database_credential_url")),
+        ("let normal = \"hello_world\";".into(), None),
+    ];
+    for (sample, want) in samples {
+        assert_eq!(find_secret(&sample), want);
+    }
+
+    let red = redact_secrets(format!("a={aws} b={gh} c={db} s={slack} p={pem}"));
+    let leaks = [
+        aws.as_str(),
+        gh.as_str(),
+        slack.as_str(),
+        "sup3rs3cr3t",
+        "SuperSecretBodyPayload",
+    ];
+    for leak in leaks {
+        assert!(!red.contains(leak), "leaked {leak}");
+    }
+    for tag in ["REDACTED_AWS_", "REDACTED_GITHUB_", "REDACTED_SLACK_"] {
+        assert!(red.contains(tag));
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testutil::{TempRepo, TestRng};
-    use std::time::Duration;
-
-    #[test]
-    fn atomic_io_clock_and_cmd() {
-        let dir = TempRepo::with_files(
-            "plat_io",
-            &[
-                (".gitignore", "ignored_gen/\n*.generated.py\n"),
-                (".refitignore", "custom_skip/\n"),
-                ("src/keep.rs", "pub fn keep() {}\n"),
-                (".git/HEAD", "ref: refs/heads/main\n"),
-                ("node_modules/pkg/index.js", "module.exports = 1;\n"),
-                ("target/debug/bin.rs", "fn main() {}\n"),
-                (".refit/cas/blob", "x"),
-                ("ignored_gen/junk.py", "x = 1\n"),
-                ("src/auto.generated.py", "x = 2\n"),
-                ("custom_skip/skip.ts", "export const x = 1;\n"),
-            ],
-        );
-        let rels: Vec<String> = walk_files(dir.path(), None)
-            .iter()
-            .filter_map(|p| crate::source::rel_norm(dir.path(), p))
-            .collect();
-        assert_eq!(rels, vec![".gitignore", ".refitignore", "src/keep.rs"]);
-
-        let target = dir.join("state.json");
-        for i in 0..25 {
-            let payload = format!("{{\"rev\":{i}}}");
-            write_atomic(&target, payload.as_bytes()).unwrap();
-            assert_eq!(dir.read("state.json"), payload);
-        }
-        let mut prev = now_ms();
-        for _ in 0..10_000 {
-            let cur = now_ms();
-            assert!(cur >= prev);
-            prev = cur;
-        }
-
-        let big = dir.join("big.txt");
-        fs::write(&big, "hello\n".repeat(4000)).unwrap();
-        let (len, hex) = FileBuf::new().hash_file_blake3(&big).unwrap();
-        let raw = fs::read(&big).unwrap();
-        assert_eq!((len, hex), (raw.len() as u64, blake3::hash(&raw).to_hex().to_string()));
-
-        let lp = dir.join(".refit/test.lock");
-        let lk = SidecarLock::acquire(&lp).unwrap();
-        assert!(SidecarLock::try_acquire(&lp).unwrap().is_none());
-        drop(lk);
-        let lk2 = SidecarLock::try_acquire(&lp).unwrap().expect("lock reacquired");
-        assert!(SidecarLock::try_acquire(&lp).unwrap().is_none());
-        drop(lk2);
-
-        let cwd = std::env::temp_dir();
-        let (prog, flag, slow_cmd) = if cfg!(windows) {
-            ("cmd", "/C", "ping -n 5 127.0.0.1 >nul")
-        } else {
-            ("sh", "-c", "sleep 3")
-        };
-        let run = |s: &str, ms: u64| run_cmd(prog, &[flag.into(), s.into()], &cwd, &[], false, ms).unwrap();
-        let ok = run("echo ok", 5_000);
-        assert_eq!((ok.exit_code, ok.timed_out, ok.stdout.trim().to_ascii_lowercase().as_str()), (0, false, "ok"));
-        let slow = run(slow_cmd, 150);
-        assert_eq!((slow.timed_out, slow.exit_code), (true, -1));
+#[test]
+fn stat_bin_migrates_stale() {
+    let tmp = TempRepo::new("io_stat_mig");
+    let cache = tmp.join(".refit/cache/stat.bin");
+    let mut stale_lz4 = vec![12, 0, 0, 0];
+    stale_lz4.extend_from_slice(b"RFST0001\x00\x00\x00\x00");
+    let stale_zst = zstd::bulk::compress(b"RFST0001\x00\x00\x00\x00", 1).unwrap();
+    for payload in [&stale_lz4, &stale_zst] {
+        write_atomic(&cache, payload).unwrap();
+        assert!(load_stat_cache(&cache).is_empty());
     }
 
-    #[test]
-    fn http_retry_and_secrets() {
-        let _c1 = new_http(concat!("refit-probe/", env!("CARGO_PKG_VERSION")), 30, 16).unwrap();
-        let _c2 = stream_http(concat!("refit-stream/", env!("CARGO_PKG_VERSION")), 15, 600, 16).unwrap();
-        for code in [200, 201, 204, 400, 401, 403, 404, 422, 432] {
-            assert!(!is_retryable(code), "code={code}");
-        }
-        assert!(is_quota_exhausted(432) && !is_quota_exhausted(429));
-        for code in [408, 429, 500, 502, 503, 504, 529] {
-            assert!(is_retryable(code), "code={code}");
-        }
-        for (raw, want) in [("3", Some(3_000)), ("1.5", Some(1_500)), ("9999", Some(30_000)), ("-5", None), ("bad", None)] {
-            assert_eq!(retry_ms(raw, 30_000), want);
-        }
-        let soon = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(5));
-        assert!((2_000..=6_500).contains(&retry_ms(&soon, 30_000).unwrap()));
-        let far = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(3600));
-        assert_eq!(retry_ms(&far, 15_000), Some(15_000));
-        assert_eq!(backoff_ms(0, 200, 10_000, Some(4_500), 1), 4_500);
-        assert_ne!(backoff_ms(2, 200, 10_000, None, 11), backoff_ms(2, 200, 10_000, None, 97));
+    let mtime = 1_000_000_000_000u64;
+    let entry = StatEntry { mtime_ns: mtime, size: 128, blake3: "abcd".into() };
+    save_stat_cache(&cache, &BTreeMap::from([("src/a.rs".into(), entry)])).unwrap();
+    assert!(has_cachedir_tag(&tmp.join(".refit/cache")));
+    assert_eq!(&fs::read(&cache).unwrap()[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+    let loaded = load_stat_cache(&cache);
+    let ent = loaded.get("src/a.rs").unwrap();
+    assert!(!stat_cache_fresh(ent, mtime, 128, mtime + RACY_GIT_NS - 1));
+    assert!(stat_cache_fresh(ent, mtime, 128, mtime + RACY_GIT_NS));
+    assert!(!stat_cache_fresh(ent, mtime, 129, mtime + RACY_GIT_NS));
+}
 
-        let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
-        let gh = ["ghp_", "1234567890abcdefghij123456"].concat();
-        let db = ["postgres://", "admin:sup3rs3cr3t@db.internal:5432/prod"].concat();
-        let slack = ["xoxa-", "1234567890abcdef1234"].concat();
-        let pem = [
-            "-----BEGIN RSA ", "PRIVATE KEY-----\nMIIEpAIBAAKCAQEASuperSecretBodyPayload==\n",
-            "-----END RSA PRIVATE KEY-----",
-        ].concat();
-        let multi = "docs = 'postgres://localhost/db' prod = 'postgres://admin:p4ssw0rd@db.prod:5432/app'";
-        for (sample, want) in [
-            (format!("key = \"{aws}\""), Some("aws_access_key_id")),
-            (format!("tok = '{gh}'"), Some("github_pat")),
-            (db.clone(), Some("database_credential_url")),
-            (pem.clone(), Some("pem_private_key")),
-            (multi.into(), Some("database_credential_url")),
-            ("let normal = \"hello_world\";".into(), None),
-        ] {
-            assert_eq!(find_secret(&sample), want);
-        }
-        let red = redact_secrets(format!("a={aws} b={gh} c={db} s={slack} p={pem}"));
-        for leak in [&aws, &gh, &slack, &"sup3rs3cr3t".to_string(), &"SuperSecretBodyPayload".to_string()] {
-            assert!(!red.contains(leak.as_str()), "leaked {leak}");
-        }
-        assert!(red.contains("REDACTED_AWS_") && red.contains("REDACTED_GITHUB_") && red.contains("REDACTED_SLACK_"));
-    }
-
-    #[test]
-    fn stat_bin_migrates_stale() {
-        let tmp = TempRepo::new("io_stat_mig");
-        let cache = tmp.join(".refit/cache/stat.bin");
-        let mut stale_lz4 = vec![12, 0, 0, 0];
-        stale_lz4.extend_from_slice(b"RFST0001\x00\x00\x00\x00");
-        let stale_zst = zstd::bulk::compress(b"RFST0001\x00\x00\x00\x00", 1).unwrap();
-        for payload in [&stale_lz4, &stale_zst] {
-            write_atomic(&cache, payload).unwrap();
-            assert!(load_stat_cache(&cache).is_empty());
-        }
-
-        let mtime = 1_000_000_000_000u64;
-        let entry = StatEntry { mtime_ns: mtime, size: 128, blake3: "abcd".into() };
-        save_stat_cache(&cache, &BTreeMap::from([("src/a.rs".into(), entry)])).unwrap();
-        assert!(has_cachedir_tag(&tmp.join(".refit/cache")));
-        assert_eq!(&fs::read(&cache).unwrap()[..4], &[0x28, 0xB5, 0x2F, 0xFD]);
-        let loaded = load_stat_cache(&cache);
-        let e = loaded.get("src/a.rs").unwrap();
-        assert!(!stat_cache_fresh(e, mtime, 128, mtime + RACY_GIT_NS - 1));
-        assert!(stat_cache_fresh(e, mtime, 128, mtime + RACY_GIT_NS));
-        assert!(!stat_cache_fresh(e, mtime, 129, mtime + RACY_GIT_NS));
-    }
-
-    fn sieve_step(
-        cache: &SieveCache<u32, u32>, model: &mut BTreeMap<u32, (u32, usize)>,
-        rng: &mut TestRng, step: u32,
-    ) {
-        let k = rng.next_usize(20) as u32;
-        match rng.next_usize(10) {
-            0..=4 => {
-                let w = 1 + rng.next_usize(320);
-                let had = model.get(&k).map(|x| x.0);
-                assert_eq!(cache.insert(k, step, w), had, "step={step} k={k}");
-                if w > 256 {
-                    model.remove(&k);
-                    assert_eq!(cache.get(&k), None);
-                } else {
-                    model.insert(k, (step, w));
-                    assert_eq!(cache.get(&k), Some(step));
-                }
+#[cfg(test)]
+fn sieve_step(
+    cache: &SieveCache<u32, u32>, model: &mut BTreeMap<u32, (u32, usize)>, rng: &mut TestRng, step: u32,
+) {
+    let key = rng.next_usize(20) as u32;
+    match rng.next_usize(10) {
+        0..=4 => {
+            let weight = 1 + rng.next_usize(320);
+            let had = model.get(&key).map(|item| item.0);
+            assert_eq!(cache.insert(key, step, weight), had, "step={step} k={key}");
+            if weight > 256 {
+                model.remove(&key);
+                assert_eq!(cache.get(&key), None);
+            } else {
+                model.insert(key, (step, weight));
+                assert_eq!(cache.get(&key), Some(step));
             }
-            5..=7 => assert_eq!(cache.get(&k), model.get(&k).map(|x| x.0)),
-            _ => assert_eq!(cache.remove(&k), model.remove(&k).map(|x| x.0)),
         }
-        let g = cache.inner.lock();
-        let exact_w: usize = g.map.values().map(|&(_, w, _)| w).sum();
-        assert!(g.total_weight <= g.max_bytes && g.map.len() <= g.max_entries);
-        assert_eq!(g.total_weight, exact_w);
-        for (&ck, &(cv, cw, _)) in &g.map {
-            assert_eq!(model.get(&ck), Some(&(cv, cw)));
-        }
-        model.retain(|mk, _| g.map.contains_key(mk));
+        5..=7 => assert_eq!(cache.get(&key), model.get(&key).map(|item| item.0)),
+        _ => assert_eq!(cache.remove(&key), model.remove(&key).map(|item| item.0)),
     }
+    let entries: Vec<(u32, (u32, usize))> = cache.inner.iter().collect();
+    let exact_w: usize = entries.iter().map(|&(_, (_, weight))| weight).sum();
+    assert!(exact_w <= cache.max_bytes && cache.len() <= 8);
+    for &(ck, (cv, cw)) in &entries { assert_eq!(model.get(&ck), Some(&(cv, cw))); }
+    model.retain(|mk, _| cache.inner.peek(mk).is_some());
+}
 
-    #[test]
-    fn sieve_model_and_byte_cap() {
-        let hot = SieveCache::<&str, u32>::new(3, 1024);
-        for (k, v) in [("hot", 1), ("c1", 2), ("c2", 3)] { hot.insert(k, v, 100); }
-        assert_eq!(hot.get(&"hot"), Some(1));
-        hot.insert("fresh", 4, 100);
-        assert_eq!((hot.len(), hot.get(&"hot"), hot.get(&"fresh")), (3, Some(1), Some(4)));
+#[cfg(test)]
+#[test]
+fn sieve_model_and_byte_cap() {
+    let hot = SieveCache::<&str, u32>::new(3, 1024);
+    for (key, val) in [("hot", 1), ("c1", 2), ("c2", 3)] { hot.insert(key, val, 100); }
+    assert_eq!(hot.get(&"hot"), Some(1));
+    hot.insert("fresh", 4, 100);
+    assert_eq!((hot.len(), hot.get(&"hot"), hot.get(&"fresh")), (3, Some(1), Some(4)));
 
-        let cache = SieveCache::<u32, u32>::new(8, 256);
-        let (mut model, mut rng) = (BTreeMap::new(), TestRng::new(0x51E7_CAFE));
-        for step in 0..1_000u32 {
-            sieve_step(&cache, &mut model, &mut rng, step);
-        }
-    }
+    let cache = SieveCache::<u32, u32>::new(8, 256);
+    let (mut model, mut rng) = (BTreeMap::new(), TestRng::new(0x51E7_CAFE));
+    for step in 0..1_000u32 { sieve_step(&cache, &mut model, &mut rng, step); }
+}
 
-    #[test]
-    fn epoch_single_publish_on_mvcc_commit() {
-        let tmp = TempRepo::with_files("epoch_mvcc", &[("src/a.rs", "pub fn a() -> i32 { 1 }\n")]);
-        let reg = std::sync::Arc::new(EpochRegistry::new());
-        let store = crate::mvcc::MvccStore::open_with_epoch(tmp.path(), "ep", reg.clone()).unwrap();
-        let ep0 = reg.global_epoch();
-        let exp = BTreeMap::from([("src/a.rs".into(), tmp.hash("src/a.rs"))]);
-        let next = BTreeMap::from([("src/a.rs".into(), b"pub fn a() -> i32 { 2 }\n".to_vec())]);
-        let out = store.commit_tx("mod_a", &exp, &next, &[]).unwrap();
-        assert!(matches!(out, crate::mvcc::CommitOutcome::Committed { head_rev: 1, .. }));
+#[cfg(test)]
+#[test]
+fn epoch_single_publish_on_commit() {
+    let tmp = TempRepo::with_files("epoch_mvcc", &[("src/a.rs", "pub fn a() -> i32 { 1 }\n")]);
+    let reg = std::sync::Arc::new(EpochRegistry::new());
+    let store = crate::mvcc::MvccStore::open_with_epoch(tmp.path(), "ep", reg.clone()).unwrap();
+    let ep0 = reg.global_epoch();
+    let exp = BTreeMap::from([("src/a.rs".into(), tmp.hash("src/a.rs"))]);
+    let next = BTreeMap::from([("src/a.rs".into(), b"pub fn a() -> i32 { 2 }\n".to_vec())]);
+    let out = store.commit_tx("mod_a", &exp, &next, &[]).unwrap();
+    std::assert_matches!(out, crate::mvcc::CommitOutcome::Committed { head_rev: 1, .. });
 
-        let ep1 = reg.global_epoch();
-        assert_eq!((ep1, reg.slot_epoch("src/a.rs"), reg.slot_epoch("mod_a")), (ep0 + 1, ep1, ep1));
-        let def = crate::mvcc::MvccStore::open(tmp.path(), "ep-def").unwrap();
-        assert!(std::sync::Arc::ptr_eq(def.epoch_registry(), &EpochRegistry::global_arc()));
-    }
+    let ep1 = reg.global_epoch();
+    assert_eq!((ep1, reg.slot_epoch("src/a.rs"), reg.slot_epoch("mod_a")), (ep0 + 1, ep1, ep1));
+    let def = crate::mvcc::MvccStore::open(tmp.path(), "ep-def").unwrap();
+    assert!(std::sync::Arc::ptr_eq(def.epoch_registry(), &EpochRegistry::global_arc()));
 }

@@ -1,5 +1,5 @@
 pub(crate) mod analysis;
-mod parse;
+pub(crate) mod parse;
 
 use crate::lex::strip_jsonc;
 use crate::mvcc::MvccStore;
@@ -58,66 +58,63 @@ const STEM_SQL: &str = concat!(
 
 #[derive(Debug, Clone)]
 pub struct EdgeScan {
-    pub used_stem: bool,
-    pub index_ms: u64,
-    pub edges: Vec<(String, String)>,
-    pub runtime_edges: Vec<(String, String)>,
+    pub used_stem: bool, pub index_ms: u64,
+    pub edges: Vec<(String, String)>, pub runtime_edges: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct SymbolGraph {
-    pub defs_by_file: BTreeMap<String, Vec<String>>,
-    pub refs_by_file: BTreeMap<String, Vec<String>>,
-    pub imports_by_file: BTreeMap<String, Vec<String>>,
-    pub edges: Vec<(String, String)>,
-    pub runtime_edges: Vec<(String, String)>,
-    pub fan_in: HashMap<String, usize>,
-    pub fan_out: HashMap<String, usize>,
-    pub dead_symbols: Vec<DeadSymbol>,
+    pub defs_by_file: BTreeMap<String, Vec<String>>, pub refs_by_file: BTreeMap<String, Vec<String>>,
+    pub imports_by_file: BTreeMap<String, Vec<String>>, pub edges: Vec<(String, String)>,
+    pub runtime_edges: Vec<(String, String)>, pub fan_in: HashMap<String, usize>,
+    pub fan_out: HashMap<String, usize>, pub dead_symbols: Vec<DeadSymbol>,
     pub metrics_by_file: BTreeMap<String, ModuleMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SymbolCache {
-    version: String,
-    files: BTreeMap<String, FileSymbols>,
-    #[serde(default)]
-    test_hashes: BTreeMap<String, (String, Vec<u64>)>,
+    version: String, files: BTreeMap<String, FileSymbols>,
+    #[serde(default)] test_hashes: BTreeMap<String, (String, Vec<u64>)>,
 }
 
 #[derive(Serialize)]
 struct SymbolCacheRef<'a> {
-    version: &'a str,
-    files: &'a BTreeMap<String, FileSymbols>,
+    version: &'a str, files: &'a BTreeMap<String, FileSymbols>,
     test_hashes: &'a BTreeMap<String, (String, Vec<u64>)>,
 }
 
 struct TsConfigScope { pkg_dir: String, aliases: Vec<(String, String)> }
 
 struct LookupTables {
-    all_rels: FxHashSet<String>,
-    mod_to_rel: FxHashMap<String, String>,
-    stem_to_rels: FxHashMap<String, Vec<String>>,
-    go_pkg_rels: FxHashMap<String, Vec<String>>,
-    go_full_pkg_rels: FxHashMap<String, Vec<String>>,
-    ts_scopes: Vec<TsConfigScope>,
+    all_rels: FxHashSet<String>, mod_to_rel: FxHashMap<String, String>,
+    stem_to_rels: FxHashMap<String, Vec<String>>, go_pkg_rels: FxHashMap<String, Vec<String>>,
+    go_full_pkg_rels: FxHashMap<String, Vec<String>>, ts_scopes: Vec<TsConfigScope>,
     rs_crate_roots: Vec<String>,
 }
 
+impl LookupTables {
+    fn lookup_js(&self, base: &str) -> Option<String> {
+        self.mod_to_rel.get(base).or_else(|| self.mod_to_rel.get(&format!("{base}/index"))).cloned()
+    }
+}
+
+fn sorted_pairs(set: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+    let mut out: Vec<_> = set.into_iter().collect();
+    out.sort();
+    out
+}
+
 pub fn locate_stem(hint: Option<&Path>) -> Option<PathBuf> {
-    if let Some(h) = hint.filter(|p| p.exists()) { return Some(h.to_path_buf()); }
-    if let Some(p) = env_trimmed("REFIT_STEM_BIN").map(PathBuf::from).filter(|p| p.exists()) {
-        return Some(p);
-    }
     let bin = if cfg!(windows) { "stem.exe" } else { "stem" };
-    let sibling = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(bin)));
-    if let Some(p) = sibling.filter(|c| c.exists()) {
-        return Some(p);
-    }
-    let local = PathBuf::from(".tools").join(bin);
-    local.exists().then_some(local)
+    [
+        hint.map(Path::to_path_buf),
+        env_trimmed("REFIT_STEM_BIN").map(PathBuf::from),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(bin))),
+        Some(PathBuf::from(".tools").join(bin)),
+    ]
+    .into_iter().flatten().find(|p| p.exists())
 }
 
 pub fn scan_edges(
@@ -132,11 +129,10 @@ pub fn scan_edges(
         disc.used_stem = true;
         rt_set.extend(edge_set.iter().cloned());
     }
-    let mut edges: Vec<(String, String)> = edge_set.into_iter().collect();
-    let mut runtime_edges: Vec<(String, String)> = rt_set.into_iter().collect();
-    edges.sort();
-    runtime_edges.sort();
-    EdgeScan { used_stem: disc.used_stem, index_ms: started.elapsed().as_millis() as u64, edges, runtime_edges }
+    EdgeScan {
+        used_stem: disc.used_stem, index_ms: started.elapsed().as_millis() as u64,
+        edges: sorted_pairs(edge_set), runtime_edges: sorted_pairs(rt_set),
+    }
 }
 
 fn query_ext(repo_root: &Path, hint: Option<&Path>, edge_set: &mut HashSet<(String, String)>) -> bool {
@@ -157,7 +153,7 @@ fn query_ext(repo_root: &Path, hint: Option<&Path>, edge_set: &mut HashSet<(Stri
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
             "protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": { "name": "refit", "version": "0.5.0" }
+            "clientInfo": { "name": "refit", "version": env!("CARGO_PKG_VERSION") }
         }
     });
     let call = json!({
@@ -204,16 +200,11 @@ fn file_query_json(
     norm: &str, defs: &[String], imports: &[String], edges: &[(String, String)],
     fan_in: usize, fan_out: usize,
 ) -> Value {
-    let deps: Vec<String> = edges
-        .iter()
-        .filter(|(s, _)| s == norm)
-        .map(|(_, d)| d.clone())
-        .collect();
-    let dependents: Vec<String> = edges
-        .iter()
-        .filter(|(_, d)| d == norm)
-        .map(|(s, _)| s.clone())
-        .collect();
+    let (mut deps, mut dependents) = (Vec::new(), Vec::new());
+    for (s, d) in edges {
+        if s == norm { deps.push(d.as_str()); }
+        if d == norm { dependents.push(s.as_str()); }
+    }
     json!({
         "file": norm, "defs": defs, "imports": imports,
         "deps": deps, "dependents": dependents, "fan_in": fan_in, "fan_out": fan_out
@@ -226,9 +217,7 @@ pub fn query_symbols(repo_root: &Path, symbol: Option<&str>, file: Option<&str>)
         if let Some(hit) = query_file_sst(repo_root, CACHE_VERSION, &norm) {
             let fan_in = hit.runtime_edges.iter().filter(|(_, d)| d == &norm).count();
             let fan_out = hit.runtime_edges.iter().filter(|(s, _)| s == &norm).count();
-            return file_query_json(
-                &norm, &hit.sym.defs, &hit.sym.imports, &hit.edges, fan_in, fan_out,
-            );
+            return file_query_json(&norm, &hit.sym.defs, &hit.sym.imports, &hit.edges, fan_in, fan_out);
         }
     }
     query_symbol_graph(&load_symbols(repo_root, None), symbol, file)
@@ -236,18 +225,13 @@ pub fn query_symbols(repo_root: &Path, symbol: Option<&str>, file: Option<&str>)
 
 pub fn query_symbol_graph(snap: &SymbolGraph, symbol: Option<&str>, file: Option<&str>) -> Value {
     if let Some(sym) = symbol {
-        let definers: Vec<String> = snap
-            .defs_by_file
-            .iter()
+        let definers: Vec<&str> = snap.defs_by_file.iter()
             .filter(|(_, defs)| defs.iter().any(|d| d == sym))
-            .map(|(f, _)| f.clone())
+            .map(|(f, _)| f.as_str())
             .collect();
-        let callers: Vec<String> = snap
-            .refs_by_file
-            .iter()
-            .filter(|(f, refs)| !definers.contains(*f) && refs.iter().any(|r| r == sym))
-            .map(|(f, _)| f.clone())
-            .collect();
+        let callers: Vec<&str> = snap.refs_by_file.iter()
+            .filter(|(f, refs)| !definers.contains(&f.as_str()) && refs.iter().any(|r| r == sym))
+            .map(|(f, _)| f.as_str()).collect();
         return json!({
             "symbol": sym, "definers": definers, "callers": callers,
             "is_dead": !definers.is_empty() && callers.is_empty()
@@ -257,8 +241,10 @@ pub fn query_symbol_graph(snap: &SymbolGraph, symbol: Option<&str>, file: Option
         let norm = f.replace('\\', "/");
         let defs = snap.defs_by_file.get(&norm).map(Vec::as_slice).unwrap_or(&[]);
         let imports = snap.imports_by_file.get(&norm).map(Vec::as_slice).unwrap_or(&[]);
-        let fan_in = snap.fan_in.get(&norm).copied().unwrap_or(0);
-        let fan_out = snap.fan_out.get(&norm).copied().unwrap_or(0);
+        let (fan_in, fan_out) = (
+            snap.fan_in.get(&norm).copied().unwrap_or(0),
+            snap.fan_out.get(&norm).copied().unwrap_or(0),
+        );
         return file_query_json(&norm, defs, imports, &snap.edges, fan_in, fan_out);
     }
     json!({
@@ -284,23 +270,15 @@ pub fn index_stats(repo_root: &Path) -> (EdgeScan, usize, usize) {
 
 fn resolve_tsconfig_base(rel_dir: &str, base_url: &str) -> String {
     let clean = base_url.trim_start_matches("./").trim_matches('/');
-    if rel_dir.is_empty() {
-        clean.to_string()
-    } else if clean.is_empty() || clean == "." {
-        rel_dir.to_string()
-    } else {
-        format!("{rel_dir}/{clean}")
-    }
+    if rel_dir.is_empty() { clean.to_string() }
+    else if clean.is_empty() || clean == "." { rel_dir.to_string() }
+    else { format!("{rel_dir}/{clean}") }
 }
 
 fn map_tsconfig_target(effective_base: &str, raw_target: &str) -> String {
-    if effective_base.is_empty() || effective_base == "." {
-        raw_target.to_string()
-    } else if raw_target.is_empty() {
-        format!("{effective_base}/")
-    } else {
-        join_rel(effective_base, raw_target)
-    }
+    if effective_base.is_empty() || effective_base == "." { raw_target.to_string() }
+    else if raw_target.is_empty() { format!("{effective_base}/") }
+    else { join_rel(effective_base, raw_target) }
 }
 
 fn apply_tsconfig_paths(
@@ -327,9 +305,7 @@ fn load_tsconfig_resolved(repo_root: &Path, cfg_path: &Path, depth: usize) -> (S
         let mut parent = cfg_dir.join(ext_rel);
         if !parent.exists() && parent.extension().is_none() { parent.set_extension("json"); }
         load_tsconfig_resolved(repo_root, &dunce::canonicalize(&parent).unwrap_or(parent), depth + 1)
-    } else {
-        (String::new(), Vec::new())
-    };
+    } else { (String::new(), Vec::new()) };
     let canon_root = dunce::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let canon_dir = dunce::canonicalize(cfg_dir).unwrap_or_else(|_| cfg_dir.to_path_buf());
     let rel_dir = rel_norm(&canon_root, &canon_dir).or_else(|| rel_norm(repo_root, cfg_dir)).unwrap_or_default();
@@ -337,51 +313,36 @@ fn load_tsconfig_resolved(repo_root: &Path, cfg_path: &Path, depth: usize) -> (S
         base = resolve_tsconfig_base(&rel_dir, base_url);
     }
     if let Some(paths) = val["compilerOptions"]["paths"].as_object() {
-        let eff = if base.is_empty() { rel_dir.as_str() } else { base.as_str() };
-        apply_tsconfig_paths(paths, eff, &mut aliases);
+        apply_tsconfig_paths(paths, if base.is_empty() { &rel_dir } else { &base }, &mut aliases);
     }
     (base, aliases)
 }
 
 fn discover_ts_scopes(repo_root: &Path, pre_ts_configs: Option<&[PathBuf]>) -> Vec<TsConfigScope> {
-    let mut cfg_paths = Vec::new();
-    if let Some(found) = pre_ts_configs {
-        cfg_paths.extend(found.iter().cloned());
-    } else {
+    let mut cfg_paths: Vec<PathBuf> = pre_ts_configs.map(<[PathBuf]>::to_vec).unwrap_or_else(|| {
         let root_cfg = repo_root.join("tsconfig.json");
-        if root_cfg.exists() { cfg_paths.push(root_cfg); }
+        let mut out = Vec::new();
+        if root_cfg.exists() { out.push(root_cfg); }
         for p in walk_files(repo_root, None) {
-            if let Some(name) = p.file_name().and_then(|s| s.to_str())
-                && matches!(name, "tsconfig.json" | "jsconfig.json") && !cfg_paths.contains(&p)
-            {
-                cfg_paths.push(p);
-            }
+            let is_cfg = p.file_name().and_then(|s| s.to_str())
+                .is_some_and(|n| matches!(n, "tsconfig.json" | "jsconfig.json"));
+            if is_cfg && !out.contains(&p) { out.push(p); }
         }
-    }
-    let mut scopes = Vec::new();
-    for cfg in cfg_paths {
+        out
+    });
+    let mut scopes: Vec<TsConfigScope> = cfg_paths.drain(..).filter_map(|cfg| {
         let (_, aliases) = load_tsconfig_resolved(repo_root, &cfg, 0);
-        if aliases.is_empty() { continue; }
+        if aliases.is_empty() { return None; }
         let pkg_dir = cfg.parent().and_then(|d| rel_norm(repo_root, d)).unwrap_or_default();
-        scopes.push(TsConfigScope { pkg_dir, aliases });
-    }
+        Some(TsConfigScope { pkg_dir, aliases })
+    }).collect();
     scopes.sort_by(|a, b| b.pkg_dir.len().cmp(&a.pkg_dir.len()).then_with(|| a.pkg_dir.cmp(&b.pkg_dir)));
     scopes
 }
 
-fn parse_go_work_dirs(work_text: &str, mod_dirs: &mut Vec<PathBuf>) {
-    for raw in parse_go_block_lines(work_text, "use") {
-        let no_comment = raw.split("//").next().unwrap_or("");
-        let cleaned = no_comment.trim().trim_matches('"').trim_start_matches("./");
-        if !cleaned.is_empty() {
-            mod_dirs.push(PathBuf::from(cleaned));
-        }
-    }
-}
-
 fn read_go_mod_path(go_mod_path: &Path) -> Option<String> {
-    let txt = fs::read_to_string(go_mod_path).ok()?;
-    txt.lines().map(str::trim).find_map(|line| {
+    let raw = fs::read_to_string(go_mod_path).ok()?;
+    raw.lines().map(str::trim).find_map(|line| {
         let mod_path = line.strip_prefix("module ")?.split_whitespace().next()?.trim_matches('"');
         (!mod_path.is_empty()).then(|| mod_path.to_string())
     })
@@ -391,7 +352,11 @@ fn discover_go_modules(repo_root: &Path) -> Vec<(String, String)> {
     let mut mod_dirs = Vec::new();
     if repo_root.join("go.mod").exists() { mod_dirs.push(PathBuf::new()); }
     if let Ok(work) = fs::read_to_string(repo_root.join("go.work")) {
-        parse_go_work_dirs(&work, &mut mod_dirs);
+        for raw in parse_go_block_lines(&work, "use") {
+            let no_cmt = raw.split("//").next().unwrap_or("");
+            let clean = no_cmt.trim().trim_matches('"').trim_start_matches("./");
+            if !clean.is_empty() { mod_dirs.push(PathBuf::from(clean)); }
+        }
     }
     mod_dirs.into_iter().filter_map(|sub| {
         let gm = if sub.as_os_str().is_empty() {
@@ -540,11 +505,11 @@ fn load_cached_symbols(repo_root: &Path) -> SymbolCache {
 }
 
 fn persist_symbol_caches(
-    repo_root: &Path, new_files: &BTreeMap<String, FileSymbols>,
-    new_test_hashes: &BTreeMap<String, (String, Vec<u64>)>,
-    edges: &[(String, String)], runtime_edges: &[(String, String)], prev_len: usize,
+    paths: (&Path, &Path), want_sst: bool, new_files: &BTreeMap<String, FileSymbols>,
+    new_test_hashes: &TestHashMap, edges: &[(String, String)],
+    runtime_edges: &[(String, String)], prev_len: usize,
 ) {
-    let (cache_path, sst_path) = cache_paths(repo_root);
+    let (cache_path, sst_path) = paths;
     if check_wipe_guard(prev_len, new_files.len()) {
         tracing::warn!(
             prev_files = prev_len, new_files = new_files.len(),
@@ -552,17 +517,17 @@ fn persist_symbol_caches(
         );
         return;
     }
-    if should_use_sst(new_files.len(), estimate_symbol_json_bytes(new_files)) {
-        if save_symbol_sst(&sst_path, CACHE_VERSION, new_files, edges, runtime_edges, prev_len)
-            .is_ok_and(|written| written)
+    if want_sst {
+        if save_symbol_sst(sst_path, CACHE_VERSION, new_files, edges, runtime_edges, prev_len)
+            .is_ok_and(|w| w)
         {
-            let _ = fs::remove_file(&cache_path);
+            let _ = fs::remove_file(cache_path);
         }
     } else {
         let next_ref = SymbolCacheRef {
             version: CACHE_VERSION, files: new_files, test_hashes: new_test_hashes,
         };
-        if write_zstd(&cache_path, &next_ref).is_ok() { let _ = fs::remove_file(&sst_path); }
+        if write_zstd(cache_path, &next_ref).is_ok() { let _ = fs::remove_file(sst_path); }
     }
 }
 
@@ -571,13 +536,8 @@ fn discover_internal(
 ) -> (EdgeScan, usize, usize, SymbolGraph) {
     let started = Instant::now();
     let prev = load_cached_symbols(repo_root);
-    let scan: RepoScan = match repo_snap {
-        Some(s) => s.to_repo_scan(),
-        None => scan_files(repo_root, preloaded),
-    };
-    let tables = build_tables(
-        repo_root, &scan.sources, &scan.all, repo_snap.map(|s| s.ts_configs.as_slice()),
-    );
+    let scan: RepoScan = repo_snap.map_or_else(|| scan_files(repo_root, preloaded), RepoSnapshot::to_repo_scan);
+    let tables = build_tables(repo_root, &scan.sources, &scan.all, repo_snap.map(|s| s.ts_configs.as_slice()));
 
     let parsed_rows = par_map(&scan.sources, |(rel, ext, _)| {
         let bytes = read_bytes(repo_root, rel, preloaded)?;
@@ -590,11 +550,7 @@ fn discover_internal(
 
     let (mut parsed_n, mut cached_n, mut new_files) = (0usize, 0usize, BTreeMap::new());
     for (rel, entry, was_parsed) in parsed_rows.into_iter().flatten() {
-        if was_parsed {
-            parsed_n += 1;
-        } else {
-            cached_n += 1;
-        }
+        if was_parsed { parsed_n += 1; } else { cached_n += 1; }
         new_files.insert(rel, entry);
     }
 
@@ -606,7 +562,10 @@ fn discover_internal(
     let (cache_exists, sst_exists) = (cache_path.is_file(), sst_path.is_file());
     let format_mismatch = if want_sst { !sst_exists || cache_exists } else { !cache_exists || sst_exists };
     if parsed_n > 0 || test_changed || prev.files.len() != new_files.len() || format_mismatch {
-        persist_symbol_caches(repo_root, &new_files, &new_test_hashes, &edges, &runtime_edges, prev.files.len());
+        persist_symbol_caches(
+            (&cache_path, &sst_path), want_sst, &new_files, &new_test_hashes,
+            &edges, &runtime_edges, prev.files.len(),
+        );
     }
     let snap = build_graph(new_files, &new_test_hashes, &edges, &runtime_edges, &glob_reexport_targets);
     let edge_scan = EdgeScan {
@@ -643,11 +602,7 @@ fn collect_edges(files: &BTreeMap<String, FileSymbols>, tbl: &LookupTables) -> E
     for (rel, entry) in files {
         collect_file_edges(rel, entry, tbl, &mut edge_set, &mut rt_set, &mut glob_targets);
     }
-    let mut edges: Vec<(String, String)> = edge_set.into_iter().collect();
-    let mut runtime_edges: Vec<(String, String)> = rt_set.into_iter().collect();
-    edges.sort();
-    runtime_edges.sort();
-    (edges, runtime_edges, glob_targets)
+    (sorted_pairs(edge_set), sorted_pairs(rt_set), glob_targets)
 }
 
 fn compute_fan_counts(
@@ -779,9 +734,10 @@ fn strip_js_ext(p: &str) -> &str {
 fn resolve_relative_import(imp: &str, src_dir: &str, tbl: &LookupTables) -> Option<String> {
     if !imp.starts_with("./") && !imp.starts_with("../") { return None; }
     let base = join_rel(src_dir, strip_js_ext(imp));
-    tbl.mod_to_rel.get(&base)
-        .or_else(|| tbl.mod_to_rel.get(&format!("{base}/index"))).cloned()
-        .or_else(|| tbl.all_rels.contains(&base).then_some(base))
+    if let Some(hit) = tbl.lookup_js(&base) {
+        return Some(hit);
+    }
+    tbl.all_rels.contains(&base).then_some(base)
 }
 
 fn resolve_ts_scope_import(imp: &str, src_dir: &str, tbl: &LookupTables) -> Option<String> {
@@ -791,10 +747,9 @@ fn resolve_ts_scope_import(imp: &str, src_dir: &str, tbl: &LookupTables) -> Opti
         if !in_scope { continue; }
         for (alias, target_prefix) in &scope.aliases {
             let Some(rest) = imp.strip_prefix(alias.as_str()) else { continue };
-            let mapped = format!("{target_prefix}{}", strip_js_ext(rest));
-            if let Some(hit) = tbl.mod_to_rel.get(&mapped)
-                .or_else(|| tbl.mod_to_rel.get(&format!("{mapped}/index")))
-            { return Some(hit.clone()); }
+            if let Some(hit) = tbl.lookup_js(&format!("{target_prefix}{}", strip_js_ext(rest))) {
+                return Some(hit);
+            }
         }
     }
     None
@@ -843,7 +798,7 @@ fn resolve_pyrel(imp: &str, src_dir: &str, tbl: &LookupTables) -> Option<String>
 }
 
 fn resolve_stem(imp: &str, src_dir: &str, src_ext: &str, tbl: &LookupTables) -> Vec<String> {
-    let key = imp.strip_prefix("super::").unwrap_or(imp);
+    let key = imp.trim_prefix("super::");
     let Some(cands) = tbl.stem_to_rels.get(key) else { return Vec::new() };
     if !imp.starts_with("super::") && let Some(same) = cands.iter().find(|c| dir_of(c) == src_dir) {
         return vec![same.clone()];
@@ -1051,43 +1006,48 @@ struct SstIndex {
     last_block: Option<(usize, Vec<u8>)>,
 }
 
+fn encode_sst_bytes(entries: &[(&[u8], &[u8])]) -> Result<Option<Vec<u8>>> {
+    let mut raw = vec![0u8; SST_HEADER_LEN];
+    let (mut anchors, mut idx) = (Vec::new(), 0usize);
+    while idx < entries.len() {
+        let end = next_sst_block_end(entries, idx);
+        let block = encode_front_coded_block(&entries[idx..end]);
+        if block.len() > MAX_DECOMP_BLOCK_BYTES {
+            tracing::warn!(block_len = block.len(), "SST block exceeds cap; skipping write");
+            return Ok(None);
+        }
+        let comp = zstd::bulk::compress(&block, 1)?;
+        let (offset, comp_len, raw_len) =
+            (raw.len() as u64, u32::try_from(comp.len())?, u32::try_from(block.len())?);
+        let tag = sst_block_tag(offset, comp_len, raw_len, &comp);
+        anchors.push(BlockAnchor { first_key: entries[idx].0.to_vec(), offset, comp_len, raw_len, tag });
+        raw.extend_from_slice(&comp);
+        idx = end;
+    }
+    let index_offset = raw.len() as u64;
+    for a in &anchors {
+        write_varint(&mut raw, a.first_key.len() as u32);
+        raw.extend_from_slice(&a.first_key);
+        raw.extend_from_slice(&a.offset.to_le_bytes());
+        for word in [a.comp_len, a.raw_len, a.tag] { raw.extend_from_slice(&word.to_le_bytes()); }
+    }
+    raw[0..8].copy_from_slice(SST_MAGIC);
+    raw[8] = 1;
+    raw[10..14].copy_from_slice(&(anchors.len() as u32).to_le_bytes());
+    raw[14..18].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    raw[18..26].copy_from_slice(&index_offset.to_le_bytes());
+    let ftag = blake3_tag(&[&raw[0..26], &raw[index_offset as usize..]]);
+    raw[26..30].copy_from_slice(&ftag.to_le_bytes());
+    Ok(Some(raw))
+}
+
 impl SstIndex {
     fn write_atomic(path: &Path, entries: &[(&[u8], &[u8])], prev_entries: usize) -> Result<bool> {
         if check_wipe_guard(prev_entries, entries.len()) {
             tracing::warn!(prev_entries, new_entries = entries.len(), "SST wipe guard triggered; preserving prior SST");
             return Ok(false);
         }
-        let mut raw = vec![0u8; SST_HEADER_LEN];
-        let (mut anchors, mut idx) = (Vec::new(), 0usize);
-        while idx < entries.len() {
-            let end = next_sst_block_end(entries, idx);
-            let block = encode_front_coded_block(&entries[idx..end]);
-            if block.len() > MAX_DECOMP_BLOCK_BYTES {
-                tracing::warn!(block_len = block.len(), "SST block exceeds cap; skipping write");
-                return Ok(false);
-            }
-            let comp = zstd::bulk::compress(&block, 1)?;
-            let (offset, comp_len, raw_len) =
-                (raw.len() as u64, u32::try_from(comp.len())?, u32::try_from(block.len())?);
-            let tag = sst_block_tag(offset, comp_len, raw_len, &comp);
-            anchors.push(BlockAnchor { first_key: entries[idx].0.to_vec(), offset, comp_len, raw_len, tag });
-            raw.extend_from_slice(&comp);
-            idx = end;
-        }
-        let index_offset = raw.len() as u64;
-        for a in &anchors {
-            write_varint(&mut raw, a.first_key.len() as u32);
-            raw.extend_from_slice(&a.first_key);
-            raw.extend_from_slice(&a.offset.to_le_bytes());
-            for word in [a.comp_len, a.raw_len, a.tag] { raw.extend_from_slice(&word.to_le_bytes()); }
-        }
-        raw[0..8].copy_from_slice(SST_MAGIC);
-        raw[8] = 1;
-        raw[10..14].copy_from_slice(&(anchors.len() as u32).to_le_bytes());
-        raw[14..18].copy_from_slice(&(entries.len() as u32).to_le_bytes());
-        raw[18..26].copy_from_slice(&index_offset.to_le_bytes());
-        let ftag = blake3_tag(&[&raw[0..26], &raw[index_offset as usize..]]);
-        raw[26..30].copy_from_slice(&ftag.to_le_bytes());
+        let Some(raw) = encode_sst_bytes(entries)? else { return Ok(false) };
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             ensure_cachedir_tag(parent);
         }
@@ -1152,9 +1112,13 @@ impl SstIndex {
     fn blocks_decoded(&self) -> usize { self.blocks_decoded }
 }
 
-fn load_symbol_sst(path: &Path, expected_version: &str) -> Option<BTreeMap<String, FileSymbols>> {
+fn open_versioned_sst(path: &Path, expected_version: &str) -> Option<SstIndex> {
     let mut sst = SstIndex::open(path)?;
-    if sst.get(VERSION_KEY).as_deref() != Some(expected_version.as_bytes()) { return None; }
+    (sst.get(VERSION_KEY).as_deref() == Some(expected_version.as_bytes())).then_some(sst)
+}
+
+fn load_symbol_sst(path: &Path, expected_version: &str) -> Option<BTreeMap<String, FileSymbols>> {
+    let mut sst = open_versioned_sst(path, expected_version)?;
     let mut files = BTreeMap::new();
     for (key, val) in sst.decode_all()? {
         if let Some(rel) = key.strip_prefix(b"f:") {
@@ -1183,8 +1147,7 @@ struct FileSstLookup { sym: FileSymbols, edges: Vec<(String, String)>, runtime_e
 
 fn query_file_sst(repo_root: &Path, expected_version: &str, norm_rel: &str) -> Option<FileSstLookup> {
     let (_, sst_path) = cache_paths(repo_root);
-    let mut sst = sst_path.is_file().then(|| SstIndex::open(&sst_path))??;
-    if sst.get(VERSION_KEY).as_deref() != Some(expected_version.as_bytes()) { return None; }
+    let mut sst = sst_path.is_file().then(|| open_versioned_sst(&sst_path, expected_version))??;
     let sym: FileSymbols = serde_json::from_slice(&sst.get(format!("f:{norm_rel}").as_bytes())?).ok()?;
     let disk_bytes = fs::read(repo_root.join(norm_rel)).ok()?;
     if MvccStore::hash_bytes(&disk_bytes) != sym.blake3 { return None; }
@@ -1207,21 +1170,17 @@ mod tests {
             "pub fn base_fn() -> i32 { 1 }\n#[cfg(test)]\nmod tests {\n",
             "    use crate::top::top_fn;\n    #[test] fn t() { assert_eq!(top_fn(), 1); }\n}\n",
         );
-        let auth = "export function verifyToken() { return true; }\nexport function unusedGhost() { return false; }\n";
-        let login = "import { verifyToken } from '../core/auth';\nexport default function Login() { return verifyToken(); }\n";
-        let profile = "import { verifyToken } from '@/core/auth';\nexport function Profile() { return verifyToken(); }\n";
         let dir = TempRepo::with_files("sym_all", &[
             ("tsconfig.json", r#"{"compilerOptions":{"paths":{"@/*":["src/*"]}}}"#),
-            ("src/core/auth.ts", auth),
-            ("src/ui/login.tsx", login),
-            ("src/ui/profile.tsx", profile),
+            ("src/core/auth.ts", "export function verifyToken() { return true; }\nexport function unusedGhost() { return false; }\n"),
+            ("src/ui/login.tsx", "import { verifyToken } from '../core/auth';\nexport default function Login() { return verifyToken(); }\n"),
+            ("src/ui/profile.tsx", "import { verifyToken } from '@/core/auth';\nexport function Profile() { return verifyToken(); }\n"),
             ("src/leaf.rs", leaf),
             ("src/top.rs", "use crate::leaf::base_fn;\npub fn top_fn() -> i32 { base_fn() }\n"),
         ]);
 
         let (d1, p1, c1) = index_stats(dir.path());
-        assert_eq!((p1, c1), (5, 0));
-        assert!(d1.index_ms < 500);
+        assert_eq!((p1, c1, d1.index_ms < 500), (5, 0, true));
 
         let snap = load_symbols(dir.path(), None);
         for (src, dst, want) in [
@@ -1233,9 +1192,7 @@ mod tests {
             assert_eq!(has_edge(&snap.edges, src, dst), want, "{src} -> {dst}");
         }
         assert!(snap.dead_symbols.iter().any(|d| d.symbol == "unusedGhost"));
-
-        let (_, p2, c2) = index_stats(dir.path());
-        assert_eq!((p2, c2), (0, 5));
+        assert_eq!((index_stats(dir.path()).1, index_stats(dir.path()).2), (0, 5));
 
         dir.write("src/top.rs", "use crate::leaf::base_fn;\npub fn top_fn() -> i32 { base_fn() + 1 }\n");
         let (_, p3, c3) = index_stats(dir.path());
@@ -1245,31 +1202,17 @@ mod tests {
     #[test]
     fn dead_symbol_tiers_monorepo() {
         let web_a = concat!(
-            "import type { UserDto } from '@shared/types';\n",
-            "import { liveShared } from '@shared/types';\n",
+            "import type { UserDto } from '@shared/types';\nimport { liveShared } from '@shared/types';\n",
             "export function runWeb(u: UserDto) { return liveShared() + u.id.length; }\n",
         );
         let rules = concat!(
-            "use crate::sub::{\n    mod_helper,\n};\n",
-            "#[unsafe(no_mangle)]\npub extern \"C\" fn abi_export() -> i32 { 1 }\n",
-            "#[ctor::ctor]\npub fn ctor_hook() {}\n",
-            "pub(crate) fn recursive_dead(n: u32) -> u32 {\n",
-            "    if n == 0 { 0 } else { recursive_dead(n - 1) }\n}\n",
-            "pub(crate) fn intra_helper() -> i32 { mod_helper() }\n",
-            "pub fn entry_caller() -> i32 { intra_helper() }\n",
-            "pub(crate) fn test_only_helper() -> i32 { 42 }\n",
-            "#[cfg(test)]\nmod tests {\n",
-            "    fn chk(buf: [u8; 16]) -> usize { buf.len() + super::test_only_helper() as usize }\n}\n",
+            "use crate::sub::{\n    mod_helper,\n};\n#[unsafe(no_mangle)]\npub extern \"C\" fn abi_export() -> i32 { 1 }\n",
+            "#[ctor::ctor]\npub fn ctor_hook() {}\npub(crate) fn recursive_dead(n: u32) -> u32 {\n",
+            "    if n == 0 { 0 } else { recursive_dead(n - 1) }\n}\npub(crate) fn intra_helper() -> i32 { mod_helper() }\n",
+            "pub fn entry_caller() -> i32 { intra_helper() }\npub(crate) fn test_only_helper() -> i32 { 42 }\n",
+            "#[cfg(test)]\nmod tests {\n    fn chk(buf: [u8; 16]) -> usize { buf.len() + super::test_only_helper() as usize }\n}\n",
         );
-        let store_go = concat!(
-            "package store\n//go:linkname LinkedHook runtime.hook\n",
-            "func LinkedHook() int { return 1 }\nfunc UnusedGoFn() int { return 2 }\n",
-        );
-        let handler_go = concat!(
-            "package api\nimport \"example.com/acme/pkg/store\"\n",
-            "func ServeHTTP() int { return store.LinkedHook() }\n",
-        );
-        let dir = TempRepo::with_files("stem_v2_v4", &[
+        let dir = TempRepo::with_files("stem_graph", &[
             ("tsconfig.base.json", r#"{"compilerOptions":{"paths":{"@shared/*":["packages/shared/src/*"]}}}"#),
             ("packages/web/tsconfig.json", r#"{"extends":"../../tsconfig.base.json","compilerOptions":{"paths":{"@web/*":["src/*"]}}}"#),
             ("packages/shared/src/types.ts", "export interface UserDto { id: string }\nexport function liveShared() { return 1; }\n"),
@@ -1279,42 +1222,52 @@ mod tests {
             ("src/sub/mod.rs", "pub fn mod_helper() -> i32 { 7 }\n"),
             ("src/pymod/api.py", "__all__ = ['public_exported']\ndef public_exported():\n    return 1\ndef dead_py_helper():\n    return 2\n"),
             ("go.mod", "module example.com/acme\n\ngo 1.24\n"),
-            ("pkg/store/store.go", store_go),
-            ("pkg/api/handler.go", handler_go),
+            ("pkg/store/store.go", "package store\n//go:linkname LinkedHook runtime.hook\nfunc LinkedHook() int { return 1 }\nfunc UnusedGoFn() int { return 2 }\n"),
+            ("pkg/api/handler.go", "package api\nimport \"example.com/acme/pkg/store\"\nfunc ServeHTTP() int { return store.LinkedHook() }\n"),
         ]);
 
         let (disc, snap) = index_repo(dir.path(), None);
-        assert!(has_edge(&disc.runtime_edges, "src/rules.rs", "src/sub/mod.rs"));
-        assert!(has_edge(&disc.runtime_edges, "packages/web/src/a.ts", "packages/shared/src/types.ts"));
-        assert!(!has_edge(&disc.runtime_edges, "packages/web/src/b.ts", "packages/web/src/a.ts"));
-        assert!(has_edge(&disc.runtime_edges, "pkg/api/handler.go", "pkg/store/store.go"));
-
-        let dead_names: HashMap<&str, Option<&str>> =
-            snap.dead_symbols.iter().map(|d| (d.symbol.as_str(), d.proof_tier.as_deref())).collect();
-        assert_eq!(dead_names.get("recursive_dead"), Some(&Some("T1ProvenDead")));
-        assert_eq!(dead_names.get("dead_py_helper"), Some(&Some("T2LikelyDead")));
-        assert_eq!(dead_names.get("UnusedGoFn"), Some(&Some("T2LikelyDead")));
-        for safe in [
-            "intra_helper", "test_only_helper", "abi_export", "ctor_hook",
-            "public_exported", "LinkedHook", "ServeHTTP",
+        for (src, dst, want) in [
+            ("src/rules.rs", "src/sub/mod.rs", true),
+            ("packages/web/src/a.ts", "packages/shared/src/types.ts", true),
+            ("packages/web/src/b.ts", "packages/web/src/a.ts", false),
+            ("pkg/api/handler.go", "pkg/store/store.go", true),
         ] {
-            assert!(!dead_names.contains_key(safe), "false dead symbol: {safe}");
+            assert_eq!(has_edge(&disc.runtime_edges, src, dst), want, "{src} -> {dst}");
         }
+
+        let dead: HashMap<&str, Option<&str>> =
+            snap.dead_symbols.iter().map(|d| (d.symbol.as_str(), d.proof_tier.as_deref())).collect();
+        for (sym, tier) in [
+            ("recursive_dead", "T1ProvenDead"), ("dead_py_helper", "T2LikelyDead"), ("UnusedGoFn", "T2LikelyDead"),
+        ] {
+            assert_eq!(dead.get(sym), Some(&Some(tier)), "{sym}");
+        }
+        for safe in ["intra_helper", "test_only_helper", "abi_export", "ctor_hook", "public_exported", "LinkedHook", "ServeHTTP"] {
+            assert!(!dead.contains_key(safe), "false dead symbol: {safe}");
+        }
+    }
+
+    fn make_chain_files(count: usize) -> Vec<(String, String)> {
+        let mut big = vec![("src/m_000.rs".to_string(), "pub fn sym_000() -> i32 { 0 }\n".to_string())];
+        for i in 1..count {
+            let p = i - 1;
+            let body = format!(
+                "use crate::m_{p:03}::sym_{p:03};\npub fn sym_{i:03}() -> i32 {{ sym_{p:03}() + {i} }}\n"
+            );
+            big.push((format!("src/m_{i:03}.rs"), body));
+        }
+        big
     }
 
     #[test]
     fn sst_zstd_lazy_and_threshold() {
-        assert!(!should_use_sst(499, 4096));
-        assert_eq!(should_use_sst(500, 4096), cfg!(feature = "sst-storage"));
-        assert_eq!(pkg_id_for_rel("packages/core/src/lib.rs"), "packages/core");
-        assert_eq!(pkg_id_for_rel("src/lib.rs"), "src");
-        assert_eq!(pkg_id_for_rel("lib.rs"), "root");
+        assert!(!should_use_sst(499, 4096) && should_use_sst(500, 4096) == cfg!(feature = "sst-storage"));
+        for (rel, pkg) in [("packages/core/src/lib.rs", "packages/core"), ("src/lib.rs", "src"), ("lib.rs", "root")] {
+            assert_eq!(pkg_id_for_rel(rel), pkg);
+        }
         let (h1, h2) = ([1u8; 32], [2u8; 32]);
-        assert!(
-            package_abi_changed(None, &h1)
-                && !package_abi_changed(Some(&h1), &h1)
-                && package_abi_changed(Some(&h1), &h2)
-        );
+        assert!(package_abi_changed(None, &h1) && !package_abi_changed(Some(&h1), &h1) && package_abi_changed(Some(&h1), &h2));
 
         fn as_pairs(entries: &[(String, String)]) -> Vec<(&str, &str)> {
             entries.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
@@ -1325,39 +1278,26 @@ mod tests {
         let small_repo = TempRepo::with_files("sst_small", &as_pairs(&small));
         let _ = index_repo(small_repo.path(), None);
         assert!(small_repo.join(".refit/cache/symbol_index.zst").is_file());
-        assert!(!small_repo.join(".refit/cache/sym.sst").exists());
-        assert!(!should_use_sst(20, 4096));
+        assert!(!small_repo.join(".refit/cache/sym.sst").exists() && !should_use_sst(20, 4096));
 
-        let mut big = vec![("src/m_000.rs".to_string(), "pub fn sym_000() -> i32 { 0 }\n".to_string())];
-        for i in 1..520 {
-            let p = i - 1;
-            let body = format!(
-                "use crate::m_{p:03}::sym_{p:03};\npub fn sym_{i:03}() -> i32 {{ sym_{p:03}() + {i} }}\n"
-            );
-            big.push((format!("src/m_{i:03}.rs"), body));
-        }
+        let big = make_chain_files(520);
         let big_repo = TempRepo::with_files("sst_big", &as_pairs(&big));
         let (disc, snap) = index_repo(big_repo.path(), None);
         let (zst_path, sst_path) = cache_paths(big_repo.path());
         if cfg!(feature = "sst-storage") {
             assert!(should_use_sst(520, 4096) && sst_path.is_file() && !zst_path.exists());
         } else {
-            let loaded = read_zstd::<Value>(&zst_path).unwrap();
             let files: BTreeMap<String, FileSymbols> =
-                serde_json::from_value(loaded["files"].clone()).unwrap();
+                serde_json::from_value(read_zstd::<Value>(&zst_path).unwrap()["files"].clone()).unwrap();
             assert!(save_symbol_sst(&sst_path, "0.6.0", &files, &disc.edges, &disc.runtime_edges, 0).unwrap());
             let _ = fs::remove_file(&zst_path);
         }
 
         let sst_bytes = fs::read(&sst_path).unwrap();
         assert_eq!(&sst_bytes[0..8], SST_MAGIC);
-        let mut idx = SstIndex::open(&sst_path).unwrap();
-        let decoded = idx.decode_all().unwrap();
+        let decoded = SstIndex::open(&sst_path).unwrap().decode_all().unwrap();
         let raw_json: usize = decoded.iter().map(|(k, v)| k.len() + v.len()).sum();
-        assert!(
-            (sst_bytes.len() as f64) < (raw_json as f64) * 0.35,
-            "sst={}B raw={}B", sst_bytes.len(), raw_json
-        );
+        assert!((sst_bytes.len() as f64) < (raw_json as f64) * 0.35, "sst={}B raw={}B", sst_bytes.len(), raw_json);
 
         let mut lazy = SstIndex::open(&sst_path).unwrap();
         assert_eq!(lazy.blocks_decoded(), 0);
@@ -1365,11 +1305,10 @@ mod tests {
         assert_eq!((lazy.blocks_decoded(), sym_250.defs), (1, vec!["sym_250".to_string()]));
 
         let q_sst = query_symbols(big_repo.path(), None, Some("src/m_250.rs"));
-        assert_eq!(q_sst["defs"], json!(snap.defs_by_file["src/m_250.rs"]));
-        assert_eq!(q_sst["imports"], json!(snap.imports_by_file["src/m_250.rs"]));
         assert_eq!(
-            (&q_sst["fan_in"], &q_sst["fan_out"]),
-            (&json!(snap.fan_in["src/m_250.rs"]), &json!(snap.fan_out["src/m_250.rs"]))
+            (&q_sst["defs"], &q_sst["imports"], &q_sst["fan_in"], &q_sst["fan_out"]),
+            (&json!(snap.defs_by_file["src/m_250.rs"]), &json!(snap.imports_by_file["src/m_250.rs"]),
+             &json!(snap.fan_in["src/m_250.rs"]), &json!(snap.fan_out["src/m_250.rs"]))
         );
 
         let mut bad_footer = sst_bytes.clone();

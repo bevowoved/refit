@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail};
-use constant_time_eq::constant_time_eq;
 use flate2::read::DeflateDecoder;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -235,13 +234,15 @@ pub(super) fn load_verified_override(repo_root: &Path) -> Result<Option<Arc<Reso
     let npz_bytes = read_capped_file(&npz_path, MAX_NPZ_ARCHIVE_BYTES)
         .with_context(|| format!("read weights archive {}", npz_path.display()))?;
 
-    let actual_hex = blake3::hash(&npz_bytes).to_hex().to_string();
-    if !constant_time_eq(actual_hex.as_bytes(), expected_hex.as_bytes()) {
+    let expected = blake3::Hash::from_hex(&expected_hex)
+        .map_err(|_| anyhow!("weights manifest `blake3` must be a 64-char hex digest"))?;
+    let actual = blake3::hash(&npz_bytes);
+    if actual != expected {
         bail!(
             "weights digest mismatch for `{}`: expected {}, got {}",
             npz_path.display(),
             expected_hex,
-            actual_hex
+            actual.to_hex()
         );
     }
 
@@ -329,101 +330,66 @@ fn parse_npy(bytes: &[u8]) -> Result<NpyData> {
     }
 }
 
-fn inflate_entry_capped(method: u16, raw: &[u8]) -> Result<Vec<u8>> {
-    match method {
-        0 => {
-            if raw.len() > MAX_NPY_ENTRY_BYTES {
+fn read_zip_entry_capped(
+    archive: &rawzip::ZipSliceArchive<&[u8]>,
+    entry: &rawzip::ZipFileHeaderRecord<'_>,
+) -> Result<Vec<u8>> {
+    let local = archive.get_entry(entry.wayfinder()).context("read NPZ ZIP entry")?;
+    let mut out = Vec::new();
+    match entry.compression_method() {
+        rawzip::CompressionMethod::STORE => {
+            if local.data().len() > MAX_NPY_ENTRY_BYTES {
                 bail!("stored NPZ entry exceeds {MAX_NPY_ENTRY_BYTES} byte cap");
             }
-            Ok(raw.to_vec())
-        }
-        8 => {
-            let mut out = Vec::new();
-            DeflateDecoder::new(raw)
-                .take((MAX_NPY_ENTRY_BYTES + 1) as u64)
+            local
+                .verifying_reader(local.data())
                 .read_to_end(&mut out)
-                .context("inflate NPZ entry")?;
+                .context("verify stored NPZ entry")?;
+        }
+        rawzip::CompressionMethod::DEFLATE => {
+            if entry.uncompressed_size_hint() > MAX_NPY_ENTRY_BYTES as u64 {
+                bail!("deflated NPZ entry exceeds {MAX_NPY_ENTRY_BYTES} byte zip-bomb cap");
+            }
+            let res = local
+                .verifying_reader(DeflateDecoder::new(local.data()))
+                .take((MAX_NPY_ENTRY_BYTES + 1) as u64)
+                .read_to_end(&mut out);
             if out.len() > MAX_NPY_ENTRY_BYTES {
                 bail!("deflated NPZ entry exceeds {MAX_NPY_ENTRY_BYTES} byte zip-bomb cap");
             }
-            Ok(out)
+            res.context("inflate NPZ entry")?;
         }
-        other => bail!("unsupported ZIP compression method {other}"),
+        other => bail!("unsupported ZIP compression method {other:?}"),
     }
-}
-
-fn add_checked(base: usize, delta: usize, label: &str) -> Result<usize> {
-    base.checked_add(delta).ok_or_else(|| anyhow!("{label}"))
-}
-
-fn read_zip_entry(bytes: &[u8], dir: usize) -> Result<(String, Vec<u8>, usize)> {
-    if le_u32(bytes, dir)? != 0x0201_4b50 {
-        bail!("invalid ZIP central dir at {dir}");
-    }
-    let method = le_u16(bytes, dir + 10)?;
-    let comp = le_u32(bytes, dir + 20)? as usize;
-    let nlen = le_u16(bytes, dir + 28)? as usize;
-    let extra = le_u16(bytes, dir + 30)? as usize;
-    let comment = le_u16(bytes, dir + 32)? as usize;
-    let local = le_u32(bytes, dir + 42)? as usize;
-
-    let name_start = add_checked(dir, 46, "ZIP name offset overflow")?;
-    let name_end = add_checked(name_start, nlen, "ZIP name offset overflow")?;
-    let name_bytes = bytes
-        .get(name_start..name_end)
-        .ok_or_else(|| anyhow!("truncated ZIP name"))?;
-    let name = String::from_utf8_lossy(name_bytes).into_owned();
-
-    if le_u32(bytes, local)? != 0x0403_4b50 {
-        bail!("invalid ZIP local header at {local}");
-    }
-    let lnlen = le_u16(bytes, local + 26)? as usize;
-    let lextra = le_u16(bytes, local + 28)? as usize;
-    let base_local = add_checked(local, 30, "ZIP local offset overflow")?;
-    let hdr_end = add_checked(base_local, lnlen, "ZIP local offset overflow")?;
-    let data_start = add_checked(hdr_end, lextra, "ZIP local offset overflow")?;
-
-    let data_end = add_checked(data_start, comp, "ZIP size overflow")?;
-    let comp_slice = bytes
-        .get(data_start..data_end)
-        .ok_or_else(|| anyhow!("truncated ZIP payload"))?;
-    let unzipped = inflate_entry_capped(method, comp_slice)?;
-
-    let after_extra = add_checked(name_end, extra, "ZIP dir advance overflow")?;
-    let next_dir = add_checked(after_extra, comment, "ZIP dir advance overflow")?;
-    Ok((name, unzipped, next_dir))
+    Ok(out)
 }
 
 pub(super) fn load_weights_from_npz(bytes: &[u8]) -> Result<ResolvedWeights> {
     if bytes.len() > MAX_NPZ_ARCHIVE_BYTES {
         bail!("weights archive size {} exceeds {MAX_NPZ_ARCHIVE_BYTES} byte cap", bytes.len());
     }
-    if bytes.len() < 22 {
-        bail!("weights archive too small ({} bytes)", bytes.len());
-    }
     let hash_prefix = blake3::hash(bytes).to_hex()[..16].to_string();
-    let eocd_lo = bytes.len().saturating_sub(65557);
-    let eocd = (eocd_lo..=bytes.len() - 22)
-        .rev()
-        .find(|&pos| le_u32(bytes, pos).ok() == Some(0x0605_4b50))
-        .ok_or_else(|| anyhow!("missing ZIP EOCD in weights.npz"))?;
-    let count = le_u16(bytes, eocd + 10)? as usize;
-    if count == 0 || count > MAX_ZIP_ENTRIES {
-        bail!("invalid NPZ entry count {count}");
-    }
-    let mut dir = le_u32(bytes, eocd + 16)? as usize;
-    let (mut trits, mut vec_buf, mut meta) = (None, None, None);
+    let archive = rawzip::ZipArchive::from_slice(bytes)
+        .context("missing or invalid ZIP EOCD in weights.npz")?;
+    let mut entries = archive.entries();
+    let (mut count, mut trits, mut vec_buf, mut meta) = (0usize, None, None, None);
 
-    for _ in 0..count {
-        let (name, unzipped, next_dir) = read_zip_entry(bytes, dir)?;
-        let stem = name.strip_suffix(".npy").unwrap_or(&name);
-        match (stem, parse_npy(&unzipped)?) {
+    while let Some(entry) = entries.next_entry().context("read NPZ central directory")? {
+        count += 1;
+        if count > MAX_ZIP_ENTRIES {
+            bail!("invalid NPZ entry count > {MAX_ZIP_ENTRIES}");
+        }
+        let unzipped = read_zip_entry_capped(&archive, &entry)?;
+        let name = String::from_utf8_lossy(entry.file_path().as_bytes());
+        match (name.trim_suffix(".npy"), parse_npy(&unzipped)?) {
             ("trits", NpyData::U8(v)) => trits = Some(v),
             ("vecs", NpyData::F32(v)) => vec_buf = Some(v),
             ("meta", NpyData::Str(s)) => meta = Some(s),
             _ => {}
         }
-        dir = next_dir;
+    }
+    if count == 0 {
+        bail!("invalid NPZ entry count 0");
     }
     let (Some(trits), Some(vec_buf), Some(meta)) = (trits, vec_buf, meta) else {
         bail!("missing required `trits.npy`/`vecs.npy`/`meta.npy` in weights archive");
@@ -626,7 +592,7 @@ fn unpack_raw(trit_buf: &[u8], vec_buf: &[f32], meta_str: &str) -> Result<RawUnp
         let skey = if name == "col_sum_proj" {
             "col_sum_s".to_string()
         } else {
-            format!("{}_s", name.strip_suffix("_w").unwrap_or(&name))
+            format!("{}_s", name.trim_suffix("_w"))
         };
         let trit_slice = flat_trits
             .get(trit_start..)
