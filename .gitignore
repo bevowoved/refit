@@ -6,6 +6,7 @@
 .refit/
 .tools/
 .venv/
+.agents/
 
 # Build & package artifacts
 target/

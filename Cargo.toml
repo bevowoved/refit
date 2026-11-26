@@ -15,7 +15,7 @@ homepage = "https://bevowoved.github.io/refit/"
 repository = "https://github.com/bevowoved/refit"
 keywords = ["code-hygiene", "untangle", "mcp", "refactor", "verification"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = ["fixture/*", "SUBMISSIONS/*", ".refit/*"]
+include = ["Cargo.toml", "Cargo.lock", "README.md", "src/**", "skills/refit/SKILL.md", "vendor/codehygiene/weights.npz", "plugin.json", "mcp.json"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"
