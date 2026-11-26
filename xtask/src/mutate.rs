@@ -136,7 +136,7 @@ pub fn run(repo_root: &Path, out_json: Option<&Path>) -> Result<()> {
 
     println!("=== T14 Mutation Sensitivity Suite ({} Faults) ===", MUTANTS.len());
     let warm = Command::new("cargo")
-        .args(["test", "--offline", "--features", "full", "--bin", "refit", "--no-run"])
+        .args(["test", "--locked", "--features", "full", "--bin", "refit", "--no-run"])
         .current_dir(tmp_root)
         .env("CARGO_TARGET_DIR", &target_dir)
         .output()
