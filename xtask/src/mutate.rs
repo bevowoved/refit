@@ -125,7 +125,7 @@ pub fn run(repo_root: &Path, out_json: Option<&Path>) -> Result<()> {
     let target_dir = std::env::temp_dir().join("refit_t14_cargo_target");
     fs::create_dir_all(&target_dir)?;
 
-    for item in ["Cargo.toml", "Cargo.lock", "src", "tests", "vendor", "xtask"] {
+    for item in ["Cargo.toml", "Cargo.lock", "src", "skills", "tests", "vendor", "xtask"] {
         let src = repo_root.join(item);
         if src.is_dir() {
             copy_tree(&src, &tmp_root.join(item))?;

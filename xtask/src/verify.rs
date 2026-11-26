@@ -690,6 +690,13 @@ fn s12_clones(ctx: &mut Ctx) -> Result<()> {
 fn s13_linux_bench(ctx: &mut Ctx) -> Result<()> {
     if !ctx.want("S13") { return Ok(()); }
     if ctx.skip_linux { ctx.skip("S13", "Linux 1-vCPU Perf & Peak RSS", "skipped via --skip-linux"); return Ok(()); }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        ctx.skip("S13", "Linux 1-vCPU Perf & Peak RSS", "taskset 1-vCPU bench runs on Linux/WSL2");
+        Ok(())
+    }
+    #[cfg(any(windows, target_os = "linux"))]
+    {
     let t0 = Instant::now();
     let (mut errs, mut m) = (Vec::new(), Map::new());
 
@@ -751,13 +758,7 @@ rm -rf "$BENCH_REPO" /tmp/refit-rss.tmp /tmp/refit-jem /tmp/refit-mim /tmp/refit
     let r = run_wsl_bash(&bench_body(&to_wsl_path(&ctx.wt)))?;
     #[cfg(target_os = "linux")]
     let r = run_cmd("bash", &["-c", &bench_body(&ctx.wt.to_string_lossy())], &ctx.wt, &[], None)?;
-    #[cfg(not(any(windows, target_os = "linux")))]
-    {
-        ctx.skip("S13", "Linux 1-vCPU Perf & Peak RSS", "taskset 1-vCPU bench runs on Linux/WSL2");
-        return Ok(());
-    }
 
-    #[cfg(any(windows, target_os = "linux"))]
     {
         if r.code != 0 {
             errs.push(format!("S13 bench failed (exit={}): {}", r.code, r.stderr));
@@ -787,6 +788,7 @@ rm -rf "$BENCH_REPO" /tmp/refit-rss.tmp /tmp/refit-jem /tmp/refit-mim /tmp/refit
         }
         ctx.record("S13", "Linux 1-vCPU Perf & Peak RSS", t0, m, "jem / mim / jem_full measured".into(), errs);
         Ok(())
+    }
     }
 }
 
