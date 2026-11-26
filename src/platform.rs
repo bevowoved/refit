@@ -16,7 +16,8 @@ pub use proc::{
 use crate::lex::left_bound;
 use crate::net::build_http;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use flate2::read::DeflateDecoder;
 use ignore::WalkBuilder;
 use rustc_hash::{FxBuildHasher, FxHasher};
 use serde::de::DeserializeOwned;
@@ -272,6 +273,82 @@ pub fn compress_file_zstd(src: &Path, dst: &Path, level: i32) -> Result<(u64, u6
         enc.finish()?;
         Ok((raw_total, writer.metadata().map_or(0, |meta| meta.len())))
     })
+}
+
+/// Read and CRC-verify a single `STORE` or `DEFLATE` ZIP entry with an uncompressed byte cap.
+pub fn read_zip_entry_capped(
+    archive: &rawzip::ZipSliceArchive<&[u8]>,
+    entry: &rawzip::ZipFileHeaderRecord<'_>,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let local = archive.get_entry(entry.wayfinder()).context("read ZIP entry")?;
+    let mut out = Vec::new();
+    match entry.compression_method() {
+        rawzip::CompressionMethod::STORE => {
+            if local.data().len() > max_bytes {
+                bail!("stored ZIP entry exceeds {max_bytes} byte cap");
+            }
+            local.verifying_reader(local.data()).read_to_end(&mut out).context("verify stored ZIP entry")?;
+        }
+        rawzip::CompressionMethod::DEFLATE => {
+            if entry.uncompressed_size_hint() > max_bytes as u64 {
+                bail!("deflated ZIP entry exceeds {max_bytes} byte zip-bomb cap");
+            }
+            let res = local
+                .verifying_reader(DeflateDecoder::new(local.data()))
+                .take((max_bytes + 1) as u64)
+                .read_to_end(&mut out);
+            if out.len() > max_bytes {
+                bail!("deflated ZIP entry exceeds {max_bytes} byte zip-bomb cap");
+            }
+            res.context("inflate ZIP entry")?;
+        }
+        other => bail!("unsupported ZIP compression method {other:?}"),
+    }
+    Ok(out)
+}
+
+/// Read the active Git `HEAD` commit hash directly from `.git/HEAD` (0 subprocesses, worktree-safe).
+pub fn read_git_head_fast(repo_root: &Path) -> Option<String> {
+    let dot_git = repo_root.join(".git");
+    let git_dir = if dot_git.is_file() {
+        let raw = fs::read_to_string(&dot_git).ok()?;
+        let rest = raw.trim().strip_prefix("gitdir:")?.trim();
+        let p = PathBuf::from(rest);
+        if p.is_absolute() { p } else { repo_root.join(p) }
+    } else {
+        dot_git
+    };
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let trimmed = head.trim();
+    if let Some(ref_rel) = trimmed.strip_prefix("ref:") {
+        let ref_rel = ref_rel.trim();
+        if let Ok(sha) = fs::read_to_string(git_dir.join(ref_rel)) {
+            let s = sha.trim();
+            if !s.is_empty() { return Some(s.to_string()); }
+        }
+        let commondir = fs::read_to_string(git_dir.join("commondir")).ok().map_or_else(
+            || git_dir.clone(),
+            |c| {
+                let p = PathBuf::from(c.trim());
+                if p.is_absolute() { p } else { git_dir.join(p) }
+            },
+        );
+        if let Ok(sha) = fs::read_to_string(commondir.join(ref_rel)) {
+            let s = sha.trim();
+            if !s.is_empty() { return Some(s.to_string()); }
+        }
+        let packed = fs::read_to_string(commondir.join("packed-refs")).ok()?;
+        for line in packed.lines() {
+            if let Some((sha, name)) = line.trim().split_once(' ')
+                && name == ref_rel && !sha.starts_with('#')
+            {
+                return Some(sha.to_string());
+            }
+        }
+        return None;
+    }
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 pub fn mkdir_private(path: &Path) -> Result<()> {
@@ -763,6 +840,91 @@ fn find_generic_entropy(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+const BASE62_ALPHABET: &[u8; 62] =
+    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+fn ieee_crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn encode_base62_6(mut val: u32) -> [u8; 6] {
+    let mut out = [b'0'; 6];
+    for slot in out.iter_mut().rev() {
+        *slot = BASE62_ALPHABET[(val % 62) as usize];
+        val /= 62;
+    }
+    out
+}
+
+/// Offline IEEE CRC32-Base62 checksum verifier for 36-char GitHub and npm tokens.
+pub fn verify_token_checksum(prefix: &str, body: &[u8]) -> Option<bool> {
+    if !matches!(prefix, "ghp_" | "gho_" | "ghu_" | "ghs_" | "ghr_" | "npm_") {
+        return None;
+    }
+    if body.len() != 36 || !body.iter().all(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    let expected = encode_base62_6(ieee_crc32(&body[..30]));
+    Some(&body[30..36] == expected.as_slice())
+}
+
+fn invisible_unicode_kind(ch: char) -> Option<&'static str> {
+    match ch {
+        '\u{E0000}'..='\u{E007F}' => Some("unicode_tag_injection"),
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => Some("unicode_bidi_override"),
+        _ => None,
+    }
+}
+
+/// Detect invisible Unicode Tag prompt-injection or BiDi Trojan Source overrides (1-based line).
+pub fn find_invisible_unicode(bytes: &[u8]) -> Option<(usize, &'static str)> {
+    memchr::memchr2(0xE2, 0xF3, bytes)?;
+    for (idx, line) in bytes.split(|&b| b == b'\n').enumerate() {
+        if memchr::memchr2(0xE2, 0xF3, line).is_none() { continue; }
+        let kind = line.utf8_chunks()
+            .flat_map(|chunk| chunk.valid().chars())
+            .find_map(invisible_unicode_kind);
+        if let Some(k) = kind && !has_ignore_tag(line) {
+            return Some((idx + 1, k));
+        }
+    }
+    None
+}
+
+/// Strip invisible Unicode Tag (`U+E0000..=U+E007F`) and BiDi override/isolate codepoints.
+pub fn sanitize_invisible_unicode(text: &str) -> (String, usize) {
+    if memchr::memchr2(0xE2, 0xF3, text.as_bytes()).is_none() {
+        return (text.to_string(), 0);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut stripped = 0usize;
+    for ch in text.chars() {
+        if invisible_unicode_kind(ch).is_some() { stripped += 1; } else { out.push(ch); }
+    }
+    (out, stripped)
+}
+
+/// Severity tier for detected secrets and security hazards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SecretTier { High, Warn }
+
+impl SecretTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Warn => "warn",
+        }
+    }
+}
+
 fn match_slabs(bytes: &[u8]) -> Option<(usize, &'static str)> {
     for (si, slab) in SECRET_ENGINE.slabs.iter().enumerate() {
         let base = slab.rules.len();
@@ -783,9 +945,12 @@ fn match_slabs(bytes: &[u8]) -> Option<(usize, &'static str)> {
                 }
             } else {
                 let r = &slab.rules[pid];
-                if left_bound(bytes, mat.start()) && token_len(&bytes[mat.end()..], r.mode) >= r.dmin
+                let tlen = token_len(&bytes[mat.end()..], r.mode);
+                if left_bound(bytes, mat.start()) && tlen >= r.dmin
                     && !has_ignore_tag(line_slice(bytes, mat.start()))
                 {
+                    let body = &bytes[mat.end()..mat.end() + tlen];
+                    if verify_token_checksum(r.pfx, body) == Some(false) { continue; }
                     return Some((mat.start(), r.kind));
                 }
             }
@@ -794,16 +959,30 @@ fn match_slabs(bytes: &[u8]) -> Option<(usize, &'static str)> {
     None
 }
 
+fn line_number_at(bytes: &[u8], pos: usize) -> usize {
+    bytes[..pos].iter().filter(|&&b| b == b'\n').count() + 1
+}
+
 /// Single-pass 2-slab AVX2 Fat-Teddy SIMD detection across 120+ prefix/URI/PEM rules.
 pub fn find_secret(line: &str) -> Option<&'static str> { match_slabs(line.as_bytes()).map(|(_, k)| k) }
 
-/// Binary-safe zero-copy secret scan with Tier-4 high-entropy generic secret detection.
-pub fn find_secret_in_bytes(bytes: &[u8]) -> Option<(usize, &'static str)> {
+/// Tiered binary-safe secret & invisible-Unicode scanner (`High` blocks, `Warn` advises).
+pub fn find_secret_tiered(bytes: &[u8]) -> Option<(usize, &'static str, SecretTier)> {
     if bytes[..bytes.len().min(8000)].contains(&0) { return None; }
-    let (pos, kind) = match_slabs(bytes)
-        .or_else(|| find_generic_entropy(bytes).map(|p| (p, "high_entropy_secret")))?;
-    let line = bytes[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
-    Some((line, kind))
+    if let Some((pos, kind)) = match_slabs(bytes) {
+        return Some((line_number_at(bytes, pos), kind, SecretTier::High));
+    }
+    if let Some((line, kind)) = find_invisible_unicode(bytes) {
+        return Some((line, kind, SecretTier::High));
+    }
+    let pos = find_generic_entropy(bytes)?;
+    Some((line_number_at(bytes, pos), "high_entropy_secret", SecretTier::Warn))
+}
+
+/// Binary-safe zero-copy secret scan with Tier-4 high-entropy generic secret detection.
+#[cfg_attr(not(test), expect(dead_code))]
+pub fn find_secret_in_bytes(bytes: &[u8]) -> Option<(usize, &'static str)> {
+    find_secret_tiered(bytes).map(|(line, kind, _)| (line, kind))
 }
 
 fn consume_pem_block(text: &str, end: usize) -> Option<usize> {
@@ -814,8 +993,13 @@ fn consume_pem_block(text: &str, end: usize) -> Option<usize> {
     Some(tail_start + end_rel + close_rel + PEM_MARKER.len())
 }
 
-/// Single-pass SIMD secret redaction across all secret prefixes, URIs, and PEM blocks.
+/// Single-pass SIMD secret redaction across all secret prefixes, URIs, PEM blocks, and invisible Unicode.
 pub fn redact_secrets(text: String) -> String {
+    let text = if memchr::memchr2(0xE2, 0xF3, text.as_bytes()).is_some() {
+        sanitize_invisible_unicode(&text).0
+    } else {
+        text
+    };
     let bytes = text.as_bytes();
     if SECRET_ENGINE.slabs.iter().all(|s| s.ac.find(bytes).is_none()) && !text.contains(PEM_MARKER) {
         return text;
@@ -957,10 +1141,20 @@ fn http_and_retry_logic() {
 }
 
 #[cfg(test)]
+fn make_valid_crc_token(prefix: &str, entropy30: &str) -> String {
+    assert_eq!(entropy30.len(), 30);
+    let tail = encode_base62_6(ieee_crc32(entropy30.as_bytes()));
+    format!("{prefix}{entropy30}{}", std::str::from_utf8(&tail).unwrap())
+}
+
+#[cfg(test)]
 #[test]
 fn secret_detection_redaction() {
     let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
-    let gh = ["ghp_", "1234567890abcdefghij123456"].concat();
+    let gh = make_valid_crc_token("ghp_", "1234567890abcdefghij1234567890");
+    let gh_bad = ["ghp_", "1234567890abcdefghij1234567890", "000000"].concat();
+    let npm_ok = make_valid_crc_token("npm_", "abcdefghij1234567890ABCDEFGHIJ");
+    let npm_bad = ["npm_", "abcdefghij1234567890ABCDEFGHIJ", "zzzzzz"].concat();
     let db = ["postgres://", "admin:sup3rs3cr3t@db.internal:5432/prod"].concat();
     let slack = ["xoxa-", "1234567890abcdef1234"].concat();
     let age = ["AGE-SECRET-KEY-1", "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"].concat();
@@ -972,9 +1166,19 @@ fn secret_detection_redaction() {
     let multi = format!("docs = 'postgres://localhost/db' prod = '{}'",
         ["postgres://", "admin:p4ssw0rd@db.prod:5432/app"].concat());
 
+    assert_eq!(ieee_crc32(b"123456789"), 0xCBF4_3926);
+    assert_eq!(verify_token_checksum("ghp_", &gh.as_bytes()[4..]), Some(true));
+    assert_eq!(verify_token_checksum("ghp_", &gh_bad.as_bytes()[4..]), Some(false));
+    assert_eq!(verify_token_checksum("npm_", &npm_ok.as_bytes()[4..]), Some(true));
+    assert_eq!(verify_token_checksum("npm_", &npm_bad.as_bytes()[4..]), Some(false));
+    assert_eq!(verify_token_checksum("xoxa-", &gh.as_bytes()[4..]), None);
+
     for (sample, want) in [
         (format!("key = \"{aws}\""), Some("aws_access_key_id")),
         (format!("tok = '{gh}'"), Some("github_pat")),
+        (format!("tok = '{gh_bad}'"), None),
+        (format!("tok = '{npm_ok}'"), Some("npm_access_token")),
+        (format!("tok = '{npm_bad}'"), None),
         (format!("k = \"{age}\""), Some("age_secret_key")),
         (format!("tok = '{gh}' # gitleaks:allow"), None),
         (db.clone(), Some("database_credential_url")),
@@ -988,6 +1192,24 @@ fn secret_detection_redaction() {
     assert_eq!(find_secret_in_bytes(b"\x00\x01AKIAIOSFODNN7EXAMPLE"), None);
     let ent_line = ["api_key = \"", "aB9xQ2mK7pZ4vL8nR3tW6yC1eH5j\""].concat();
     assert_eq!(find_secret_in_bytes(ent_line.as_bytes()), Some((1, "high_entropy_secret")));
+    assert_eq!(
+        find_secret_tiered(ent_line.as_bytes()),
+        Some((1, "high_entropy_secret", SecretTier::Warn))
+    );
+    assert_eq!(
+        find_secret_tiered(format!("tok = '{gh}'").as_bytes()),
+        Some((1, "github_pat", SecretTier::High))
+    );
+
+    let tag_inj = "ok\nhidden \u{E0001}\u{E0041} text\n";
+    assert_eq!(find_invisible_unicode(tag_inj.as_bytes()), Some((2, "unicode_tag_injection")));
+    assert_eq!(find_secret_tiered(tag_inj.as_bytes()), Some((2, "unicode_tag_injection", SecretTier::High)));
+    let bidi = "let access = \"\u{202E}admin\";\n";
+    assert_eq!(find_invisible_unicode(bidi.as_bytes()), Some((1, "unicode_bidi_override")));
+    let bidi_ignored = "let access = \"\u{202E}admin\"; // refit:ignore\n";
+    assert_eq!(find_invisible_unicode(bidi_ignored.as_bytes()), None);
+    assert_eq!(sanitize_invisible_unicode(tag_inj), ("ok\nhidden  text\n".into(), 2));
+    assert_eq!(sanitize_invisible_unicode("clean ascii"), ("clean ascii".into(), 0));
 
     let red = redact_secrets(format!("a={aws} b={gh} c={db} s={slack} p={pem}"));
     for leak in [aws.as_str(), gh.as_str(), slack.as_str(), "sup3rs3cr3t", "SuperSecretBodyPayload"] {

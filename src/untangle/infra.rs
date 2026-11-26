@@ -1,7 +1,7 @@
 use crate::lex::{ident_byte, left_bound, quoted_lit, scan_code};
 use crate::platform::{
-    ensure_cachedir_tag, find_secret, find_secret_in_bytes, read_zstd, secret_rule_meta,
-    walk_files, write_atomic, write_zstd,
+    SecretTier, ensure_cachedir_tag, find_secret, find_secret_tiered, now_ms, read_git_head_fast,
+    read_zstd, secret_rule_meta, walk_files, write_atomic, write_zstd,
 };
 use crate::source::{RepoSnapshot, ext_of, parse_deps, rel_norm, supported_ext};
 use crate::types::{InfraFinding, UnusedDep};
@@ -11,13 +11,14 @@ use fixedbitset::FixedBitSet;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 #[cfg(test)]
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::time::{Instant, UNIX_EPOCH};
@@ -205,21 +206,35 @@ fn scan_unused_deps(
     collect_unused_from_matchers(parsed, &matchers)
 }
 
+fn default_tier_high() -> String { "high".into() }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecretHit { pub file: String, pub line: usize, pub kind: String }
+pub struct SecretHit {
+    pub file: String, pub line: usize, pub kind: String,
+    #[serde(default = "default_tier_high")]
+    pub tier: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SecretScanReport {
     pub mode: String, pub rule_count: usize, pub files_checked: usize, pub cache_hits: usize,
-    pub duration_ms: u64, pub findings: Vec<SecretHit>,
+    pub duration_ms: u64, pub blocking_count: usize, pub warning_count: usize,
+    pub findings: Vec<SecretHit>,
 }
 
-type CachedSecret = (u64, u64, Option<(usize, String)>);
+type CachedSecret = (u64, u64, Option<(usize, String, String)>);
 
 #[derive(Default, Serialize, Deserialize)]
 struct SecretCacheDisk { rules_hash: String, entries: HashMap<String, CachedSecret> }
 
-struct FileSecretScan { file: String, mtime: u64, sz: u64, cached: bool, hit: Option<(usize, String)> }
+struct FileSecretScan {
+    file: String, mtime: u64, sz: u64, cached: bool, hit: Option<(usize, String, String)>,
+}
+
+fn count_tiers(findings: &[SecretHit]) -> (usize, usize) {
+    let blocking = findings.iter().filter(|f| f.tier == "high").count();
+    (blocking, findings.len() - blocking)
+}
 
 fn scan_git_blobs(repo: &Path, specs: &[(String, String)]) -> Vec<SecretHit> {
     if specs.is_empty() { return Vec::new(); }
@@ -254,8 +269,8 @@ fn scan_git_blobs(repo: &Path, specs: &[(String, String)]) -> Vec<SecretHit> {
     }
     let _ = child.wait();
     blobs.into_par_iter().filter_map(|(file, buf)| {
-        let (line, kind) = find_secret_in_bytes(&buf)?;
-        Some(SecretHit { file, line, kind: kind.into() })
+        let (line, kind, tier) = find_secret_tiered(&buf)?;
+        Some(SecretHit { file, line, kind: kind.into(), tier: tier.as_str().into() })
     }).collect()
 }
 
@@ -264,6 +279,7 @@ pub fn scan_repo_secrets(
     repo_root: &Path, staged: bool, diff_base: Option<&str>, no_cache: bool,
 ) -> Result<SecretScanReport> {
     let (started, (rule_count, rhash)) = (Instant::now(), secret_rule_meta());
+    let cache_hash = format!("{rhash}:v2-tiered");
     if staged || diff_base.is_some() {
         let (mode, specs): (String, Vec<(String, String)>) = if staged {
             let out = Command::new("git").args(["diff-index", "--cached", "--full-index", "HEAD"])
@@ -285,9 +301,11 @@ pub fn scan_repo_secrets(
         };
         let mut findings = scan_git_blobs(repo_root, &specs);
         findings.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+        let (blocking_count, warning_count) = count_tiers(&findings);
         return Ok(SecretScanReport {
             mode, rule_count, files_checked: specs.len(), cache_hits: 0,
-            duration_ms: started.elapsed().as_millis() as u64, findings,
+            duration_ms: started.elapsed().as_millis() as u64,
+            blocking_count, warning_count, findings,
         });
     }
     let cache_path = repo_root.join(".refit/cache/secrets_cache.zst");
@@ -295,7 +313,7 @@ pub fn scan_repo_secrets(
         HashMap::new()
     } else {
         read_zstd::<SecretCacheDisk>(&cache_path)
-            .filter(|c| c.rules_hash == rhash)
+            .filter(|c| c.rules_hash == cache_hash)
             .map_or_else(HashMap::new, |c| c.entries)
     };
     let files = walk_files(repo_root, None);
@@ -313,43 +331,199 @@ pub fn scan_repo_secrets(
                 return Some(FileSecretScan { file: rel, mtime, sz, cached: true, hit: ph.clone() });
             }
             let bytes = fs::read(abs).ok()?;
-            let hit = find_secret_in_bytes(&bytes).map(|(l, k)| (l, k.to_string()));
+            let hit = find_secret_tiered(&bytes)
+                .map(|(l, k, t)| (l, k.to_string(), t.as_str().to_string()));
             Some(FileSecretScan { file: rel, mtime, sz, cached: false, hit })
         })
         .collect();
     let (mut next_map, mut findings, mut cache_hits) = (HashMap::with_capacity(results.len()), Vec::new(), 0usize);
     for row in results {
         if row.cached { cache_hits += 1; }
-        if let Some((line, ref kind)) = row.hit {
-            findings.push(SecretHit { file: row.file.clone(), line, kind: kind.clone() });
+        if let Some((line, ref kind, ref tier)) = row.hit {
+            findings.push(SecretHit {
+                file: row.file.clone(), line, kind: kind.clone(), tier: tier.clone(),
+            });
         }
         next_map.insert(row.file, (row.mtime, row.sz, row.hit));
     }
     findings.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    let (blocking_count, warning_count) = count_tiers(&findings);
     if !no_cache {
         if let Some(p) = cache_path.parent() { ensure_cachedir_tag(p); }
-        let _ = write_zstd(&cache_path, &SecretCacheDisk { rules_hash: rhash.into(), entries: next_map });
+        let _ = write_zstd(&cache_path, &SecretCacheDisk { rules_hash: cache_hash, entries: next_map });
     }
     Ok(SecretScanReport {
         mode: "repo".into(), rule_count, files_checked: files.len(), cache_hits,
-        duration_ms: started.elapsed().as_millis() as u64, findings,
+        duration_ms: started.elapsed().as_millis() as u64,
+        blocking_count, warning_count, findings,
     })
 }
 
-/// Install local pre-commit and pre-push Git hooks backed by `refit secrets`.
+/// Render a `SecretScanReport` as minimal OASIS SARIF 2.1.0 JSON for GitHub Code Scanning.
+pub fn render_secrets_sarif(rep: &SecretScanReport) -> Value {
+    let rules: Vec<Value> = rep.findings.iter()
+        .map(|f| f.kind.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|id| json!({
+            "id": id,
+            "shortDescription": { "text": format!("refit secret guard rule: {id}") },
+        }))
+        .collect();
+    let results: Vec<Value> = rep.findings.iter().map(|hit| {
+        let level = if hit.tier == "high" { "error" } else { "warning" };
+        let fp = blake3::hash(format!("{}:{}:{}", hit.file, hit.line, hit.kind).as_bytes())
+            .to_hex()
+            .to_string();
+        json!({
+            "ruleId": hit.kind,
+            "level": level,
+            "message": { "text": format!("[refit:{}] detected ({} tier)", hit.kind, hit.tier) },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": hit.file },
+                    "region": { "startLine": hit.line.max(1) }
+                }
+            }],
+            "partialFingerprints": { "primaryLocationLineHash": fp }
+        })
+    }).collect();
+    json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "refit",
+                    "informationUri": "https://github.com/patrickfield152-del/refit",
+                    "rules": rules
+                }
+            },
+            "results": results
+        }]
+    })
+}
+
+/// Append a single BLAKE3-fingerprinted result (and rule definition if new) to a SARIF 2.1.0 doc.
+pub fn push_sarif_result(
+    sarif: &mut Value, rule_id: &str, level: &str, file: &str, line: usize, text: &str,
+) {
+    if let Some(rules) = sarif.pointer_mut("/runs/0/tool/driver/rules").and_then(Value::as_array_mut)
+        && !rules.iter().any(|r| r.get("id").and_then(Value::as_str) == Some(rule_id))
+    {
+        rules.push(json!({ "id": rule_id, "shortDescription": { "text": format!("refit rule: {rule_id}") } }));
+    }
+    let Some(results) = sarif.pointer_mut("/runs/0/results").and_then(Value::as_array_mut) else { return };
+    let ln = line.max(1);
+    let fp = blake3::hash(format!("{file}:{ln}:{rule_id}").as_bytes()).to_hex().to_string();
+    results.push(json!({
+        "ruleId": rule_id, "level": level, "message": { "text": text },
+        "locations": [{ "physicalLocation": {
+            "artifactLocation": { "uri": file }, "region": { "startLine": ln }
+        } }],
+        "partialFingerprints": { "primaryLocationLineHash": fp }
+    }));
+}
+
+pub fn escape_gh_prop(raw: &str) -> String {
+    raw.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A")
+        .replace(':', "%3A").replace(',', "%2C")
+}
+
+/// Render a `SecretScanReport` as GitHub Actions workflow annotations (`::error` / `::warning`).
+pub fn render_secrets_gh(rep: &SecretScanReport) -> String {
+    let mut out = String::new();
+    for hit in &rep.findings {
+        let level = if hit.tier == "high" { "error" } else { "warning" };
+        let file = escape_gh_prop(&hit.file);
+        let detail = if hit.tier == "high" {
+            "High-confidence secret or invisible-Unicode hazard detected"
+        } else {
+            "Potential high-entropy secret detected (verify or suppress with refit:ignore)"
+        };
+        out.push_str(&format!(
+            "::{level} file={file},line={}::[refit:{}] {detail}\n",
+            hit.line.max(1), hit.kind
+        ));
+    }
+    out
+}
+
+const REFIT_HOOK_MARKER: &str = "# refit-managed-hook";
+
+fn resolve_git_hooks_dir(repo_root: &Path) -> PathBuf {
+    let common = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(repo_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|raw| {
+            let p = PathBuf::from(&raw);
+            if p.is_absolute() { p } else { repo_root.join(p) }
+        })
+        .unwrap_or_else(|| repo_root.join(".git"));
+    common.join("hooks")
+}
+
+pub(crate) fn planned_secret_hook_paths(repo_root: &Path) -> Vec<String> {
+    let hooks = resolve_git_hooks_dir(repo_root);
+    ["pre-commit", "pre-push"]
+        .into_iter()
+        .map(|name| hooks.join(name).to_string_lossy().into_owned())
+        .collect()
+}
+
+fn preserve_existing_hook(hook_path: &Path, name: &str) -> Result<()> {
+    if !hook_path.exists() { return Ok(()); }
+    let existing = fs::read_to_string(hook_path).unwrap_or_default();
+    if existing.contains(REFIT_HOOK_MARKER) { return Ok(()); }
+    let prev = hook_path.with_file_name(format!("{name}.refit-prev"));
+    if !prev.exists() { fs::rename(hook_path, &prev)?; }
+    Ok(())
+}
+
+/// Install worktree-safe, chained, idempotent pre-commit and pre-push Git hooks.
 pub fn install_secret_hooks(repo_root: &Path) -> Result<Vec<String>> {
-    let hooks = repo_root.join(".git/hooks");
+    let hooks = resolve_git_hooks_dir(repo_root);
     fs::create_dir_all(&hooks)?;
-    let pc = "#!/usr/bin/env sh\nexec refit secrets . --staged\n";
+    let pc = concat!(
+        "#!/usr/bin/env sh\n",
+        "# refit-managed-hook\n",
+        "PREV=\"$(dirname \"$0\")/pre-commit.refit-prev\"\n",
+        "if [ -x \"$PREV\" ]; then\n  \"$PREV\" \"$@\" || exit $?\n",
+        "elif [ -f \"$PREV\" ]; then\n  sh \"$PREV\" \"$@\" || exit $?\nfi\n",
+        "exec refit secrets . --staged\n",
+    );
     let pp = concat!(
-        "#!/usr/bin/env sh\nZ=0000000000000000000000000000000000000000\n",
-        "while read -r _ l _ r; do\n  [ \"$l\" = \"$Z\" ] && continue\n",
-        "  if [ \"$r\" = \"$Z\" ]; then refit secrets . --diff \"HEAD~1..$l\" || exit 1\n",
-        "  else refit secrets . --diff \"$r..$l\" || exit 1; fi\ndone\n",
+        "#!/usr/bin/env sh\n",
+        "# refit-managed-hook\n",
+        "STDIN_DATA=\"$(cat)\"\n",
+        "PREV=\"$(dirname \"$0\")/pre-push.refit-prev\"\n",
+        "if [ -x \"$PREV\" ]; then\n  printf '%s\\n' \"$STDIN_DATA\" | \"$PREV\" \"$@\" || exit $?\n",
+        "elif [ -f \"$PREV\" ]; then\n  printf '%s\\n' \"$STDIN_DATA\" | sh \"$PREV\" \"$@\" || exit $?\nfi\n",
+        "Z=0000000000000000000000000000000000000000\n",
+        "EMPTY=\"$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)\"\n",
+        "printf '%s\\n' \"$STDIN_DATA\" | while read -r _ l _ r; do\n",
+        "  [ -z \"$l\" ] || [ \"$l\" = \"$Z\" ] && continue\n",
+        "  if [ \"$r\" = \"$Z\" ]; then\n",
+        "    FIRST=\"$(git rev-list \"$l\" --not --remotes 2>/dev/null | tail -n 1)\"\n",
+        "    [ -z \"$FIRST\" ] && continue\n",
+        "    BASE=\"$(git rev-parse --verify \"${FIRST}^\" 2>/dev/null || true)\"\n",
+        "    if [ -n \"$BASE\" ]; then refit secrets . --diff \"$BASE..$l\" || exit 1\n",
+        "    else refit secrets . --diff \"$EMPTY..$l\" || exit 1; fi\n",
+        "  else\n",
+        "    refit secrets . --diff \"$r..$l\" || exit 1\n",
+        "  fi\n",
+        "done\n",
     );
     let mut written = Vec::new();
     for (name, body) in [("pre-commit", pc), ("pre-push", pp)] {
         let p = hooks.join(name);
+        preserve_existing_hook(&p, name)?;
         write_atomic(&p, body.as_bytes())?;
         #[cfg(unix)]
         {
@@ -359,6 +533,286 @@ pub fn install_secret_hooks(repo_root: &Path) -> Result<Vec<String>> {
         written.push(p.to_string_lossy().into_owned());
     }
     Ok(written)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookHost { Claude, Cursor, Gemini, Kiro }
+
+fn detect_hook_host(val: &Value) -> HookHost {
+    let ev = val.get("hook_event_name").and_then(Value::as_str).unwrap_or("");
+    if matches!(ev, "fileEdited" | "preToolUse" | "agentStop") { return HookHost::Kiro; }
+    if matches!(ev, "beforeShellExecution" | "beforeReadFile" | "afterFileEdit")
+        || (val.get("tool_name").is_none()
+            && (val.get("command").is_some() || val.get("file_path").is_some() || val.get("edits").is_some()))
+    {
+        return HookHost::Cursor;
+    }
+    if matches!(ev, "BeforeTool" | "AfterTool") { return HookHost::Gemini; }
+    HookHost::Claude
+}
+
+fn is_sensitive_read_path(path: &str) -> bool {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
+    if base.is_empty() { return false; }
+    if base == ".env" { return true; }
+    if base.starts_with(".env.") {
+        return !matches!(base.as_str(), ".env.example" | ".env.sample" | ".env.template");
+    }
+    matches!(base.as_str(), "id_rsa" | "id_ed25519") || base.ends_with(".pem") || base.ends_with(".key")
+}
+
+fn split_shell_segments(cmd: &str) -> Vec<String> {
+    let (mut segs, mut cur, mut quote, mut esc) = (Vec::new(), String::new(), 0u8, false);
+    for ch in cmd.chars() {
+        if esc { cur.push(ch); esc = false; continue; }
+        if ch == '\\' && quote != b'\'' { cur.push(ch); esc = true; continue; }
+        if quote != 0 {
+            if ch as u32 == u32::from(quote) { quote = 0; }
+            cur.push(ch);
+            continue;
+        }
+        if ch == '\'' || ch == '"' { quote = ch as u8; cur.push(ch); continue; }
+        if matches!(ch, ';' | '|' | '&' | '\n') {
+            if !cur.trim().is_empty() { segs.push(std::mem::take(&mut cur)); }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.trim().is_empty() { segs.push(cur); }
+    segs
+}
+
+/// Returns `(is_git_push, has_no_verify_bypass)` from a single `shlex` pass.
+fn inspect_git_segment(seg: &str) -> (bool, bool) {
+    let toks = shlex::split(seg)
+        .unwrap_or_else(|| seg.split_whitespace().map(str::to_string).collect());
+    let mut i = 0usize;
+    while i < toks.len() {
+        let bin = toks[i].rsplit(['/', '\\']).next().unwrap_or(&toks[i]).to_ascii_lowercase();
+        if bin == "git" || bin == "git.exe" { break; }
+        i += 1;
+    }
+    if i >= toks.len() { return (false, false); }
+    i += 1;
+    while i < toks.len() {
+        let t = toks[i].as_str();
+        if matches!(t, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace") { i += 2; continue; }
+        if t.starts_with('-') { i += 1; continue; }
+        break;
+    }
+    let Some(sub) = toks.get(i).map(String::as_str) else { return (false, false) };
+    let is_push = sub == "push";
+    if !matches!(sub, "push" | "commit") { return (false, false); }
+    let mut j = i + 1;
+    while j < toks.len() {
+        let arg = toks[j].as_str();
+        if arg == "--" { break; }
+        if arg == "--no-verify" { return (is_push, true); }
+        if sub == "commit" {
+            if matches!(arg, "-m" | "-F" | "-C" | "-c" | "--message" | "--file" | "--author") {
+                j += 2; continue;
+            }
+            if arg == "-n" || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('n')) {
+                return (false, true);
+            }
+        }
+        j += 1;
+    }
+    (is_push, false)
+}
+
+fn hook_cwd(val: &Value) -> PathBuf {
+    val.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn kane_gate_enabled(cwd: &Path) -> bool {
+    std::env::var("REFIT_KANE_GATE").ok().is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        || cwd.join(".refit/kane.json").is_file()
+}
+
+fn is_kane_watched_path(path: &str) -> bool {
+    let low = path.to_ascii_lowercase();
+    low.ends_with(".html") || low.ends_with(".tsx") || low.ends_with(".jsx")
+        || low.ends_with(".ts") || low.ends_with(".js") || low.ends_with(".vue")
+        || low.ends_with(".svelte") || low.ends_with(".css")
+        || low.ends_with("readme.md") || low.ends_with("skill.md")
+}
+
+fn check_kane_push_gate(cwd: &Path) -> Option<(&'static str, String, &'static str)> {
+    if !kane_gate_enabled(cwd) { return None; }
+    let last_raw = fs::read_to_string(cwd.join(".refit/kane_last.json")).ok();
+    let Some(last) = last_raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()) else {
+        return Some((
+            "kane_gate_unverified",
+            "no Gate 4 Kane verification receipt found in `.refit/kane_last.json`".into(),
+            "Run `refit check . --kane <spec>` before pushing",
+        ));
+    };
+    if last.get("ok").and_then(Value::as_bool) != Some(true) {
+        let v = last.get("verdict").and_then(Value::as_str).unwrap_or("failed");
+        return Some((
+            "kane_gate_unverified",
+            format!("last Gate 4 Kane receipt failed (`{v}`)"),
+            "Fix the failing browser/UI step and re-run `refit check . --kane <spec>`",
+        ));
+    }
+    if let Some(cur_head) = read_git_head_fast(cwd)
+        && let Some(rec_head) = last.get("git_head").and_then(Value::as_str)
+        && cur_head != rec_head
+    {
+        return Some((
+            "kane_gate_stale_head",
+            "HEAD changed since the last green Gate 4 Kane receipt".into(),
+            "Re-run `refit check . --kane <spec>` on the current commit before pushing",
+        ));
+    }
+    let rec_ms = last.get("recorded_ms").and_then(Value::as_u64).unwrap_or(0);
+    if let Ok(raw) = fs::read_to_string(cwd.join(".refit/kane_state.json"))
+        && let Ok(st) = serde_json::from_str::<Value>(&raw)
+        && st.get("dirty_ms").and_then(Value::as_u64).unwrap_or(0) > rec_ms
+    {
+        return Some((
+            "kane_gate_dirty_ui",
+            "UI/docs files were edited after the last green Gate 4 Kane run".into(),
+            "Re-verify with `refit check . --kane <spec>` before pushing",
+        ));
+    }
+    None
+}
+
+fn collect_write_payloads<'a>(val: &'a Value, input: &'a Value) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for src in [input, val] {
+        for key in ["content", "new_string", "new_source", "newText"] {
+            if let Some(s) = src.get(key).and_then(Value::as_str) { out.push(s); }
+        }
+        if let Some(arr) = src.get("edits").and_then(Value::as_array) {
+            for item in arr {
+                for key in ["new_string", "newText", "content"] {
+                    if let Some(s) = item.get(key).and_then(Value::as_str) { out.push(s); }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn inspect_hook_event(val: &Value) -> Option<(&'static str, String, &'static str)> {
+    let ev = val.get("hook_event_name").and_then(Value::as_str).unwrap_or("");
+    let tool = val.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    let input = val.get("tool_input").unwrap_or(val);
+
+    let is_shell = ev == "beforeShellExecution"
+        || matches!(tool, "Bash" | "run_shell_command" | "shell" | "Shell");
+    if is_shell {
+        let cmd = input.get("command").or_else(|| val.get("command")).and_then(Value::as_str)?;
+        let (mut has_push, mut has_bypass) = (false, false);
+        for seg in split_shell_segments(cmd) {
+            let (p, b) = inspect_git_segment(&seg);
+            has_push |= p;
+            has_bypass |= b;
+        }
+        if has_bypass {
+            return Some((
+                "git_hook_bypass",
+                "command attempts to bypass Git verification hooks".into(),
+                "Remove --no-verify/-n and fix the underlying hook failure",
+            ));
+        }
+        if let Some((_, kind, SecretTier::High)) = find_secret_tiered(cmd.as_bytes()) {
+            return Some((
+                kind,
+                "high-confidence secret embedded in shell command".into(),
+                "Pass credentials via environment variables or a secret manager, never inline",
+            ));
+        }
+        if has_push {
+            return check_kane_push_gate(&hook_cwd(val));
+        }
+        return None;
+    }
+
+    let is_read = ev == "beforeReadFile"
+        || matches!(tool, "Read" | "read_file" | "ReadFile" | "view_file");
+    if is_read {
+        let path = input.get("file_path").or_else(|| input.get("path"))
+            .or_else(|| val.get("file_path")).or_else(|| val.get("path"))
+            .and_then(Value::as_str)?;
+        if is_sensitive_read_path(path) {
+            return Some((
+                "sensitive_file_read",
+                format!("reading sensitive credential file `{path}`"),
+                "Read `.env.example` or ask the user to inspect secrets outside the agent context",
+            ));
+        }
+        return None;
+    }
+
+    let is_write = ev == "afterFileEdit"
+        || matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "write_file" | "replace" | "edit_file" | "WriteFile" | "Replace");
+    if is_write {
+        for payload in collect_write_payloads(val, input) {
+            if let Some((line, kind, SecretTier::High)) = find_secret_tiered(payload.as_bytes()) {
+                return Some((
+                    kind,
+                    format!("high-confidence secret or Unicode hazard on payload line {line}"),
+                    "Remove the secret or invisible Unicode characters, or use an env var placeholder",
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn format_hook_deny(host: HookHost, reason: &str) -> String {
+    match host {
+        HookHost::Cursor => json!({ "permission": "deny", "agentMessage": reason }).to_string(),
+        HookHost::Claude | HookHost::Kiro => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason
+            }
+        }).to_string(),
+        HookHost::Gemini => json!({ "decision": "deny", "reason": reason }).to_string(),
+    }
+}
+
+/// Native sub-5ms pre/post-tool hook engine for Claude Code, Cursor, Gemini CLI, and Kiro.
+pub fn run_agent_hook(stdin_json: &str) -> (i32, String, String) {
+    if stdin_json.trim().is_empty() { return (0, String::new(), String::new()); }
+    let Ok(val) = serde_json::from_str::<Value>(stdin_json) else {
+        return (0, String::new(), String::new());
+    };
+    let host = detect_hook_host(&val);
+    if let Some((kind, detail, remediation)) = inspect_hook_event(&val) {
+        let reason = format!("[refit:hook] blocked {kind}: {detail}. Remediation: {remediation}");
+        return (2, format_hook_deny(host, &reason), reason);
+    }
+    let ev = val.get("hook_event_name").and_then(Value::as_str).unwrap_or("");
+    if matches!(ev, "PostToolUse" | "AfterTool" | "afterFileEdit" | "fileEdited") {
+        let input = val.get("tool_input").unwrap_or(&val);
+        let path = input.get("file_path").or_else(|| input.get("path"))
+            .or_else(|| val.get("file_path")).or_else(|| val.get("path"))
+            .and_then(Value::as_str).unwrap_or("");
+        let cwd = hook_cwd(&val);
+        if is_kane_watched_path(path) && kane_gate_enabled(&cwd) {
+            let body = json!({ "dirty_ms": now_ms(), "file": path }).to_string();
+            let _ = write_atomic(&cwd.join(".refit/kane_state.json"), body.as_bytes());
+            if matches!(host, HookHost::Claude | HookHost::Gemini) {
+                let ctx = format!("[refit:kane] UI/doc edit in `{path}`. Re-verify via `refit check . --kane <spec>` before pushing.");
+                return (0, json!({ "hookSpecificOutput": { "hookEventName": ev, "additionalContext": ctx } }).to_string(), String::new());
+            }
+        }
+    }
+    let ok_out = if host == HookHost::Cursor {
+        r#"{"permission":"allow"}"#.to_string()
+    } else {
+        "{}".to_string()
+    };
+    (0, ok_out, String::new())
 }
 
 /// Snapshot-backed infra & unused-dependency scan sharing the single `RepoSnapshot` tree walk.
@@ -861,5 +1315,147 @@ mod tests {
             let count = findings.iter().filter(|f| f.file == file && f.rule_id == rule).count();
             assert_eq!(count, expected, "{file}:{rule}");
         }
+    }
+
+    #[test]
+    fn secrets_tiered_sarif_and_gh_formatters() {
+        let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+        let ent = ["api_key = \"", "aB9xQ2mK7pZ4vL8nR3tW6yC1eH5j\""].concat();
+        let dir = TempRepo::with_files("sec_tier_fmt", &[
+            ("src/a.rs", &format!("let k = \"{aws}\";\n")),
+            ("src/b.rs", &format!("{ent}\n")),
+            ("src/c.rs", "let ok = \"clean\";\n"),
+        ]);
+        let rep = scan_repo_secrets(dir.path(), false, None, false).unwrap();
+        assert_eq!((rep.blocking_count, rep.warning_count, rep.findings.len()), (1, 1, 2));
+        let sarif = render_secrets_sarif(&rep);
+        assert_eq!(sarif["version"], "2.1.0");
+        assert_eq!(sarif["runs"][0]["tool"]["driver"]["name"], "refit");
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["level"], "error");
+        assert_eq!(results[1]["level"], "warning");
+        assert!(results[0]["partialFingerprints"]["primaryLocationLineHash"].as_str().unwrap().len() == 64);
+
+        let gh = render_secrets_gh(&rep);
+        assert!(gh.contains("::error file=src/a.rs,line=1::[refit:aws_access_key_id]"));
+        assert!(gh.contains("::warning file=src/b.rs,line=1::[refit:high_entropy_secret]"));
+    }
+
+    #[test]
+    fn install_hooks_chains_idempotent_and_worktree_safe() {
+        let repo = TempRepo::git("hooks_wt", "app", &[("src/lib.rs", "pub fn ok() {}\n")]);
+        let hooks_dir = repo.join(".git/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let orig = "#!/usr/bin/env sh\necho custom-pre-commit\n";
+        fs::write(hooks_dir.join("pre-commit"), orig).unwrap();
+
+        let first = install_secret_hooks(repo.path()).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(fs::read_to_string(hooks_dir.join("pre-commit.refit-prev")).unwrap(), orig);
+        let pc_body = fs::read_to_string(hooks_dir.join("pre-commit")).unwrap();
+        let pp_body = fs::read_to_string(hooks_dir.join("pre-push")).unwrap();
+        assert!(pc_body.contains(REFIT_HOOK_MARKER) && !pc_body.contains('\r'));
+        assert!(pp_body.contains("git rev-list") && !pp_body.contains("HEAD~1..$l") && !pp_body.contains('\r'));
+
+        let _second = install_secret_hooks(repo.path()).unwrap();
+        assert_eq!(fs::read_to_string(hooks_dir.join("pre-commit.refit-prev")).unwrap(), orig);
+
+        let wt_path = repo.join("linked_wt");
+        let st = Command::new("git")
+            .args(["worktree", "add", "-b", "wt-branch", wt_path.to_str().unwrap()])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert!(wt_path.join(".git").is_file());
+        let wt_hooks = install_secret_hooks(&wt_path).unwrap();
+        assert_eq!(wt_hooks.len(), 2);
+        assert!(!wt_path.join(".git/hooks").exists());
+        assert_eq!(fs::read_to_string(hooks_dir.join("pre-commit.refit-prev")).unwrap(), orig);
+    }
+
+    #[test]
+    fn agent_hook_blocks_and_allows_all_hosts() {
+        let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+        assert_eq!(run_agent_hook(""), (0, String::new(), String::new()));
+        assert_eq!(run_agent_hook("{bad json"), (0, String::new(), String::new()));
+
+        let claude_write_bad = json!({
+            "hook_event_name": "PreToolUse", "tool_name": "Write",
+            "tool_input": { "file_path": "src/cfg.rs", "content": format!("const K: &str = \"{aws}\";") }
+        }).to_string();
+        let (code, out, err) = run_agent_hook(&claude_write_bad);
+        assert_eq!(code, 2);
+        assert!(err.contains("aws_access_key_id") && out.contains("\"permissionDecision\":\"deny\""));
+
+        let claude_unicode = json!({
+            "tool_name": "Edit", "tool_input": { "new_string": "safe \u{E0001} prompt" }
+        }).to_string();
+        assert_eq!(run_agent_hook(&claude_unicode).0, 2);
+
+        let claude_bash_bypass = json!({
+            "tool_name": "Bash", "tool_input": { "command": "git commit -n -m 'skip'" }
+        }).to_string();
+        assert_eq!(run_agent_hook(&claude_bash_bypass).0, 2);
+
+        let claude_bash_safe = json!({
+            "tool_name": "Bash", "tool_input": { "command": "git commit -m 'note -n inside msg'" }
+        }).to_string();
+        assert_eq!(run_agent_hook(&claude_bash_safe), (0, "{}".into(), String::new()));
+
+        let cursor_push_bypass = json!({
+            "hook_event_name": "beforeShellExecution",
+            "command": "git push origin main --no-verify"
+        }).to_string();
+        let (code, out, _) = run_agent_hook(&cursor_push_bypass);
+        assert_eq!(code, 2);
+        assert!(out.contains("\"permission\":\"deny\""));
+
+        let cursor_read_env = json!({ "hook_event_name": "beforeReadFile", "file_path": "/app/.env.production" }).to_string();
+        assert_eq!(run_agent_hook(&cursor_read_env).0, 2);
+        let cursor_read_example = json!({ "hook_event_name": "beforeReadFile", "file_path": "/app/.env.example" }).to_string();
+        assert_eq!(run_agent_hook(&cursor_read_example), (0, r#"{"permission":"allow"}"#.into(), String::new()));
+
+        let gemini_read_key = json!({
+            "hook_event_name": "BeforeTool", "tool_name": "read_file",
+            "tool_input": { "file_path": "/home/u/.ssh/id_ed25519" }
+        }).to_string();
+        let (code, out, _) = run_agent_hook(&gemini_read_key);
+        assert_eq!(code, 2);
+        assert!(out.contains("\"decision\":\"deny\""));
+    }
+
+    #[test]
+    fn agent_hook_kane_push_gate_and_dirty_ui_tracking() {
+        let repo = TempRepo::git("kane_hook_gate", "app", &[("docs/index.html", "<h1>ok</h1>\n")]);
+        fs::create_dir_all(repo.join(".refit")).unwrap();
+        fs::write(repo.join(".refit/kane.json"), r#"{"default_spec":"tests/kane/hud_test.md"}"#).unwrap();
+        let cwd = repo.path().display().to_string();
+
+        // 1. Push without receipt is denied when .refit/kane.json exists
+        let push_ev = json!({
+            "hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": cwd,
+            "tool_input": { "command": "git push origin main" }
+        }).to_string();
+        let (code, out, err) = run_agent_hook(&push_ev);
+        assert_eq!(code, 2);
+        assert!(err.contains("kane_gate_unverified") && out.contains("\"permissionDecision\":\"deny\""));
+
+        // 2. PostToolUse UI edit marks .refit/kane_state.json dirty and emits additionalContext
+        let edit_ev = json!({
+            "hook_event_name": "PostToolUse", "tool_name": "Edit", "cwd": cwd,
+            "tool_input": { "file_path": "docs/index.html", "new_string": "<h1>v2</h1>" }
+        }).to_string();
+        let (code, out, _) = run_agent_hook(&edit_ev);
+        assert_eq!(code, 0);
+        assert!(out.contains("additionalContext") && repo.join(".refit/kane_state.json").is_file());
+
+        // 3. Green receipt newer than dirty_ms matching HEAD unblocks git push
+        let head = read_git_head_fast(repo.path()).unwrap();
+        let green = json!({ "ok": true, "verdict": "passed", "git_head": head, "recorded_ms": now_ms() + 10_000 }).to_string();
+        fs::write(repo.join(".refit/kane_last.json"), green).unwrap();
+        let (code, out, _) = run_agent_hook(&push_ev);
+        assert_eq!(code, 0, "expected push allowed after green receipt: {out}");
     }
 }

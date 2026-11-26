@@ -198,16 +198,62 @@ fn cli_mcp_stdio_roundtrip_and_batch_reject() {
 
     let init = responses.iter().find(|r| r["id"] == 1).expect("init response");
     assert!(init["result"]["serverInfo"]["name"].as_str().is_some());
+    assert!(init["result"]["instructions"].as_str().is_some(), "missing MCP instructions: {init}");
 
     let list = responses.iter().find(|r| r["id"] == 2).expect("tools/list response");
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 17, "expected 17 MCP tools, got {}", tools.len());
+    assert_eq!(tools.len(), 12, "expected 12 converged MCP tools, got {}", tools.len());
+    assert!(
+        tools.iter().all(|t| t["annotations"]["readOnlyHint"].is_boolean()),
+        "all tools must include MCP annotations"
+    );
 
     let batch_err = responses.iter().find(|r| r["error"]["code"] == -32600);
     assert!(batch_err.is_some(), "batch array must return -32600: {responses:?}");
 
     let scan = responses.iter().find(|r| r["id"] == 4).expect("refit_scan response");
     assert!(scan["error"].is_null(), "refit_scan failed: {scan:?}");
+}
+
+#[test]
+fn cli_hook_check_and_init_e2e() {
+    let repo = TestRepo::new("varc_e2e");
+    repo.write("src/lib.rs", "pub fn ok() -> i32 { 1 }\n");
+    let root = repo.path().to_str().unwrap();
+
+    // 1. `refit check --format sarif` emits valid SARIF 2.1.0 with 0 findings
+    let (code, out, err) = run_refit(&["check", root, "--format", "sarif"], &[]);
+    assert_eq!(code, 0, "check sarif failed: {err}");
+    let sarif: Value = serde_json::from_str(&out).expect("valid SARIF JSON");
+    assert_eq!(sarif["version"], "2.1.0");
+
+    // 2. `refit init --dry-run` reports planned integrations without writing files
+    let (code, out, err) = run_refit(&["init", root, "--dry-run"], &[]);
+    assert_eq!(code, 0, "init dry-run failed: {err}");
+    let init_json: Value = serde_json::from_str(&out).expect("valid init JSON");
+    assert_eq!(init_json["dry_run"], true);
+    assert!(!repo.path().join(".claude/settings.json").exists());
+
+    // 3. `refit hook` blocks `git push --no-verify` with exit code 2
+    let mut child = Command::new(env!("CARGO_BIN_EXE_refit"))
+        .args(["hook"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn refit hook");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{{"command":"git push --no-verify"}}}}"#
+        )
+        .unwrap();
+    }
+    let out = child.wait_with_output().expect("wait refit hook");
+    assert_eq!(out.status.code(), Some(2), "expected exit 2, got {:?}", out.status.code());
+    let hook_out: Value = serde_json::from_slice(&out.stdout).expect("valid hook JSON");
+    assert_eq!(hook_out["hookSpecificOutput"]["permissionDecision"], "deny");
 }
 
 #[test]
@@ -330,4 +376,67 @@ fn cli_bench_cmd_and_run_worktree_mock() {
     if let Some(wt) = rj["worktree_path"].as_str() {
         let _ = fs::remove_dir_all(wt);
     }
+}
+
+#[test]
+fn cli_check_kane_short_circuit_and_mock_sarif_e2e() {
+    let repo = TestRepo::new("kane_e2e");
+    let aws = ["AKIA", "IOSFODNN7EXAMPLE"].concat();
+    repo.write("src/leak.rs", &format!("pub const K: &str = \"{aws}\";\n"));
+    let root = repo.path().to_str().unwrap();
+
+    // 1. Static secret short-circuits Gate 4 Kane BEFORE spawning kane-cli (0 credits!)
+    let (code, out, _err) = run_refit(
+        &["check", root, "--kane", "verify HUD", "--format", "json"],
+        &[("REFIT_KANE_BIN", "nonexistent_kane_canary_bin")],
+    );
+    assert_ne!(code, 0);
+    let j: Value = serde_json::from_str(&out).expect("valid short-circuit JSON");
+    assert_eq!(j["kane"]["verdict"], "short_circuited");
+    assert_eq!(j["kane"]["credits_consumed"], 0.0);
+
+    // 2. Remove secret and run cross-platform mock REFIT_KANE_BIN -> SARIF + .refit/kane_last.json
+    fs::remove_file(repo.path().join("src/leak.rs")).unwrap();
+    repo.write("src/hud.rs", "pub fn render_mvcc_drawer() -> i32 { 1 }\n");
+    let mock_path = if cfg!(windows) {
+        let p = repo.path().join("mock_kane.cmd");
+        let body = concat!(
+            "@echo off\r\n",
+            "if \"%1\"==\"--version\" (echo 0.10.9 & exit /b 0)\r\n",
+            "echo {\"v\":1,\"type\":\"stream_start\",\"cli_version\":\"0.10.9\"}\r\n",
+            "echo {\"v\":1,\"type\":\"step_end\",\"step\":2,\"kind\":\"AGENT_INFO\",\"status\":\"failed\",\"remark\":\"render_mvcc_drawer failed\"}\r\n",
+            "echo {\"v\":1,\"type\":\"run_end\",\"status\":\"failed\",\"result_code\":\"740\",\"credits_consumed\":1.2,\"verdict\":{\"confirmed\":true}}\r\n",
+            "exit /b 1\r\n",
+        );
+        fs::write(&p, body).unwrap();
+        p
+    } else {
+        let p = repo.path().join("mock_kane.sh");
+        let body = concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then echo 0.10.9; exit 0; fi\n",
+            "echo '{\"v\":1,\"type\":\"stream_start\",\"cli_version\":\"0.10.9\"}'\n",
+            "echo '{\"v\":1,\"type\":\"step_end\",\"step\":2,\"kind\":\"AGENT_INFO\",\"status\":\"failed\",\"remark\":\"render_mvcc_drawer failed\"}'\n",
+            "echo '{\"v\":1,\"type\":\"run_end\",\"status\":\"failed\",\"result_code\":\"740\",\"credits_consumed\":1.2,\"verdict\":{\"confirmed\":true}}'\n",
+            "exit 1\n",
+        );
+        fs::write(&p, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o755));
+        }
+        p
+    };
+    let mock_str = mock_path.to_str().unwrap();
+    let (code, out, _err) = run_refit(
+        &["check", root, "--kane", "verify render_mvcc_drawer", "--format", "sarif"],
+        &[("REFIT_KANE_BIN", mock_str)],
+    );
+    assert_ne!(code, 0);
+    let sarif: Value = serde_json::from_str(&out).expect("valid Kane SARIF JSON");
+    assert_eq!(sarif["version"], "2.1.0");
+    let results = sarif["runs"][0]["results"].as_array().expect("sarif results");
+    assert!(results.iter().any(|r| r["ruleId"] == "kane/product_bug_740"), "missing 740 SARIF: {sarif}");
+    assert!(repo.path().join(".refit/kane_last.json").is_file());
 }

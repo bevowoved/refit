@@ -584,7 +584,7 @@ fn s10_mcp(ctx: &mut Ctx) -> Result<()> {
     if let Some(t) = vals.iter().find(|v| v["id"] == 3) {
         let n = t["result"]["tools"].as_array().map_or(0, Vec::len);
         m.insert("stdio_tools".into(), json!(n));
-        if n != 17 { errs.push(format!("expected 17 MCP tools, got {n}")); }
+        if n != 12 { errs.push(format!("expected 12 MCP tools, got {n}")); }
     }
     if let Some(s2) = vals.iter().find(|v| v["id"] == 5) {
         let txt = s2["result"]["content"][0]["text"].as_str().unwrap_or("{}");
@@ -611,7 +611,7 @@ fn s10_mcp(ctx: &mut Ctx) -> Result<()> {
             .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"protocolVersion":"2026-07-28"}}}))
             .send()
             && let Ok(v) = resp.json::<Value>()
-            && v["result"]["tools"].as_array().is_some_and(|a| a.len() == 17)
+            && v["result"]["tools"].as_array().is_some_and(|a| a.len() == 12)
         {
             http_ok = true;
             break;

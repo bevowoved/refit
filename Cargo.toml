@@ -131,3 +131,11 @@ lto = "thin"
 codegen-units = 16
 strip = "symbols"
 panic = "abort"
+
+[profile.dist]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

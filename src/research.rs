@@ -24,8 +24,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OnceCell};
 
 const DEFAULT_KEENABLE_URL: &str = "https://api.keenable.ai/mcp";
+const DEFAULT_KEENABLE_PUBLIC_URL: &str = "https://api.keenable.ai/mcp-public";
 const DEFAULT_EXA_URL: &str = "https://api.exa.ai/search";
 const DEFAULT_FIRECRAWL_URL: &str = "https://api.firecrawl.dev/v2/search";
+const DEFAULT_OSV_BATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
+const OSV_CACHE_TTL_MS: u64 = 6 * 3_600_000;
+const OSV_BATCH_CHUNK: usize = 1000;
+const OSV_MAX_LOCKFILE_BYTES: u64 = 16 * 1024 * 1024;
+const OSV_MAX_RESP_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_PROVIDERS_ENV: &str = "keenable,exa,firecrawl";
 const DEFAULT_SLIDING_SLOTS: usize = 10;
 const DEFAULT_TTL_SECS: u64 = 86_400;
@@ -300,13 +306,23 @@ fn cache_entry_weight(key: &str, entry: &WebCacheEntry) -> usize {
         .saturating_add(sum_len(&entry.result.urls)).saturating_add(128)
 }
 
-fn parse_custom_provider(spec: &str, seen: &mut HashSet<String>) -> Option<SearchProvider> {
+fn is_offline_val(val: Option<&str>) -> bool {
+    val.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn is_refit_offline() -> bool {
+    is_offline_val(env_trimmed("REFIT_OFFLINE").as_deref())
+}
+
+fn parse_custom_provider_with(
+    spec: &str, seen: &mut HashSet<String>, get_env: &impl Fn(&str) -> Option<String>,
+) -> Option<SearchProvider> {
     let rest = spec.strip_prefix("custom:")?;
     let (name, url_and_key) = rest.split_once('=')?;
     let (url, key_env) = url_and_key.rsplit_once('#')?;
     let (name, url, key_env) = (name.trim(), url.trim(), key_env.trim());
     if name.is_empty() || url.is_empty() || key_env.is_empty() { return None; }
-    let api_key = env_trimmed(key_env)?;
+    let api_key = get_env(key_env)?;
     if !seen.insert(name.to_ascii_lowercase()) { return None; }
     Some(SearchProvider {
         name: name.into(), kind: SearchBackendKind::CustomMcp,
@@ -314,7 +330,7 @@ fn parse_custom_provider(spec: &str, seen: &mut HashSet<String>) -> Option<Searc
     })
 }
 
-fn providers_from_env() -> Vec<SearchProvider> {
+fn providers_from_lookup(get_env: impl Fn(&str) -> Option<String>) -> Vec<SearchProvider> {
     const BUILTINS: &[(&str, SearchBackendKind, &str, &str, &str, usize)] = &[
         ("keenable", SearchBackendKind::KeenAbleMcp, "KEENABLE_API_KEY", "KEENABLE_MCP_URL",
             DEFAULT_KEENABLE_URL, DEFAULT_SLIDING_SLOTS),
@@ -322,22 +338,30 @@ fn providers_from_env() -> Vec<SearchProvider> {
         ("firecrawl", SearchBackendKind::FirecrawlSearch, "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL",
             DEFAULT_FIRECRAWL_URL, 5),
     ];
-    let raw = env_trimmed("REFIT_SEARCH_PROVIDERS").unwrap_or_else(|| DEFAULT_PROVIDERS_ENV.into());
+    if is_offline_val(get_env("REFIT_OFFLINE").as_deref()) { return Vec::new(); }
+    let raw = get_env("REFIT_SEARCH_PROVIDERS").unwrap_or_else(|| DEFAULT_PROVIDERS_ENV.into());
     let (mut providers, mut seen) = (Vec::new(), HashSet::new());
     for spec in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if let Some(&(name, kind, key_env, url_env, def_url, max_slots)) =
             BUILTINS.iter().find(|b| spec.eq_ignore_ascii_case(b.0))
         {
-            if let Some(api_key) = env_trimmed(key_env) && seen.insert(name.to_string()) {
-                let endpoint = env_trimmed(url_env).unwrap_or_else(|| def_url.into());
+            if let Some(api_key) = get_env(key_env) && seen.insert(name.to_string()) {
+                let endpoint = get_env(url_env).unwrap_or_else(|| def_url.into());
                 providers.push(SearchProvider { name: name.into(), kind, endpoint, api_key, max_slots });
+            } else if kind == SearchBackendKind::KeenAbleMcp && seen.insert(name.to_string()) {
+                let endpoint = get_env(url_env).unwrap_or_else(|| DEFAULT_KEENABLE_PUBLIC_URL.into());
+                providers.push(SearchProvider {
+                    name: name.into(), kind, endpoint, api_key: String::new(), max_slots: DEFAULT_SLIDING_SLOTS,
+                });
             }
-        } else if let Some(custom) = parse_custom_provider(spec, &mut seen) {
+        } else if let Some(custom) = parse_custom_provider_with(spec, &mut seen, &get_env) {
             providers.push(custom);
         }
     }
     providers
 }
+
+fn providers_from_env() -> Vec<SearchProvider> { providers_from_lookup(env_trimmed) }
 
 pub struct WebClient {
     providers: Arc<[SearchProvider]>,
@@ -796,18 +820,25 @@ fn build_provider_req(
 ) -> reqwest::RequestBuilder {
     let base = client.post(&provider.endpoint).header("Content-Type", "application/json");
     match provider.kind {
-        SearchBackendKind::KeenAbleMcp | SearchBackendKind::CustomMcp => base
-            .header("X-API-Key", &provider.api_key)
-            .header("Accept", "application/json, text/event-stream")
-            .header("Mcp-Method", "tools/call")
-            .header("Mcp-Name", "search_web_pages")
-            .json(&json!({
+        SearchBackendKind::KeenAbleMcp | SearchBackendKind::CustomMcp => {
+            let mut req = base
+                .header("Accept", "application/json, text/event-stream")
+                .header("Mcp-Method", "tools/call")
+                .header("Mcp-Name", "search_web_pages");
+            if !provider.api_key.is_empty() {
+                req = req.header("X-API-Key", &provider.api_key);
+            }
+            if provider.kind == SearchBackendKind::KeenAbleMcp {
+                req = req.header("X-Keenable-Title", "refit");
+            }
+            req.json(&json!({
                 "jsonrpc": "2.0", "id": rpc_id, "method": "tools/call",
                 "params": {
                     "name": "search_web_pages",
                     "arguments": {"query": query, "mode": "realtime", "max_results": cap},
                 },
-            })),
+            }))
+        }
         SearchBackendKind::ExaSearch => base.header("x-api-key", &provider.api_key)
             .json(&json!({"query": query, "numResults": cap, "contents": {"text": {"maxCharacters": 800}}})),
         SearchBackendKind::FirecrawlSearch => base.bearer_auth(&provider.api_key)
@@ -959,6 +990,214 @@ fn parse_rpc(body: &str) -> String {
         if !joined.is_empty() { return joined; }
     }
     trimmed.to_string()
+}
+
+// Static OSV.dev lockfile SCA
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OsvFinding {
+    pub ecosystem: String,
+    pub package: String,
+    pub version: String,
+    pub advisory_id: String,
+    pub summary: String,
+    pub lockfile: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OsvLockPkg {
+    ecosystem: &'static str,
+    package: String,
+    version: String,
+    lockfile: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OsvCacheFile {
+    hash: String,
+    saved_at_ms: u64,
+    findings: Vec<OsvFinding>,
+}
+
+#[derive(Deserialize, Default)]
+struct OsvTomlLock {
+    #[serde(default)]
+    package: Vec<OsvTomlPkg>,
+}
+
+#[derive(Deserialize)]
+struct OsvTomlPkg {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    version: String,
+}
+
+#[derive(Deserialize, Default)]
+struct OsvBatchResp {
+    #[serde(default)]
+    results: Vec<OsvQueryResult>,
+}
+
+#[derive(Deserialize, Default)]
+struct OsvQueryResult {
+    #[serde(default)]
+    vulns: Vec<OsvVuln>,
+}
+
+#[derive(Deserialize)]
+struct OsvVuln {
+    id: String,
+    #[serde(default)]
+    summary: String,
+}
+
+fn read_lockfile_text(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > OSV_MAX_LOCKFILE_BYTES { return None; }
+    std::fs::read_to_string(path).ok()
+}
+
+fn parse_toml_lockfile(raw: &str, ecosystem: &'static str, lockfile: &'static str) -> Vec<OsvLockPkg> {
+    let Ok(doc) = toml::from_str::<OsvTomlLock>(raw) else { return Vec::new() };
+    doc.package.into_iter()
+        .filter(|p| !p.name.is_empty() && !p.version.is_empty())
+        .map(|p| OsvLockPkg { ecosystem, package: p.name, version: p.version, lockfile })
+        .collect()
+}
+
+fn parse_npm_lockfile(raw: &str) -> Vec<OsvLockPkg> {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else { return Vec::new() };
+    let Some(pkgs) = val.get("packages").and_then(serde_json::Value::as_object) else { return Vec::new() };
+    pkgs.iter().filter_map(|(k, v)| {
+        let (_, name) = k.rsplit_once("node_modules/")?;
+        let ver = v.get("version").and_then(serde_json::Value::as_str)?.trim();
+        (!name.is_empty() && !ver.is_empty()).then(|| OsvLockPkg {
+            ecosystem: "npm", package: name.into(), version: ver.into(), lockfile: "package-lock.json",
+        })
+    }).collect()
+}
+
+fn parse_go_sum_lockfile(raw: &str) -> Vec<OsvLockPkg> {
+    raw.lines().filter_map(|line| {
+        let mut parts = line.split_whitespace();
+        let (module, raw_ver) = (parts.next()?, parts.next()?);
+        let stripped = raw_ver.strip_suffix("/go.mod").unwrap_or(raw_ver);
+        let ver = stripped.strip_prefix('v')?;
+        (!module.is_empty() && !ver.is_empty()).then(|| OsvLockPkg {
+            ecosystem: "Go", package: module.into(), version: ver.into(), lockfile: "go.sum",
+        })
+    }).collect()
+}
+
+fn collect_osv_lock_packages(repo_root: &Path) -> Vec<OsvLockPkg> {
+    let mut pkgs = Vec::new();
+    if let Some(raw) = read_lockfile_text(&repo_root.join("Cargo.lock")) {
+        pkgs.extend(parse_toml_lockfile(&raw, "crates.io", "Cargo.lock"));
+    }
+    if let Some(raw) = read_lockfile_text(&repo_root.join("package-lock.json")) {
+        pkgs.extend(parse_npm_lockfile(&raw));
+    }
+    if let Some(raw) = read_lockfile_text(&repo_root.join("uv.lock")) {
+        pkgs.extend(parse_toml_lockfile(&raw, "PyPI", "uv.lock"));
+    }
+    if let Some(raw) = read_lockfile_text(&repo_root.join("go.sum")) {
+        pkgs.extend(parse_go_sum_lockfile(&raw));
+    }
+    pkgs.sort();
+    pkgs.dedup();
+    pkgs
+}
+
+fn hash_osv_packages(pkgs: &[OsvLockPkg]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for p in pkgs {
+        hasher.update(p.ecosystem.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(p.package.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(p.version.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(p.lockfile.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+async fn query_osv_chunk(
+    client: &reqwest::Client, url: &str, chunk: &[OsvLockPkg],
+) -> Option<Vec<OsvFinding>> {
+    let queries: Vec<serde_json::Value> = chunk.iter().map(|p| json!({
+        "package": { "name": p.package, "ecosystem": p.ecosystem },
+        "version": p.version,
+    })).collect();
+    let resp = match client.post(url).json(&json!({ "queries": queries })).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(error = %err, "OSV querybatch network error; returning empty findings");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(status = resp.status().as_u16(), "OSV querybatch non-success HTTP status");
+        return None;
+    }
+    let body = read_body_capped(resp, OSV_MAX_RESP_BYTES).await;
+    let parsed: OsvBatchResp = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(error = %err, "OSV querybatch invalid JSON response");
+            return None;
+        }
+    };
+    let mut out = Vec::new();
+    for (pkg, res) in chunk.iter().zip(parsed.results) {
+        for vuln in res.vulns {
+            out.push(OsvFinding {
+                ecosystem: pkg.ecosystem.into(), package: pkg.package.clone(), version: pkg.version.clone(),
+                advisory_id: vuln.id, summary: vuln.summary, lockfile: pkg.lockfile.into(),
+            });
+        }
+    }
+    Some(out)
+}
+
+async fn scan_lockfiles_osv_with(repo_root: &Path, osv_url: &str, offline: bool) -> Result<Vec<OsvFinding>> {
+    if offline { return Ok(Vec::new()); }
+    let pkgs = collect_osv_lock_packages(repo_root);
+    if pkgs.is_empty() { return Ok(Vec::new()); }
+
+    let hash = hash_osv_packages(&pkgs);
+    let cache_path = repo_root.join(".refit/cache/osv_cache.zst");
+    if let Some(cached) = read_zstd::<OsvCacheFile>(&cache_path)
+        && cached.hash == hash && now_ms().saturating_sub(cached.saved_at_ms) <= OSV_CACHE_TTL_MS
+    {
+        return Ok(cached.findings);
+    }
+
+    let ua = concat!("refit-osv/", env!("CARGO_PKG_VERSION"));
+    let client = new_http(ua, 20, HTTP_IDLE_POOL_PER_HOST).unwrap_or_else(|_| reqwest::Client::new());
+    let mut findings = Vec::new();
+    for chunk in pkgs.chunks(OSV_BATCH_CHUNK) {
+        let Some(mut batch) = query_osv_chunk(&client, osv_url, chunk).await else {
+            return Ok(Vec::new());
+        };
+        findings.append(&mut batch);
+    }
+    findings.sort_by(|a, b| {
+        (&a.lockfile, &a.ecosystem, &a.package, &a.version, &a.advisory_id)
+            .cmp(&(&b.lockfile, &b.ecosystem, &b.package, &b.version, &b.advisory_id))
+    });
+    if let Some(parent) = cache_path.parent() { ensure_cachedir_tag(parent); }
+    let _ = write_zstd(&cache_path, &OsvCacheFile { hash, saved_at_ms: now_ms(), findings: findings.clone() });
+    Ok(findings)
+}
+
+/// Statically parse repo lockfiles (`Cargo.lock`, `package-lock.json`, `uv.lock`, `go.sum`)
+/// and query OSV.dev `/v1/querybatch` with BLAKE3-keyed 6-hour zstd caching.
+pub async fn scan_lockfiles_osv(repo_root: &Path) -> Result<Vec<OsvFinding>> {
+    let url = env_trimmed("REFIT_OSV_URL").unwrap_or_else(|| DEFAULT_OSV_BATCH_URL.into());
+    scan_lockfiles_osv_with(repo_root, &url, is_refit_offline()).await
 }
 
 #[cfg(test)]
@@ -1211,6 +1450,92 @@ fn check_firecrawl_v2_and_legacy() {
 }
 
 #[cfg(test)]
+async fn check_keyless_keenable_and_offline() {
+    let none_env = |_: &str| None;
+    let def_providers = providers_from_lookup(none_env);
+    assert_eq!(def_providers.len(), 1);
+    assert_eq!(
+        (def_providers[0].name.as_str(), def_providers[0].endpoint.as_str(), def_providers[0].api_key.as_str()),
+        ("keenable", DEFAULT_KEENABLE_PUBLIC_URL, ""),
+    );
+    let off_one = providers_from_lookup(|k| (k == "REFIT_OFFLINE").then(|| "1".into()));
+    let off_true = providers_from_lookup(|k| (k == "REFIT_OFFLINE").then(|| "TRUE".into()));
+    assert!(off_one.is_empty() && off_true.is_empty());
+
+    let captured = Arc::new(Mutex::new(Vec::<TestHeaderMap>::new()));
+    let app = TestRouter::new()
+        .route("/mcp-public", test_post({
+            let cap = Arc::clone(&captured);
+            move |hdrs: TestHeaderMap| serve_hdr(hdrs, Arc::clone(&cap))
+        }));
+    let srv = TestAxum::spawn(app).await;
+    let keyless = mk_provider("keenable", SearchBackendKind::KeenAbleMcp, format!("{}/mcp-public", srv.base_url), "", 10);
+    let wc = WebClient::with_providers(vec![keyless], None, 60, None);
+    let res = wc.search_web("rust osv", 3).await.unwrap();
+    assert!(res.online);
+    let hdrs = captured.lock();
+    assert_eq!(hdrs.len(), 1);
+    assert!(hdrs[0].get("x-api-key").is_none());
+    assert_eq!(test_header_str(&hdrs[0], "x-keenable-title"), Some("refit"));
+}
+
+#[cfg(test)]
+async fn check_osv_parsers_and_batch_cache() {
+    let cargo_raw = "[[package]]\nname = \"serde\"\nversion = \"1.0.154\"\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.154\"\n";
+    let npm_raw = r#"{"packages":{"":{"version":"0.1.0"},"node_modules/lodash":{"version":"4.17.20"},"node_modules/@scope/pkg":{"version":"1.2.3"}}}"#;
+    let uv_raw = "[[package]]\nname = \"app\"\n\n[[package]]\nname = \"requests\"\nversion = \"2.31.0\"\n";
+    let go_raw = "golang.org/x/net v0.17.0 h1:abc\ngolang.org/x/net v0.17.0/go.mod h1:def\n";
+
+    let dir = TempRepo::new("osv_sca");
+    dir.write("Cargo.lock", cargo_raw);
+    dir.write("package-lock.json", npm_raw);
+    dir.write("uv.lock", uv_raw);
+    dir.write("go.sum", go_raw);
+
+    let pkgs = collect_osv_lock_packages(dir.path());
+    assert_eq!(pkgs.len(), 5);
+    assert!(pkgs.iter().any(|p| p.ecosystem == "crates.io" && p.package == "serde" && p.version == "1.0.154"));
+    assert!(pkgs.iter().any(|p| p.ecosystem == "npm" && p.package == "lodash" && p.version == "4.17.20"));
+    assert!(pkgs.iter().any(|p| p.ecosystem == "npm" && p.package == "@scope/pkg" && p.version == "1.2.3"));
+    assert!(pkgs.iter().any(|p| p.ecosystem == "PyPI" && p.package == "requests" && p.version == "2.31.0"));
+    assert!(pkgs.iter().any(|p| p.ecosystem == "Go" && p.package == "golang.org/x/net" && p.version == "0.17.0"));
+
+    let hits = Arc::new(TestAtomicUsize::new(0));
+    let app = TestRouter::new().route("/v1/querybatch", test_post({
+        let hits = Arc::clone(&hits);
+        move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let hits = Arc::clone(&hits);
+            async move {
+                hits.fetch_add(1, Ordering::Relaxed);
+                let qs = body["queries"].as_array().cloned().unwrap_or_default();
+                let results: Vec<serde_json::Value> = qs.iter().map(|q| {
+                    if q["package"]["name"] == "lodash" {
+                        json!({"vulns": [{"id": "GHSA-35jh-r3h4-6jhm", "summary": "Command injection in lodash"}]})
+                    } else {
+                        json!({})
+                    }
+                }).collect();
+                json_ok(json!({ "results": results }).to_string())
+            }
+        }
+    }));
+    let srv = TestAxum::spawn(app).await;
+    let url = format!("{}/v1/querybatch", srv.base_url);
+
+    let off = scan_lockfiles_osv_with(dir.path(), &url, true).await.unwrap();
+    assert!(off.is_empty() && hits.load(Ordering::Relaxed) == 0);
+
+    let f1 = scan_lockfiles_osv_with(dir.path(), &url, false).await.unwrap();
+    assert_eq!(f1.len(), 1);
+    assert_eq!((f1[0].ecosystem.as_str(), f1[0].package.as_str(), f1[0].advisory_id.as_str()), ("npm", "lodash", "GHSA-35jh-r3h4-6jhm"));
+    assert!(dir.join(".refit/cache/osv_cache.zst").exists());
+
+    let f2 = scan_lockfiles_osv_with(dir.path(), &url, false).await.unwrap();
+    assert_eq!(f1, f2);
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1225,4 +1550,10 @@ mod tests {
 
     #[test]
     fn firecrawl_v2_and_legacy_parse() { check_firecrawl_v2_and_legacy(); }
+
+    #[tokio::test]
+    async fn keyless_keenable_and_offline_env() { check_keyless_keenable_and_offline().await; }
+
+    #[tokio::test]
+    async fn osv_lockfile_parsers_and_cache() { check_osv_parsers_and_batch_cache().await; }
 }

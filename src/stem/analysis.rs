@@ -1,7 +1,7 @@
 //! Unified static-graph, deep-module architecture, clean-room git co-change NPMI,
 //! and 16-byte proof-lattice witness analysis (merged `csr` + `genome` + `witness`).
 
-use crate::lex::ident_byte;
+use crate::lex::{LangKind, LexCursor, LexKind, ident_byte};
 use crate::platform::{par_map, read_zstd, write_zstd};
 use crate::source::{dir_of, read_text, stem_of};
 use crate::types::{CloneCluster, FileEgoContext};
@@ -337,6 +337,7 @@ pub struct ArchGraphRef<'a> {
     pub metrics: &'a BTreeMap<String, ModuleMetrics>,
     pub defs_by_file: Option<&'a BTreeMap<String, Vec<String>>>,
     pub refs_by_file: Option<&'a BTreeMap<String, Vec<String>>>,
+    pub sources: Option<&'a BTreeMap<String, Vec<u8>>>,
 }
 
 fn index_source_rels(source_rels: &[String]) -> FxHashMap<&str, usize> {
@@ -346,9 +347,160 @@ fn index_source_rels(source_rels: &[String]) -> FxHashMap<&str, usize> {
         .collect()
 }
 
+struct RustStructFields<'a> { pub_fields: Vec<&'a str>, has_private: bool }
+
+const TRIVIAL_DTO_TRAITS: &[&str] = &[
+    "Default", "Display", "Debug", "Clone", "Copy", "PartialEq", "Eq",
+    "PartialOrd", "Ord", "Hash", "From", "Into", "TryFrom", "AsRef", "Deref",
+];
+
+fn collect_rs_code_tokens(bytes: &[u8]) -> Vec<(LexKind, &str)> {
+    let mut cursor = LexCursor::new(LangKind::Rust, bytes);
+    let mut toks = Vec::new();
+    let mut skip_attr_brackets = 0usize;
+    let mut pending_hash = false;
+    while let Some(tok) = cursor.next_token() {
+        if matches!(tok.kind, LexKind::LineComment | LexKind::BlockComment | LexKind::Newline)
+            || tok.flags.in_test()
+        {
+            continue;
+        }
+        if skip_attr_brackets > 0 {
+            if tok.kind == LexKind::LBracket { skip_attr_brackets += 1; }
+            else if tok.kind == LexKind::RBracket { skip_attr_brackets -= 1; }
+            continue;
+        }
+        if pending_hash {
+            if tok.kind == LexKind::Bang { continue; }
+            pending_hash = false;
+            if tok.kind == LexKind::LBracket { skip_attr_brackets = 1; continue; }
+        }
+        if tok.kind == LexKind::Hash { pending_hash = true; continue; }
+        toks.push((tok.kind, tok.as_str()));
+    }
+    toks
+}
+
+fn parse_rs_struct_body<'a>(toks: &[(LexKind, &'a str)], start: usize) -> (RustStructFields<'a>, usize) {
+    let (mut pub_fields, mut has_private) = (Vec::new(), false);
+    let (mut i, mut depth, mut at_field_start) = (start, 0usize, true);
+    while i < toks.len() {
+        let (kind, text) = toks[i];
+        if depth == 0 && kind == LexKind::RBrace { return (RustStructFields { pub_fields, has_private }, i + 1); }
+        if depth == 0 && kind == LexKind::Comma { at_field_start = true; i += 1; continue; }
+        if depth == 0 && at_field_start {
+            at_field_start = false;
+            if kind == LexKind::Ident && text == "pub" {
+                let restricted = toks.get(i + 1).is_some_and(|(k, _)| *k == LexKind::LParen);
+                if restricted {
+                    has_private = true;
+                } else if let Some((LexKind::Ident, name)) = toks.get(i + 1)
+                    && toks.get(i + 2).is_some_and(|(k, _)| *k == LexKind::Colon)
+                {
+                    pub_fields.push(*name);
+                }
+            } else if kind == LexKind::Ident
+                && toks.get(i + 1).is_some_and(|(k, _)| *k == LexKind::Colon)
+            {
+                has_private = true;
+            }
+        }
+        match kind {
+            LexKind::LBrace | LexKind::LParen | LexKind::LBracket | LexKind::Lt => depth += 1,
+            LexKind::RBrace | LexKind::RParen | LexKind::RBracket | LexKind::Gt => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    (RustStructFields { pub_fields, has_private }, i)
+}
+
+fn parse_rs_impl_behavior<'a>(toks: &[(LexKind, &'a str)], start: usize) -> (Option<&'a str>, bool, usize) {
+    let (mut i, mut angle, mut in_where) = (start, 0usize, false);
+    let (mut seen_for, mut trait_name, mut target_name) = (false, None, None);
+    while i < toks.len() && !(angle == 0 && toks[i].0 == LexKind::LBrace) {
+        let (kind, text) = toks[i];
+        match kind {
+            LexKind::Lt => angle += 1,
+            LexKind::Gt => angle = angle.saturating_sub(1),
+            LexKind::Ident if angle == 0 => {
+                if text == "where" { in_where = true; }
+                else if !in_where && text == "for" { seen_for = true; }
+                else if !in_where && seen_for { target_name = Some(text); }
+                else if !in_where {
+                    if trait_name.is_none() || !seen_for { trait_name = Some(text); }
+                    target_name = Some(text);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if i >= toks.len() { return (None, false, i); }
+    let (mut depth, mut has_fn) = (1usize, false);
+    i += 1;
+    while i < toks.len() && depth > 0 {
+        match toks[i] {
+            (LexKind::LBrace, _) => depth += 1,
+            (LexKind::RBrace, _) => depth -= 1,
+            (LexKind::Ident, "fn") if depth == 1 => has_fn = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    let trivial_trait = seen_for && trait_name.is_some_and(|t| TRIVIAL_DTO_TRAITS.contains(&t));
+    (target_name, has_fn && !trivial_trait, i)
+}
+
+fn extract_rs_pure_dto_fields(bytes: &[u8]) -> FxHashSet<String> {
+    let toks = collect_rs_code_tokens(bytes);
+    let mut structs: Vec<(&str, RustStructFields<'_>)> = Vec::new();
+    let mut behavioral: FxHashSet<&str> = FxHashSet::default();
+    let (mut i, mut brace_depth) = (0usize, 0usize);
+    while i < toks.len() {
+        let (kind, text) = toks[i];
+        if brace_depth == 0 && kind == LexKind::Ident && text == "pub"
+            && toks.get(i + 1) == Some(&(LexKind::Ident, "struct"))
+            && let Some(&(LexKind::Ident, sname)) = toks.get(i + 2)
+        {
+            let mut j = i + 3;
+            while j < toks.len() && !matches!(toks[j].0, LexKind::LBrace | LexKind::LParen | LexKind::Semi) {
+                j += 1;
+            }
+            if toks.get(j).is_some_and(|(k, _)| *k == LexKind::LBrace) {
+                let (info, next_i) = parse_rs_struct_body(&toks, j + 1);
+                structs.push((sname, info));
+                i = next_i;
+                continue;
+            }
+            i = (j + 1).min(toks.len());
+            continue;
+        }
+        if brace_depth == 0 && kind == LexKind::Ident && text == "impl" {
+            let (target, has_behavior, next_i) = parse_rs_impl_behavior(&toks, i + 1);
+            if has_behavior && let Some(t) = target { behavioral.insert(t); }
+            i = next_i;
+            continue;
+        }
+        if kind == LexKind::LBrace { brace_depth += 1; }
+        else if kind == LexKind::RBrace { brace_depth = brace_depth.saturating_sub(1); }
+        i += 1;
+    }
+    let mut non_dto: FxHashSet<&str> = FxHashSet::default();
+    let mut dto: FxHashSet<&str> = FxHashSet::default();
+    for (name, info) in structs {
+        let is_pure = !info.has_private && !behavioral.contains(name) && !info.pub_fields.is_empty();
+        for field in info.pub_fields {
+            if is_pure { dto.insert(field); } else { non_dto.insert(field); }
+        }
+    }
+    dto.into_iter().filter(|f| !non_dto.contains(f)).map(str::to_string).collect()
+}
+
 struct ImportLeakCtx<'a> {
     source_rels: &'a [String], importers_of: Vec<FxHashSet<usize>>,
     field_readers: FxHashMap<&'a str, FxHashSet<usize>>,
+    pure_dto_fields: Vec<FxHashSet<String>>,
 }
 
 fn build_leak_ctx<'a>(
@@ -362,13 +514,17 @@ fn build_leak_ctx<'a>(
     }
 
     let mut field_readers: FxHashMap<&'a str, FxHashSet<usize>> = FxHashMap::default();
+    let mut pure_dto_fields = vec![FxHashSet::default(); source_rels.len()];
     for (idx, rel) in source_rels.iter().enumerate() {
+        if rel.ends_with(".rs") && let Some(bytes) = arch.sources.and_then(|m| m.get(rel)) {
+            pure_dto_fields[idx] = extract_rs_pure_dto_fields(bytes);
+        }
         let Some(metric) = arch.metrics.get(rel) else { continue };
         for field in &metric.field_reads {
             field_readers.entry(field.as_str()).or_default().insert(idx);
         }
     }
-    ImportLeakCtx { source_rels, importers_of, field_readers }
+    ImportLeakCtx { source_rels, importers_of, field_readers, pure_dto_fields }
 }
 
 impl<'a> ImportLeakCtx<'a> {
@@ -380,6 +536,7 @@ impl<'a> ImportLeakCtx<'a> {
         let (metric, importers) = (arch.metrics.get(rel)?, &self.importers_of[idx]);
         let mut best: Option<(String, usize)> = None;
         for pub_field in &metric.pub_fields {
+            if self.pure_dto_fields[idx].contains(pub_field.as_str()) { continue; }
             let Some(readers) = self.field_readers.get(pub_field.as_str()) else { continue };
             let is_generic = COMMON_GENERIC_FIELDS.contains(&pub_field.as_str());
             let count = readers.iter().filter(|&&r| {
@@ -1103,7 +1260,10 @@ fn verify_shallow_and_field_leak() {
         ("src/a.rs".into(), "src/model.rs".into()), ("src/b.rs".into(), "src/model.rs".into()),
     ];
     let sccs = CsrGraph::from_named_edges(&rels, &edges).0.pearce_scc();
-    let arch = ArchGraphRef { all_edges: &edges, runtime_edges: &edges, metrics: &metrics, defs_by_file: None, refs_by_file: None };
+    let arch = ArchGraphRef {
+        all_edges: &edges, runtime_edges: &edges, metrics: &metrics,
+        defs_by_file: None, refs_by_file: None, sources: None,
+    };
     let (ego, findings) = analyze_ego_and_deep_modules(&rels, &sccs, &arch, &BTreeMap::new(), &[]);
 
     for (needle, want) in [
@@ -1113,6 +1273,45 @@ fn verify_shallow_and_field_leak() {
         assert_eq!(findings.iter().any(|f| f.contains(needle)), want, "{needle} in {findings:?}");
     }
     assert_eq!((ego["src/model.rs"].external_field_readers, ego["src/a.rs"].has_module_cycle), (2, true));
+}
+
+#[cfg(test)]
+fn verify_rs_pure_dto_exemption() {
+    let sources = BTreeMap::from([
+        ("src/dto.rs".into(), concat!(
+            "#[derive(Debug, Clone)]\n",
+            "pub struct ReportDto {\n    pub summary_text: String,\n    pub metric_val: usize,\n}\n",
+            "impl Default for ReportDto {\n    fn default() -> Self { Self { summary_text: String::new(), metric_val: 0 } }\n}\n",
+        ).as_bytes().to_vec()),
+        ("src/stateful.rs".into(),
+            b"pub struct SessionStore {\n    pub raw_token: String,\n    secret_nonce: u64,\n}\n".to_vec()),
+        ("src/engine.rs".into(), concat!(
+            "pub struct Engine {\n    pub cache_budget: usize,\n}\n",
+            "impl Engine {\n    pub fn recompute(&mut self) { self.cache_budget += 1; }\n}\n",
+        ).as_bytes().to_vec()),
+    ]);
+    let metrics = BTreeMap::from([
+        ("src/dto.rs".into(), mk_metric(8, 1, 1, 0, &["summary_text", "metric_val"], &[])),
+        ("src/stateful.rs".into(), mk_metric(5, 1, 0, 0, &["raw_token"], &[])),
+        ("src/engine.rs".into(), mk_metric(7, 1, 1, 0, &["cache_budget"], &[])),
+        ("src/c1.rs".into(), mk_metric(40, 1, 2, 0, &[], &["summary_text", "raw_token", "cache_budget"])),
+        ("src/c2.rs".into(), mk_metric(40, 1, 2, 0, &[], &["summary_text", "raw_token", "cache_budget"])),
+    ]);
+    let rels: Vec<String> = metrics.keys().cloned().collect();
+    let edges = vec![
+        ("src/c1.rs".into(), "src/dto.rs".into()), ("src/c2.rs".into(), "src/dto.rs".into()),
+        ("src/c1.rs".into(), "src/stateful.rs".into()), ("src/c2.rs".into(), "src/stateful.rs".into()),
+        ("src/c1.rs".into(), "src/engine.rs".into()), ("src/c2.rs".into(), "src/engine.rs".into()),
+    ];
+    let arch = ArchGraphRef {
+        all_edges: &edges, runtime_edges: &edges, metrics: &metrics,
+        defs_by_file: None, refs_by_file: None, sources: Some(&sources),
+    };
+    let (ego, findings) = analyze_ego_and_deep_modules(&rels, &[], &arch, &BTreeMap::new(), &[]);
+    assert_eq!(ego["src/dto.rs"].external_field_readers, 0);
+    assert!(!findings.iter().any(|f| f.contains("src/dto.rs")), "unexpected DTO leak: {findings:?}");
+    assert!(findings.iter().any(|f| f.contains("[field-leak] src/stateful.rs") && f.contains(".raw_token")));
+    assert!(findings.iter().any(|f| f.contains("[field-leak] src/engine.rs") && f.contains(".cache_budget")));
 }
 
 #[cfg(test)]
@@ -1155,6 +1354,7 @@ mod tests {
     fn csr_shallow_and_field_leak() {
         verify_inv_test_match();
         verify_shallow_and_field_leak();
+        verify_rs_pure_dto_exemption();
     }
 
     #[test]

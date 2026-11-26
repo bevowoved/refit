@@ -36,12 +36,22 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static MALLOC_CONF: &[u8] = b"dirty_decay_ms:50,muzzy_decay_ms:50,narenas:2\0";
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use runner::DEFAULT_UPSTREAM;
 use serde::Serialize;
 use serde_json::json;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Human,
+    Json,
+    Md,
+    Gh,
+    Sarif,
+}
 
 #[derive(Parser)]
 #[command(
@@ -80,10 +90,16 @@ enum Commands {
         #[arg(long)] ste_dict: Option<PathBuf>,
         #[arg(long)] approx_long: bool,
     },
+    /// One-command repo setup: AGENTS.md, invariants, worktree-safe Git hooks, and agent hooks.
+    Init {
+        repo: PathBuf,
+        #[arg(long)] dry_run: bool,
+    },
     /// Generate AGENTS.md, .refit/invariants.yml, ADR-001, and the CI guard workflow.
     Sustain {
         repo: PathBuf,
         #[arg(long)] dry_run: bool,
+        #[arg(long)] init: bool,
         #[arg(long)] ste100: bool,
         #[arg(long)] ste_dict: Option<PathBuf>,
     },
@@ -130,6 +146,29 @@ enum Commands {
     },
     /// Start the concurrent JSON-RPC 2.0 MCP server (stdio, or stateless HTTP via --http).
     Mcp { repo: PathBuf, #[arg(long)] http: Option<String> },
+    /// Unified pre-flight check: tiered secrets, invisible Unicode, optional OSV.dev SCA, doc-drift & Gate 4 Kane CLI.
+    Check {
+        repo: PathBuf,
+        #[arg(long)] staged: bool,
+        #[arg(long)] diff: Option<String>,
+        #[arg(long)] deps: bool,
+        #[arg(long)] strict: bool,
+        #[arg(long)] no_cache: bool,
+        #[arg(long)] kane: Option<String>,
+        #[arg(long)] url: Option<String>,
+        #[arg(long)] policy: Option<String>,
+        #[arg(long)] target: Option<String>,
+        #[arg(long)] app: Option<String>,
+        #[arg(long)] remote: bool,
+        #[arg(long)] headed: bool,
+        #[arg(long)] bug_detection: bool,
+        #[arg(long)] no_adaptive_heal: bool,
+        #[arg(long, default_value_t = 180)] timeout: u64,
+        #[arg(long)] verify_docs: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)] format: OutputFormat,
+    },
+    /// Native <5ms stdin-JSON agent hook for Claude Code, Cursor, and Gemini CLI.
+    Hook,
     /// Scan repo, staged index, or git diff for secrets (or install pre-commit/pre-push hooks).
     Secrets {
         repo: PathBuf,
@@ -137,6 +176,9 @@ enum Commands {
         #[arg(long)] diff: Option<String>,
         #[arg(long)] install_hooks: bool,
         #[arg(long)] no_cache: bool,
+        #[arg(long)] strict: bool,
+        #[arg(long)] sarif: bool,
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)] format: OutputFormat,
     },
     /// Run batch web research searches.
     Research {
@@ -334,9 +376,16 @@ fn cmd_audit_sync(
     emit_audit_output(&report, &dep_res, markdown, ste100, ste_dict)
 }
 
-fn cmd_sustain(repo: &Path, dry_run: bool, ste100: bool, ste_dict: Option<&Path>) -> Result<()> {
+fn cmd_sustain(
+    repo: &Path, dry_run: bool, init: bool, ste100: bool, ste_dict: Option<&Path>,
+) -> Result<()> {
     let scorer = hygiene::HygieneScorer::open_persistent(repo);
     let rep = untangle::untangle_repo_with_scope(repo, &scorer, untangle::AuditScope::Sustain)?;
+    if init {
+        let written = untangle::init_repo_integrations(repo, &rep, dry_run)?;
+        platform::collect_os_memory();
+        return print_json(&json!({ "dry_run": dry_run, "files_written": written }));
+    }
     if ste100 || ste_dict.is_some() {
         return emit_sustain_prose(repo, &rep, dry_run, ste_dict);
     }
@@ -367,14 +416,291 @@ fn cmd_mcp(repo: PathBuf, http: Option<String>) -> Result<()> {
     }
 }
 
-fn cmd_secrets(repo: &Path, staged: bool, diff: Option<&str>, install_hooks: bool, no_cache: bool) -> Result<()> {
+struct CheckOpts<'a> {
+    staged: bool,
+    diff: Option<&'a str>,
+    deps: bool,
+    strict: bool,
+    no_cache: bool,
+    verify_docs: bool,
+    kane: Option<gates::KaneRequest>,
+    format: OutputFormat,
+}
+
+fn render_check_human(
+    rep: &untangle::SecretScanReport, osv: &[research::OsvFinding],
+    doc_drift: &[types::DocDriftFinding], kane: Option<&gates::KaneReceipt>,
+) -> String {
+    let mut out = String::new();
+    for hit in &rep.findings {
+        let lvl = if hit.tier == "high" { "error" } else { "warning" };
+        out.push_str(&format!(
+            "{lvl}[refit:{}]: {}:{}\n  help: remove credential/hazard or suppress false positives with `refit:ignore`\n",
+            hit.kind, hit.file, hit.line.max(1)
+        ));
+    }
+    for v in osv {
+        out.push_str(&format!(
+            "error[refit:osv:{}]: {} ({} {}@{}) {}\n",
+            v.advisory_id, v.lockfile, v.ecosystem, v.package, v.version, v.summary
+        ));
+    }
+    for d in doc_drift {
+        out.push_str(&format!(
+            "warning[refit:{}]: {}:{} — {} ({})\n",
+            d.kind, d.file, d.line.max(1), d.message, d.reference
+        ));
+    }
+    if let Some(k) = kane {
+        let lvl = if k.ok { "ok" } else { "error" };
+        out.push_str(&format!(
+            "{lvl}[refit:kane:{}]: {} ({:.2}s, replay={}, author={}, credits={})\n",
+            k.verdict, k.summary, k.duration_s, k.replay_steps, k.author_steps,
+            k.credits_consumed.map_or_else(|| "0".into(), |c| format!("{c:.2}"))
+        ));
+        for f in &k.failed_steps {
+            let tag = if f.is_agent_info { "AGENT_INFO" } else { "step" };
+            out.push_str(&format!("  {tag} #{}: {}\n", f.step, f.remark));
+        }
+        for lk in &k.evidence_secret_leaks {
+            out.push_str(&format!("  error[refit:kane/evidence_secret_leak]: {lk}\n"));
+        }
+        if let Some(cmd) = &k.evidence_serve_cmd {
+            out.push_str(&format!("  evidence: {cmd}\n"));
+        }
+        if !k.suspected_spans.is_empty() {
+            let spans: Vec<String> = k.suspected_spans.iter()
+                .map(|s| format!("{}:{} ({})", s.file, s.line, s.symbol)).collect();
+            out.push_str(&format!("  rewind: {}\n", spans.join(", ")));
+        }
+    }
+    out.push_str(&format!(
+        "refit check ({}): {} files ({} cached), {} blocking, {} warnings, {} osv, {} doc_drift in {}ms\n",
+        rep.mode, rep.files_checked, rep.cache_hits, rep.blocking_count, rep.warning_count,
+        osv.len(), doc_drift.len(), rep.duration_ms
+    ));
+    out
+}
+
+fn render_check_md(
+    rep: &untangle::SecretScanReport, osv: &[research::OsvFinding],
+    doc_drift: &[types::DocDriftFinding], kane: Option<&gates::KaneReceipt>,
+) -> String {
+    let mut out = format!(
+        "## refit check ({})\n\n- Files: {} ({} cached) | Blocking: {} | Warnings: {} | OSV: {} | DocDrift: {} | {}ms\n",
+        rep.mode, rep.files_checked, rep.cache_hits, rep.blocking_count, rep.warning_count,
+        osv.len(), doc_drift.len(), rep.duration_ms
+    );
+    if !rep.findings.is_empty() {
+        out.push_str("\n| Tier | Rule | Location |\n|---|---|---|\n");
+        for h in &rep.findings {
+            out.push_str(&format!("| {} | `{}` | `{}:{}` |\n", h.tier, h.kind, h.file, h.line.max(1)));
+        }
+    }
+    if !osv.is_empty() {
+        out.push_str("\n| Advisory | Package | Lockfile |\n|---|---|---|\n");
+        for v in osv {
+            out.push_str(&format!("| `{}` | `{}@{}` | `{}` |\n", v.advisory_id, v.package, v.version, v.lockfile));
+        }
+    }
+    if !doc_drift.is_empty() {
+        out.push_str("\n### Doc Drift\n\n| Kind | Location | Reference |\n|---|---|---|\n");
+        for d in doc_drift {
+            out.push_str(&format!("| `{}` | `{}:{}` | `{}` |\n", d.kind, d.file, d.line.max(1), d.reference));
+        }
+    }
+    if let Some(k) = kane {
+        out.push_str("\n### Gate 4 — Kane CLI\n\n| Surface | Verdict | Duration | Credits | Replay/Author | Evidence |\n|---|---|---:|---:|---|---|\n");
+        out.push_str(&format!(
+            "| `{:?}` | `{}` | {:.2}s | {} | {}/{} | `{}` |\n",
+            k.surface, k.verdict, k.duration_s,
+            k.credits_consumed.map_or_else(|| "0".into(), |c| format!("{c:.2}")),
+            k.replay_steps, k.author_steps,
+            k.evidence_serve_cmd.as_deref().unwrap_or("-")
+        ));
+    }
+    out
+}
+
+fn append_extra_sarif(
+    sarif: &mut serde_json::Value, osv: &[research::OsvFinding],
+    doc_drift: &[types::DocDriftFinding], kane: Option<&gates::KaneReceipt>,
+) {
+    for v in osv {
+        let msg = format!("{} {}@{}: {}", v.ecosystem, v.package, v.version, v.summary);
+        untangle::push_sarif_result(sarif, &v.advisory_id, "error", &v.lockfile, 1, &msg);
+    }
+    for d in doc_drift {
+        let msg = format!("{} (`{}`)", d.message, d.reference);
+        untangle::push_sarif_result(sarif, &d.kind, "warning", &d.file, d.line, &msg);
+    }
+    if let Some(k) = kane {
+        let (uri, ln) = k.suspected_spans.first()
+            .map_or(("README.md", 1usize), |s| (s.file.as_str(), s.line));
+        if !k.ok {
+            let rule_id = match k.verdict.as_str() {
+                "bug_740" => "kane/product_bug_740",
+                "policy_failed" => "kane/policy_fail",
+                "policy_errored" => "kane/policy_errored",
+                _ => "kane/step_failure",
+            };
+            let level = gates::KANE_SARIF_RULES.iter()
+                .find(|(id, _, _)| *id == rule_id).map_or("error", |(_, l, _)| *l);
+            untangle::push_sarif_result(sarif, rule_id, level, uri, ln, &k.summary);
+        }
+        for lk in &k.evidence_secret_leaks {
+            untangle::push_sarif_result(sarif, "kane/evidence_secret_leak", "error", uri, 1, lk);
+        }
+        for uv in &k.unresolved_vars {
+            untangle::push_sarif_result(sarif, "kane/unresolved_vars", "warning", uri, 1, &format!("unresolved Kane variable `{uv}`"));
+        }
+        for adv in &k.advisories {
+            untangle::push_sarif_result(sarif, "kane/schema_version_drift", "note", uri, 1, adv);
+        }
+    }
+}
+
+fn emit_check_output(
+    rep: &untangle::SecretScanReport, osv: &[research::OsvFinding],
+    doc_drift: &[types::DocDriftFinding], kane: Option<&gates::KaneReceipt>,
+    format: OutputFormat, include_osv: bool,
+) -> Result<()> {
+    match format {
+        OutputFormat::Sarif => {
+            let mut sarif = untangle::render_secrets_sarif(rep);
+            append_extra_sarif(&mut sarif, osv, doc_drift, kane);
+            print_json(&sarif)
+        }
+        OutputFormat::Gh => {
+            print!("{}", untangle::render_secrets_gh(rep));
+            for v in osv {
+                let f = untangle::escape_gh_prop(&v.lockfile);
+                println!(
+                    "::error file={f},line=1::[refit:osv:{}] {}@{} {}",
+                    v.advisory_id, v.package, v.version, v.summary
+                );
+            }
+            for d in doc_drift {
+                let f = untangle::escape_gh_prop(&d.file);
+                println!(
+                    "::warning file={f},line={}::[refit:{}] {} ({})",
+                    d.line.max(1), d.kind, d.message, d.reference
+                );
+            }
+            if let Some(k) = kane {
+                let (uri, ln) = k.suspected_spans.first()
+                    .map_or(("README.md", 1usize), |s| (s.file.as_str(), s.line));
+                let f = untangle::escape_gh_prop(uri);
+                if !k.ok {
+                    println!("::error file={f},line={ln}::[refit:kane:{}] {}", k.verdict, k.summary);
+                }
+                for lk in &k.evidence_secret_leaks {
+                    println!("::error file={f},line=1::[refit:kane/evidence_secret_leak] {lk}");
+                }
+            }
+            Ok(())
+        }
+        OutputFormat::Human => { print!("{}", render_check_human(rep, osv, doc_drift, kane)); Ok(()) }
+        OutputFormat::Md => { print!("{}", render_check_md(rep, osv, doc_drift, kane)); Ok(()) }
+        OutputFormat::Json => {
+            if include_osv {
+                let kane_fail = usize::from(kane.is_some_and(|k| !k.ok));
+                let blocking = rep.blocking_count + osv.len() + kane_fail;
+                let mut body = json!({
+                    "ok": blocking == 0, "blocking_count": blocking, "warning_count": rep.warning_count,
+                    "secrets": rep, "osv_findings": osv
+                });
+                if let Some(obj) = body.as_object_mut() {
+                    if !doc_drift.is_empty() { obj.insert("doc_drift".into(), json!(doc_drift)); }
+                    if let Some(k) = kane { obj.insert("kane".into(), json!(k)); }
+                }
+                print_json(&body)
+            } else {
+                print_json(rep)
+            }
+        }
+    }
+}
+
+fn short_circuit_receipt(repo: &Path, req: &gates::KaneRequest, verdict: &str, exit_code: i32, summary: String) -> gates::KaneReceipt {
+    gates::KaneReceipt {
+        ok: false, verdict: verdict.into(), surface: req.surface.unwrap_or(gates::KaneSurface::Run),
+        exit_code, cli_version: None, duration_s: 0.0, credits_consumed: Some(0.0),
+        replay_steps: 0, author_steps: 0, adaptive_healed: false, confirmed_bug_740: false,
+        summary, test_url: None, evidence_path: None, evidence_serve_cmd: None,
+        failed_steps: Vec::new(), evidence_excerpts: Vec::new(), evidence_secret_leaks: Vec::new(),
+        unresolved_vars: Vec::new(), policy_verdict: None, final_state: None,
+        suspected_spans: Vec::new(), rewind_affected_files: Vec::new(), advisories: Vec::new(),
+        git_head: platform::read_git_head_fast(repo), recorded_ms: platform::now_ms(),
+    }
+}
+
+fn enrich_kane_rewind(repo: &Path, receipt: &mut gates::KaneReceipt) {
+    if receipt.ok { return; }
+    let mut diag = receipt.summary.clone();
+    for f in &receipt.failed_steps { diag.push(' '); diag.push_str(&f.remark); }
+    for e in &receipt.evidence_excerpts { diag.push(' '); diag.push_str(e); }
+    let (spans, affected) = learn::rewind_kane_tokens(repo, None, &diag);
+    receipt.suspected_spans = spans.into_iter()
+        .map(|(file, line, symbol)| gates::CodeSpanHint { file, line, symbol }).collect();
+    receipt.rewind_affected_files = affected;
+    if let Ok(raw) = serde_json::to_vec_pretty(receipt) {
+        let _ = platform::write_atomic(&repo.join(".refit/kane_last.json"), &raw);
+    }
+}
+
+fn cmd_check(repo: &Path, opts: &CheckOpts<'_>) -> Result<()> {
+    let rep = untangle::scan_repo_secrets(repo, opts.staged, opts.diff, opts.no_cache)?;
+    let osv = if opts.deps { build_rt(false)?.block_on(research::scan_lockfiles_osv(repo))? } else { Vec::new() };
+    let doc_drift = if opts.verify_docs { untangle::scan_doc_drift_quick(repo, None) } else { Vec::new() };
+    let static_blocked = rep.blocking_count + osv.len()
+        + if opts.strict { rep.warning_count + doc_drift.len() } else { 0 };
+    let kane = if let Some(req) = &opts.kane {
+        if static_blocked > 0 {
+            Some(short_circuit_receipt(
+                repo, req, "short_circuited", 1,
+                "skipped Kane CLI because static pre-flight blocked (0 credits spent)".into(),
+            ))
+        } else if let Some(u) = req.url.as_deref().filter(|s| !s.is_empty())
+            && let Err(msg) = build_rt(false)?.block_on(gates::probe_url_reachable(u))
+        {
+            Some(short_circuit_receipt(repo, req, "did_not_start", 2, format!("URL preflight failed (0 credits spent): {msg}")))
+        } else {
+            let mut rec = gates::run_kane(repo, req);
+            enrich_kane_rewind(repo, &mut rec);
+            Some(rec)
+        }
+    } else {
+        None
+    };
+    emit_check_output(&rep, &osv, &doc_drift, kane.as_ref(), opts.format, true)?;
+    let kane_blocked = usize::from(kane.as_ref().is_some_and(|k| !k.ok));
+    let blocked = static_blocked + kane_blocked;
+    if blocked > 0 { anyhow::bail!("blocked: {blocked} finding(s) detected"); }
+    Ok(())
+}
+
+fn cmd_hook() -> Result<()> {
+    let mut stdin_buf = String::new();
+    std::io::stdin().read_to_string(&mut stdin_buf)?;
+    let (code, out, err) = untangle::run_agent_hook(&stdin_buf);
+    if !out.is_empty() { println!("{out}"); }
+    if !err.is_empty() { eprintln!("{err}"); }
+    if code != 0 { std::process::exit(code); }
+    Ok(())
+}
+
+fn cmd_secrets(
+    repo: &Path, staged: bool, diff: Option<&str>, install_hooks: bool, no_cache: bool,
+    strict: bool, format: OutputFormat,
+) -> Result<()> {
     if install_hooks {
         return print_json(&json!({ "installed_hooks": untangle::install_secret_hooks(repo)? }));
     }
     let rep = untangle::scan_repo_secrets(repo, staged, diff, no_cache)?;
-    let count = rep.findings.len();
-    print_json(&rep)?;
-    if count > 0 { anyhow::bail!("blocked: {count} secret(s) detected"); }
+    emit_check_output(&rep, &[], &[], None, format, false)?;
+    let blocked = rep.blocking_count + if strict { rep.warning_count } else { 0 };
+    if blocked > 0 { anyhow::bail!("blocked: {blocked} secret(s) detected"); }
     Ok(())
 }
 
@@ -389,8 +715,9 @@ fn main() -> Result<()> {
         Commands::Audit { repo, markdown, research, ste100, ste_dict, approx_long } => {
             cmd_audit_sync(&repo, markdown, research, ste100, ste_dict.as_deref(), approx_long)
         }
-        Commands::Sustain { repo, dry_run, ste100, ste_dict } => {
-            cmd_sustain(&repo, dry_run, ste100, ste_dict.as_deref())
+        Commands::Init { repo, dry_run } => cmd_sustain(&repo, dry_run, true, false, None),
+        Commands::Sustain { repo, dry_run, init, ste100, ste_dict } => {
+            cmd_sustain(&repo, dry_run, init, ste100, ste_dict.as_deref())
         }
         Commands::Gc { repo, keep_revs, cache_max_mb } => {
             let pruned_cas_blobs = mvcc::MvccStore::open(&repo, "gc")?.gc_cas(keep_revs)?;
@@ -442,8 +769,22 @@ fn main() -> Result<()> {
             })
         }
         Commands::Mcp { repo, http } => cmd_mcp(repo, http),
-        Commands::Secrets { repo, staged, diff, install_hooks, no_cache } => {
-            cmd_secrets(&repo, staged, diff.as_deref(), install_hooks, no_cache)
+        Commands::Check {
+            repo, staged, diff, deps, strict, no_cache, kane, url, policy, target, app,
+            remote, headed, bug_detection, no_adaptive_heal, timeout, verify_docs, format,
+        } => {
+            let kane_req = kane.map(|spec| gates::KaneRequest {
+                spec, surface: None, url, policy, target, app, tunnel_name: None,
+                remote, headless: !headed, bug_detection, no_adaptive_heal, timeout_secs: timeout,
+            });
+            cmd_check(&repo, &CheckOpts {
+                staged, diff: diff.as_deref(), deps, strict, no_cache, verify_docs, kane: kane_req, format,
+            })
+        }
+        Commands::Hook => cmd_hook(),
+        Commands::Secrets { repo, staged, diff, install_hooks, no_cache, strict, sarif, format } => {
+            let fmt = if sarif { OutputFormat::Sarif } else { format };
+            cmd_secrets(&repo, staged, diff.as_deref(), install_hooks, no_cache, strict, fmt)
         }
         Commands::Research { lang, repo, max_results, queries } => {
             init_tracing();

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail};
-use flate2::read::DeflateDecoder;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
@@ -330,40 +329,6 @@ fn parse_npy(bytes: &[u8]) -> Result<NpyData> {
     }
 }
 
-fn read_zip_entry_capped(
-    archive: &rawzip::ZipSliceArchive<&[u8]>,
-    entry: &rawzip::ZipFileHeaderRecord<'_>,
-) -> Result<Vec<u8>> {
-    let local = archive.get_entry(entry.wayfinder()).context("read NPZ ZIP entry")?;
-    let mut out = Vec::new();
-    match entry.compression_method() {
-        rawzip::CompressionMethod::STORE => {
-            if local.data().len() > MAX_NPY_ENTRY_BYTES {
-                bail!("stored NPZ entry exceeds {MAX_NPY_ENTRY_BYTES} byte cap");
-            }
-            local
-                .verifying_reader(local.data())
-                .read_to_end(&mut out)
-                .context("verify stored NPZ entry")?;
-        }
-        rawzip::CompressionMethod::DEFLATE => {
-            if entry.uncompressed_size_hint() > MAX_NPY_ENTRY_BYTES as u64 {
-                bail!("deflated NPZ entry exceeds {MAX_NPY_ENTRY_BYTES} byte zip-bomb cap");
-            }
-            let res = local
-                .verifying_reader(DeflateDecoder::new(local.data()))
-                .take((MAX_NPY_ENTRY_BYTES + 1) as u64)
-                .read_to_end(&mut out);
-            if out.len() > MAX_NPY_ENTRY_BYTES {
-                bail!("deflated NPZ entry exceeds {MAX_NPY_ENTRY_BYTES} byte zip-bomb cap");
-            }
-            res.context("inflate NPZ entry")?;
-        }
-        other => bail!("unsupported ZIP compression method {other:?}"),
-    }
-    Ok(out)
-}
-
 pub(super) fn load_weights_from_npz(bytes: &[u8]) -> Result<ResolvedWeights> {
     if bytes.len() > MAX_NPZ_ARCHIVE_BYTES {
         bail!("weights archive size {} exceeds {MAX_NPZ_ARCHIVE_BYTES} byte cap", bytes.len());
@@ -379,7 +344,7 @@ pub(super) fn load_weights_from_npz(bytes: &[u8]) -> Result<ResolvedWeights> {
         if count > MAX_ZIP_ENTRIES {
             bail!("invalid NPZ entry count > {MAX_ZIP_ENTRIES}");
         }
-        let unzipped = read_zip_entry_capped(&archive, &entry)?;
+        let unzipped = crate::platform::read_zip_entry_capped(&archive, &entry, MAX_NPY_ENTRY_BYTES)?;
         let name = String::from_utf8_lossy(entry.file_path().as_bytes());
         match (name.trim_suffix(".npy"), parse_npy(&unzipped)?) {
             ("trits", NpyData::U8(v)) => trits = Some(v),

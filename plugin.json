@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "refit",
+  "version": "0.6.0",
+  "description": "Two-speed closed-loop verification spine: <7ms Rust static pre-flight shield, atomic MVCC WAL, and Gate 4 TestMu AI Kane CLI live browser/mobile proof.",
+  "author": {
+    "name": "patrickfield152-del",
+    "url": "https://github.com/patrickfield152-del/refit"
+  },
+  "homepage": "https://patrickfield152-del.github.io/refit/",
+  "repository": "https://github.com/patrickfield152-del/refit",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["kane-cli", "verification", "mcp", "security", "e2e", "refactor", "closed-loop"]
+}

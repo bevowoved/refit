@@ -24,6 +24,11 @@ fixture/target_repo_crash_test/
 telemetry/
 reports/
 SUBMISSIONS/
+.testmuai/evidence/
+.testmuai/variables/*.local.json
+.context/
+.hyperexecute/
+.updatedhyperexecute.yaml
 *.mp4
 *.zip
 *.tmp

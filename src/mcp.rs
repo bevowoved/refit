@@ -60,56 +60,84 @@ const EPOCH_MEMO_TTL: Duration = Duration::from_secs(5);
 static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
 static NONCE_SEQ: AtomicU64 = AtomicU64::new(1);
 
+const SKILL_MD: &str = include_str!("../skills/refit/SKILL.md");
+const SKILL_URI: &str = "skill://refit";
+const SKILL_MD_URI: &str = "skill://refit/SKILL.md";
+const MCP_INSTRUCTIONS: &str = concat!(
+    "Run refit_check before commit/push for <10ms secret/OSV/doc-drift checks and optional Gate 4 Kane CLI live verification. ",
+    "Inspect code with refit_read and refit_symbols before editing. ",
+    "Use refit_tx (op: begin|stage|create|delete|move|commit|abort) or refit_apply ",
+    "for verified MVCC edits. Read skill://refit/SKILL.md for the full workflow."
+);
+
 // Tool catalog
+
+type ToolAnnotations = (bool, bool, bool, bool);
 
 type ToolRow = (
     &'static str,
     &'static str,
     &'static [(&'static str, &'static str)],
     &'static [&'static str],
+    ToolAnnotations,
 );
 
 /// Tool definitions sorted strictly A->Z by `name` for prompt-cache stability.
+/// Annotations tuple: `(read_only, destructive, idempotent, open_world)`.
 const TOOLS: &[ToolRow] = &[
     ("refit_apply", "Apply ASRF patches, run Gates 0 to 3.5, and commit via MVCC WAL.",
         &[("allow_abi_change", "boolean"), ("dry_run", "boolean"), ("module_id", "string"), ("patch_text", "string")],
-        &["module_id", "patch_text"]),
+        &["module_id", "patch_text"],
+        (false, true, false, false)),
     ("refit_audit", "Audit clones, dead symbols, large files, unused deps, and infra configs.",
-        &[("markdown", "boolean"), ("research", "boolean")], &[]),
+        &[("markdown", "boolean"), ("research", "boolean")], &[],
+        (true, false, true, false)),
+    ("refit_check", "Run <10ms static secret/OSV/doc-drift check and optional Gate 4 Kane CLI live browser/mobile verification.",
+        &[
+            ("app", "string"), ("bug_detection", "boolean"), ("deps", "boolean"),
+            ("diff", "string"), ("headless", "boolean"), ("kane", "string"),
+            ("kane_op", "string"), ("no_adaptive_heal", "boolean"), ("no_cache", "boolean"),
+            ("policy", "string"), ("remote", "boolean"), ("staged", "boolean"),
+            ("target", "string"), ("timeout_secs", "integer"), ("url", "string"),
+            ("verify_docs", "boolean"),
+        ], &[],
+        (true, false, false, true)),
     ("refit_read", "Read a bounded line range from a repository file.",
-        &[("end_line", "integer"), ("path", "string"), ("start_line", "integer")], &["path"]),
-    ("refit_resume", "Recover unfinished WAL transactions from CAS and report committed modules.", &[], &[]),
+        &[("end_line", "integer"), ("path", "string"), ("start_line", "integer")], &["path"],
+        (true, false, true, false)),
+    ("refit_resume", "Recover unfinished WAL transactions from CAS and report committed modules.", &[], &[],
+        (false, false, true, false)),
     ("refit_rewind", "Query SymbolGraph-backed rewind impact set and learned rules for a symbol token.",
-        &[("token", "string"), ("trigger", "string")], &["token"]),
+        &[("token", "string"), ("trigger", "string")], &["token"],
+        (true, false, true, false)),
     ("refit_scan", "Scan repository DAG and codehygiene scores (fast cached by default).",
-        &[("fast", "boolean")], &[]),
+        &[("fast", "boolean")], &[],
+        (true, false, true, false)),
     ("refit_search", "Run 10 req/s GCRA-paced web search with repo-scoped BLAKE3 cache.",
-        &[("capability", "string"), ("language", "string")], &["capability", "language"]),
+        &[("capability", "string"), ("language", "string")], &["capability", "language"],
+        (true, false, true, true)),
     ("refit_sustain", "Generate AGENTS.md, .refit/invariants.yml, ADR-001, and CI guard.",
-        &[("dry_run", "boolean")], &[]),
+        &[("dry_run", "boolean")], &[],
+        (false, false, true, false)),
     ("refit_symbols", "Query symbol definitions, callers, dependencies, fan-in/out, and dead symbols.",
-        &[("file", "string"), ("symbol", "string")], &[]),
-    ("refit_tx_abort", "Abort an active shadow transaction and remove its staged files.",
-        &[("tx_handle", "string")], &["tx_handle"]),
-    ("refit_tx_begin", "Start a multi-file shadow transaction outside the repository.",
-        &[("ttl_secs", "integer")], &[]),
-    ("refit_tx_commit", "Verify all staged files with Gates 0 to 3.5, then commit via MVCC WAL.",
-        &[("allow_abi_change", "boolean"), ("dry_run", "boolean"), ("tx_handle", "string")], &["tx_handle"]),
-    ("refit_tx_create", "Stage a new file inside an active transaction.",
-        &[("content", "string"), ("path", "string"), ("tx_handle", "string")], &["content", "path", "tx_handle"]),
-    ("refit_tx_delete", "Stage file deletion inside an active transaction.",
-        &[("path", "string"), ("tx_handle", "string")], &["path", "tx_handle"]),
-    ("refit_tx_move", "Stage a file move or rename inside an active transaction.",
-        &[("from_path", "string"), ("to_path", "string"), ("tx_handle", "string")],
-        &["from_path", "to_path", "tx_handle"]),
-    ("refit_tx_stage", "Stage ASRF patches (edit, create, delete, rename) in an active transaction.",
-        &[("patch_text", "string"), ("tx_handle", "string")], &["patch_text", "tx_handle"]),
-    ("refit_verify", "Run a full repository audit with BLAKE3 content caching.", &[], &[]),
+        &[("file", "string"), ("symbol", "string")], &[],
+        (true, false, true, false)),
+    ("refit_tx", "Manage multi-file shadow transactions (op: begin|stage|create|delete|move|commit|abort).",
+        &[
+            ("allow_abi_change", "boolean"), ("content", "string"), ("dry_run", "boolean"),
+            ("from_path", "string"), ("op", "string"), ("patch_text", "string"),
+            ("path", "string"), ("to_path", "string"), ("ttl_secs", "integer"), ("tx_handle", "string"),
+        ],
+        &["op"],
+        (false, true, false, false)),
+    ("refit_verify", "Run a full repository audit with BLAKE3 content caching.", &[], &[],
+        (true, false, true, false)),
 ];
 
 struct FrozenCatalog { value: Value, bytes: Box<[u8]>, digest: String }
 
 static CATALOG: OnceLock<FrozenCatalog> = OnceLock::new();
+static SKILL_DIGEST: OnceLock<String> = OnceLock::new();
 
 fn frozen_catalog() -> &'static FrozenCatalog {
     CATALOG.get_or_init(|| {
@@ -136,7 +164,7 @@ fn encode_base_tools(id: Option<Value>) -> String {
     format!(r#"{{"jsonrpc":"2.0","id":{id_json},"result":{{"tools":{tools_str}}}}}"#)
 }
 
-fn encode_tool(&(name, desc, prop_list, req): &ToolRow) -> Value {
+fn encode_tool(&(name, desc, prop_list, req, (ro, dest, idem, ow)): &ToolRow) -> Value {
     let props: Map<String, Value> = prop_list.iter().map(|&(k, ty)| (k.into(), json!({ "type": ty }))).collect();
     let mut schema = Map::from_iter([("properties".into(), Value::Object(props))]);
     if !req.is_empty() {
@@ -145,7 +173,110 @@ fn encode_tool(&(name, desc, prop_list, req): &ToolRow) -> Value {
         schema.insert("required".into(), json!(req_sorted));
     }
     schema.insert("type".into(), "object".into());
-    json!({ "description": desc, "inputSchema": Value::Object(schema), "name": name })
+    json!({
+        "annotations": {
+            "destructiveHint": dest, "idempotentHint": idem, "openWorldHint": ow, "readOnlyHint": ro,
+        },
+        "description": desc, "inputSchema": Value::Object(schema), "name": name,
+    })
+}
+
+// Pure-Rust SHA-256 (FIPS 180-4) and SEP-2640 Skills helpers
+
+const SHA256_INIT: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn sha256_compress(st: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for (slot, chunk) in w[..16].iter_mut().zip(block.as_chunks::<4>().0) {
+        *slot = u32::from_be_bytes(*chunk);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *st;
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        (h, g, f, e, d, c, b, a) = (g, f, e, d.wrapping_add(t1), c, b, a, t1.wrapping_add(t2));
+    }
+    for (slot, delta) in st.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+        *slot = slot.wrapping_add(delta);
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use std::fmt::Write;
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut buf = data.to_vec();
+    buf.push(0x80);
+    while (buf.len() % 64) != 56 { buf.push(0); }
+    buf.extend_from_slice(&bit_len.to_be_bytes());
+    let mut state = SHA256_INIT;
+    for chunk in buf.as_chunks::<64>().0 { sha256_compress(&mut state, chunk); }
+    let mut hex = String::with_capacity(64);
+    for word in state { let _ = write!(&mut hex, "{word:08x}"); }
+    hex
+}
+
+fn skill_digest() -> &'static str {
+    SKILL_DIGEST.get_or_init(|| format!("sha256:{}", sha256_hex(SKILL_MD.as_bytes())))
+}
+
+fn skill_description() -> String {
+    let mut in_fm = false;
+    let mut in_desc = false;
+    let mut parts = Vec::new();
+    for line in SKILL_MD.lines() {
+        let trim = line.trim();
+        if trim == "---" {
+            if in_fm { break; }
+            in_fm = true;
+            continue;
+        }
+        if !in_fm { continue; }
+        if in_desc {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                if !trim.is_empty() { parts.push(trim); }
+                continue;
+            }
+            break;
+        }
+        if let Some(rest) = trim.strip_prefix("description:") {
+            let val = rest.trim();
+            if val == ">" || val == "|" || val.is_empty() { in_desc = true; } else { return val.into(); }
+        }
+    }
+    if parts.is_empty() {
+        "Local pre-flight code audit, secret guard, symbol graph, and atomic MVCC refactoring engine.".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn refit_skill_obj() -> Value {
+    json!({
+        "uri": SKILL_URI,
+        "frontmatter": { "name": "refit", "description": skill_description() },
+        "resources": [{ "uri": SKILL_MD_URI, "size": SKILL_MD.len(), "digest": skill_digest() }],
+    })
 }
 
 // Base64URL and resume tokens
@@ -434,12 +565,17 @@ struct ToolArgs {
     symbol: Option<String>, file: Option<String>, token: Option<String>, trigger: Option<String>,
     language: Option<String>, capability: Option<String>, start_line: Option<u64>,
     end_line: Option<u64>, module_id: String, patch_text: String,
+    op: Option<String>, deps: bool, staged: bool, diff: Option<String>, no_cache: bool,
+    kane: Option<String>, kane_op: Option<String>, url: Option<String>, policy: Option<String>,
+    target: Option<String>, app: Option<String>, remote: bool, headless: Option<bool>,
+    bug_detection: bool, no_adaptive_heal: bool, timeout_secs: Option<u64>, verify_docs: bool,
 }
 
 #[derive(Serialize)]
 struct ReadResp<'a> {
     path: &'a str, start_line: usize, end_line: usize, total_lines: usize,
     content: String, epoch: u64, file_epoch: u64,
+    invisible_unicode_stripped: usize, taint: &'static str,
 }
 #[derive(Serialize)]
 struct VerifyResp {
@@ -544,11 +680,14 @@ fn discover_result() -> Value {
     json!({
         "protocolVersion": PROTO_STATELESS, "supportedProtocolVersions": [PROTO_STATELESS, PROTO_BASE],
         "serverInfo": { "name": "refit", "version": env!("CARGO_PKG_VERSION") },
+        "instructions": MCP_INSTRUCTIONS,
         "capabilities": {
             "tools": { "listChanged": false },
+            "resources": {},
             "extensions": {
                 "io.modelcontextprotocol/tasks": { "methods": ["tasks/get", "tasks/update", "tasks/cancel"] },
-                "io.modelcontextprotocol/mrtr": { "stateless": true }
+                "io.modelcontextprotocol/mrtr": { "stateless": true },
+                "io.modelcontextprotocol/skills": { "directoryRead": false }
             }
         },
         "tools": tool_catalog(), "_meta": catalog_meta(),
@@ -603,10 +742,15 @@ fn check_param_hdrs(headers: &HeaderMap, body: &Value) -> std::result::Result<()
     Ok(())
 }
 
-fn estimate_tool_bytes(name: &str) -> usize {
-    match name {
-        "refit_read" | "refit_symbols" | "refit_search" | "refit_tx_abort" => LIGHT_TOOL_RESERVE_BYTES,
-        _ => HEAVY_TOOL_RESERVE_BYTES,
+fn estimate_tool_bytes(name: &str, args: &Value) -> usize {
+    let light_tx = name == "refit_tx"
+        && matches!(args.get("op").and_then(Value::as_str), Some("abort" | "begin"));
+    if light_tx
+        || matches!(name, "refit_read" | "refit_symbols" | "refit_search" | "refit_check" | "refit_tx_abort")
+    {
+        LIGHT_TOOL_RESERVE_BYTES
+    } else {
+        HEAVY_TOOL_RESERVE_BYTES
     }
 }
 
@@ -615,6 +759,39 @@ fn with_stateless_meta(mut res: Value, mode: Proto) -> Value {
         m.insert("_meta".into(), catalog_meta());
     }
     res
+}
+
+fn handle_skills_or_resources(
+    method: &str, id: Option<Value>, params: &Value, mode: Proto,
+) -> (StatusCode, Option<Value>) {
+    let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+    match method {
+        "skills/list" => (
+            StatusCode::OK,
+            Some(rpc_ok(id, with_stateless_meta(json!({ "skills": [refit_skill_obj()] }), mode))),
+        ),
+        "skills/get" if uri == SKILL_URI || uri == SKILL_MD_URI => (
+            StatusCode::OK,
+            Some(rpc_ok(id, with_stateless_meta(refit_skill_obj(), mode))),
+        ),
+        "skills/get" => rpc_fail(StatusCode::OK, id, ERR_INVALID_PARAMS, format!("unknown skill uri `{uri}`")),
+        "resources/list" => (
+            StatusCode::OK,
+            Some(rpc_ok(id, with_stateless_meta(json!({
+                "resources": [{
+                    "uri": SKILL_MD_URI, "name": "refit/SKILL.md",
+                    "mimeType": "text/markdown", "size": SKILL_MD.len(),
+                }]
+            }), mode))),
+        ),
+        "resources/read" if uri == SKILL_MD_URI => (
+            StatusCode::OK,
+            Some(rpc_ok(id, with_stateless_meta(json!({
+                "contents": [{ "uri": SKILL_MD_URI, "mimeType": "text/markdown", "text": SKILL_MD }]
+            }), mode))),
+        ),
+        _ => rpc_fail(StatusCode::OK, id, ERR_INVALID_PARAMS, format!("unknown resource uri `{uri}`")),
+    }
 }
 
 async fn handle_rpc(ctx: &Arc<McpCtx>, req: &Value, mode: Proto) -> (StatusCode, Option<Value>) {
@@ -630,7 +807,12 @@ async fn handle_rpc(ctx: &Arc<McpCtx>, req: &Value, mode: Proto) -> (StatusCode,
             let tools_cap = if stateless { json!({ "listChanged": false }) } else { json!({}) };
             let res = json!({
                 "protocolVersion": if stateless { PROTO_STATELESS } else { PROTO_BASE },
-                "capabilities": { "tools": tools_cap },
+                "instructions": MCP_INSTRUCTIONS,
+                "capabilities": {
+                    "tools": tools_cap,
+                    "resources": {},
+                    "extensions": { "io.modelcontextprotocol/skills": { "directoryRead": false } }
+                },
                 "serverInfo": { "name": "refit", "version": env!("CARGO_PKG_VERSION") },
             });
             (StatusCode::OK, Some(rpc_ok(id, with_stateless_meta(res, mode))))
@@ -640,6 +822,9 @@ async fn handle_rpc(ctx: &Arc<McpCtx>, req: &Value, mode: Proto) -> (StatusCode,
             Some(rpc_ok(id, with_stateless_meta(json!({ "tools": tool_catalog() }), mode))),
         ),
         "tools/call" => handle_tool_call(ctx, id, params, mode).await,
+        "skills/list" | "skills/get" | "resources/list" | "resources/read" => {
+            handle_skills_or_resources(&env.method, id, params, mode)
+        }
         "tasks/get" | "tasks/update" | "tasks/cancel" => {
             (StatusCode::OK, Some(handle_tasks(ctx, id, &env.method, params)))
         }
@@ -669,8 +854,11 @@ async fn handle_tool_call(
     let args = p.arguments;
     if mode == Proto::Stateless {
         let f: ToolArgs = parse_args(&args);
+        let op = f.op.as_deref();
+        let destructive_tx = name == "refit_tx_delete"
+            || (name == "refit_tx" && (op == Some("delete") || (op == Some("commit") && f.allow_abi_change == Some(true))));
         let needs_confirm = !f.confirmed
-            && (f.require_confirmation || (name == "refit_apply" && f.allow_abi_change == Some(true)) || name == "refit_tx_delete");
+            && (f.require_confirmation || (name == "refit_apply" && f.allow_abi_change == Some(true)) || destructive_tx);
         if needs_confirm { return resume_challenge(ctx, id, &name, args); }
         if p.task == Some(true) || p.mode.as_deref() == Some("task") || f.async_task {
             return spawn_durable_task(ctx, id, name, args);
@@ -752,6 +940,12 @@ async fn execute_tool_async(
     if name == "refit_audit" && parse_args::<ToolArgs>(&args).research {
         return Ok(run_audit_async(ctx, &args).await);
     }
+    if name == "refit_check" {
+        let a: ToolArgs = parse_args(&args);
+        if a.deps || a.kane.is_some() || a.kane_op.is_some() || a.verify_docs {
+            return Ok(run_check_async(ctx, &args).await);
+        }
+    }
     let _sem = ctx.blocking_sem.acquire().await.ok();
     if cancel.is_some_and(|f| f.load(Ordering::Acquire)) { return Err("cancelled before execution".into()); }
     let cc = ctx.clone();
@@ -764,16 +958,16 @@ async fn execute_tool_async(
     .map_err(|e| format!("task join error: {e}"))
 }
 
-fn try_admit_tool(name: &str) -> (usize, Option<impl Drop + Send + 'static>) {
+fn try_admit_tool(name: &str, args: &Value) -> (usize, Option<impl Drop + Send + 'static>) {
     let gate = MemGate::global();
-    let reserve = estimate_tool_bytes(name).min(gate.capacity());
+    let reserve = estimate_tool_bytes(name, args).min(gate.capacity());
     (reserve, gate.try_admit(reserve).ok())
 }
 
 async fn run_tool(
     ctx: &Arc<McpCtx>, id: Option<Value>, name: String, args: Value, mode: Proto,
 ) -> (StatusCode, Option<Value>) {
-    let (reserve, pre_permit) = try_admit_tool(&name);
+    let (reserve, pre_permit) = try_admit_tool(&name, &args);
     if mode == Proto::Stateless && pre_permit.is_none() {
         return rpc_fail(StatusCode::SERVICE_UNAVAILABLE, id, ERR_OVERLOADED, "server busy: MemGate limit");
     }
@@ -801,7 +995,7 @@ fn spawn_durable_task(
     ctx: &Arc<McpCtx>, id: Option<Value>, name: String, args: Value,
 ) -> (StatusCode, Option<Value>) {
     let (epoch, _) = ctx.snapshot_epoch(&name, &args);
-    let (_, Some(permit)) = try_admit_tool(&name) else {
+    let (_, Some(permit)) = try_admit_tool(&name, &args) else {
         return rpc_fail(StatusCode::SERVICE_UNAVAILABLE, id, ERR_OVERLOADED, "server busy: MemGate denied");
     };
     let (record, cancel_flag) = match ctx.tasks.create(&name, Some("queued for execution".into())) {
@@ -975,18 +1169,146 @@ fn ok_json<T: Serialize>(res: Result<T>) -> Value {
     }
 }
 
+fn dispatch_tx(tctx: &ToolCtx<'_>, args: &Value) -> Value {
+    let op = args.get("op").and_then(Value::as_str).unwrap_or("");
+    match op {
+        "begin" => tx_begin(tctx.repo_root, args),
+        "stage" => tx_mutate(tctx.repo_root, "stage", args),
+        "create" => tx_mutate(tctx.repo_root, "create", args),
+        "delete" => tx_mutate(tctx.repo_root, "delete", args),
+        "move" => tx_mutate(tctx.repo_root, "move", args),
+        "commit" => tx_commit(tctx, args),
+        "abort" => tx_abort(tctx.repo_root, args),
+        other => err_val(format!(
+            "invalid refit_tx op `{other}` (expected begin|stage|create|delete|move|commit|abort)"
+        )),
+    }
+}
+
+fn resolve_kane_spec(a: &ToolArgs) -> Option<String> {
+    a.kane.clone().or_else(|| match a.kane_op.as_deref() {
+        Some("cover") => Some("cover".into()),
+        Some("bugs") => Some("bugs".into()),
+        Some("validate") if !a.path.is_empty() => Some(format!("validate:{}", a.path)),
+        _ => None,
+    })
+}
+
+async fn run_kane_for_mcp(
+    ctx: &McpCtx, a: &ToolArgs, spec: String, static_ok: bool, warm_snap: Option<Arc<SymbolGraph>>,
+) -> Option<Value> {
+    if !static_ok {
+        return Some(json!({
+            "ok": false, "verdict": "short_circuited", "credits_consumed": 0.0,
+            "summary": "skipped Kane CLI because static pre-flight blocked (0 credits spent)"
+        }));
+    }
+    if let Some(u) = a.url.as_deref().filter(|s| !s.is_empty())
+        && let Err(msg) = crate::gates::probe_url_reachable(u).await
+    {
+        return Some(json!({
+            "ok": false, "verdict": "did_not_start", "exit_code": 2,
+            "credits_consumed": 0.0, "summary": msg
+        }));
+    }
+    let req = crate::gates::KaneRequest {
+        spec, surface: None, url: a.url.clone(), policy: a.policy.clone(),
+        target: a.target.clone(), app: a.app.clone(), tunnel_name: None,
+        remote: a.remote, headless: a.headless.unwrap_or(true),
+        bug_detection: a.bug_detection, no_adaptive_heal: a.no_adaptive_heal,
+        timeout_secs: a.timeout_secs.unwrap_or(180),
+    };
+    let r = ctx.repo_root.clone();
+    let rec = tokio::task::spawn_blocking(move || {
+        let mut rec = crate::gates::run_kane(&r, &req);
+        if !rec.ok {
+            let mut diag = rec.summary.clone();
+            for f in &rec.failed_steps { diag.push(' '); diag.push_str(&f.remark); }
+            let (spans, aff) = crate::learn::rewind_kane_tokens(&r, warm_snap.as_deref(), &diag);
+            rec.suspected_spans = spans.into_iter()
+                .map(|(file, line, symbol)| crate::gates::CodeSpanHint { file, line, symbol }).collect();
+            rec.rewind_affected_files = aff;
+        }
+        rec
+    }).await;
+    rec.ok().and_then(|v| serde_json::to_value(v).ok())
+}
+
+async fn run_check_async(ctx: &McpCtx, args: &Value) -> Value {
+    let a: ToolArgs = parse_args(args);
+    if a.kane_op.as_deref() == Some("status") {
+        return crate::gates::read_kane_status(&ctx.repo_root);
+    }
+    let (repo_root, owned_args) = (ctx.repo_root.clone(), args.clone());
+    let _sem_permit = ctx.blocking_sem.acquire().await.ok();
+    let mut base = tokio::task::spawn_blocking(move || run_check(&repo_root, &owned_args))
+        .await.unwrap_or_else(|e| err_val(format!("mcp check join error: {e}")));
+    let osv = if a.deps {
+        crate::research::scan_lockfiles_osv(&ctx.repo_root).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let need_graph = a.verify_docs || a.kane.is_some() || a.kane_op.is_some();
+    let warm_snap = need_graph.then(|| cached_symbols(ctx).0);
+    let doc_drift = if a.verify_docs {
+        let (r, g) = (ctx.repo_root.clone(), warm_snap.clone());
+        tokio::task::spawn_blocking(move || crate::untangle::scan_doc_drift_quick(&r, g.as_deref()))
+            .await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let static_ok = base.get("ok").and_then(Value::as_bool).unwrap_or(false) && osv.is_empty();
+    let kane_val = match resolve_kane_spec(&a) {
+        Some(spec) => run_kane_for_mcp(ctx, &a, spec, static_ok, warm_snap).await,
+        None => None,
+    };
+    if let Some(obj) = base.as_object_mut() {
+        let kane_ok = kane_val.as_ref().and_then(|v| v.get("ok")).and_then(Value::as_bool).unwrap_or(true);
+        obj.insert("ok".into(), (static_ok && kane_ok).into());
+        if a.deps {
+            obj.insert("osv_count".into(), osv.len().into());
+            obj.insert("osv_findings".into(), json!(osv));
+        }
+        if a.verify_docs {
+            obj.insert("doc_drift_count".into(), doc_drift.len().into());
+            obj.insert("doc_drift".into(), json!(doc_drift));
+        }
+        if let Some(kv) = kane_val { obj.insert("kane".into(), kv); }
+    }
+    base
+}
+
+fn run_check(repo_root: &Path, args: &Value) -> Value {
+    let a: ToolArgs = parse_args(args);
+    match crate::untangle::scan_repo_secrets(repo_root, a.staged, a.diff.as_deref(), a.no_cache) {
+        Ok(rep) => json!({
+            "ok": rep.findings.is_empty(),
+            "mode": rep.mode,
+            "files_checked": rep.files_checked,
+            "cache_hits": rep.cache_hits,
+            "duration_ms": rep.duration_ms,
+            "rule_count": rep.rule_count,
+            "findings_count": rep.findings.len(),
+            "findings": rep.findings,
+        }),
+        Err(e) => err_val(e.to_string()),
+    }
+}
+
 fn dispatch_tool_sync(name: &str, args: &Value, ctx: &McpCtx) -> Value {
     let repo_root = ctx.repo_root.as_path();
     let tctx = ToolCtx { repo_root, hygiene: &ctx.hygiene, gate_cfg: &ctx.gate_cfg };
     match name {
         "refit_scan" => run_scan(ctx, args),
         "refit_audit" => run_audit(repo_root, args, &ctx.hygiene),
+        "refit_check" => run_check(repo_root, args),
         "refit_sustain" => run_sustain(repo_root, args, &ctx.hygiene),
         "refit_symbols" => run_symbols(ctx, args),
         "refit_read" => run_read(ctx, args),
         "refit_resume" => run_resume(repo_root),
         "refit_rewind" => run_rewind(ctx, args),
         "refit_verify" => run_verify(repo_root, &ctx.hygiene),
+        "refit_tx" => dispatch_tx(&tctx, args),
         "refit_tx_begin" => tx_begin(repo_root, args),
         "refit_tx_create" => tx_mutate(repo_root, "create", args),
         "refit_tx_delete" => tx_mutate(repo_root, "delete", args),
@@ -1137,8 +1459,12 @@ fn run_read(ctx: &McpCtx, args: &Value) -> Value {
         buf.clear();
     }
     let end = req_end.min(total);
-    let content = if start <= end { kept.join("\n") } else { String::new() };
-    ok_json(Ok(ReadResp { path: &a.path, start_line: start, end_line: end, total_lines: total, content, epoch, file_epoch }))
+    let raw_content = if start <= end { kept.join("\n") } else { String::new() };
+    let (content, invisible_unicode_stripped) = crate::platform::sanitize_invisible_unicode(&raw_content);
+    ok_json(Ok(ReadResp {
+        path: &a.path, start_line: start, end_line: end, total_lines: total,
+        content, epoch, file_epoch, invisible_unicode_stripped, taint: "untrusted_repo_file",
+    }))
 }
 
 fn run_resume(repo_root: &Path) -> Value {
@@ -1269,18 +1595,27 @@ mod tests {
             .collect();
         let mut sorted = names.clone();
         sorted.sort_unstable();
-        assert_eq!((arr.len(), &names), (17, &sorted));
+        assert_eq!((arr.len(), &names), (12, &sorted));
 
         let (bytes, enc) = (catalog_bytes(), serde_json::to_vec(tool_catalog()).unwrap());
         let want = format!("blake3:{}", blake3::hash(bytes).to_hex());
         assert_eq!((catalog_digest(), bytes), (want.as_str(), enc.as_slice()));
         for tool in arr {
-            assert_eq!(obj_keys(tool), vec!["description", "inputSchema", "name"]);
+            assert_eq!(obj_keys(tool), vec!["annotations", "description", "inputSchema", "name"]);
+            let ann = &tool["annotations"];
+            assert!(ann["readOnlyHint"].is_boolean() && ann["destructiveHint"].is_boolean());
+            assert!(ann["idempotentHint"].is_boolean() && ann["openWorldHint"].is_boolean());
             let pkeys = obj_keys(&tool["inputSchema"]["properties"]);
             let mut ps = pkeys.clone();
             ps.sort_unstable();
             assert_eq!(pkeys, ps);
         }
+        let by_name = |n: &str| arr.iter().find(|t| t["name"] == n).unwrap();
+        assert_eq!(by_name("refit_read")["annotations"]["readOnlyHint"], json!(true));
+        assert_eq!(by_name("refit_search")["annotations"]["openWorldHint"], json!(true));
+        assert_eq!(by_name("refit_tx")["annotations"]["destructiveHint"], json!(true));
+        assert_eq!(by_name("refit_check")["annotations"]["readOnlyHint"], json!(true));
+
         let meta = catalog_meta();
         assert_eq!((&meta["ttlMs"], &meta["cacheScope"], &meta["catalogDigest"]), (&json!(3_600_000), &json!("server"), &json!(want)));
         let base: Value = serde_json::from_str(&encode_base_tools(Some(json!(7)))).unwrap();
@@ -1408,7 +1743,7 @@ mod tests {
         let tools_arr = body["result"]["tools"].as_array().unwrap();
         let n_tools = tools_arr.len();
         assert_eq!((&body["result"]["protocolVersion"], &body["result"]["_meta"]["catalogDigest"], n_tools),
-            (&json!(PROTO_STATELESS), &json!(catalog_digest()), 17));
+            (&json!(PROTO_STATELESS), &json!(catalog_digest()), 12));
 
         let (_, lr) = post_json(&client, &url, &[("Mcp-Method", "tools/list")], &rpc_bare(2, "tools/list")).await;
         assert_eq!((&lr["result"]["_meta"]["ttlMs"], &lr["result"]["_meta"]["cacheScope"]), (&json!(3_600_000), &json!("server")));
@@ -1557,5 +1892,77 @@ mod tests {
         assert_eq!(gate.used(), 512);
         drop(p2);
         assert_eq!(gate.used(), 0);
+    }
+
+    #[test]
+    fn polymorphic_tx_and_check() {
+        let orig = "export function mul(a: number, b: number): number {\n  return a * b;\n}\n";
+        let h = Harness::new("mcp_poly_tx", &[("src/m.ts", orig)]);
+
+        let chk = h.call("refit_check", json!({}));
+        assert_eq!((&chk["ok"], &chk["findings_count"]), (&json!(true), &json!(0)));
+
+        let id = h.call("refit_tx", json!({"op": "begin"}))["tx_handle"].as_str().unwrap().to_string();
+        let patch = asrf_edit("src/m.ts", "  return a * b;", "  const out = a * b;\n  return out;");
+        assert_eq!(h.call("refit_tx", json!({"op": "stage", "tx_handle": id, "patch_text": patch}))["staged_files_count"], json!(1));
+        let done = h.call("refit_tx", json!({"op": "commit", "tx_handle": id, "dry_run": false}));
+        assert_eq!((&done["committed"], &done["files_committed"]), (&json!(true), &json!(1)));
+        assert!(h.repo.read("src/m.ts").contains("const out = a * b;"));
+
+        let bad = h.call("refit_tx", json!({"op": "unknown_op"}));
+        assert!(bad["error"].as_str().unwrap().contains("invalid refit_tx op"));
+    }
+
+    #[tokio::test]
+    async fn skills_resources_and_instructions() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+        let h = Harness::new("mcp_skills", &[("src/a.rs", "pub fn a() {}\n")]);
+
+        let (_, init) = h.rpc(rpc_req(1, "initialize", json!({"protocolVersion": PROTO_STATELESS}))).await;
+        assert!(init["result"]["instructions"].as_str().unwrap().contains("refit_check"));
+        assert_eq!(
+            init["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/skills"]["directoryRead"],
+            json!(false),
+        );
+        assert!(init["result"]["capabilities"]["resources"].is_object());
+
+        let (_, slist) = h.rpc(rpc_bare(2, "skills/list")).await;
+        let skill = &slist["result"]["skills"][0];
+        let want_digest = format!("sha256:{}", sha256_hex(SKILL_MD.as_bytes()));
+        assert_eq!((&skill["uri"], &skill["frontmatter"]["name"]), (&json!(SKILL_URI), &json!("refit")));
+        assert_eq!(
+            (&skill["resources"][0]["uri"], &skill["resources"][0]["size"], &skill["resources"][0]["digest"]),
+            (&json!(SKILL_MD_URI), &json!(SKILL_MD.len()), &json!(want_digest)),
+        );
+
+        let (_, sget) = h.rpc(rpc_req(3, "skills/get", json!({"uri": SKILL_URI}))).await;
+        assert_eq!(sget["result"]["uri"], json!(SKILL_URI));
+        let (_, sget2) = h.rpc(rpc_req(4, "skills/get", json!({"uri": SKILL_MD_URI}))).await;
+        assert_eq!(sget2["result"]["uri"], json!(SKILL_URI));
+        let (_, sbad) = h.rpc(rpc_req(5, "skills/get", json!({"uri": "skill://nope"}))).await;
+        assert_eq!(sbad["error"]["code"], json!(ERR_INVALID_PARAMS));
+
+        let (_, rlist) = h.rpc(rpc_bare(6, "resources/list")).await;
+        assert_eq!(rlist["result"]["resources"][0]["uri"], json!(SKILL_MD_URI));
+
+        let (_, rread) = h.rpc(rpc_req(7, "resources/read", json!({"uri": SKILL_MD_URI}))).await;
+        assert_eq!(rread["result"]["contents"][0]["text"], json!(SKILL_MD));
+        let (_, rbad) = h.rpc(rpc_req(8, "resources/read", json!({"uri": "skill://missing"}))).await;
+        assert_eq!(rbad["error"]["code"], json!(ERR_INVALID_PARAMS));
+    }
+
+    #[test]
+    fn read_strips_invisible_unicode_and_marks_taint() {
+        let poisoned = "let ok = 1;\u{E0041}\u{202E} // hidden\n";
+        let h = Harness::new("mcp_taint", &[("src/p.rs", poisoned)]);
+        let rd = h.call("refit_read", json!({"path": "src/p.rs"}));
+        let content = rd["content"].as_str().unwrap();
+        assert!(!content.contains('\u{E0041}') && !content.contains('\u{202E}'));
+        assert!(content.contains("let ok = 1; // hidden"));
+        assert!(rd["invisible_unicode_stripped"].as_u64().unwrap() >= 2);
+        assert_eq!(rd["taint"], json!("untrusted_repo_file"));
     }
 }

@@ -445,6 +445,7 @@ pub async fn start_proxy(
         .route("/health", get(handle_health))
         .route("/events", get(serve_events))
         .route("/api/timeline", get(timeline_get))
+        .route("/api/kane", get(kane_get))
         .route("/api/diff/{tx_id}", get(serve_diff))
         .route("/api/steer", get(steer_get).post(steer_post))
         .route("/v1/models", get(handle_models))
@@ -558,6 +559,18 @@ async fn timeline_get(State(state): State<Arc<ProxyState>>, headers: HeaderMap) 
         .and_then(|r| MvccStore::wal_timeline(r).ok())
         .unwrap_or_default();
     Json(TimelineBody { entries }).into_response()
+}
+
+async fn kane_get(State(state): State<Arc<ProxyState>>, headers: HeaderMap) -> Response {
+    if !state.is_authorized(&headers) { return err_401(); }
+    let root = state.repo_root.lock().clone();
+    let read_j = |name: &str| {
+        root.as_deref()
+            .and_then(|r| std::fs::read_to_string(r.join(".refit").join(name)).ok())
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    };
+    Json(serde_json::json!({ "last": read_j("kane_last.json"), "state": read_j("kane_state.json") }))
+        .into_response()
 }
 
 async fn serve_diff(

@@ -2,7 +2,10 @@ mod infra;
 mod similarity;
 #[cfg(any(feature = "ste100", test))]
 pub mod ste100;
-pub use infra::{install_secret_hooks, scan_repo_secrets};
+pub use infra::{
+    SecretScanReport, escape_gh_prop, install_secret_hooks, push_sarif_result, render_secrets_gh,
+    render_secrets_sarif, run_agent_hook, scan_repo_secrets,
+};
 
 use crate::hygiene::HygieneScorer;
 use crate::lex::{
@@ -15,8 +18,9 @@ use crate::types::{
     AuditReport, DocDriftFinding, GodFileScore, InfraFinding, RoleCluster, SustainFiles,
     TriageEntry, UnusedDep,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use regex::Regex;
+use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 use std::fs;
@@ -83,6 +87,7 @@ pub fn untangle_repo_with_scope(
                 metrics: &sym_graph.metrics_by_file,
                 defs_by_file: Some(&sym_graph.defs_by_file),
                 refs_by_file: Some(&sym_graph.refs_by_file),
+                sources: Some(preloaded),
             };
             let (_ego, deep) = analysis::analyze_ego_and_deep_modules(
                 source_rels, &sccs, &arch, &genome.file_commits, &clone_clusters,
@@ -275,11 +280,116 @@ pub fn write_sustain(repo_root: &Path, report: &AuditReport, dry_run: bool) -> R
             "## Code-Precedence Guardrail\n",
             "- When docs (`README.md`, `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, or comments) ",
             "and code disagree, trust live code & tests first and update stale markdown immediately.\n",
-            "- Keep all backticked file paths and `ident()` symbol references verified against live code.\n"
+            "- Keep all backticked file paths and `ident()` symbol references verified against live code.\n",
+            "- Verify user-facing web/mobile changes with `refit check . --kane <spec>` (Gate 4 via Kane CLI).\n"
         ),
         report.scc_count
     );
     write_sustain_docs(repo_root, report, agents, dry_run)
+}
+
+fn load_json_object(path: &Path) -> Result<Map<String, Value>> {
+    if !path.exists() { return Ok(Map::new()); }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    if raw.trim().is_empty() { return Ok(Map::new()); }
+    let val: Value = serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    val.as_object().cloned().with_context(|| format!("expected JSON object in {}", path.display()))
+}
+
+fn ensure_object<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Map<String, Value> {
+    let entry = map.entry(key.to_string()).or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() { *entry = Value::Object(Map::new()); }
+    entry.as_object_mut().expect("object")
+}
+
+fn ensure_array<'a>(map: &'a mut Map<String, Value>, key: &str) -> &'a mut Vec<Value> {
+    let entry = map.entry(key.to_string()).or_insert_with(|| Value::Array(Vec::new()));
+    if !entry.is_array() { *entry = Value::Array(Vec::new()); }
+    entry.as_array_mut().expect("array")
+}
+
+fn has_refit_hook_command(entry: &Value) -> bool {
+    if entry.get("command").and_then(Value::as_str) == Some("refit hook") { return true; }
+    entry.get("hooks").and_then(Value::as_array).is_some_and(|arr| {
+        arr.iter().any(|h| h.get("command").and_then(Value::as_str) == Some("refit hook"))
+    })
+}
+
+fn merge_nested_agent_hook(path: &Path, event: &str, matcher: &str, dry_run: bool) -> Result<()> {
+    let mut root = load_json_object(path)?;
+    let hooks = ensure_object(&mut root, "hooks");
+    let list = ensure_array(hooks, event);
+    if !list.iter().any(has_refit_hook_command) {
+        list.push(json!({
+            "matcher": matcher,
+            "hooks": [{ "type": "command", "command": "refit hook" }]
+        }));
+    }
+    if !dry_run {
+        let body = format!("{}\n", serde_json::to_string_pretty(&Value::Object(root))?);
+        write_atomic(path, body.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn merge_cursor_hooks(path: &Path, dry_run: bool) -> Result<()> {
+    let mut root = load_json_object(path)?;
+    root.entry("version".to_string()).or_insert_with(|| json!(1));
+    let hooks = ensure_object(&mut root, "hooks");
+    for event in ["beforeShellExecution", "beforeReadFile", "afterFileEdit"] {
+        let list = ensure_array(hooks, event);
+        if !list.iter().any(has_refit_hook_command) {
+            list.push(json!({ "command": "refit hook" }));
+        }
+    }
+    if !dry_run {
+        let body = format!("{}\n", serde_json::to_string_pretty(&Value::Object(root))?);
+        write_atomic(path, body.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// One-shot repository onboarding: sustain guardrails, chained Git hooks, and AI agent hooks.
+pub fn init_repo_integrations(
+    repo_root: &Path, report: &AuditReport, dry_run: bool,
+) -> Result<Vec<String>> {
+    let mut written = write_sustain(repo_root, report, dry_run)?.files_written;
+    if dry_run {
+        written.extend(infra::planned_secret_hook_paths(repo_root));
+    } else {
+        written.extend(install_secret_hooks(repo_root)?);
+    }
+    merge_nested_agent_hook(
+        &repo_root.join(".claude/settings.json"), "PreToolUse", "Bash|Write|Edit|MultiEdit|Read", dry_run,
+    )?;
+    merge_nested_agent_hook(
+        &repo_root.join(".claude/settings.json"), "PostToolUse", "Write|Edit|MultiEdit", dry_run,
+    )?;
+    merge_cursor_hooks(&repo_root.join(".cursor/hooks.json"), dry_run)?;
+    merge_nested_agent_hook(
+        &repo_root.join(".gemini/settings.json"), "BeforeTool", "*", dry_run,
+    )?;
+    merge_nested_agent_hook(
+        &repo_root.join(".gemini/settings.json"), "AfterTool", "write_file|replace|edit_file", dry_run,
+    )?;
+    written.extend([
+        ".claude/settings.json".into(),
+        ".cursor/hooks.json".into(),
+        ".gemini/settings.json".into(),
+    ]);
+    if repo_root.join(".kiro").is_dir() {
+        let kiro_rel = ".kiro/hooks/refit-kane-verify.kiro.hook";
+        if !dry_run {
+            let kiro_body = serde_json::to_string_pretty(&json!({
+                "enabled": true, "name": "refit + Kane CLI Verify", "version": "1",
+                "when": { "type": "fileEdited", "patterns": ["docs/**/*.html", "src/**/*.tsx", "src/**/*.ts", "README.md"] },
+                "then": { "type": "askAgent", "prompt": "Run `refit check . --verify-docs --kane <spec>` to verify static safety and live browser proof before pushing." }
+            }))?;
+            write_atomic(&repo_root.join(kiro_rel), format!("{kiro_body}\n").as_bytes())?;
+        }
+        written.push(kiro_rel.into());
+    }
+    Ok(written)
 }
 
 /// Compile and lint an audit report with simplified prose rules and optional wordlist.
@@ -383,6 +493,17 @@ fn push_drift(
     out: &mut Vec<DocDriftFinding>, file: &str, line: usize, kind: &str, reference: String, message: String,
 ) {
     out.push(DocDriftFinding { file: file.to_string(), line, kind: kind.into(), reference, message });
+}
+
+/// Fast standalone static doc-drift scan (used by `refit check --verify-docs`).
+pub fn scan_doc_drift_quick(repo_root: &Path, warm_graph: Option<&SymbolGraph>) -> Vec<DocDriftFinding> {
+    let repo_snap = RepoSnapshot::capture(repo_root, false);
+    let owned;
+    let snap = match warm_graph {
+        Some(g) => g,
+        None => { owned = index_repo_snap(repo_root, &repo_snap).1; &owned }
+    };
+    scan_doc_drift(repo_root, &repo_snap, snap)
 }
 
 /// Scan docs and comments for stale paths and symbol references.
@@ -632,5 +753,43 @@ mod tests {
                 "false positive `{bad}` in {:?}", rep.doc_drift_findings
             );
         }
+    }
+
+    #[test]
+    fn init_repo_integrations_merges_idempotently() {
+        let dir = TempRepo::git("init_int", "app", &[
+            ("src/lib.rs", "pub fn ok() -> usize { 1 }\n"),
+            (".claude/settings.json", r#"{"customKey":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo hi"}]}]}}"#),
+            (".cursor/hooks.json", r#"{"version":1,"hooks":{"beforeShellExecution":[{"command":"echo cur"}]}}"#),
+            (".gemini/settings.json", r#"{"theme":"dark"}"#),
+        ]);
+        let rep = untangle_repo(dir.path(), &HygieneScorer::new()).unwrap();
+
+        let dry = init_repo_integrations(dir.path(), &rep, true).unwrap();
+        assert!(dry.iter().any(|p| p == ".claude/settings.json"));
+        assert!(!dir.has("AGENTS.md"));
+
+        let first = init_repo_integrations(dir.path(), &rep, false).unwrap();
+        assert!(first.len() >= 9);
+        let _second = init_repo_integrations(dir.path(), &rep, false).unwrap();
+
+        let claude: Value = serde_json::from_str(&fs::read_to_string(dir.join(".claude/settings.json")).unwrap()).unwrap();
+        assert_eq!(claude["customKey"], true);
+        let pre = claude["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+
+        let cursor: Value = serde_json::from_str(&fs::read_to_string(dir.join(".cursor/hooks.json")).unwrap()).unwrap();
+        assert_eq!(cursor["hooks"]["beforeShellExecution"].as_array().unwrap().len(), 2);
+        assert_eq!(cursor["hooks"]["beforeReadFile"].as_array().unwrap().len(), 1);
+        assert_eq!(cursor["hooks"]["afterFileEdit"].as_array().unwrap().len(), 1);
+
+        let gemini: Value = serde_json::from_str(&fs::read_to_string(dir.join(".gemini/settings.json")).unwrap()).unwrap();
+        assert_eq!(gemini["theme"], "dark");
+        assert_eq!(gemini["hooks"]["BeforeTool"].as_array().unwrap().len(), 1);
+
+        let sec_rep = scan_repo_secrets(dir.path(), false, None, true).unwrap();
+        assert_eq!(render_secrets_sarif(&sec_rep)["version"], "2.1.0");
+        assert!(render_secrets_gh(&sec_rep).is_empty());
+        assert_eq!(run_agent_hook("").0, 0);
     }
 }

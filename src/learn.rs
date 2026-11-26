@@ -253,7 +253,51 @@ const DIAG_RULES: &[DiagRow] = &[
     ("gate3_ty", &["ty:"], "ty_types", "Add explicit type annotations and narrow Optional values before use."),
     ("gate3_5_invariants", &["builtin_no_secrets", "secret literal"], "invariants_security", "Never hardcode credentials or violate .refit/invariants.yml boundaries."),
     ("gate1_tests", &["assert", "pytest"], "test_boundary", "Trace exact boundary conditions (<= vs <, clamping, None guards) carefully."),
+    ("gate4_kane", &["kane", "agent_info", "assert", "verify", "console", "locator", "bug_740", "policy"], "kane_live_fail", "Inspect Kane .evidence failure.yaml + console log, fix the UI/route regression, and re-verify with refit check --kane."),
 ];
+
+/// Map a Kane failure diagnostic to suspected `(file, line, symbol)` spans & rewind-affected files.
+pub fn rewind_kane_tokens(
+    repo_root: &Path, warm_graph: Option<&SymbolGraph>, diagnostic: &str,
+) -> (Vec<(String, usize, String)>, Vec<String>) {
+    if let Ok(store) = LearnStore::open(repo_root) {
+        let _ = store.record_failure("gate4_kane", "*", diagnostic);
+    }
+    let owned;
+    let snap = match warm_graph {
+        Some(g) => g,
+        None => { owned = load_symbols(repo_root, None); &owned }
+    };
+    let mut tokens: Vec<String> = Vec::new();
+    for raw in diagnostic.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))) {
+        let clean = raw.trim_matches('-');
+        if clean.len() >= 4 && clean.len() <= 48 && !tokens.iter().any(|t| t == clean) {
+            tokens.push(clean.to_string());
+        }
+        if tokens.len() >= 24 { break; }
+    }
+    let mut spans: Vec<(String, usize, String)> = Vec::new();
+    for (file, defs) in &snap.defs_by_file {
+        for sym in defs {
+            if tokens.iter().any(|t| t == sym || (sym.len() >= 5 && t.eq_ignore_ascii_case(sym)))
+                && !spans.iter().any(|(f, _, s)| f == file && s == sym)
+            {
+                spans.push((file.clone(), 1, sym.clone()));
+            }
+        }
+        if spans.len() >= 8 { break; }
+    }
+    let idx = InvertedRewindIndex::from_symbol_graph(snap, &FxHashMap::default());
+    let mut affected: Vec<String> = Vec::new();
+    for tok in spans.iter().map(|(_, _, s)| s.as_str()).chain(tokens.iter().map(String::as_str)).take(8) {
+        let ev = RewindEvent::new(RewindTrigger::AbiChanged, tok.to_string(), "kane_live_fail".into());
+        for f in idx.query_event_paths(&ev, MIN_KERNEL_COST_US) {
+            if !affected.contains(&f) { affected.push(f); }
+            if affected.len() >= 12 { break; }
+        }
+    }
+    (spans, affected)
+}
 
 pub struct LearnStore {
     path: PathBuf,
@@ -389,7 +433,7 @@ fn trigger_for_rule(key: &str, raw_diagnostic: &str) -> Option<RewindTrigger> {
         return Some(RewindTrigger::NewDepAdvisory);
     }
     match key {
-        "abi_pin" => Some(RewindTrigger::AbiChanged),
+        "abi_pin" | "kane_live_fail" => Some(RewindTrigger::AbiChanged),
         "invariants_security" => Some(RewindTrigger::NewInvariantRule),
         "ruff_b006" | "ruff_f401" | "ruff_f841" | "line_len" | "deep_nesting" | "dedup"
         | "cramped_layout" | "ty_types" => Some(RewindTrigger::NewSmellPattern),

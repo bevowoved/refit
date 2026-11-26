@@ -1,0 +1,24 @@
+# Declarative Gate 4 Kane CLI policy for refit (kane-cli >= 0.10.0).
+# Run via: refit check . --kane tests/kane/hud_desktop_replay_test.md --policy tests/kane/refit-policy.yaml
+policy: refit-gate4-pr
+gates:
+  - id: no-broken-tests
+    metric: totals.broken
+    equals: 0
+    severity: blocking
+    message: Every refit Gate 4 browser/mobile contract must execute cleanly.
+  - id: full-pass-rate
+    metric: pass_rate
+    min: 1
+    severity: blocking
+    message: Gate 4 pass rate must be 100% before MVCC commit or git push.
+  - id: every-test-checks
+    metric: metrics.tests_without_checks
+    equals: 0
+    severity: blocking
+    message: Every Kane flow must verify concrete DOM state transitions (anti-cheat rule).
+  - id: no-silent-heals
+    metric: metrics.heal.healed_tests
+    max: 0
+    severity: warning
+    message: Review any adaptive heal to ensure UI drift did not mask a product regression.

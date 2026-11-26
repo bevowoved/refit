@@ -9,7 +9,10 @@ pub use audit::{
     AuditStats, GateConfig, ScanCache, audit_repo, read_gates, scan_cached, scan_repo,
 };
 pub use rules::check_rules;
-pub use runners::net_new_diagnostics;
+pub use runners::{
+    CodeSpanHint, KANE_SARIF_RULES, KaneReceipt, KaneRequest, KaneSurface, net_new_diagnostics,
+    probe_url_reachable, read_kane_status, run_kane,
+};
 #[cfg(test)]
 pub use stage::{decode_lsp, encode_lsp, stage_copies};
 pub use stage::{prune_repo_caches, stage_hardlinks, sweep_stages};
