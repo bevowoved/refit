@@ -5,10 +5,11 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license--credits)
 [![Rust 1.100+](https://img.shields.io/badge/rust-1.100%2B-orange.svg)](rust-toolchain.toml)
 
-**Keep AI-written code clean and proven.**
-One static Rust binary pairs local neural hygiene, symbol-graph untangling, web-wired MCP, and `<5 ms` hooks with **TestMu AI Kane CLI** live proof.
+**`refit` works inside your coding agent loop and from your terminal or CI.**
+One static Rust binary equips Claude Code, Cursor, Gemini CLI, Kiro, and Antigravity with local neural hygiene, symbol-graph untangling, web-wired MCP, and `<5 ms` hooks.
+It pairs those local gates directly with **TestMu AI Kane CLI** for real browser and mobile proof.
 
-> **Two-Tier Loop Engineering:** TestMu AI research reports that **81% of teams merged AI code they did not fully understand**. No agent harness can reliably audit itself. `refit` enforces fast structural and neural hygiene on every edit, then hands clean diffs to **TestMu AI Kane CLI** for independent runtime proof.
+> **Two-Tier Loop Engineering:** TestMu AI research reports that **81% of teams merged AI code they did not fully understand**. No agent harness can reliably audit itself. `refit` guides and verifies coding agents on every edit, then hands clean diffs to **TestMu AI Kane CLI** for independent runtime proof.
 
 - **Live Gate 4 Site:** [bevowoved.github.io/refit/?demo=1&at=100&tab=kane](https://bevowoved.github.io/refit/?demo=1&at=100&tab=kane)
 - **Crates.io:** [crates.io/crates/refit](https://crates.io/crates/refit) (`cargo install refit --locked`)
@@ -16,9 +17,9 @@ One static Rust binary pairs local neural hygiene, symbol-graph untangling, web-
 
 ---
 
-## What `refit` Combines
+## What `refit` Gives Coding Agents (and Standalone CLI)
 
-One `12.71 MiB` binary replaces six separate tools with zero active Cargo duplicates.
+One `12.71 MiB` binary replaces six separate tools inside the agent loop or CI, with zero active Cargo duplicates.
 
 | Layer | Local Capability | Ecosystem Lineage |
 | :--- | :--- | :--- |

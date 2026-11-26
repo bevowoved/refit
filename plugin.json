@@ -2,7 +2,7 @@
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "refit",
   "version": "0.6.0",
-  "description": "Keep AI-written code clean and proven: local neural code hygiene, symbol-graph untangling, web-wired MCP, event-driven hooks, and Kane CLI live proof.",
+  "description": "Give coding agents local neural hygiene, symbol-graph untangling, web-wired MCP, <5 ms hooks, and Kane CLI live proof.",
   "author": {
     "name": "bevowoved",
     "url": "https://github.com/bevowoved/refit"
